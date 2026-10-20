@@ -41,7 +41,8 @@ impl Client {
     }
 
     /// Sends one API call and returns its `result_data`.
-    async fn call(&self, path: &str, params: Value) -> Result<Value> {
+    /// Also used by the `api` subcommand for exploring endpoints.
+    pub async fn call(&self, path: &str, params: Value) -> Result<Value> {
         let cfg = &self.config;
         let url = format!("{}{}", cfg.gateway.trim_end_matches('/'), path);
         let body = build_body(&cfg.appkey, params, &crypto::nonce(), &now_millis()?);

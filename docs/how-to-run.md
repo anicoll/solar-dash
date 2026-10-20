@@ -72,6 +72,21 @@ For more logging:
 RUST_LOG=debug cargo run -- serve
 ```
 
+## Exploring the API
+
+The `api` subcommand logs in, calls any iSolarCloud endpoint and prints the
+`result_data` as pretty JSON. The params are optional and must be a JSON
+object (they default to `{}`):
+
+```sh
+cargo run -- api /openapi/getPowerStationList '{"curPage":1,"size":10}'
+cargo run -- api /openapi/getDeviceList '{"ps_id":"1234567","curPage":1,"size":50}'
+```
+
+Check the developer portal docs for endpoint names and their params. Every
+call counts toward the API limits of 2,000 calls per hour and 100,000 per
+month, so keep exploring to a few calls.
+
 ## Database
 
 Data is stored in a SQLite file, `data/solar.db` by default (change it with

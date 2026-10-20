@@ -6,6 +6,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 
 - [x] Project scaffold (CLI, config, docs, CI)
 - [x] iSolarCloud API client: login + plant list (`login-test`)
+- [x] API explorer (`api` subcommand)
 - [x] SQLite storage (schema, migrations, typed queries)
 - [ ] Backfill of historical data
 - [ ] Live sync
