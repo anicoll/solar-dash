@@ -3,6 +3,7 @@
 //! The pure pieces ([`build_body`], [`parse_response`]) are separate
 //! functions so they can be unit tested without any network.
 
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -19,6 +20,19 @@ pub struct Plant {
     pub ps_id: i64,
     pub ps_name: String,
 }
+
+/// An error reported by iSolarCloud itself (as opposed to a network problem).
+/// Callers can tell the two apart with `err.downcast_ref::<ApiError>()`.
+#[derive(Debug)]
+pub struct ApiError(String);
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "iSolarCloud error: {}", self.0)
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 pub struct Client {
     http: reqwest::Client,
@@ -158,12 +172,8 @@ fn parse_response(text: &str, envelope: Option<&Envelope>) -> Result<Value> {
         // Some errors leave result_msg empty, so fall back to the whole
         // response (error responses carry no token or secrets).
         match response["result_msg"].as_str().filter(|m| !m.is_empty()) {
-            Some(msg) => Err(anyhow!(
-                "iSolarCloud error: result_code {code:?}, result_msg {msg:?}"
-            )),
-            None => Err(anyhow!(
-                "iSolarCloud error: result_code {code:?}, response {response}"
-            )),
+            Some(msg) => Err(ApiError(format!("result_code {code:?}, result_msg {msg:?}")).into()),
+            None => Err(ApiError(format!("result_code {code:?}, response {response}")).into()),
         }
     }
 }
@@ -229,6 +239,16 @@ mod tests {
         let msg = parse_response(text, None).unwrap_err().to_string();
         assert!(msg.contains("E00003"));
         assert!(msg.contains("token expired"));
+    }
+
+    #[test]
+    fn parse_error_is_an_api_error() {
+        let text = r#"{"result_code":"E00003","result_msg":"token expired"}"#;
+        let err = parse_response(text, None).unwrap_err();
+        assert!(err.downcast_ref::<ApiError>().is_some());
+        // Not-JSON is a different kind of failure.
+        let err = parse_response("nope", None).unwrap_err();
+        assert!(err.downcast_ref::<ApiError>().is_none());
     }
 
     #[test]

@@ -20,6 +20,17 @@ password = "your-password"
 # Which plant to sync. Run login-test to list your plants. If unset and you
 # have exactly one plant, it is used.
 # plant_id = 1234567
+# The plant's time zone (IANA name). History timestamps are in this zone.
+# timezone = "Australia/Adelaide"
+# Which measuring points `backfill` downloads. Default list and meanings:
+#   83033 plant power (W)              83067 PV total active power (W)
+#   83106 load power (W)               83328 grid active power (W)
+#   83326 ESS (battery) active power (W)   83252 battery SOC (%)
+#   83022 plant daily yield (Wh)       83102 energy purchased today (Wh)
+#   83072 feed-in energy today (Wh)    83118 daily load consumption (Wh)
+#   83322 ESS daily charge (Wh)        83323 ESS daily discharge (Wh)
+#   83097 daily PV consumed by loads (Wh)
+# points = [83033, 83067, 83106, 83328, 83326, 83252, 83022, 83102, 83072, 83118, 83322, 83323, 83097]
 
 # Optional section; defaults shown.
 [server]

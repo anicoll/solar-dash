@@ -1,12 +1,12 @@
 mod config;
-// Most of db.rs is not called yet; later PRs will use it. Remove this then.
-#[allow(dead_code)]
 mod db;
+mod ingest;
 mod isolar;
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tracing::info;
@@ -72,7 +72,12 @@ async fn main() -> Result<()> {
             info!(path = %config.database.path, "database ready");
             info!("serve is not implemented yet");
         }
-        Command::Backfill { from } => info!(%from, "backfill is not implemented yet"),
+        Command::Backfill { from } => {
+            if let Err(err) = run_backfill(config, &from).await {
+                eprintln!("Backfill failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
         Command::LoginTest => {
             // `{:#}` prints the whole error chain on one line.
             if let Err(err) = login_test(config).await {
@@ -88,6 +93,17 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Opens the database, logs in and downloads history starting at `from`.
+async fn run_backfill(config: Config, from: &str) -> Result<()> {
+    // Check the date first, so a typo fails before any network call.
+    let from = NaiveDate::parse_from_str(from, "%Y-%m-%d")
+        .with_context(|| format!("--from must look like 2023-02-21, got {from:?}"))?;
+    let pool = db::open(&config.database.path).await?;
+    let mut client = Client::new(config.isolarcloud.clone())?;
+    client.login().await?;
+    ingest::backfill(&client, &pool, &config.isolarcloud, from).await
 }
 
 /// Logs in, calls one endpoint and prints its `result_data` as pretty JSON.

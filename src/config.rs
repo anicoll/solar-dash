@@ -33,6 +33,12 @@ pub struct IsolarCloud {
     pub password: String,
     /// Which plant to sync; see config.example.toml.
     pub plant_id: Option<i64>,
+    /// Which measuring points to download; see config.example.toml.
+    #[serde(default = "default_points")]
+    pub points: Vec<i64>,
+    /// The plant's time zone (an IANA name). History timestamps are in it.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
 }
 
 // Deriving Debug would print the secrets into logs, so we write it by hand
@@ -48,6 +54,8 @@ impl fmt::Debug for IsolarCloud {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("plant_id", &self.plant_id)
+            .field("points", &self.points)
+            .field("timezone", &self.timezone)
             .finish()
     }
 }
@@ -88,6 +96,16 @@ fn default_gateway() -> String {
 
 fn default_encrypt() -> bool {
     true
+}
+
+fn default_points() -> Vec<i64> {
+    vec![
+        83033, 83067, 83106, 83328, 83326, 83252, 83022, 83102, 83072, 83118, 83322, 83323, 83097,
+    ]
+}
+
+fn default_timezone() -> String {
+    "Australia/Adelaide".to_string()
 }
 
 fn default_bind() -> String {
@@ -137,6 +155,9 @@ mod tests {
         assert!(cfg.isolarcloud.encrypt);
         assert_eq!(cfg.server.bind, "127.0.0.1:8080");
         assert_eq!(cfg.database.path, "data/solar.db");
+        assert_eq!(cfg.isolarcloud.timezone, "Australia/Adelaide");
+        assert_eq!(cfg.isolarcloud.points.len(), 13);
+        assert!(cfg.isolarcloud.points.contains(&83252));
     }
 
     #[test]
