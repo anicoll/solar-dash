@@ -17,6 +17,9 @@ encrypt = true
 # Your normal iSolarCloud login.
 username = "you@example.com"
 password = "your-password"
+# Which plant to sync. Run login-test to list your plants. If unset and you
+# have exactly one plant, it is used.
+# plant_id = 1234567
 
 # Optional section; defaults shown.
 [server]

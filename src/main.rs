@@ -1,4 +1,7 @@
 mod config;
+// Most of db.rs is not called yet; later PRs will use it. Remove this then.
+#[allow(dead_code)]
+mod db;
 mod isolar;
 
 use std::path::PathBuf;
@@ -56,7 +59,11 @@ async fn main() -> Result<()> {
     tracing::debug!(?config, "parsed config (secrets are redacted)");
 
     match cli.command {
-        Command::Serve => info!("serve is not implemented yet"),
+        Command::Serve => {
+            let _pool = db::open(&config.database.path).await?;
+            info!(path = %config.database.path, "database ready");
+            info!("serve is not implemented yet");
+        }
         Command::Backfill { from } => info!(%from, "backfill is not implemented yet"),
         Command::LoginTest => {
             // `{:#}` prints the whole error chain on one line.
@@ -71,6 +78,7 @@ async fn main() -> Result<()> {
 
 /// Logs in, lists the plants and prints a short summary.
 async fn login_test(config: Config) -> Result<()> {
+    let config_plant_id = config.isolarcloud.plant_id;
     let mut client = Client::new(config.isolarcloud)?;
     client.login().await?;
     let plants = client.plants().await?;
@@ -79,6 +87,9 @@ async fn login_test(config: Config) -> Result<()> {
     println!("Logged in. Found {} {noun}", plants.len());
     for plant in &plants {
         println!("  {} {}", plant.ps_id, plant.ps_name);
+    }
+    if config_plant_id.is_none() && plants.len() > 1 {
+        println!("Set plant_id in config.toml to choose one");
     }
     Ok(())
 }

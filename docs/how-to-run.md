@@ -72,6 +72,19 @@ For more logging:
 RUST_LOG=debug cargo run -- serve
 ```
 
+## Database
+
+Data is stored in a SQLite file, `data/solar.db` by default (change it with
+`path` in the `[database]` section of `config.toml`). It is created, and its
+tables are set up, the first time you run `serve`. To look inside:
+
+```sh
+sudo apt install sqlite3
+sqlite3 data/solar.db
+```
+
+Try `.tables` and `.schema reading` at the prompt.
+
 ## Checks
 
 Run these before opening a PR (CI runs the same):
