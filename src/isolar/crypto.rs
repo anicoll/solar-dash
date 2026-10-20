@@ -4,9 +4,6 @@
 //! key is itself encrypted with the server's RSA public key and sent in the
 //! `x-random-secret-key` header, so the server can decrypt the body.
 
-// Nothing outside the tests calls this yet. Remove once the client uses it.
-#![allow(dead_code)]
-
 use aes::Aes128;
 use aes::cipher::block_padding::Pkcs7;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyInit};

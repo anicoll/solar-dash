@@ -11,6 +11,9 @@ appkey = "YOUR_APPKEY"
 access_key = "YOUR_ACCESS_KEY"
 # The RSA public key shown on the same page (used to encrypt the password).
 rsa_public_key = "YOUR_RSA_PUBLIC_KEY"
+# Whether requests are encrypted. Must match the app's encryption setting in
+# the developer portal, or every call will fail.
+encrypt = true
 # Your normal iSolarCloud login.
 username = "you@example.com"
 password = "your-password"
