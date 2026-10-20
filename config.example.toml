@@ -1,0 +1,24 @@
+# Copy this file to config.toml and fill in your own values.
+# config.toml is gitignored, so your secrets stay out of git.
+
+[isolarcloud]
+# API gateway for your region. The default is the Australian gateway.
+gateway = "https://augateway.isolarcloud.com"
+# The next three values come from your application's page on the
+# iSolarCloud developer portal.
+appkey = "YOUR_APPKEY"
+# "Access Key", also shown as the secret. Keep this private.
+access_key = "YOUR_ACCESS_KEY"
+# The RSA public key shown on the same page (used to encrypt the password).
+rsa_public_key = "YOUR_RSA_PUBLIC_KEY"
+# Your normal iSolarCloud login.
+username = "you@example.com"
+password = "your-password"
+
+# Optional section; defaults shown.
+[server]
+bind = "127.0.0.1:8080"
+
+# Optional section; defaults shown.
+[database]
+path = "data/solar.db"

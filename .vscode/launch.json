@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug serve",
+      "cargo": {
+        "args": ["build", "--bin=solar-dash"],
+        "filter": { "name": "solar-dash", "kind": "bin" }
+      },
+      "args": ["serve"],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
