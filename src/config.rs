@@ -1,14 +1,13 @@
 //! Configuration loaded from a TOML file.
 
-// Most fields are not read yet; later PRs will use them. Remove this then.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+// Not read yet; a later PR will use it. Remove this then.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub isolarcloud: IsolarCloud,
@@ -20,13 +19,16 @@ pub struct Config {
     pub database: Database,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct IsolarCloud {
     #[serde(default = "default_gateway")]
     pub gateway: String,
     pub appkey: String,
     pub access_key: String,
     pub rsa_public_key: String,
+    /// Must match the "encrypt" setting of the app in the developer portal.
+    #[serde(default = "default_encrypt")]
+    pub encrypt: bool,
     pub username: String,
     pub password: String,
 }
@@ -40,12 +42,15 @@ impl fmt::Debug for IsolarCloud {
             .field("appkey", &self.appkey)
             .field("access_key", &"<redacted>")
             .field("rsa_public_key", &self.rsa_public_key)
+            .field("encrypt", &self.encrypt)
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .finish()
     }
 }
 
+// Not read yet; a later PR will use it. Remove this then.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Server {
     #[serde(default = "default_bind")]
@@ -60,6 +65,8 @@ impl Default for Server {
     }
 }
 
+// Not read yet; a later PR will use it. Remove this then.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Database {
     #[serde(default = "default_db_path")]
@@ -76,6 +83,10 @@ impl Default for Database {
 
 fn default_gateway() -> String {
     "https://augateway.isolarcloud.com".to_string()
+}
+
+fn default_encrypt() -> bool {
+    true
 }
 
 fn default_bind() -> String {
@@ -122,6 +133,7 @@ mod tests {
     fn defaults_apply_when_sections_omitted() {
         let cfg: Config = toml::from_str(MINIMAL).unwrap();
         assert_eq!(cfg.isolarcloud.gateway, "https://augateway.isolarcloud.com");
+        assert!(cfg.isolarcloud.encrypt);
         assert_eq!(cfg.server.bind, "127.0.0.1:8080");
         assert_eq!(cfg.database.path, "data/solar.db");
     }

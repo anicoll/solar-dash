@@ -21,16 +21,36 @@ cp config.example.toml config.toml
 ```
 
 Edit `config.toml` and fill in your iSolarCloud developer-portal values
-(appkey, access key, RSA public key) and your normal iSolarCloud login.
+(appkey, access key, RSA public key, gateway for your region) and your normal
+iSolarCloud login. Set `encrypt` to match the app's setting in the portal.
 `config.toml` is gitignored.
 
 ## Run
 
-Check your credentials (not implemented yet, currently it only loads the config):
+Check your credentials:
 
 ```sh
 cargo run -- login-test
 ```
+
+Success looks like this (your plant id and name will differ):
+
+```
+Logged in. Found 1 plant
+  1234567 My House
+```
+
+Add `RUST_LOG=debug` to also see the raw plant-list data.
+
+### Troubleshooting
+
+If `login-test` fails, it prints the error and exits with status 1. Check:
+
+- `encrypt` in `config.toml` matches the app's encryption setting in the
+  developer portal.
+- `gateway` is the one for your region.
+- The app has been approved in the developer portal.
+- The appkey, access key and RSA public key were copied without extra spaces.
 
 Start the server:
 

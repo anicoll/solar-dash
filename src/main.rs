@@ -9,6 +9,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
+use isolar::client::Client;
 
 /// Self-hosted Sungrow iSolarCloud dashboard.
 #[derive(Debug, Parser)]
@@ -57,7 +58,27 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve => info!("serve is not implemented yet"),
         Command::Backfill { from } => info!(%from, "backfill is not implemented yet"),
-        Command::LoginTest => info!("login-test is not implemented yet"),
+        Command::LoginTest => {
+            // `{:#}` prints the whole error chain on one line.
+            if let Err(err) = login_test(config).await {
+                eprintln!("Login test failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Logs in, lists the plants and prints a short summary.
+async fn login_test(config: Config) -> Result<()> {
+    let mut client = Client::new(config.isolarcloud)?;
+    client.login().await?;
+    let plants = client.plants().await?;
+
+    let noun = if plants.len() == 1 { "plant" } else { "plants" };
+    println!("Logged in. Found {} {noun}", plants.len());
+    for plant in &plants {
+        println!("  {} {}", plant.ps_id, plant.ps_name);
     }
     Ok(())
 }
