@@ -6,8 +6,9 @@ mod isolar;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use serde_json::Value;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -38,6 +39,13 @@ enum Command {
     },
     /// Check that the iSolarCloud credentials work.
     LoginTest,
+    /// Call any iSolarCloud endpoint and print the result (for exploring the API).
+    Api {
+        /// Endpoint path, e.g. /openapi/getPowerStationList.
+        path: String,
+        /// Params as a JSON object, e.g. '{"curPage":1,"size":10}'. Defaults to {}.
+        params: Option<String>,
+    },
 }
 
 // `#[tokio::main]` turns this async fn into a normal `main` that starts the
@@ -72,8 +80,39 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Api { path, params } => {
+            if let Err(err) = api_call(config, &path, params.as_deref()).await {
+                eprintln!("API call failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
+}
+
+/// Logs in, calls one endpoint and prints its `result_data` as pretty JSON.
+async fn api_call(config: Config, path: &str, params: Option<&str>) -> Result<()> {
+    // Check the params before logging in, so a typo fails without a network call.
+    let params: Value = serde_json::from_str(params.unwrap_or("{}"))
+        .context("params must be valid JSON, e.g. '{\"curPage\":1}'")?;
+    if !params.is_object() {
+        bail!("params must be a JSON object, e.g. '{{\"curPage\":1}}'");
+    }
+
+    let mut client = Client::new(config.isolarcloud)?;
+    client.login().await?;
+    let data = client.call(&with_leading_slash(path), params).await?;
+    println!("{}", serde_json::to_string_pretty(&data)?);
+    Ok(())
+}
+
+/// Adds a leading `/` to an endpoint path if it is missing.
+fn with_leading_slash(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
 }
 
 /// Logs in, lists the plants and prints a short summary.
@@ -92,4 +131,15 @@ async fn login_test(config: Config) -> Result<()> {
         println!("Set plant_id in config.toml to choose one");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_missing_leading_slash() {
+        assert_eq!(with_leading_slash("/openapi/login"), "/openapi/login");
+        assert_eq!(with_leading_slash("openapi/login"), "/openapi/login");
+    }
 }
