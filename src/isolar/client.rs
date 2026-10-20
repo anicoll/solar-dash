@@ -154,10 +154,16 @@ fn parse_response(text: &str, envelope: Option<&Envelope>) -> Result<Value> {
     if code == "1" {
         Ok(response["result_data"].take())
     } else {
-        let msg = response["result_msg"].as_str().unwrap_or("no message");
-        Err(anyhow!(
-            "iSolarCloud error: result_code {code:?}, result_msg {msg:?}"
-        ))
+        // Some errors leave result_msg empty, so fall back to the whole
+        // response (error responses carry no token or secrets).
+        match response["result_msg"].as_str().filter(|m| !m.is_empty()) {
+            Some(msg) => Err(anyhow!(
+                "iSolarCloud error: result_code {code:?}, result_msg {msg:?}"
+            )),
+            None => Err(anyhow!(
+                "iSolarCloud error: result_code {code:?}, response {response}"
+            )),
+        }
     }
 }
 
@@ -222,6 +228,14 @@ mod tests {
         let msg = parse_response(text, None).unwrap_err().to_string();
         assert!(msg.contains("E00003"));
         assert!(msg.contains("token expired"));
+    }
+
+    #[test]
+    fn parse_error_without_message_shows_response() {
+        let text = r#"{"result_code":"E919","req_serial_num":"abc123"}"#;
+        let msg = parse_response(text, None).unwrap_err().to_string();
+        assert!(msg.contains("E919"));
+        assert!(msg.contains("abc123"));
     }
 
     #[test]
