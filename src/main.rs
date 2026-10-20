@@ -1,4 +1,5 @@
 mod config;
+mod isolar;
 
 use std::path::PathBuf;
 
