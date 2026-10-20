@@ -31,6 +31,8 @@ pub struct IsolarCloud {
     pub encrypt: bool,
     pub username: String,
     pub password: String,
+    /// Which plant to sync; see config.example.toml.
+    pub plant_id: Option<i64>,
 }
 
 // Deriving Debug would print the secrets into logs, so we write it by hand
@@ -45,6 +47,7 @@ impl fmt::Debug for IsolarCloud {
             .field("encrypt", &self.encrypt)
             .field("username", &self.username)
             .field("password", &"<redacted>")
+            .field("plant_id", &self.plant_id)
             .finish()
     }
 }
@@ -65,8 +68,6 @@ impl Default for Server {
     }
 }
 
-// Not read yet; a later PR will use it. Remove this then.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Database {
     #[serde(default = "default_db_path")]

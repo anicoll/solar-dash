@@ -6,7 +6,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 
 - [x] Project scaffold (CLI, config, docs, CI)
 - [x] iSolarCloud API client: login + plant list (`login-test`)
-- [ ] SQLite storage
+- [x] SQLite storage (schema, migrations, typed queries)
 - [ ] Backfill of historical data
 - [ ] Live sync
 - [ ] Web dashboard
@@ -24,6 +24,8 @@ See [docs/how-to-run.md](docs/how-to-run.md).
 
 - `src/main.rs` - CLI and program entry point
 - `src/config.rs` - config file loading
+- `src/db.rs` - SQLite storage: opening, migrations and typed queries
+- `migrations/` - SQL schema, applied automatically on startup
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`
 - `docs/` - documentation
