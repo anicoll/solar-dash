@@ -52,6 +52,13 @@ If `login-test` fails, it prints the error and exits with status 1. Check:
 - The app has been approved in the developer portal.
 - The appkey, access key and RSA public key were copied without extra spaces.
 
+Error codes seen so far:
+
+| Code | Meaning | Fix |
+| --- | --- | --- |
+| `E912` "Illegal x-access-key" | The access key was not accepted | Copy the app's Secret Key into `access_key` again |
+| `E919` (no message) | Your iSolarCloud account is not on the app's whitelist | Add your account's email to the app's whitelist in the developer portal |
+
 Start the server:
 
 ```sh
