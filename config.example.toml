@@ -47,3 +47,17 @@ bind = "127.0.0.1:8080"
 # Optional section; defaults shown.
 [database]
 path = "data/solar.db"
+
+# Optional: read live power straight from the inverter over your LAN (Modbus
+# TCP). Without this section Modbus is off. To use it, first enable Modbus TCP
+# in the WiNet-S dongle's settings (its web page, "Advanced settings"): port
+# 502, SSL/TLS off, and the IP whitelist either off or including the machine
+# running solar-dash. Test it with `cargo run -- modbus-test --watch`.
+# [modbus]
+# IP address (or host name) of the WiNet-S dongle. Required in this section.
+# host = "192.168.1.60"
+# port = 502
+# The Modbus unit id.
+# unit = 1
+# Seconds between reads. The dongle is slow, so don't go much below 5.
+# interval_secs = 15
