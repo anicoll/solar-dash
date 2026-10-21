@@ -38,9 +38,9 @@ const MAX_CALLS_PER_HOUR: i64 = 1500;
 const MAX_CALLS_PER_30_DAYS: i64 = 80_000;
 const BUDGET_RECHECK: Duration = Duration::from_secs(60);
 /// Pause between calls, to be polite to the server.
+const CALL_PAUSE: Duration = Duration::from_secs(1);
 /// How often the live loop prunes old `api_call` rows.
 const PRUNE_EVERY_SECS: i64 = 24 * 3600;
-const CALL_PAUSE: Duration = Duration::from_secs(1);
 
 /// Data lands a little after each 5-minute mark, so live sync waits this long.
 const TICK_LAG_SECS: i64 = 60;
