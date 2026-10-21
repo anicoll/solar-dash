@@ -1,8 +1,10 @@
 //! Downloading history from iSolarCloud into SQLite.
 //!
 //! The parsing and time helpers are pure functions (no network, no database)
-//! so they can be unit tested. [`backfill`] ties them together.
+//! so they can be unit tested. [`sync_range`] ties them together, and is used
+//! by both [`backfill`] and the live loop, [`run_live_sync`].
 
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,7 +20,8 @@ use crate::isolar::client::{ApiError, Client};
 
 const HISTORY_ENDPOINT: &str = "/openapi/getDevicePointMinuteDataList";
 const POINT_INFO_ENDPOINT: &str = "/openapi/getOpenPointInfo";
-/// Name of this job in the `sync_state` table.
+/// Name of this job in the `sync_state` table. Backfill and live sync share
+/// it, so the name stays "backfill" (renaming would need a migration).
 const JOB: &str = "backfill";
 
 /// The history has one row every 5 minutes.
@@ -35,6 +38,11 @@ const MAX_CALLS_PER_30_DAYS: i64 = 80_000;
 const BUDGET_RECHECK: Duration = Duration::from_secs(60);
 /// Pause between calls, to be polite to the server.
 const CALL_PAUSE: Duration = Duration::from_secs(1);
+
+/// Data lands a little after each 5-minute mark, so live sync waits this long.
+const TICK_LAG_SECS: i64 = 60;
+/// A cursor further behind than this is logged as "catching up".
+const CATCH_UP_SECS: i64 = 2 * 24 * 3600;
 
 /// The timestamp format used by the history API, in the plant's local time.
 const LOCAL_FORMAT: &str = "%Y%m%d%H%M%S";
@@ -195,6 +203,21 @@ async fn budgeted_call(
     result
 }
 
+/// Makes sure every wanted point has a row, because readings refer to it.
+/// A point that already has a row (maybe with its real name) is left alone.
+pub async fn ensure_points(pool: &SqlitePool, wanted: &[i64]) -> Result<()> {
+    for &point_id in wanted {
+        let point = Point {
+            point_id,
+            code: Some(format!("p{point_id}")),
+            name: None,
+            unit: None,
+        };
+        db::insert_point_if_missing(pool, &point).await?;
+    }
+    Ok(())
+}
+
 /// Saves the metadata (name, unit) of every point, so readings have a point
 /// row to refer to. Runs once at the start of each backfill.
 async fn sync_points(
@@ -205,15 +228,7 @@ async fn sync_points(
 ) -> Result<()> {
     // Placeholders first, so a wanted point missing from the API's list still
     // works. The real metadata below overwrites them.
-    for &point_id in wanted {
-        let point = Point {
-            point_id,
-            code: Some(format!("p{point_id}")),
-            name: None,
-            unit: None,
-        };
-        db::upsert_point(pool, &point).await?;
-    }
+    ensure_points(pool, wanted).await?;
 
     let size = 200;
     let mut page = 1;
@@ -237,60 +252,78 @@ async fn sync_points(
     }
 }
 
-/// Downloads 5-minute history from local midnight of `from` until now.
-/// Safe to stop and run again: it resumes from the saved cursor.
-pub async fn backfill(
+/// The plant settings from the config, checked and ready to use.
+struct PlantSetup {
+    plant_id: i64,
+    tz: Tz,
+    /// Device key used by the history API, e.g. "1204811_11_0_0".
+    ps_key: String,
+    /// The configured points as the API wants them, e.g. "p83022,p83033".
+    points: String,
+}
+
+impl PlantSetup {
+    fn from_config(config: &IsolarCloud) -> Result<Self> {
+        let plant_id = config.plant_id.ok_or_else(|| {
+            anyhow!("syncing needs plant_id in config.toml (run login-test to see your plants)")
+        })?;
+        let tz: Tz = config
+            .timezone
+            .parse()
+            .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.timezone))?;
+        let points = config
+            .points
+            .iter()
+            .map(|id| format!("p{id}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(Self {
+            plant_id,
+            tz,
+            ps_key: format!("{plant_id}_11_0_0"),
+            points,
+        })
+    }
+}
+
+/// What one [`sync_range`] call did.
+#[derive(Debug, Default, PartialEq)]
+pub struct SyncStats {
+    /// Readings saved.
+    pub rows: usize,
+    /// History API calls made (including ones the API rejected).
+    pub calls: u32,
+}
+
+/// Downloads history for `start_ts..end_ts` (end exclusive, unix seconds) in
+/// windows, saving the cursor after each one. Used by both `backfill` and the
+/// live sync, so they share one cursor. Safe to stop and run again.
+pub async fn sync_range(
     client: &Client,
     pool: &SqlitePool,
     config: &IsolarCloud,
-    from: NaiveDate,
-) -> Result<()> {
-    let plant_id = config.plant_id.ok_or_else(|| {
-        anyhow!("backfill needs plant_id in config.toml (run login-test to see your plants)")
-    })?;
-    let tz: Tz = config
-        .timezone
-        .parse()
-        .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.timezone))?;
-    let ps_key = format!("{plant_id}_11_0_0");
-    let points = config
-        .points
-        .iter()
-        .map(|id| format!("p{id}"))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let from_ts = parse_local(&from.format("%Y%m%d000000").to_string(), tz)
-        .ok_or_else(|| anyhow!("{from} has no local midnight in {tz}"))?;
-    let cursor = db::get_cursor(pool, JOB).await?;
-    let mut start = cursor.map_or(from_ts, |c| c.max(from_ts));
-    let now = db::now();
-    let end = now - now % STEP_SECS;
-    if start >= end {
-        info!("history is already up to date");
-        return Ok(());
-    }
-    match cursor {
-        Some(c) if c >= from_ts => info!(resume_at = %format_local(c, tz), "resuming backfill"),
-        _ => info!(start = %format_local(start, tz), "starting backfill"),
-    }
-
-    sync_points(client, pool, &config.points, &ps_key).await?;
-
+    start_ts: i64,
+    end_ts: i64,
+) -> Result<SyncStats> {
+    let plant = PlantSetup::from_config(config)?;
+    let tz = plant.tz;
+    let mut stats = SyncStats::default();
+    let mut start = start_ts;
     let mut window = START_WINDOW_SECS;
-    while start < end {
+    while start < end_ts {
         // `window_end` is exclusive. The API includes its end time, so we ask
         // for one step less; the next window then starts right after.
-        let (_, window_end) = windows(start, end, window)[0];
+        let (_, window_end) = windows(start, end_ts, window)[0];
         let params = json!({
-            "ps_key_list": [&ps_key],
-            "points": points,
+            "ps_key_list": [&plant.ps_key],
+            "points": plant.points,
             "start_time_stamp": format_local(start, tz),
             "end_time_stamp": format_local(window_end - STEP_SECS, tz),
             "minute_interval": "5",
         });
         debug!(window_hours = window / 3600, "requesting window");
 
+        stats.calls += 1;
         let data = match budgeted_call(client, pool, HISTORY_ENDPOINT, params).await {
             Ok(data) => data,
             // Only an error from iSolarCloud itself suggests the window was
@@ -314,9 +347,10 @@ pub async fn backfill(
             &data.to_string(),
         )
         .await?;
-        let readings = parse_history(&data, &ps_key, tz);
-        db::upsert_readings(pool, plant_id, &readings).await?;
+        let readings = parse_history(&data, &plant.ps_key, tz);
+        db::upsert_readings(pool, plant.plant_id, &readings).await?;
         db::set_cursor(pool, JOB, window_end).await?;
+        stats.rows += readings.len();
 
         let calls_this_hour = db::api_calls_since(pool, db::now() - 3600).await?;
         info!(
@@ -329,7 +363,151 @@ pub async fn backfill(
         );
         start = window_end;
     }
+    Ok(stats)
+}
+
+/// Downloads 5-minute history from local midnight of `from` until now.
+/// Safe to stop and run again: it resumes from the saved cursor.
+pub async fn backfill(
+    client: &Client,
+    pool: &SqlitePool,
+    config: &IsolarCloud,
+    from: NaiveDate,
+) -> Result<()> {
+    let plant = PlantSetup::from_config(config)?;
+    let tz = plant.tz;
+
+    let from_ts = parse_local(&from.format("%Y%m%d000000").to_string(), tz)
+        .ok_or_else(|| anyhow!("{from} has no local midnight in {tz}"))?;
+    let cursor = db::get_cursor(pool, JOB).await?;
+    let start = cursor.map_or(from_ts, |c| c.max(from_ts));
+    let end = round_down_to_step(db::now());
+    if start >= end {
+        info!("history is already up to date");
+        return Ok(());
+    }
+    match cursor {
+        Some(c) if c >= from_ts => info!(resume_at = %format_local(c, tz), "resuming backfill"),
+        _ => info!(start = %format_local(start, tz), "starting backfill"),
+    }
+
+    sync_points(client, pool, &config.points, &plant.ps_key).await?;
+    sync_range(client, pool, config, start, end).await?;
     info!("backfill finished");
+    Ok(())
+}
+
+/// Rounds a timestamp down to a multiple of 5 minutes.
+fn round_down_to_step(ts: i64) -> i64 {
+    ts - ts % STEP_SECS
+}
+
+/// Seconds to sleep so the next live sync lands just after a 5-minute mark.
+/// Data shows up a little after each mark, so we wait an extra minute.
+pub fn next_tick_delay(now_ts: i64) -> Duration {
+    // The inner `%` makes an exact 5-minute mark give 0 rather than 300.
+    let to_boundary = (STEP_SECS - now_ts % STEP_SECS) % STEP_SECS;
+    Duration::from_secs((to_boundary + TICK_LAG_SECS) as u64)
+}
+
+/// Unix seconds of the most recent local midnight at or before `now_ts`.
+fn local_midnight(now_ts: i64, tz: Tz) -> Option<i64> {
+    let today = DateTime::from_timestamp(now_ts, 0)?
+        .with_timezone(&tz)
+        .date_naive();
+    parse_local(&today.format("%Y%m%d000000").to_string(), tz)
+}
+
+/// How far back each live sync re-reads before the cursor. iSolarCloud can
+/// publish the latest readings a few minutes late, and the cursor has already
+/// moved past them; re-reading is safe because writes are upserts.
+const LIVE_OVERLAP_SECS: i64 = 15 * 60;
+
+/// Where the next live sync should start: a little before the saved cursor,
+/// or else local midnight today.
+async fn live_start(pool: &SqlitePool, tz: Tz, now_ts: i64) -> Result<i64> {
+    if let Some(cursor) = db::get_cursor(pool, JOB).await? {
+        return Ok(cursor - LIVE_OVERLAP_SECS);
+    }
+    info!("no history yet; starting from midnight today. Run backfill to fetch older history");
+    local_midnight(now_ts, tz).ok_or_else(|| anyhow!("could not work out local midnight in {tz}"))
+}
+
+/// One live sync: from the cursor up to now (rounded down to 5 minutes).
+async fn sync_once(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> Result<()> {
+    let tz = PlantSetup::from_config(config)?.tz;
+    let now = db::now();
+    let end = round_down_to_step(now);
+    let start = live_start(pool, tz, now).await?;
+    if start >= end {
+        debug!("already up to date");
+        return Ok(());
+    }
+    if end - start > CATCH_UP_SECS {
+        info!(since = %format_local(start, tz), "cursor is far behind; catching up");
+    }
+    let stats = sync_range(client, pool, config, start, end).await?;
+    info!(rows = stats.rows, calls = stats.calls, "sync done");
+    Ok(())
+}
+
+/// A sync that logs in again and retries once if iSolarCloud reports an error.
+/// The token-expiry codes are not confirmed, so any `ApiError` gets one retry.
+async fn sync_with_relogin(
+    client: &mut Client,
+    pool: &SqlitePool,
+    config: &IsolarCloud,
+) -> Result<()> {
+    match sync_once(client, pool, config).await {
+        Err(err) if err.downcast_ref::<ApiError>().is_some() => {
+            warn!("iSolarCloud returned an error ({err:#}); logging in again");
+            client.login().await?;
+            sync_once(client, pool, config).await
+        }
+        other => other,
+    }
+}
+
+/// Keeps the database up to date until `shutdown` completes.
+///
+/// The loop takes the `Client` by value because `login` needs `&mut self`.
+/// Nothing else uses the client while we sync, so owning it is simpler than
+/// sharing it behind a lock.
+pub async fn run_live_sync(
+    mut client: Client,
+    pool: &SqlitePool,
+    config: &IsolarCloud,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    // Readings need point rows. Check the config now, so mistakes fail at startup.
+    PlantSetup::from_config(config)?;
+    ensure_points(pool, &config.points).await?;
+
+    // A future can only be awaited by value, but we wait on it in every loop
+    // round. Pinning lets `select!` poll it by `&mut` without moving it.
+    tokio::pin!(shutdown);
+    info!("live sync started");
+    loop {
+        // Dropping an unfinished sync is safe: each window is saved
+        // atomically, along with its cursor.
+        tokio::select! {
+            _ = &mut shutdown => break,
+            result = sync_with_relogin(&mut client, pool, config) => {
+                // A failed tick is not fatal: try again on the next one.
+                if let Err(err) = result {
+                    warn!("sync failed: {err:#}");
+                }
+            }
+        }
+
+        let delay = next_tick_delay(db::now());
+        debug!(seconds = delay.as_secs(), "sleeping until next sync");
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+    info!("sync stopped");
     Ok(())
 }
 
@@ -466,5 +644,44 @@ mod tests {
         assert_eq!(check_budget(1500, 10), Budget::WaitForHour);
         assert_eq!(check_budget(0, 80_000), Budget::MonthlyLimit);
         assert_eq!(check_budget(1500, 80_000), Budget::MonthlyLimit);
+    }
+
+    #[test]
+    fn next_tick_is_a_minute_after_the_boundary() {
+        let noon = 1_792_000_800; // an exact hour (divisible by 3600)
+        assert_eq!(
+            next_tick_delay(noon + 3 * 60 + 30),
+            Duration::from_secs(150)
+        );
+        assert_eq!(next_tick_delay(noon + 5 * 60), Duration::from_secs(60));
+        assert_eq!(next_tick_delay(noon + 5 * 60 + 1), Duration::from_secs(359));
+    }
+
+    #[test]
+    fn next_tick_delay_stays_in_range() {
+        for offset in 0..3600 {
+            let secs = next_tick_delay(1_792_000_800 + offset).as_secs();
+            assert!((60..=360).contains(&secs), "offset {offset} gave {secs}");
+        }
+    }
+
+    #[test]
+    fn midnight_is_local_not_utc() {
+        // 2026-10-20 23:30 local (+10:30) is 13:00 UTC the same day.
+        let now = parse_local("20261020233000", ADELAIDE).unwrap();
+        let midnight = local_midnight(now, ADELAIDE).unwrap();
+        assert_eq!(format_local(midnight, ADELAIDE), "20261020000000");
+        // Just after midnight local is still the new day.
+        let now = parse_local("20261021000500", ADELAIDE).unwrap();
+        assert_eq!(
+            local_midnight(now, ADELAIDE),
+            parse_local("20261021000000", ADELAIDE)
+        );
+    }
+
+    #[test]
+    fn rounds_down_to_five_minutes() {
+        assert_eq!(round_down_to_step(1_000), 900);
+        assert_eq!(round_down_to_step(900), 900);
     }
 }

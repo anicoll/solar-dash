@@ -92,6 +92,19 @@ pub async fn upsert_point(pool: &SqlitePool, point: &Point) -> Result<()> {
     Ok(())
 }
 
+/// Adds a point only if it has no row yet, so real metadata is never overwritten.
+pub async fn insert_point_if_missing(pool: &SqlitePool, point: &Point) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO point (point_id, code, name, unit) VALUES (?, ?, ?, ?)")
+        .bind(point.point_id)
+        .bind(&point.code)
+        .bind(&point.name)
+        .bind(&point.unit)
+        .execute(pool)
+        .await
+        .context("could not save point")?;
+    Ok(())
+}
+
 /// Saves all readings in one transaction: either all of them are stored or none.
 /// Saving the same reading again just overwrites its value.
 pub async fn upsert_readings(pool: &SqlitePool, plant_id: i64, readings: &[Reading]) -> Result<()> {
@@ -247,6 +260,30 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rows, vec![(100, Some(9.0)), (200, Some(2.5))]);
+    }
+
+    #[tokio::test]
+    async fn insert_point_if_missing_keeps_existing_row() {
+        let (_dir, pool) = test_db().await;
+        let real = Point {
+            name: Some("Real name".to_string()),
+            ..point(1)
+        };
+        upsert_point(&pool, &real).await.unwrap();
+        let placeholder = Point {
+            name: None,
+            ..point(1)
+        };
+        insert_point_if_missing(&pool, &placeholder).await.unwrap();
+        insert_point_if_missing(&pool, &point(2)).await.unwrap();
+
+        let names: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT name FROM point ORDER BY point_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].as_deref(), Some("Real name"));
     }
 
     #[tokio::test]
