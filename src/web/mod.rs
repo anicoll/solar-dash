@@ -23,6 +23,7 @@ use tokio::net::TcpListener;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::modbus::Latest;
 use auth::Lockout;
 pub use auth::hash_password;
 
@@ -47,6 +48,8 @@ pub struct AppState {
     /// Failed-login bookkeeping. A plain `Mutex` is fine: it is only held for
     /// a moment and never across an `.await`.
     lockout: Arc<Mutex<Lockout>>,
+    /// The newest Modbus sample, kept by the poller.
+    latest: Latest,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -72,7 +75,13 @@ impl AppState {
             password_hash: password_hash.into(),
             key,
             lockout: Arc::new(Mutex::new(Lockout::default())),
+            latest: Latest::default(),
         })
+    }
+
+    /// The slot the Modbus poller writes its newest sample to.
+    pub fn latest(&self) -> Latest {
+        self.latest.clone()
     }
 
     /// Builds the state from the config, with clear errors for missing settings.

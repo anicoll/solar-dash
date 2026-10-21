@@ -11,6 +11,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -67,6 +68,23 @@ pub struct Sample {
     pub battery_w: Option<f64>,
     /// Battery state of charge, 0 to 100.
     pub soc_pct: Option<f64>,
+}
+
+/// The newest sample, shared between the poller and the web server so
+/// `/api/live` can answer without a database read. Cloning gives another
+/// handle to the same slot.
+#[derive(Clone, Default)]
+pub struct Latest(Arc<Mutex<Option<Sample>>>);
+
+impl Latest {
+    pub fn set(&self, sample: Sample) {
+        // A poisoned lock only means a panic elsewhere; the value is still fine.
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(sample);
+    }
+
+    pub fn get(&self) -> Option<Sample> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Joins two registers into one number. The low word comes first.
@@ -252,12 +270,13 @@ impl FailureLog {
     }
 }
 
-/// Reads a sample every `interval_secs` and saves it, until `shutdown`
-/// completes. Failures are logged (throttled) and never end the loop: the
+/// Reads a sample every `interval_secs`, keeps it in `latest` and saves it,
+/// until `shutdown` completes. Failures are logged (throttled) and never end the loop: the
 /// dongle is flaky, and the rest of `serve` must keep going without it.
 pub async fn run_poll(
     config: Modbus,
     pool: &SqlitePool,
+    latest: Latest,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(config.interval_secs));
@@ -283,6 +302,7 @@ pub async fn run_poll(
                 if let Some(count) = failures.succeeded() {
                     info!(failed_reads = count, "Modbus back");
                 }
+                latest.set(sample);
                 if let Err(err) = db::insert_live_sample(pool, &sample).await {
                     warn!("could not save Modbus sample: {err:#}");
                 }
