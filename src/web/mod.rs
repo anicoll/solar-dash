@@ -4,6 +4,7 @@
 mod api;
 mod auth;
 mod costs;
+mod payback;
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,7 @@ use crate::cost::Tariff;
 use crate::modbus::Latest;
 use auth::Lockout;
 pub use auth::hash_password;
+use payback::Purchase;
 
 /// The files in `static/`, compiled into the binary.
 // (In debug builds rust-embed reads them from disk instead, so edits show up
@@ -58,6 +60,8 @@ pub struct AppState {
     latest: Latest,
     /// The parsed `[tariff]` section; `None` turns the cost API off.
     tariff: Option<Arc<Tariff>>,
+    /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
+    purchases: Arc<[Purchase]>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -85,12 +89,19 @@ impl AppState {
             lockout: Arc::new(Mutex::new(Lockout::default())),
             latest: Latest::default(),
             tariff: None,
+            purchases: Arc::from([]),
         })
     }
 
     /// Turns on the cost API with this tariff.
     pub fn with_tariff(mut self, tariff: Option<Tariff>) -> Self {
         self.tariff = tariff.map(Arc::new);
+        self
+    }
+
+    /// Turns on the payback API with these purchases (oldest first).
+    pub fn with_purchases(mut self, purchases: Vec<Purchase>) -> Self {
+        self.purchases = purchases.into();
         self
     }
 
@@ -127,7 +138,10 @@ impl AppState {
             .as_ref()
             .map(Tariff::from_config)
             .transpose()?;
-        Ok(Self::new(pool, plant_id, tz, password_hash, key)?.with_tariff(tariff))
+        let purchases = payback::purchases_from_config(&config.system.purchase)?;
+        Ok(Self::new(pool, plant_id, tz, password_hash, key)?
+            .with_tariff(tariff)
+            .with_purchases(purchases))
     }
 }
 
@@ -160,6 +174,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
         .route("/api/costs", get(costs::costs))
+        .route("/api/payback", get(payback::payback))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
@@ -360,7 +375,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["ok"], true);
-        assert_eq!(json["last_reading_ts"], 1_800_000_600);
+        assert_eq!(json, serde_json::json!({ "ok": true }));
     }
 
     #[tokio::test]
@@ -704,16 +719,33 @@ mod tests {
         assert!(body_text(response).await.is_empty());
     }
 
-    /// A simple tariff: 100 c supply, 25 c import, 5 c export, no windows.
-    fn flat_tariff() -> Tariff {
+    /// A simple tariff: 100 c supply, `import_cents` import, 5 c export, no windows.
+    fn flat_tariff_with(import_cents: f64) -> Tariff {
         #[derive(serde::Deserialize)]
         struct Wrapper {
             tariff: crate::config::Tariff,
         }
-        let text = "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 25.0\n\
-                    default_export_cents = 5.0\n";
-        let w: Wrapper = toml::from_str(text).unwrap();
+        let text = format!(
+            "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = {import_cents}\n\
+             default_export_cents = 5.0\n"
+        );
+        let w: Wrapper = toml::from_str(&text).unwrap();
         Tariff::from_config(&w.tariff).unwrap()
+    }
+
+    /// The flat tariff at 25 c import.
+    fn flat_tariff() -> Tariff {
+        flat_tariff_with(25.0)
+    }
+
+    /// A router over `pool` with this tariff.
+    fn costs_router(pool: &SqlitePool, tariff: Tariff) -> Router {
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_tariff(Some(tariff));
+        router(state)
     }
 
     /// A router with the flat tariff over an empty database (plus a pool for seeding).
@@ -732,12 +764,8 @@ mod tests {
             };
             db::upsert_point(&pool, &point).await.unwrap();
         }
-        let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
-        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
-            .unwrap()
-            .with_tariff(Some(flat_tariff()));
-        (dir, router(state), pool)
+        let app = costs_router(&pool, flat_tariff());
+        (dir, app, pool)
     }
 
     /// Unix time of local Adelaide midnight on 2026-09-15 (+09:30, no DST change).
@@ -870,5 +898,208 @@ mod tests {
         assert_eq!(day["actual"], 7.0);
         assert_eq!(day["baseline"], 7.0);
         assert_eq!(day["savings"], 0.0);
+    }
+
+    /// Counter readings for one day: import `import_wh`, export twice that and
+    /// load four times that, all at each offset (seconds after `day_start`).
+    async fn seed_counters(pool: &SqlitePool, day_start: i64, offsets: &[i64], import_wh: f64) {
+        let mut readings = Vec::new();
+        for (point_id, factor) in [(83102, 1.0), (83072, 2.0), (83118, 4.0)] {
+            for offset in offsets {
+                readings.push(Reading {
+                    point_id,
+                    ts: day_start + offset,
+                    value: Some(import_wh * factor),
+                });
+            }
+        }
+        db::upsert_readings(pool, PLANT, &readings).await.unwrap();
+    }
+
+    /// How many days are stored in the `daily_cost` table.
+    async fn stored_days(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM daily_cost")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `/api/costs` for a range, logging in on `app` first.
+    async fn costs_json(app: &Router, range: &str) -> Value {
+        let cookie = log_in(app).await;
+        let uri = format!("/api/costs?{range}");
+        let response = send(app, get_request(&uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await
+    }
+
+    /// Unix time of the start of today's local day.
+    fn today_start() -> i64 {
+        let tz = chrono_tz::Australia::Adelaide;
+        api::day_bounds_or_error(api::today(tz), tz).unwrap().0
+    }
+
+    /// Seconds after midnight of the last reading of a complete cloud day (23:55).
+    const LAST_READING: i64 = 86_400 - 300;
+
+    #[tokio::test]
+    async fn finished_days_come_from_the_cache_but_today_is_recomputed() {
+        let (_dir, app, pool) = costs_app().await;
+        let today = api::today(chrono_tz::Australia::Adelaide);
+        let range = format!("from=2026-09-15&to={today}");
+        seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
+        seed_counters(&pool, today_start(), &[3600], 1000.0).await;
+
+        let first = costs_json(&app, &range).await;
+        assert_eq!(first["totals"]["days"], 2);
+        assert_eq!(first["days"][0]["savings"], 0.85);
+        // Only the finished day is stored.
+        assert_eq!(stored_days(&pool).await, 1);
+
+        // Wipe the source data and give today new numbers. The finished day
+        // can only be answered from the cache; today must be worked out again.
+        sqlx::query("DELETE FROM reading")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_counters(&pool, today_start(), &[3600], 2000.0).await;
+        let second = costs_json(&app, &range).await;
+        assert_eq!(second["days"][0], first["days"][0]);
+        assert_eq!(second["days"][1]["date"], today.to_string());
+        assert_eq!(second["days"][1]["savings"], 1.7);
+        assert_eq!(stored_days(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_changed_tariff_recomputes_cached_days() {
+        let (_dir, app, pool) = costs_app().await;
+        seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
+        let range = "from=2026-09-15&to=2026-09-15";
+        let before = costs_json(&app, range).await;
+        assert_eq!(before["days"][0]["actual"], 1.15);
+        assert_eq!(stored_days(&pool).await, 1);
+
+        // Same database, import now 35 c: 100 + 35 - 10 = 125 c.
+        let dearer = costs_router(&pool, flat_tariff_with(35.0));
+        let after = costs_json(&dearer, range).await;
+        assert_eq!(after["days"][0]["actual"], 1.25);
+        // The row was replaced, not added.
+        assert_eq!(stored_days(&pool).await, 1);
+        // And the original tariff does not see the replaced row as its own.
+        sqlx::query("DELETE FROM reading")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let gone = costs_json(&app, range).await;
+        assert_eq!(gone["days"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_day_is_not_cached_until_it_is_complete() {
+        let (_dir, app, pool) = costs_app().await;
+        let range = "from=2026-09-15&to=2026-09-15";
+        // Readings stop at 01:05: the day shows up but is not stored.
+        seed_counters(&pool, SEP_15_START, &[3600, 3900], 1000.0).await;
+        let partial = costs_json(&app, range).await;
+        assert_eq!(partial["days"][0]["import_kwh"], 1.0);
+        assert_eq!(stored_days(&pool).await, 0);
+
+        // A backfill adds the rest of the day, so the next request sees it
+        // and stores it.
+        seed_counters(&pool, SEP_15_START, &[LAST_READING], 3000.0).await;
+        let complete = costs_json(&app, range).await;
+        assert_eq!(complete["days"][0]["import_kwh"], 3.0);
+        assert_eq!(stored_days(&pool).await, 1);
+    }
+
+    fn solar_purchase(date: &str, cost_dollars: f64) -> Purchase {
+        Purchase {
+            name: "Solar".to_string(),
+            date: date.parse().unwrap(),
+            cost_dollars,
+        }
+    }
+
+    /// Like `costs_router`, with these purchases as well.
+    fn payback_router(pool: &SqlitePool, purchases: Vec<Purchase>) -> Router {
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_tariff(Some(flat_tariff()))
+            .with_purchases(purchases);
+        router(state)
+    }
+
+    async fn payback_json(app: &Router) -> Value {
+        let cookie = log_in(app).await;
+        let response = send(app, get_request("/api/payback", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await
+    }
+
+    #[tokio::test]
+    async fn payback_needs_a_tariff_and_purchases() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/payback", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let off = serde_json::json!({ "configured": false });
+        assert_eq!(payback_json(&app).await, off);
+
+        // A tariff but no purchases.
+        let (_dir, app, pool) = costs_app().await;
+        assert_eq!(payback_json(&app).await, off);
+        // Purchases but no tariff.
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool, PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_purchases(vec![solar_purchase("2026-09-14", 10.0)]);
+        assert_eq!(payback_json(&router(state)).await, off);
+    }
+
+    #[tokio::test]
+    async fn payback_adds_up_savings_against_purchases() {
+        let (_dir, _app, pool) = costs_app().await;
+        // One finished day saving 85 c (see `costs_for_a_cloud_day`).
+        seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
+        let app = payback_router(
+            &pool,
+            vec![
+                solar_purchase("2026-09-14", 10.0),
+                solar_purchase("2026-10-02", 5.0),
+            ],
+        );
+        let json = payback_json(&app).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["total_cost"], 15.0);
+        assert_eq!(json["saved"], 0.85);
+        assert_eq!(json["net"], -14.15);
+        assert_eq!(json["recovered_pct"], 5.67);
+        assert_eq!(json["rate_per_day"], 0.85);
+        // 14.15 / 0.85 = 17 days from today: some "YYYY-MM" in the future.
+        let projected = json["projected_payback"].as_str().unwrap();
+        assert!(projected.len() == 7 && projected.as_bytes()[4] == b'-');
+        assert_eq!(json["purchases"][1]["date"], "2026-10-02");
+        assert_eq!(json["purchases"][1]["cost"], 5.0);
+        // September: the saving and the first purchase. October: the second purchase too.
+        assert_eq!(
+            json["series"][0],
+            serde_json::json!({ "month": "2026-09", "saved": 0.85, "net": -9.15 })
+        );
+        assert_eq!(
+            json["series"][1],
+            serde_json::json!({ "month": "2026-10", "saved": 0.85, "net": -14.15 })
+        );
+        assert_eq!(
+            json["by_year"],
+            serde_json::json!([{ "year": 2026, "saved": 0.85, "days": 1, "partial": true }])
+        );
+
+        // Already paid back: no projection date.
+        let cheap = payback_router(&pool, vec![solar_purchase("2026-09-14", 0.5)]);
+        let json = payback_json(&cheap).await;
+        assert_eq!(json["net"], 0.35);
+        assert_eq!(json["projected_payback"], Value::Null);
     }
 }

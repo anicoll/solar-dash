@@ -97,6 +97,11 @@ impl Client {
             .with_context(|| format!("{path} failed (HTTP {status})"))
     }
 
+    /// Whether a login has succeeded (the token may still have expired).
+    pub fn is_logged_in(&self) -> bool {
+        self.token.is_some()
+    }
+
     /// Logs in with the configured username and password and stores the token.
     pub async fn login(&mut self) -> Result<()> {
         let params = json!({

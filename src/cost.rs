@@ -59,6 +59,8 @@ pub struct Tariff {
     default_export_cents: f64,
     export: Vec<PricedWindow>,
     zero_import_credit: Option<ZeroImportCredit>,
+    /// Identifies these exact rates; see [`Tariff::key`].
+    key: String,
 }
 
 /// Parse "HH:MM" start and end strings into a [`Window`].
@@ -104,7 +106,15 @@ impl Tariff {
             default_export_cents: cfg.default_export_cents,
             export: parse_priced(&cfg.export).context("invalid export window in [tariff]")?,
             zero_import_credit,
+            key: serde_json::to_string(cfg).context("could not describe the [tariff] section")?,
         })
+    }
+
+    /// A string that is the same for the same rates and differs when any rate
+    /// or window changes (it is the config section written as JSON). Stored
+    /// costs are tagged with it, so editing config.toml makes them stale.
+    pub fn key(&self) -> &str {
+        &self.key
     }
 
     /// Cents per kWh paid to import at this local time (minutes since midnight).
@@ -275,6 +285,14 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn the_key_changes_with_the_rates() {
+        let base = "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 25.0\n";
+        let dearer = base.replace("25.0", "26.0");
+        assert_eq!(tariff(base).key(), tariff(base).key());
+        assert_ne!(tariff(base).key(), tariff(&dearer).key());
     }
 
     #[test]

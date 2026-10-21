@@ -20,6 +20,21 @@
   const kw = (w) => (w / 1000).toFixed(2);
   const kwh = (v) => (v == null ? '–' : v.toFixed(1));
   const pad = (n) => String(n).padStart(2, '0');
+  /** Escapes text for the few places ECharts tooltips take an HTML string. */
+  const esc = (t) => String(t).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  /** Dollars: "$6,912" for `dp` 0, "$186.40" for 2. Negative amounts get a leading minus. */
+  function money(v, dp = 2) {
+    if (v == null || !Number.isFinite(v)) return '–';
+    const t = Math.abs(v).toLocaleString('en-AU', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+    return `${v < 0 ? '-' : ''}$${t}`;
+  }
+  /** Creates an element with optional class and text. */
+  const el = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  };
 
   const fmtDate = new Intl.DateTimeFormat('en-CA', {
     timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -106,14 +121,12 @@
   }
 
   function tile(label, valueText, unit, colour) {
-    const el = document.createElement('div');
-    el.className = 'tile';
-    if (colour) el.style.setProperty('--tile', `var(${colour})`);
-    const l = document.createElement('div'); l.className = 'label'; l.textContent = label;
-    const v = document.createElement('div'); v.className = 'value'; v.textContent = valueText;
-    if (unit) { const u = document.createElement('span'); u.className = 'unit'; u.textContent = unit; v.appendChild(u); }
-    el.append(l, v);
-    return el;
+    const t = el('div', 'tile');
+    if (colour) t.style.setProperty('--tile', `var(${colour})`);
+    const v = el('div', 'value', valueText);
+    if (unit) v.appendChild(el('span', 'unit', unit));
+    t.append(el('div', 'label', label), v);
+    return t;
   }
 
   const TOTALS = [
@@ -142,12 +155,12 @@
   }
 
   function baseTheme() {
-    return { fg: css('--fg'), muted: css('--muted'), line: css('--line') };
+    return { fg: css('--fg'), muted: css('--muted'), line: css('--border') };
   }
 
   function tooltipStyle() {
     return {
-      backgroundColor: css('--card'), borderColor: css('--line'),
+      backgroundColor: css('--panel-2'), borderColor: css('--border-strong'),
       textStyle: { color: css('--fg'), fontSize: 13 },
     };
   }
@@ -159,6 +172,122 @@
     const c = getChart(id);
     if (!c) return;
     if (hasData) { c.setOption(option, true); c.resize(); } else { c.clear(); }
+  }
+
+  // ---------- savings data (shared, fetched at most once a minute) ----------
+
+  const COSTS_TTL_MS = 60 * 1000;
+  // /api/costs allows at most 1500 days per request.
+  const COSTS_MAX_DAYS = 1500;
+  const savingsCache = { at: 0, promise: null };
+
+  /**
+   * All-history costs. Resolves to `{ configured: false }`, or `{ configured: true,
+   * saved, days, totals }` where `saved` is /api/payback's total when that is
+   * configured (it counts from the first purchase) and /api/costs' otherwise.
+   * Cached for COSTS_TTL_MS so a 15 s poll does not hit the server every time.
+   */
+  const paybackCache = { at: 0, promise: null };
+
+  /** /api/payback, cached like loadSavings. */
+  function loadPayback() {
+    if (paybackCache.promise && Date.now() - paybackCache.at < COSTS_TTL_MS) return paybackCache.promise;
+    paybackCache.at = Date.now();
+    const p = api('/api/payback');
+    paybackCache.promise = p;
+    p.catch(() => { paybackCache.at = 0; });
+    return p;
+  }
+
+  function loadSavings() {
+    if (savingsCache.promise && Date.now() - savingsCache.at < COSTS_TTL_MS) return savingsCache.promise;
+    savingsCache.at = Date.now();
+    const p = (async () => {
+      const today = todayStr();
+      const payback = await loadPayback().catch((err) => {
+        if (err.message === 'Not logged in.') throw err;
+        return null;
+      });
+      const earliest = addDays(today, 1 - COSTS_MAX_DAYS);
+      let from = earliest;
+      if (payback && payback.configured && payback.purchases.length) {
+        from = payback.purchases[0].date > earliest ? payback.purchases[0].date : earliest;
+      }
+      const costs = await api(`/api/costs?from=${from}&to=${today}`);
+      if (!costs.configured) return { configured: false };
+      const saved = payback && payback.configured ? payback.saved : costs.totals.savings;
+      const purchases = payback && payback.configured ? payback.purchases : [];
+      return { configured: true, saved, days: costs.days, totals: costs.totals, purchases };
+    })();
+    savingsCache.promise = p;
+    p.catch(() => { savingsCache.at = 0; });
+    return p;
+  }
+
+  /** Running total of `savings`, as `[date, total]` pairs. */
+  function runningTotal(days) {
+    let total = 0;
+    return days.map((d) => [d.date, (total += d.savings)]);
+  }
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  /** A small filled line of `values` as an SVG, built without HTML strings. */
+  function sparkline(values, label) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 300 70');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', label);
+    if (values.length < 2) return svg;
+    // At most ~120 points is plenty at this size.
+    const stride = Math.max(1, Math.floor(values.length / 120));
+    const pts = values.filter((_, i) => i % stride === 0 || i === values.length - 1);
+    const lo = Math.min(0, ...pts), hi = Math.max(...pts, lo + 1);
+    const xy = pts.map((v, i) => [(i / (pts.length - 1)) * 300, 66 - ((v - lo) / (hi - lo)) * 62]);
+    const line = xy.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join('');
+    const area = document.createElementNS(SVG_NS, 'path');
+    area.setAttribute('d', `${line}L300 70L0 70Z`);
+    area.setAttribute('fill', css('--save'));
+    area.setAttribute('fill-opacity', '0.12');
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', line);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', css('--save'));
+    path.setAttribute('stroke-width', '2.5');
+    path.setAttribute('stroke-linejoin', 'round');
+    path.setAttribute('vector-effect', 'non-scaling-stroke');
+    svg.append(area, path);
+    return svg;
+  }
+
+  /** "Feb 2023" for a YYYY-MM-DD string. */
+  const monthYear = (d) => `${MONTHS[+d.slice(5, 7) - 1]} ${d.slice(0, 4)}`;
+
+  const NOT_CONFIGURED_TARIFF =
+    'Add a [tariff] section to the config file to see what solar and the battery save you.';
+
+  function renderHero(data) {
+    const empty = $('hero-empty'), body = $('hero-body');
+    if (!data || !data.configured) {
+      empty.textContent = data ? NOT_CONFIGURED_TARIFF : 'Savings are unavailable right now.';
+      empty.hidden = false;
+      body.hidden = true;
+      return;
+    }
+    empty.hidden = true;
+    body.hidden = false;
+    const today = todayStr();
+    const month = today.slice(0, 7);
+    const sumOf = (rows) => rows.reduce((a, d) => a + d.savings, 0);
+    $('hero-total').textContent = money(data.saved, 0);
+    $('hero-since').textContent = data.days.length ? `All time, since ${monthYear(data.days[0].date)}` : 'All time';
+    $('hero-month').textContent = money(sumOf(data.days.filter((d) => d.date.startsWith(month))));
+    const t = data.days.find((d) => d.date === today);
+    $('hero-today').textContent = t ? money(t.savings) : money(0);
+    const first = data.days.length ? monthYear(data.days[0].date) : 'the start';
+    $('hero-spark').replaceChildren(sparkline(runningTotal(data.days).map((r) => r[1]),
+      `Running total of savings since ${first}, now ${money(data.saved, 0)}`));
   }
 
   // ---------- Now ----------
@@ -181,23 +310,49 @@
     }
   }
 
+  /** A power tile: coloured label, big value, optional extra node underneath. */
+  function powerTile(label, valueText, unit, colourVar, extra) {
+    const t = el('div', 'ptile');
+    t.style.setProperty('--tile', `var(${colourVar})`);
+    const v = el('div', 'value', valueText);
+    if (unit) v.appendChild(el('span', 'unit', unit));
+    t.append(el('div', 'label', label), v);
+    if (extra) t.appendChild(extra);
+    return t;
+  }
+
+  /** Battery charge bar with a percentage. */
+  function socBar(pct) {
+    const row = el('div', 'soc');
+    const bar = el('div', 'bar'), fill = el('span', 'fill');
+    fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    bar.appendChild(fill);
+    row.append(bar, el('span', 'pct', `${Math.round(pct)}%`));
+    return row;
+  }
+
   /** Power tile in kW with a direction word: positive means `pos`, negative `neg`. */
-  function flowTile(label, w, pos, neg, colourPos, colourNeg) {
-    if (w == null) return tile(label, '–', 'kW', colourPos);
+  function flowTile(label, w, pos, neg, colourVar, extra) {
+    if (w == null) return powerTile(label, '–', 'kW', colourVar, extra);
     const word = w > 0 ? pos : w < 0 ? neg : 'idle';
-    return tile(`${label} · ${word}`, kw(Math.abs(w)), 'kW', w < 0 ? colourNeg : colourPos);
+    return powerTile(`${label} · ${word}`, kw(Math.abs(w)), 'kW', colourVar, extra);
+  }
+
+  function setStatus(text, stale) {
+    $('updated-text').textContent = text;
+    $('updated').classList.toggle('stale', !!stale);
   }
 
   function renderLiveTiles(sample) {
-    const power = (label, w, colour) => tile(label, w == null ? '–' : kw(w), 'kW', colour);
+    const kwTile = (label, w, colourVar) => powerTile(label, w == null ? '–' : kw(w), 'kW', colourVar);
     $('live-tiles').replaceChildren(
-      power('Solar (PV)', sample.pv_w, '--c-pv'),
-      power('Load', sample.load_w, '--c-load'),
-      flowTile('Grid', sample.grid_w, 'importing', 'exporting', '--c-import', '--c-export'),
-      flowTile('Battery', sample.battery_w, 'charging', 'discharging', '--c-charge', '--c-discharge'),
-      tile('State of charge', sample.soc_pct == null ? '–' : Math.round(sample.soc_pct), '%', '--c-soc'),
+      kwTile('Solar', sample.pv_w, '--c-pv'),
+      kwTile('Home', sample.load_w, '--c-load'),
+      flowTile('Battery', sample.battery_w, 'charging', 'discharging', '--c-battery',
+        sample.soc_pct == null ? null : socBar(sample.soc_pct)),
+      flowTile('Grid', sample.grid_w, 'importing', 'exporting', '--c-grid'),
     );
-    $('updated').textContent = `Live from inverter · updated ${ageText(Date.now() / 1000 - sample.ts)}`;
+    setStatus(`Live from inverter · updated ${ageText(Date.now() / 1000 - sample.ts)}`, false);
   }
 
   function renderCloudTiles(latest) {
@@ -211,43 +366,88 @@
     const pv = watt(P_PV), load = watt(P_LOAD);
     const soc = byId[P_SOC] && byId[P_SOC].value;
     $('live-tiles').replaceChildren(
-      tile('Solar (PV)', pv == null ? '–' : kw(pv), 'kW', '--c-pv'),
-      tile('Load', load == null ? '–' : kw(load), 'kW', '--c-load'),
-      tile('Battery', soc == null ? '–' : Math.round(soc), '%', '--c-soc'),
+      powerTile('Solar', pv == null ? '–' : kw(pv), 'kW', '--c-pv'),
+      powerTile('Home', load == null ? '–' : kw(load), 'kW', '--c-load'),
+      powerTile('Battery charge', soc == null ? '–' : String(Math.round(soc)), '%', '--c-battery',
+        soc == null ? null : socBar(soc)),
     );
     const ts = Math.max(0, ...[P_PV, P_LOAD, P_SOC].map((id) => (byId[id] ? byId[id].ts : 0)));
-    $('updated').textContent = ts
+    setStatus(ts
       ? `From iSolarCloud · updated ${ageText(Date.now() / 1000 - ts)} (${fmtLong.format(new Date(ts * 1000))})`
-      : 'No readings yet';
+      : 'No readings yet', true);
   }
+
+  function stat(label, valueText, unit, note) {
+    const s = el('div', 'stat');
+    const v = el('div', 'value', valueText);
+    if (unit) v.appendChild(el('span', 'unit', unit));
+    s.append(el('div', 'label', label), v);
+    if (note) s.appendChild(el('div', 'note', note));
+    return s;
+  }
+
+  function renderToday(t, costDay) {
+    const pct = (t.load_kwh > 0 && t.import_kwh != null)
+      ? Math.round(Math.max(0, Math.min(100, (1 - t.import_kwh / t.load_kwh) * 100))) : null;
+    const items = [
+      stat('Generated', kwh(t.pv_kwh), 'kWh'),
+      stat('Used', kwh(t.load_kwh), 'kWh'),
+      stat('Imported', kwh(t.import_kwh), 'kWh'),
+      stat('Exported', kwh(t.export_kwh), 'kWh'),
+      stat('Self-powered', pct == null ? '–' : String(pct), '%'),
+    ];
+    if (costDay) {
+      items.push(stat('Cost so far', money(costDay.actual), '',
+        costDay.credit > 0 ? `${money(costDay.credit)} evening credit earned` : ''));
+    }
+    $('today-tiles').replaceChildren(...items);
+  }
+
+  let lastNowChartAt = 0;
 
   /** Loads the Now view. Returns the delay before the next refresh. */
   async function loadNow() {
     const today = todayStr();
-    const [sample, daily] = await Promise.all([
+    const [sample, daily, savings] = await Promise.all([
       fetchLive(),
       api(`/api/daily?from=${today}&to=${today}`),
+      loadSavings().catch((err) => { if (err.message === 'Not logged in.') throw err; return null; }),
     ]);
+    if (state.view !== 'now') return LIVE_REFRESH_MS;
+    renderHero(savings);
     const todayTotals = daily.days[0] || {};
-    renderTotals($('today-tiles'), todayTotals);
+    renderToday(todayTotals,
+      savings && savings.configured ? savings.days.find((d) => d.date === today) : null);
     // Say where today's totals come from (see "source" in /api/daily).
     $('today-source').textContent =
       todayTotals.source === 'inverter' ? '(inverter)'
       : todayTotals.source === 'cloud' ? '(iSolarCloud)' : '';
+    let delay = REFRESH_MS;
     if (sample) {
       renderLiveTiles(sample);
-      return LIVE_REFRESH_MS;
+      delay = LIVE_REFRESH_MS;
+    } else {
+      renderCloudTiles(await api('/api/latest'));
     }
-    renderCloudTiles(await api('/api/latest'));
-    return REFRESH_MS;
+    // The chart needs two heavier requests, so it refreshes on the slower cadence.
+    if (Date.now() - lastNowChartAt >= REFRESH_MS - 1000) {
+      lastNowChartAt = Date.now();
+      try {
+        await loadDayChart('now-chart', 'now-source', today, () => state.view === 'now');
+      } catch (err) {
+        lastNowChartAt = 0;
+        throw err;
+      }
+    }
+    return delay;
   }
 
   // ---------- Day ----------
 
   const DAY_SERIES = [
     // key, label, colour var, sign, kind
-    ['pv_w', 'PV', '--c-pv', 1, 'area'],
-    ['load_w', 'Load', '--c-load', 1, 'line'],
+    ['pv_w', 'Solar', '--c-pv', 1, 'area'],
+    ['load_w', 'Home', '--c-load', 1, 'line'],
     ['grid_import_w', 'Grid import', '--c-import', 1, 'line'],
     ['grid_export_w', 'Grid export', '--c-export', -1, 'area'],
     ['battery_charge_w', 'Battery charge', '--c-charge', 1, 'line'],
@@ -317,19 +517,30 @@
 
   async function loadDay(date) {
     $('day-input').value = date;
+    const current = () => state.view === 'day' && state.day === date;
     const [day, daily] = await Promise.all([
       api(`/api/day?date=${date}`),
       api(`/api/daily?from=${date}&to=${date}`),
     ]);
-    if (state.view !== 'day' || state.day !== date) return;
+    if (!current()) return;
+    renderTotals($('day-totals'), daily.days[0] || {});
+    await loadDayChart('day-chart', 'day-source', date, current, day);
+  }
+
+  /**
+   * Draws the power chart for `date` (the Day view and the Now view share it).
+   * `current()` says whether the view is still showing this chart; `day` is an
+   * already-fetched /api/day response, if the caller has one.
+   */
+  async function loadDayChart(chartId, noteId, date, current, day) {
+    day = day || await api(`/api/day?date=${date}`);
     const start = day.start * 1000;
     const end = day.end * 1000;
     const live = await fetchLiveDay(day.start, day.end);
-    if (state.view !== 'day' || state.day !== date) return;
+    if (!current()) return;
     const { byKey, source } = mergeDay(day.series, live);
     const hasData = Object.values(byKey).some((d) => d.length > 0);
-    renderTotals($('day-totals'), daily.days[0] || {});
-    const note = $('day-source');
+    const note = $(noteId);
     note.textContent = source;
     note.hidden = !hasData;
 
@@ -368,8 +579,9 @@
 
     const option = {
       animation: false,
-      grid: { left: 8, right: 8, top: narrow ? 84 : 56, bottom: 8, containLabel: true },
+      grid: { left: 8, right: 8, top: narrow ? 108 : 56, bottom: 8, containLabel: true },
       legend: { top: 0, left: 8, right: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      textStyle: { fontFamily: css('--font') },
       tooltip: {
         trigger: 'axis', axisPointer: { type: 'line' }, ...tooltipStyle(),
         formatter(params) {
@@ -387,24 +599,24 @@
       },
       xAxis: {
         type: 'value', min: start, max: end, interval: step,
-        axisLabel: { color: th.muted, formatter: (v) => clock(v) },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => clock(v) },
         axisLine: { lineStyle: { color: th.line } }, splitLine: { show: false },
       },
       yAxis: [
         {
           type: 'value', name: 'kW', nameTextStyle: { color: th.muted },
-          axisLabel: { color: th.muted, formatter: (v) => v.toFixed(1) },
+          axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => v.toFixed(1) },
           splitLine: { lineStyle: { color: th.line } },
         },
         {
           type: 'value', name: 'SOC %', min: 0, max: 100, nameTextStyle: { color: th.muted },
-          axisLabel: { color: th.muted }, splitLine: { show: false },
+          axisLabel: { color: th.muted, fontFamily: css('--mono') }, splitLine: { show: false },
         },
       ],
       series,
     };
     const peak = Math.max(0, ...(byKey.pv_w || []).map((d) => d[1]));
-    showChart('day-chart', hasData, option,
+    showChart(chartId, hasData, option,
       hasData
         ? `Power chart for ${date}: peak solar ${kw(peak)} kW; PV, load, grid import and export, battery charge and discharge in kW, battery state of charge in percent.`
         : `Power chart for ${date}: no data`);
@@ -430,6 +642,7 @@
       animation: false,
       grid: { left: 8, right: 8, top: narrow ? 72 : 44, bottom: 8, containLabel: true },
       legend: { top: 0, left: 8, right: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      textStyle: { fontFamily: css('--font') },
       tooltip: {
         trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
         formatter(params) {
@@ -438,17 +651,17 @@
             return `<div style="display:flex;justify-content:space-between;gap:16px">`
               + `<span>${p.marker}${p.seriesName}</span><b>${val == null ? '–' : val.toFixed(1) + ' kWh'}</b></div>`;
           });
-          return `<div style="margin-bottom:4px">${tooltipTitle(params[0].dataIndex)}</div>${rows.join('')}`;
+          return `<div style="margin-bottom:4px">${esc(tooltipTitle(params[0].dataIndex))}</div>${rows.join('')}`;
         },
       },
       xAxis: {
         type: 'category', data: labels,
-        axisLabel: { color: th.muted, interval: narrow && thin ? 'auto' : 0 },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), interval: narrow && thin ? 'auto' : 0 },
         axisLine: { lineStyle: { color: th.line } },
       },
       yAxis: {
         type: 'value', name: 'kWh', nameTextStyle: { color: th.muted },
-        axisLabel: { color: th.muted }, splitLine: { lineStyle: { color: th.line } },
+        axisLabel: { color: th.muted, fontFamily: css('--mono') }, splitLine: { lineStyle: { color: th.line } },
       },
       series: [
         { name: 'PV generation', type: 'bar', stack: 'e', data: v('pv_kwh'), itemStyle: { color: css('--c-pv') } },
@@ -490,15 +703,393 @@
       `Monthly energy for ${year}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
   }
 
+  // ---------- shared bits for the money views ----------
+
+  /** A big-number card. `cls` is "save", "cost" or "". */
+  function kpi(cls, label, valueText, unit, note) {
+    const k = el('div', `kpi ${cls}`.trim());
+    const v = el('div', 'value', valueText);
+    if (unit) v.appendChild(el('span', 'unit', unit));
+    k.append(el('div', 'label', label), v);
+    if (note) k.appendChild(el('div', 'note', note));
+    return k;
+  }
+
+  /** Shows the "add this to the config" message instead of a view's content. */
+  function setConfigured(prefix, ok, message) {
+    const note = $(`${prefix}-unconfigured`);
+    note.textContent = message;
+    note.hidden = ok;
+    $(`${prefix}-body`).hidden = !ok;
+  }
+
+  /** Groups costed days by month ("YYYY-MM"), or by day, oldest first. */
+  function bucketDays(days, byDay) {
+    const map = new Map();
+    for (const d of days) {
+      const key = byDay ? d.date : d.date.slice(0, 7);
+      let b = map.get(key);
+      if (!b) map.set(key, (b = { key, actual: 0, baseline: 0, savings: 0, credit: 0, creditDays: 0, days: 0 }));
+      b.actual += d.actual;
+      b.baseline += d.baseline;
+      b.savings += d.savings;
+      b.credit += d.credit;
+      if (d.credit > 0) b.creditDays++;
+      b.days++;
+    }
+    return [...map.values()];
+  }
+
+  /** Label for a bucket key: "Feb 2023" for months, "21 Oct" for days. */
+  function bucketLabel(key) {
+    return key.length === 7 ? monthYear(`${key}-01`) : `${+key.slice(8)} ${MONTHS[+key.slice(5, 7) - 1]}`;
+  }
+
+  /** Tooltip HTML from `[marker, name, text]` rows; every API-derived string is escaped. */
+  function moneyTooltip(rows, title) {
+    return `<div style="margin-bottom:4px">${esc(title)}</div>${rows.map(([marker, name, text]) =>
+      `<div style="display:flex;justify-content:space-between;gap:16px"><span>${marker}${esc(name)}</span><b>${esc(text)}</b></div>`).join('')}`;
+  }
+
+  /** Fills a `<table class="data">`'s body from arrays of `[text, className]` cells. */
+  function fillTable(tableId, rows) {
+    const body = $(tableId).tBodies[0];
+    body.replaceChildren(...rows.map((cells) => {
+      const tr = document.createElement('tr');
+      for (const [text, cls] of cells) tr.appendChild(el('td', cls || '', text));
+      return tr;
+    }));
+  }
+
+  // ---------- Savings ----------
+
+  const RANGES = ['month', 'year', 'all'];
+
+  function inRange(days, range) {
+    const today = todayStr();
+    if (range === 'month') return days.filter((d) => d.date.startsWith(today.slice(0, 7)));
+    if (range === 'year') return days.filter((d) => d.date.startsWith(today.slice(0, 4)));
+    return days;
+  }
+
+  function savingsOption(buckets, byDay, purchases) {
+    const th = baseTheme();
+    let run = 0;
+    const cumulative = buckets.map((b) => +(run += b.savings).toFixed(2));
+    const unit = byDay ? 'day' : 'month';
+    const marks = purchases
+      .map((p) => ({ name: p.name, key: byDay ? p.date : p.date.slice(0, 7) }))
+      .filter((p) => buckets.some((b) => b.key === p.key))
+      .slice(1) // the first purchase is where the line starts
+      .map((p) => ({ name: p.name, xAxis: bucketLabel(p.key) }));
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 16, top: 64, bottom: 8, containLabel: true },
+      legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        formatter: (params) => moneyTooltip(
+          params.map((p) => [p.marker, p.seriesName, money(p.value)]), params[0].axisValueLabel),
+      },
+      xAxis: {
+        type: 'category', data: buckets.map((b) => bucketLabel(b.key)),
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
+        axisLine: { lineStyle: { color: th.line } },
+      },
+      yAxis: {
+        type: 'value', name: 'Dollars ($)', nameTextStyle: { color: th.muted, align: 'left' },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series: [
+        { name: `Saved per ${unit}`, type: 'bar', data: buckets.map((b) => +b.savings.toFixed(2)), itemStyle: { color: css('--save-bar') }, barMaxWidth: 28 },
+        {
+          name: 'Saved (cumulative)', type: 'line', data: cumulative, showSymbol: false,
+          lineStyle: { width: 3, color: css('--save') }, itemStyle: { color: css('--save') }, z: 5,
+          markLine: marks.length ? {
+            silent: true, symbol: 'none', lineStyle: { color: css('--save-label'), type: 'dashed' },
+            label: { color: css('--save-label'), formatter: '{b}' }, data: marks,
+          } : undefined,
+        },
+      ],
+    };
+  }
+
+  async function loadSavingsView(range) {
+    for (const b of document.querySelectorAll('[data-range]')) {
+      b.setAttribute('aria-pressed', String(b.dataset.range === range));
+    }
+    const data = await loadSavings();
+    if (state.view !== 'savings' || state.range !== range) return;
+    setConfigured('savings', data.configured, NOT_CONFIGURED_TARIFF);
+    if (!data.configured) return;
+    const days = inRange(data.days, range);
+    const sumOf = (key) => days.reduce((a, d) => a + d[key], 0);
+    const saved = range === 'all' ? data.saved : sumOf('savings');
+    const creditDays = days.filter((d) => d.credit > 0).length;
+    $('savings-cards').replaceChildren(
+      kpi('save', 'Saved', money(saved, 0), '', days.length ? `about ${money(saved / days.length)} a day` : ''),
+      kpi('', 'What you paid', money(sumOf('actual'), 0), '', 'supply charge, imports, minus credits'),
+      kpi('', 'Without solar or battery', money(sumOf('baseline'), 0), '', 'same usage at your tariff'),
+      kpi('', 'Evening credit earned', creditDays.toLocaleString('en-AU'), 'days', `of ${days.length.toLocaleString('en-AU')} · ${money(sumOf('credit'), 0)} in credits`),
+    );
+    const byDay = range === 'month';
+    const buckets = bucketDays(days, byDay);
+    showChart('savings-chart', buckets.length > 0, savingsOption(buckets, byDay, data.purchases || []),
+      buckets.length
+        ? `Running total of savings, rising to ${money(saved, 0)}, with savings per ${byDay ? 'day' : 'month'} as bars, in dollars.`
+        : 'Running total of savings: no data');
+    $('savings-table-title').textContent = byDay ? 'By day' : 'By month';
+    $('savings-table').tHead.rows[0].cells[0].textContent = byDay ? 'Day' : 'Month';
+    const nowKey = byDay ? todayStr() : todayStr().slice(0, 7);
+    fillTable('savings-table', buckets.slice().reverse().map((b) => [
+      [bucketLabel(b.key) + (b.key === nowKey && !byDay ? ' (so far)' : '')],
+      [money(b.actual)], [money(b.baseline)], [money(b.savings), 'save'],
+      [byDay ? (b.creditDays ? 'yes' : 'no') : `${b.creditDays} / ${b.days}`],
+    ]));
+  }
+
+  // ---------- Payback ----------
+
+  const NOT_CONFIGURED_PAYBACK =
+    'Add a [tariff] section and at least one [[system.purchase]] section to the config file to see when the system pays for itself.';
+
+  /** A thin progress bar. */
+  function meter(pct, colourVar) {
+    const m = el('div', 'meter');
+    const f = el('span');
+    f.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    f.style.background = `var(${colourVar})`;
+    m.appendChild(f);
+    return m;
+  }
+
+  /** "Mar 2028" for "2028-03". */
+  const ymLabel = (ym) => `${MONTHS[+ym.slice(5, 7) - 1]} ${ym.slice(0, 4)}`;
+
+  /** Month after `ym` ("YYYY-MM"). */
+  const nextMonth = (ym) => shiftMonth(ym, 1);
+
+  /**
+   * Chart option for net position: actual month-end points, a dashed line to the
+   * projected payback month, and the purchases as dots.
+   */
+  function paybackOption(pb) {
+    const th = baseTheme();
+    const months = pb.series.map((p) => p.month);
+    const actual = pb.series.map((p) => p.net);
+    const last = pb.series[pb.series.length - 1];
+    const proj = pb.projected_payback;
+    let projected = null;
+    if (typeof proj === 'string' && /^\d{4}-\d{2}$/.test(proj) && last && proj > last.month) {
+      const extra = [];
+      for (let m = nextMonth(last.month); m <= proj; m = nextMonth(m)) extra.push(m);
+      months.push(...extra);
+      projected = months.map(() => null);
+      projected[pb.series.length - 1] = last.net;
+      extra.forEach((_, i) => {
+        projected[pb.series.length + i] = +(last.net * (1 - (i + 1) / extra.length)).toFixed(2);
+      });
+    }
+    const dots = pb.purchases
+      .map((p) => ({ name: p.name, i: months.indexOf(p.date.slice(0, 7)) }))
+      .filter((p) => p.i >= 0 && p.i < pb.series.length)
+      .map((p) => ({ name: p.name, value: [ymLabel(months[p.i]), actual[p.i]] }));
+    const labels = months.map(ymLabel);
+    const series = [
+      {
+        name: 'Actual', type: 'line', data: actual, showSymbol: false,
+        lineStyle: { width: 3, color: css('--save') }, itemStyle: { color: css('--save') }, z: 4,
+        markLine: {
+          silent: true, symbol: 'none', label: { show: false },
+          lineStyle: { color: css('--muted'), width: 1.5, type: 'solid' }, data: [{ yAxis: 0 }],
+        },
+      },
+    ];
+    if (projected) {
+      series.push({
+        name: 'Projected', type: 'line', data: projected, showSymbol: false,
+        lineStyle: { width: 3, type: 'dashed', color: css('--save') }, itemStyle: { color: css('--save') },
+        markPoint: {
+          symbol: 'circle', symbolSize: 12, label: { show: false },
+          itemStyle: { color: css('--bg'), borderColor: css('--save'), borderWidth: 2.5 },
+          data: [{ name: 'Payback', coord: [ymLabel(proj), 0] }],
+        },
+      });
+    }
+    if (dots.length) {
+      series.push({
+        name: 'Purchase', type: 'scatter', data: dots, symbolSize: 12, z: 6,
+        itemStyle: { color: css('--c-pv') },
+        label: { show: true, formatter: (p) => p.name, color: css('--c-pv'), position: 'top', fontSize: 12 },
+      });
+    }
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 24, top: 56, bottom: 28, containLabel: true },
+      legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'line' }, ...tooltipStyle(),
+        formatter: (params) => {
+          const rows = params.filter((p) => p.seriesName !== 'Purchase' && p.value != null)
+            .map((p) => [p.marker, p.seriesName, money(p.value, 0)]);
+          return rows.length ? moneyTooltip(rows, params[0].axisValueLabel) : '';
+        },
+      },
+      xAxis: {
+        type: 'category', data: labels, boundaryGap: false,
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
+        axisLine: { show: false }, axisTick: { show: false },
+      },
+      yAxis: {
+        type: 'value', name: 'Net position ($)', nameTextStyle: { color: th.muted, align: 'left' },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `${v < 0 ? '-' : ''}$${Math.abs(v).toLocaleString('en-AU')}` },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series,
+    };
+  }
+
+  async function loadPaybackView() {
+    const [pb, savings] = await Promise.all([
+      loadPayback(),
+      loadSavings().catch((err) => { if (err.message === 'Not logged in.') throw err; return null; }),
+    ]);
+    if (state.view !== 'payback') return;
+    setConfigured('payback', pb.configured, NOT_CONFIGURED_PAYBACK);
+    if (!pb.configured) return;
+
+    const proj = pb.projected_payback;
+    const projText = proj === null ? 'Paid back' : proj === 'never' ? 'Not at this rate' : ymLabel(proj);
+    const projNote = proj === null ? 'savings now cover the cost'
+      : proj === 'never' ? 'savings are not keeping up'
+      : `at about ${money(pb.rate_per_day)} a day (last 12 months)`;
+    const recovered = el('div', 'kpi');
+    const rv = el('div', 'value', `${pb.recovered_pct.toFixed(1)}%`);
+    recovered.append(el('div', 'label', 'Cost recovered'), rv, meter(pb.recovered_pct, '--save'),
+      el('div', 'note', `${money(pb.saved, 0)} saved of ${money(pb.total_cost, 0)} spent`));
+    const net = kpi('', 'Net position today', money(pb.net, 0), '', 'savings minus what the system cost');
+    net.classList.add(pb.net < 0 ? 'cost' : 'positive');
+    $('payback-cards').replaceChildren(
+      kpi('save', 'Projected payback', projText, '', projNote), recovered, net);
+
+    const hasSeries = pb.series.length > 0;
+    showChart('payback-chart', hasSeries, paybackOption(pb),
+      `Net position over time, in dollars: starts at minus ${money(pb.total_cost, 0)} cost, now ${money(pb.net, 0)}`
+      + (typeof proj === 'string' && proj !== 'never' ? `, projected to reach zero in ${ymLabel(proj)}.` : '.'));
+
+    const days = savings && savings.configured ? savings.days : [];
+    $('payback-parts').replaceChildren(...pb.purchases.map((p) => {
+      const card = el('div', 'part');
+      const head = el('div', 'part-head');
+      head.append(el('span', 'part-name', p.name), el('span', 'part-date', ymLabel(p.date)));
+      const grid = el('div', 'part-grid');
+      const cell = (label, text) => {
+        const c = el('div');
+        c.append(el('span', 'label', label), el('span', 'num', text));
+        return c;
+      };
+      grid.appendChild(cell('Cost', money(p.cost, 0)));
+      if (days.length) {
+        const since = days.filter((d) => d.date >= p.date).reduce((a, d) => a + d.savings, 0);
+        grid.appendChild(cell('Saved since', money(since, 0)));
+      }
+      card.append(head, grid);
+      return card;
+    }));
+
+    fillTable('payback-years', pb.by_year.slice().reverse().map((y) => [
+      [String(y.year) + (y.partial ? ' (partial)' : '')],
+      [money(y.saved, 0), 'save'],
+      [`${y.days}`],
+      [y.days ? money(y.saved / y.days) : '–'],
+    ]));
+  }
+
+  // ---------- Cost ----------
+
+  const NOT_CONFIGURED_COST = 'Add a [tariff] section to the config file to see what your power costs.';
+
+  /** Clustered bars of paid against without-solar cost. `labels`: x labels. */
+  function costOption(labels, actual, baseline, perUnit) {
+    const th = baseTheme();
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 16, top: 48, bottom: 8, containLabel: true },
+      legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 12, itemHeight: 10 },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        formatter: (params) => moneyTooltip(
+          params.map((p) => [p.marker, p.seriesName, money(p.value)]), params[0].axisValueLabel),
+      },
+      xAxis: {
+        type: 'category', data: labels,
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
+        axisLine: { lineStyle: { color: th.line } },
+      },
+      yAxis: {
+        type: 'value', name: `$ per ${perUnit}`, nameTextStyle: { color: th.muted, align: 'left' },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series: [
+        { name: 'Without solar or battery', type: 'bar', data: baseline, itemStyle: { color: css('--baseline') }, barMaxWidth: 26 },
+        { name: 'What you paid', type: 'bar', data: actual, itemStyle: { color: css('--save') }, barMaxWidth: 26 },
+      ],
+    };
+  }
+
+  async function loadCostView() {
+    const data = await loadSavings();
+    if (state.view !== 'cost') return;
+    setConfigured('cost', data.configured, NOT_CONFIGURED_COST);
+    if (!data.configured) return;
+    const today = todayStr();
+    const t = data.days.find((d) => d.date === today);
+    const avg = (rows, key) => (rows.length ? rows.reduce((a, d) => a + d[key], 0) / rows.length : null);
+    const last30 = data.days.filter((d) => d.date > addDays(today, -30));
+    const per = (v) => (v == null ? '–' : money(v));
+    $('cost-cards').replaceChildren(
+      kpi('', 'Today without solar or battery', per(t && t.baseline), '', 'same usage at your tariff'),
+      kpi('save', 'Today it actually cost', per(t && t.actual), '',
+        t ? `${t.import_kwh.toFixed(1)} kWh imported, ${t.export_kwh.toFixed(1)} kWh exported` : 'no data yet today'),
+      kpi('', 'Average a day without solar', per(avg(last30, 'baseline')), '', `last ${last30.length} days`),
+      kpi('save', 'Average a day paid', per(avg(last30, 'actual')), '', `last ${last30.length} days`),
+    );
+
+    const recent = data.days.filter((d) => d.date > addDays(today, -14));
+    showChart('cost-days-chart', recent.length > 0,
+      costOption(recent.map((d) => bucketLabel(d.date)), recent.map((d) => d.actual), recent.map((d) => d.baseline), 'day'),
+      'Daily cost for the last 14 days: what you paid, against what the same usage would have cost without solar or battery, in dollars.');
+
+    const monthStart = shiftMonth(today.slice(0, 7), -11);
+    const buckets = bucketDays(data.days.filter((d) => d.date.slice(0, 7) >= monthStart), false);
+    showChart('cost-months-chart', buckets.length > 0,
+      costOption(buckets.map((b) => bucketLabel(b.key)), buckets.map((b) => +b.actual.toFixed(2)),
+        buckets.map((b) => +b.baseline.toFixed(2)), 'month'),
+      'Monthly cost for the last 12 months: what you paid, against what the same usage would have cost without solar or battery, in dollars.');
+    fillTable('cost-table', buckets.slice().reverse().map((b) => [
+      [bucketLabel(b.key) + (b.key === today.slice(0, 7) ? ' (so far)' : '')],
+      [money(b.actual)], [money(b.baseline)], [money(b.actual / b.days)], [money(b.baseline / b.days)],
+    ]));
+  }
+
   // ---------- routing (hash) ----------
 
-  const state = { view: 'now', day: '', month: '', year: 0 };
+  const VIEWS = ['now', 'day', 'month', 'year', 'savings', 'payback', 'cost'];
+  const state = { view: 'now', day: '', month: '', year: 0, range: 'all' };
   let timer = null;
   let pollToken = 0;
 
   /** Loads Now, then schedules the next refresh (15 s from the inverter, 60 s from the cloud). */
   async function pollNow() {
     clearTimeout(timer);
+    timer = null;
+    // A hidden tab does not poll; visibilitychange restarts it.
+    if (document.hidden) return;
     const token = ++pollToken;
     let delay = REFRESH_MS;
     await guarded(async () => { delay = await loadNow(); });
@@ -506,37 +1097,54 @@
   }
 
   function parseHash() {
-    const raw = decodeURIComponent(window.location.hash.replace(/^#/, ''));
+    let raw = window.location.hash.replace(/^#/, '');
+    try { raw = decodeURIComponent(raw); } catch (e) { raw = ''; } // malformed escapes: fall back to Now
     const [view, value] = raw.split('=');
     const today = todayStr();
-    state.view = ['now', 'day', 'month', 'year'].includes(view) ? view : 'now';
+    state.view = VIEWS.includes(view) ? view : 'now';
+    state.range = view === 'savings' && RANGES.includes(value) ? value : 'all';
     state.day = /^\d{4}-\d{2}-\d{2}$/.test(value || '') && view === 'day' ? value : today;
     state.month = /^\d{4}-\d{2}$/.test(value || '') && view === 'month' ? value : today.slice(0, 7);
     state.year = /^\d{4}$/.test(value || '') && view === 'year' ? +value : +today.slice(0, 4);
   }
 
+  /** The hash for a view, carrying that view's current date or range. */
+  function viewHash(v) {
+    return v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}`
+      : v === 'year' ? `year=${state.year}` : v === 'savings' ? `savings=${state.range}` : 'now';
+  }
+
   function setHash() {
     const v = state.view;
-    const h = v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}` : v === 'year' ? `year=${state.year}` : 'now';
+    const h = viewHash(v);
     if (window.location.hash !== '#' + h) window.location.hash = h; // triggers render via hashchange
     else render();
   }
 
   function render() {
     parseHash();
-    for (const el of document.querySelectorAll('.view')) el.hidden = el.id !== `view-${state.view}`;
+    for (const v of document.querySelectorAll('.view')) v.hidden = v.id !== `view-${state.view}`;
     for (const tab of document.querySelectorAll('.tab')) {
-      if (tab.dataset.view === state.view) tab.setAttribute('aria-current', 'page');
+      if (tab.dataset.view === state.view) {
+        tab.setAttribute('aria-current', 'page');
+        // On a phone the tab row scrolls; keep the current tab in view.
+        const nav = tab.parentElement;
+        if (tab.offsetLeft + tab.offsetWidth > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = tab.offsetLeft + tab.offsetWidth - nav.clientWidth + 16;
+      }
       else tab.removeAttribute('aria-current');
       const v = tab.dataset.view;
-      tab.setAttribute('href', '#' + (v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}` : v === 'year' ? `year=${state.year}` : 'now'));
+      tab.setAttribute('href', '#' + viewHash(v));
     }
     clearTimeout(timer);
     timer = null;
     pollToken++;
+    lastNowChartAt = 0;
     if (state.view === 'now') pollNow();
     else if (state.view === 'day') guarded(() => loadDay(state.day));
     else if (state.view === 'month') guarded(() => loadMonth(state.month));
+    else if (state.view === 'savings') guarded(() => loadSavingsView(state.range));
+    else if (state.view === 'payback') guarded(() => loadPaybackView());
+    else if (state.view === 'cost') guarded(() => loadCostView());
     else guarded(() => loadYear(state.year));
   }
 
@@ -566,10 +1174,12 @@
     $('year-today').onclick = () => go({ year: +todayStr().slice(0, 4) });
     $('year-input').onchange = (e) => { const y = +e.target.value; if (y >= 2000 && y <= 2100) go({ year: y }); };
 
+    for (const b of document.querySelectorAll('[data-range]')) b.onclick = () => go({ range: b.dataset.range });
     window.addEventListener('hashchange', render);
     window.addEventListener('resize', () => { for (const c of Object.values(charts)) c.resize(); });
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden && state.view === 'now') pollNow(); });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && state.view === 'now') pollNow();
+    });
     render();
   }
 

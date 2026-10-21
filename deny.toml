@@ -1,0 +1,10 @@
+# Advisories only: fail CI on known RustSec vulnerabilities.
+[advisories]
+version = 2
+ignore = [
+    # Marvin attack: timing leaks when *decrypting or signing* with an RSA
+    # private key. We only encrypt with iSolarCloud's public key (the private
+    # key appears in tests only), so there is nothing to leak. No fixed rsa
+    # release exists yet; drop this once one does.
+    { id = "RUSTSEC-2023-0071", reason = "public-key encryption only; no private key in production" },
+]

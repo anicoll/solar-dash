@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
+use crate::cost::DayCost;
 use crate::modbus::Sample;
 
 /// A measuring point (a kind of value, such as "battery power").
@@ -62,7 +63,9 @@ pub async fn open(path: &str) -> Result<SqlitePool> {
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
 
+    // A small box (1-2 cores): 4 connections is plenty, and WAL lets them read concurrently.
     let pool = SqlitePoolOptions::new()
+        .max_connections(4)
         .connect_with(options)
         .await
         .with_context(|| format!("could not open database {path}"))?;
@@ -209,25 +212,35 @@ pub struct LatestReading {
 }
 
 /// The newest timestamp of any reading in the plant, or `None` if there are none.
+#[cfg(test)]
 pub async fn max_reading_ts(pool: &SqlitePool, plant_id: i64) -> Result<Option<i64>> {
-    // `MAX` gives one row holding NULL when the table is empty, hence `Option`.
-    let ts = sqlx::query_scalar("SELECT MAX(ts) FROM reading WHERE plant_id = ?")
-        .bind(plant_id)
-        .fetch_one(pool)
-        .await
-        .context("could not read newest timestamp")?;
+    // `MAX(ts) WHERE plant_id = ?` scans the whole plant, as the key is
+    // (plant_id, point_id, ts). Instead take each point's newest ts from the
+    // key, then the max of those. `MAX` gives NULL when there are none, hence `Option`.
+    let ts = sqlx::query_scalar(
+        "SELECT MAX((SELECT ts FROM reading r
+                     WHERE r.plant_id = ?1 AND r.point_id = p.point_id
+                     ORDER BY ts DESC LIMIT 1))
+         FROM point p",
+    )
+    .bind(plant_id)
+    .fetch_one(pool)
+    .await
+    .context("could not read newest timestamp")?;
     Ok(ts)
 }
 
 /// For each point, its most recent reading that has a value.
+/// `CROSS JOIN` makes `point` the outer loop; otherwise SQLite scans the plant's readings.
 pub async fn latest_readings(pool: &SqlitePool, plant_id: i64) -> Result<Vec<LatestReading>> {
     sqlx::query_as(
         "SELECT p.point_id, p.name, p.unit, r.ts, r.value
          FROM point p
-         JOIN reading r ON r.plant_id = ? AND r.point_id = p.point_id
-          AND r.ts = (SELECT MAX(ts) FROM reading
-                      WHERE plant_id = r.plant_id AND point_id = r.point_id
-                        AND value IS NOT NULL)
+         CROSS JOIN reading r ON r.plant_id = ?1 AND r.point_id = p.point_id
+          AND r.ts = (SELECT ts FROM reading
+                      WHERE plant_id = ?1 AND point_id = p.point_id
+                        AND value IS NOT NULL
+                      ORDER BY ts DESC LIMIT 1)
          ORDER BY p.point_id",
     )
     .bind(plant_id)
@@ -379,11 +392,14 @@ pub async fn live_samples_in_range(pool: &SqlitePool, from: i64, to: i64) -> Res
 /// The oldest and newest live sample times, or `None` if there are none.
 pub async fn live_ts_range(pool: &SqlitePool) -> Result<Option<(i64, i64)>> {
     // With no rows `MIN` and `MAX` are both NULL, so read them as `Option`s.
-    let (min, max): (Option<i64>, Option<i64>) =
-        sqlx::query_as("SELECT MIN(ts), MAX(ts) FROM live_sample")
-            .fetch_one(pool)
-            .await
-            .context("could not read live sample range")?;
+    // Separate subqueries let SQLite use the key for each; `MIN(ts), MAX(ts)`
+    // together scan the whole table.
+    let (min, max): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT (SELECT MIN(ts) FROM live_sample), (SELECT MAX(ts) FROM live_sample)",
+    )
+    .fetch_one(pool)
+    .await
+    .context("could not read live sample range")?;
     Ok(min.zip(max))
 }
 
@@ -398,6 +414,117 @@ pub async fn live_samples_raw(pool: &SqlitePool, from: i64, to: i64) -> Result<V
     .fetch_all(pool)
     .await
     .context("could not read live samples")
+}
+
+/// A finished local day's cost as stored in `daily_cost`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedDayCost {
+    /// Local day, `YYYY-MM-DD`.
+    pub date: String,
+    /// "inverter" or "cloud".
+    pub source: String,
+    pub cost: DayCost,
+}
+
+/// `daily_cost` columns as sqlx reads them; [`CachedDayCost`] is the tidy form.
+#[derive(sqlx::FromRow)]
+struct DailyCostRow {
+    date: String,
+    source: String,
+    import_cents: f64,
+    export_cents: f64,
+    supply_cents: f64,
+    credit_cents: f64,
+    actual_cents: f64,
+    baseline_cents: f64,
+    savings_cents: f64,
+    import_kwh: f64,
+    export_kwh: f64,
+    load_kwh: f64,
+}
+
+impl From<DailyCostRow> for CachedDayCost {
+    fn from(row: DailyCostRow) -> Self {
+        Self {
+            date: row.date,
+            source: row.source,
+            cost: DayCost {
+                import_kwh: row.import_kwh,
+                export_kwh: row.export_kwh,
+                load_kwh: row.load_kwh,
+                import_cents: row.import_cents,
+                export_cents: row.export_cents,
+                supply_cents: row.supply_cents,
+                zero_import_credit_cents: row.credit_cents,
+                actual_cents: row.actual_cents,
+                baseline_cents: row.baseline_cents,
+                savings_cents: row.savings_cents,
+            },
+        }
+    }
+}
+
+/// Stored day costs with `from <= date <= to` (`YYYY-MM-DD` text sorts like
+/// dates) that were worked out with `tariff_key`. Rows made with other rates
+/// are skipped, so they count as missing and get replaced.
+pub async fn daily_costs_in_range(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+    tariff_key: &str,
+) -> Result<Vec<CachedDayCost>> {
+    let rows: Vec<DailyCostRow> = sqlx::query_as(
+        "SELECT date, source, import_cents, export_cents, supply_cents, credit_cents,
+                actual_cents, baseline_cents, savings_cents, import_kwh, export_kwh, load_kwh
+         FROM daily_cost WHERE date >= ? AND date <= ? AND tariff_key = ? ORDER BY date",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(tariff_key)
+    .fetch_all(pool)
+    .await
+    .context("could not read stored day costs")?;
+    Ok(rows.into_iter().map(CachedDayCost::from).collect())
+}
+
+/// Saves finished days' costs (replacing any row for the same date), all in
+/// one transaction so a long backfill is one disk sync, not one per day.
+pub async fn save_daily_costs(
+    pool: &SqlitePool,
+    days: &[CachedDayCost],
+    tariff_key: &str,
+) -> Result<()> {
+    let computed_at = now();
+    let mut tx = pool.begin().await?;
+    for day in days {
+        let c = &day.cost;
+        sqlx::query(
+            "INSERT OR REPLACE INTO daily_cost
+               (date, source, import_cents, export_cents, supply_cents, credit_cents,
+                actual_cents, baseline_cents, savings_cents, import_kwh, export_kwh, load_kwh,
+                tariff_key, computed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&day.date)
+        .bind(&day.source)
+        .bind(c.import_cents)
+        .bind(c.export_cents)
+        .bind(c.supply_cents)
+        .bind(c.zero_import_credit_cents)
+        .bind(c.actual_cents)
+        .bind(c.baseline_cents)
+        .bind(c.savings_cents)
+        .bind(c.import_kwh)
+        .bind(c.export_kwh)
+        .bind(c.load_kwh)
+        .bind(tariff_key)
+        .bind(computed_at)
+        .execute(&mut *tx)
+        .await
+        .context("could not save day cost")?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -436,12 +563,12 @@ mod tests {
         let (_dir, pool) = test_db().await;
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
-             ('point', 'reading', 'raw_response', 'sync_state', 'api_call')",
+             ('point', 'reading', 'raw_response', 'sync_state', 'api_call', 'daily_cost')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 5);
+        assert_eq!(tables.len(), 6);
     }
 
     #[tokio::test]
@@ -560,6 +687,37 @@ mod tests {
         assert_eq!(latest[0].name.as_deref(), Some("Power"));
     }
 
+    #[tokio::test]
+    async fn newest_queries_span_several_points() {
+        let (_dir, pool) = test_db().await;
+        for id in 1..=3 {
+            upsert_point(&pool, &point(id)).await.unwrap();
+        }
+        let null_reading = Reading {
+            point_id: 2,
+            ts: 500,
+            value: None,
+        };
+        let rows = [
+            reading(1, 100, 1.0),
+            reading(1, 400, 2.0),
+            reading(2, 200, 3.0),
+            null_reading,
+            reading(3, 300, 4.0),
+        ];
+        upsert_readings(&pool, 7, &rows).await.unwrap();
+        // Another plant's newer reading must not leak in.
+        upsert_readings(&pool, 8, &[reading(1, 900, 9.0)])
+            .await
+            .unwrap();
+
+        // The newest ts is on point 2 (a NULL value), not the last point.
+        assert_eq!(max_reading_ts(&pool, 7).await.unwrap(), Some(500));
+        let latest = latest_readings(&pool, 7).await.unwrap();
+        let got: Vec<_> = latest.iter().map(|l| (l.point_id, l.ts, l.value)).collect();
+        assert_eq!(got, vec![(1, 400, 2.0), (2, 200, 3.0), (3, 300, 4.0)]);
+    }
+
     fn sample(ts: i64, pv_w: f64) -> Sample {
         Sample {
             ts,
@@ -645,5 +803,47 @@ mod tests {
         assert_eq!(live_ts_range(&pool).await.unwrap(), Some((100, 130)));
         // Not averaged: all three rows come back, and the end is exclusive.
         assert_eq!(live_samples_raw(&pool, 100, 130).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn day_costs_round_trip_and_follow_the_tariff_key() {
+        let (_dir, pool) = test_db().await;
+        let cost = DayCost {
+            import_kwh: 1.5,
+            export_kwh: 2.5,
+            load_kwh: 4.0,
+            import_cents: 10.0,
+            export_cents: 20.0,
+            supply_cents: 100.0,
+            zero_import_credit_cents: 5.0,
+            actual_cents: 85.0,
+            baseline_cents: 200.0,
+            savings_cents: 115.0,
+        };
+        let day = |date: &str| CachedDayCost {
+            date: date.to_string(),
+            source: "cloud".to_string(),
+            cost: cost.clone(),
+        };
+        save_daily_costs(&pool, &[day("2026-09-14"), day("2026-09-15")], "a")
+            .await
+            .unwrap();
+
+        let found = daily_costs_in_range(&pool, "2026-09-15", "2026-09-30", "a")
+            .await
+            .unwrap();
+        assert_eq!(found, vec![day("2026-09-15")]);
+        // Another tariff key sees nothing, and saving again replaces the row.
+        let other = daily_costs_in_range(&pool, "2026-09-01", "2026-09-30", "b")
+            .await
+            .unwrap();
+        assert!(other.is_empty());
+        save_daily_costs(&pool, &[day("2026-09-15")], "b")
+            .await
+            .unwrap();
+        let both = daily_costs_in_range(&pool, "2026-09-01", "2026-09-30", "a")
+            .await
+            .unwrap();
+        assert_eq!(both, vec![day("2026-09-14")]);
     }
 }

@@ -212,7 +212,7 @@ inside the LXC:
 curl http://127.0.0.1:8080/healthz
 ```
 
-It should print `{"ok":true,"last_reading_ts":...}`. If it fails, see
+It should print `{"ok":true}`. If it fails, see
 [Troubleshooting](#troubleshooting).
 
 ## 6. Cloudflare Tunnel
@@ -291,8 +291,14 @@ automatically on startup. Other options:
 cat /opt/solar-dash/VERSION           # the commit that is installed
 ```
 
+Before installing, the update takes an online backup of the database to
+`/var/backups/solar-dash/pre-update-<timestamp>.db` (these are not deleted
+automatically; remove old ones by hand). If your database is not at the `path`
+in `/etc/solar-dash/config.toml`, set `SOLAR_DASH_DB=/path/to/solar.db`.
+
 Rollback swaps the program back. A database change made by the newer version
-stays, so if an update included one, restore last night's backup too (section 8).
+stays, so if an update included one, restore the latest `pre-update-*.db`
+backup too (section 8).
 
 If you built inside the LXC (option B), update with `git pull`,
 `cargo build --release`, `./deploy/install.sh` and `systemctl restart solar-dash`
@@ -342,8 +348,10 @@ Better still, send these to a different disk or machine.
   message (for example a missing `password_hash`).
 - **"could not listen on ..."**: something else is using port 8080, or `bind`
   is wrong. Check with `ss -ltnp | grep 8080`.
-- **"login failed at startup"**: the iSolarCloud values are wrong. See the
-  error table in [how-to-run.md](how-to-run.md#troubleshooting). Test with
+- **"login to iSolarCloud failed ... retrying"** (a warning in the log): the
+  dashboard and Modbus data keep working, and the login is retried after 1
+  minute, then 2, 4 and so on up to every 30 minutes. If it never succeeds the
+  iSolarCloud values are probably wrong. See the error table in [how-to-run.md](how-to-run.md#troubleshooting). Test with
   `/opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml login-test`
   (run it as root so it can read the config).
 - **"unable to open database file" / permission denied**: the database folder
