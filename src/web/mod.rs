@@ -863,6 +863,7 @@ mod tests {
         // One finished session, and one still running that began a minute ago.
         let progress = db::ChargeProgress {
             energy_added_kwh: Some(12.5),
+            energy_used_kwh: Some(13.5),
             soc_pct: Some(70.0),
             max_power_kw: Some(7.4),
         };
@@ -885,6 +886,7 @@ mod tests {
         assert_eq!(sessions[0]["started_at"], 1_800_000_000);
         assert_eq!(sessions[0]["ended_at"], 1_800_003_600);
         assert_eq!(sessions[0]["energy_added_kwh"], 12.5);
+        assert_eq!(sessions[0]["energy_used_kwh"], 13.5);
         assert_eq!(sessions[0]["start_soc_pct"], 40.0);
         assert_eq!(sessions[0]["end_soc_pct"], 70.0);
         assert_eq!(sessions[0]["max_power_kw"], 7.4);
@@ -897,6 +899,72 @@ mod tests {
         let sessions = json["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0]["ended_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn ev_sessions_are_costed_from_the_live_samples_at_home() {
+        let (_dir, app, pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+
+        // An hour of charging with 7.4 kWh from the wall, all from the grid.
+        let start = 1_800_000_000;
+        let progress = db::ChargeProgress {
+            energy_used_kwh: Some(7.4),
+            ..db::ChargeProgress::default()
+        };
+        let id = db::start_charge_session(&pool, 1, start, None, Some("Home"))
+            .await
+            .unwrap();
+        db::end_charge_session(&pool, id, start + 3600, &progress)
+            .await
+            .unwrap();
+        for ts in (start..=start + 3600).step_by(15) {
+            let mut sample = live_sample(ts);
+            (sample.pv_w, sample.load_w) = (Some(0.0), Some(8000.0));
+            (sample.grid_w, sample.battery_w) = (Some(8000.0), Some(0.0));
+            db::insert_live_sample(&pool, &sample).await.unwrap();
+        }
+
+        let uri = format!("/api/ev/sessions?from={start}&to={}", start + 3600);
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        let session = &json["sessions"][0];
+        assert_eq!(session["energy_used_kwh"], 7.4);
+        assert_eq!(session["solar_kwh"], 0.0);
+        assert_eq!(session["battery_kwh"], 0.0);
+        assert_eq!(session["grid_kwh"], 7.4);
+        // 7.4 kWh at 25 c.
+        assert_eq!(session["cost"], 1.85);
+        assert_eq!(session["solar_value"], 0.0);
+        assert_eq!(session["coverage"], 1.0);
+
+        // The same session away from home is not costed, and nor is a home
+        // session when there is no tariff.
+        sqlx::query("UPDATE ev_charge_session SET geofence = 'Work'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        for key in ["solar_kwh", "grid_kwh", "cost", "solar_value", "coverage"] {
+            assert!(json["sessions"][0][key].is_null(), "{key}");
+        }
+        sqlx::query("UPDATE ev_charge_session SET geofence = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
+        assert_eq!(body_json(response).await["sessions"][0]["cost"], 1.85);
+        let no_tariff = {
+            let hash = hash_password(PASSWORD).unwrap();
+            let tz = chrono_tz::Australia::Adelaide;
+            router(AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate()).unwrap())
+        };
+        let cookie = log_in(&no_tariff).await;
+        let response = send(&no_tariff, get_request(&uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert!(json["sessions"][0]["cost"].is_null());
+        assert_eq!(json["sessions"][0]["energy_used_kwh"], 7.4);
     }
 
     #[tokio::test]

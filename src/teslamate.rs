@@ -32,6 +32,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// While charging, the session row is updated at most this often. The row
 /// lives on an SSD, so we keep writes rare.
 const SAVE_EVERY_SECS: i64 = 5 * 60;
+/// The longest time one charger power reading is held when adding up the
+/// energy used. A longer gap between messages is not counted.
+const MAX_HOLD_SECS: i64 = 5 * 60;
 
 /// What we know about the car. A field is `None` when TeslaMate has not sent
 /// it yet, sent an empty value, or sent something we could not read.
@@ -178,6 +181,9 @@ struct Open {
     progress: ChargeProgress,
     /// Unix seconds of the last save.
     saved_at: i64,
+    /// Unix seconds and kW of the last charger power reading, if any. The
+    /// energy used grows by this power times the time to the next message.
+    last_power: Option<(i64, f64)>,
 }
 
 /// Turns the car's messages into charging sessions. It only decides what to
@@ -198,6 +204,7 @@ impl Recorder {
                 id: open.id,
                 progress: open.progress,
                 saved_at: now,
+                last_power: None,
             }),
         }
     }
@@ -210,6 +217,7 @@ impl Recorder {
             (None, false) => None,
             (Some(open), true) => {
                 open.progress.add(state);
+                open.add_energy_used(state, now);
                 if now - open.saved_at < SAVE_EVERY_SECS {
                     return None;
                 }
@@ -232,11 +240,32 @@ impl Recorder {
         let mut progress = ChargeProgress::default();
         progress.add(state);
         progress.energy_added_kwh = None;
+        let last_power = state.charger_power_kw.map(|kw| (now, kw));
         self.open = Some(Open {
             id,
             progress,
             saved_at: now,
+            last_power,
         });
+    }
+}
+
+impl Open {
+    /// Adds the energy drawn since the last power reading: that power held
+    /// until `now`, for at most [`MAX_HOLD_SECS`], so a gap in the messages
+    /// does not inflate the total. Messages for other topics repeat the same
+    /// power, which changes nothing. A message with no power is skipped.
+    fn add_energy_used(&mut self, state: &CarState, now: i64) {
+        let Some(kw) = state.charger_power_kw else {
+            return;
+        };
+        if let Some((then, last_kw)) = self.last_power {
+            let secs = (now - then).clamp(0, MAX_HOLD_SECS);
+            let kwh = last_kw.max(0.0) * secs as f64 / 3600.0;
+            self.progress.energy_used_kwh =
+                Some(self.progress.energy_used_kwh.unwrap_or(0.0) + kwh);
+        }
+        self.last_power = Some((now, kw));
     }
 }
 
@@ -554,6 +583,21 @@ mod tests {
         }
     }
 
+    /// Checks that `step` is `expected`, which has no energy used: that is
+    /// a sum of fractions, so it only has to be close to `used_kwh`.
+    fn assert_step(step: Option<Step>, expected: Step, used_kwh: f64) {
+        let mut step = step.expect("a step");
+        let (Step::Save(_, progress) | Step::End(_, progress)) = &mut step else {
+            panic!("not a save or an end");
+        };
+        let got = progress.energy_used_kwh.take().expect("energy used");
+        assert!(
+            (got - used_kwh).abs() < 1e-9,
+            "used {got}, wanted {used_kwh}"
+        );
+        assert_eq!(step, expected);
+    }
+
     #[test]
     fn session_starts_when_charging_begins() {
         let mut recorder = Recorder::new(None, 0);
@@ -590,10 +634,16 @@ mod tests {
         later.battery_level_pct = Some(52.0);
         let expected = ChargeProgress {
             energy_added_kwh: Some(2.5),
+            energy_used_kwh: None,
             soc_pct: Some(52.0),
             max_power_kw: Some(7.4),
         };
-        assert_eq!(recorder.next(&later, 1300), Some(Step::Save(5, expected)));
+        // 3 kW for 100 s, 7.4 kW for 199 s and 6 kW for 1 s.
+        assert_step(
+            recorder.next(&later, 1300),
+            Step::Save(5, expected),
+            (3.0 * 100.0 + 7.4 * 199.0 + 6.0) / 3600.0,
+        );
         // The clock restarts after a save.
         assert_eq!(recorder.next(&later, 1400), None);
         assert!(matches!(
@@ -614,10 +664,16 @@ mod tests {
         };
         let expected = ChargeProgress {
             energy_added_kwh: Some(1.0),
+            energy_used_kwh: None,
             soc_pct: Some(50.0),
             max_power_kw: Some(7.0),
         };
-        assert_eq!(recorder.next(&stopped, 1020), Some(Step::End(5, expected)));
+        // 3 kW for the 10 s before the second message.
+        assert_step(
+            recorder.next(&stopped, 1020),
+            Step::End(5, expected),
+            3.0 * 10.0 / 3600.0,
+        );
         // It is over: nothing more, until charging begins again.
         assert_eq!(recorder.next(&stopped, 1030), None);
         assert_eq!(
@@ -632,6 +688,7 @@ mod tests {
         recorder.started(5, &charging("Charging", 3.0), 1000);
         let expected = ChargeProgress {
             energy_added_kwh: None,
+            energy_used_kwh: None,
             soc_pct: Some(50.0),
             max_power_kw: Some(3.0),
         };
@@ -649,6 +706,7 @@ mod tests {
             id: 9,
             progress: ChargeProgress {
                 energy_added_kwh: Some(4.0),
+                energy_used_kwh: Some(4.5),
                 soc_pct: Some(48.0),
                 max_power_kw: Some(7.4),
             },
@@ -661,11 +719,14 @@ mod tests {
         let step = recorder.next(&charging("Charging", 7.0), 2300);
         let expected = ChargeProgress {
             energy_added_kwh: Some(1.0),
+            energy_used_kwh: None,
             soc_pct: Some(50.0),
             // The highest power from before the restart is kept.
             max_power_kw: Some(7.4),
         };
-        assert_eq!(step, Some(Step::Save(9, expected)));
+        // The 4.5 kWh from before the restart, plus 7 kW for the 298 s since
+        // the first message. The time before that is not counted.
+        assert_step(step, Step::Save(9, expected), 4.5 + 7.0 * 298.0 / 3600.0);
     }
 
     #[test]
@@ -674,6 +735,7 @@ mod tests {
             id: 9,
             progress: ChargeProgress {
                 energy_added_kwh: Some(4.0),
+                energy_used_kwh: Some(4.5),
                 soc_pct: Some(48.0),
                 max_power_kw: Some(7.4),
             },

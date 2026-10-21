@@ -163,7 +163,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}, "car": {...}}`. `sample` is from Modbus, or `null` if there is none or it is over 5 minutes old. `car` is the Tesla's charge state from TeslaMate (see [TeslaMate](#teslamate-optional)), or `null` if that is off or nothing has arrived yet |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
-| `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence},...]}`. A session still charging has `ended_at` `null` and counts as running until now. At most 400 days. Empty without a `[teslamate]` section |
+| `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`. A session still charging has `ended_at` `null` and counts as running until now. `energy_used_kwh` is taken from the wall, `energy_added_kwh` reaches the battery. The last six fields (kWh by source, dollars, and the share 0 to 1 of the session the inverter samples cover) are `null` without a `[tariff]`, away from home (geofence not "Home") or with no energy. At most 400 days. Empty without a `[teslamate]` section |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days. Each day has a `source` (see [Modbus in `serve`](#modbus-in-serve)) |
 | `GET /api/costs?from=YYYY-MM-DD&to=YYYY-MM-DD` | Dollars per local day from the `[tariff]` section: `actual`, `baseline` (no solar or battery), `savings`, zero-import `credit`, and import, export and load kWh, plus `totals`. Default: the last 30 days. At most 1,500 days. Days with no data are left out. Finished days are stored in the database, so repeat requests are fast; editing the `[tariff]` rates makes them be worked out again (editing a `[[previous_tariff]]` only redoes the days on that plan). Days before the current plan are priced on the `[[previous_tariff]]` entry in effect on that day (its `until` is the last day it applies), if any are configured. Without a `[tariff]` section it answers `{"configured":false}` |
 | `GET /api/payback` | How much of the system's cost the savings have covered, from the `[[system.purchase]]` entries and the `[tariff]`: `total_cost`, `saved`, `net`, `recovered_pct`, `rate_per_day` (mean savings over the last 365 days with data), `price_rise_percent` (the `[system]` setting, default 3, that grows that rate each year in the projection), `projected_payback` (`"YYYY-MM"`, `null` once paid back, or `"never"`), the `purchases`, a monthly `series` of cumulative `saved` and `net`, and `by_year` (`partial` when a year has fewer days of data than days). Counts from the first purchase date to today. Without purchases or a `[tariff]` section it answers `{"configured":false}` |
@@ -289,7 +289,19 @@ by `GET /api/ev/sessions`). A session starts when `charging_state` becomes
 battery level and top power are saved every 5 minutes, so the SSD sees only a
 few writes an hour. If solar-dash restarts mid-charge it carries on with the
 open session; if the car stopped charging in the meantime, the session ends at
-the time solar-dash noticed.
+the time solar-dash noticed. The energy used from the wall is worked out by
+adding up the charger power between messages (never counting more than 5
+minutes for one reading), so it includes charging losses.
+
+With a `[tariff]`, a home session (geofence "Home", or none) is also costed
+when you ask for it, from the 15-second inverter samples. The car's power is
+already part of the house load, so for each sample the car takes its average
+power (never more than the load) and the same share of solar, battery and
+grid as the whole house load has: solar first, then battery, then grid. The
+grid part is priced at that time's import price, so a midday charge in a
+free window costs $0. `solar_value` is what that solar would have earned
+exported instead, and is not part of `cost`. Gaps in the samples over 2
+minutes are left out, and `coverage` says how much of the session was seen.
 
 The rest of the state is only kept in memory (the broker keeps the latest
 values, so they come back after a restart). Unlike the Modbus sample, `car` is not hidden

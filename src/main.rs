@@ -1,6 +1,7 @@
 mod config;
 mod cost;
 mod db;
+mod ev_cost;
 mod ingest;
 mod isolar;
 mod modbus;

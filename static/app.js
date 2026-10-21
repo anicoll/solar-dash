@@ -611,8 +611,36 @@
     return mins >= 60 ? `${Math.floor(mins / 60)} h ${mins % 60} m` : `${mins} m`;
   }
 
-  /** One-line summary of the car under the power diagram; hidden when there is no car. */
-  function renderCarTile(car) {
+  /** The share of a costed session's energy that came from solar, 0 to 100, or null. */
+  function solarPct(session) {
+    const total = session.solar_kwh + session.battery_kwh + session.grid_kwh;
+    return session.cost == null || !(total > 0) ? null : Math.round(session.solar_kwh / total * 100);
+  }
+
+  const CAR_SESSION_MS = 5 * 60 * 1000;  // costing a session reads its live samples, so not on every 15 s refresh
+  let carSession = { at: 0, charging: null, value: null };
+
+  /** The session shown on the car line: the one still charging, else the latest one that ended today. Null if none, or if the request fails.
+   * Reused for 5 minutes, or until the car starts or stops charging. */
+  async function fetchCarSession(car) {
+    const charging = car.charging_state === 'Charging';
+    if (Date.now() - carSession.at < CAR_SESSION_MS && charging === carSession.charging) return carSession.value;
+    const now = Math.floor(Date.now() / 1000), today = todayStr();
+    let value = null;
+    try {
+      const { sessions } = await api(`/api/ev/sessions?from=${now - 36 * 3600}&to=${now}`);
+      const todays = sessions.filter((c) => c.ended_at == null || fmtDate.format(new Date(c.ended_at * 1000)) === today);
+      value = todays.length ? todays[todays.length - 1] : null;
+    } catch (err) {
+      if (err.message === 'Not logged in.') throw err;
+      return null;
+    }
+    carSession = { at: Date.now(), charging, value };
+    return value;
+  }
+
+  /** One-line summary of the car under the power diagram; hidden when there is no car. `session` is from fetchCarSession. */
+  function renderCarTile(car, session) {
     const host = $('car-tile');
     host.hidden = !car;
     if (!car) return;
@@ -629,6 +657,10 @@
       ];
     } else {
       parts = [level, car.state, car.geofence];
+    }
+    if (session && session.cost != null) {
+      const solar = solarPct(session);
+      parts.push(solar == null ? null : `${solar}% solar`, money(session.cost));
     }
     const line = el('span', 'car-text');
     line.appendChild(el('span', 'car-name', car.display_name || 'Car'));
@@ -710,7 +742,7 @@
     } else {
       renderCloudTiles(await api('/api/latest'));
     }
-    renderCarTile(car);
+    renderCarTile(car, car ? await fetchCarSession(car) : null);
     // The chart needs two heavier requests, so it refreshes on the slower cadence.
     if (Date.now() - lastNowChartAt >= REFRESH_MS - 1000) {
       lastNowChartAt = Date.now();
@@ -1411,6 +1443,30 @@
       [bucketLabel(b.key) + (b.key === today.slice(0, 7) ? ' (so far)' : '')],
       [money(b.actual)], [money(b.baseline)], [money(b.actual / b.days)], [money(b.baseline / b.days)],
     ]));
+    await loadCostSessions();
+  }
+
+  /** Fills the "Charging sessions" table with the last 10 sessions of the last 60 days; the panel is hidden when there are none. */
+  async function loadCostSessions() {
+    const now = Math.floor(Date.now() / 1000);
+    let sessions = [];
+    try {
+      sessions = (await api(`/api/ev/sessions?from=${now - 60 * 86400}&to=${now}`)).sessions || [];
+    } catch (err) {
+      if (err.message === 'Not logged in.') throw err;
+    }
+    if (state.view !== 'cost') return;
+    $('cost-sessions').hidden = sessions.length === 0;
+    const shown = sessions.slice(-10).reverse();
+    fillTable('cost-sessions-table', shown.map((c) => {
+      const used = c.energy_used_kwh == null ? c.energy_added_kwh : c.energy_used_kwh;
+      const solar = solarPct(c);
+      const [, month, day] = fmtDate.format(new Date(c.started_at * 1000)).split('-');
+      return [
+        [`${+day} ${MONTHS[+month - 1]}` + (c.ended_at == null ? ' (now)' : '')],
+        [kwh(used)], [solar == null ? '–' : `${solar}%`], [money(c.cost)],
+      ];
+    }));
   }
 
   // ---------- routing (hash) ----------
