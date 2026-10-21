@@ -206,21 +206,14 @@ input[type="number"] { width: 6.5em; }
 .flow-soc.low { fill: var(--cost); }
 .flow-rays { transform-box: fill-box; transform-origin: center; }
 .flow-rays.spin { animation: flow-spin 24s linear infinite; }
-.flow-hub-body { fill: var(--panel-2); stroke: var(--border-strong); stroke-width: 1.5; }
-.flow-hub-wave { fill: none; stroke: var(--muted); stroke-width: 2; }
-.flow-hub.on .flow-hub-body { stroke: var(--fg-soft); }
-.flow-hub.on .flow-hub-wave { stroke: var(--fg); }
-.flow-pulse { fill: none; stroke: var(--fg-soft); stroke-width: 1.5; opacity: 0; transform-box: fill-box; transform-origin: center; }
-.flow-hub.on .flow-pulse { animation: flow-pulse 2.6s ease-out infinite; }
 .flow-label { fill: var(--muted); font-size: 13px; font-weight: 600; }
 .flow-value { fill: var(--muted); font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 17px; font-weight: 600; }
 .flow-node.on .flow-value { fill: var(--fg); }
 .flow-note { fill: var(--muted); font-size: 12px; }
 .flow-node.on .flow-note { fill: var(--note, var(--flow)); }
 @keyframes flow-spin { to { transform: rotate(360deg); } }
-@keyframes flow-pulse { from { opacity: 0.55; transform: scale(1); } to { opacity: 0; transform: scale(1.45); } }
 @media (prefers-reduced-motion: reduce) {
-  .flow-rays.spin, .flow-hub.on .flow-pulse { animation: none; }
+  .flow-rays.spin { animation: none; }
 }
 
 /* ---------- Now: today ---------- */

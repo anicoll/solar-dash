@@ -338,13 +338,22 @@
 
   const FLOW_MIN_W = 20;     // below this a flow counts as idle
   const FLOW_FULL_W = 5000;  // flows at or above this animate at full speed
-  const FLOW_HUB = { x: 180, y: 170, half: 24 };
-  // Each path runs in its positive direction: solar->hub, grid->hub (import), hub->home, hub->battery (charging).
+  // Sungrow-style layout: solar on top, home in the middle, battery bottom-left, grid bottom-right.
+  // tx/ty/anchor place the three text lines (label, value, note) beside or below each node.
   const FLOW_NODES = {
-    solar: { x: 60, y: 90, colour: '--c-pv', label: 'Solar', above: true, path: 'M88 90C140 90 180 100 180 146' },
-    home: { x: 300, y: 90, colour: '--c-load', label: 'Home', above: true, path: 'M204 170C260 170 300 160 300 118' },
-    grid: { x: 60, y: 250, colour: '--c-grid', label: 'Grid', path: 'M60 222C60 180 100 170 156 170' },
-    battery: { x: 300, y: 250, colour: '--c-battery', label: 'Battery', path: 'M180 194C180 240 230 250 272 250' },
+    solar: { x: 200, y: 64, colour: '--c-pv', label: 'Solar', tx: 238, ty: 22, anchor: 'start' },
+    home: { x: 200, y: 188, colour: '--c-load', label: 'Home', tx: 238, ty: 154, anchor: 'start' },
+    battery: { x: 70, y: 280, colour: '--c-battery', label: 'Battery', tx: 70, ty: 324, anchor: 'middle' },
+    grid: { x: 330, y: 280, colour: '--c-grid', label: 'Grid', tx: 330, ty: 324, anchor: 'middle' },
+  };
+  // Rounded right-angle routes. Each path runs in its positive direction (from -> to); `rev` is the colour when it runs backwards.
+  const FLOW_EDGES = {
+    pvHome: { d: 'M200 92V160', colour: '--c-pv' },
+    pvBat: { d: 'M172 64H84Q70 64 70 78V252', colour: '--c-pv' },
+    pvGrid: { d: 'M228 64H316Q330 64 330 78V252', colour: '--c-pv' },
+    batHome: { d: 'M94.6 268H171Q185 268 185 254V212', colour: '--c-battery' },
+    gridHome: { d: 'M305.4 268H229Q215 268 215 254V212', colour: '--c-grid' },
+    batGrid: { d: 'M94.6 292H305.4', colour: '--c-battery', rev: '--c-grid' },
   };
   const FLOW_ICONS = {
     home: ['M3 11.5L12 3.5l9 8', 'M5.5 10v10.5h13V10', 'M10 20.5v-6h4v6', 'M16.5 7V4h2v5'],
@@ -405,7 +414,7 @@
   function flowDefs() {
     const defs = svgEl('defs', {});
     for (const [id, dev] of [['flow-blur-lg', 7], ['flow-blur-sm', 2.2]]) {
-      const f = svgEl('filter', { id, filterUnits: 'userSpaceOnUse', x: -40, y: -40, width: 440, height: 420 });
+      const f = svgEl('filter', { id, filterUnits: 'userSpaceOnUse', x: -40, y: -40, width: 480, height: 460 });
       f.appendChild(svgEl('feGaussianBlur', { stdDeviation: dev }));
       defs.appendChild(f);
     }
@@ -427,10 +436,9 @@
     const g = flowColour(svgEl('g', {}, 'flow-node'), n.colour);
     const icon = flowIcon(kind);
     icon.g.setAttribute('transform', `translate(${n.x - 18} ${n.y - 18}) scale(1.5)`);
-    const y0 = n.above ? 14 : n.y + 48;
-    const label = svgText(n.x, y0, n.label, 'flow-label', 'middle');
-    const value = svgText(n.x, y0 + 18, '', 'flow-value', 'middle');
-    const note = svgText(n.x, y0 + 34, '', 'flow-note', 'middle');
+    const label = svgText(n.tx, n.ty, n.label, 'flow-label', n.anchor);
+    const value = svgText(n.tx, n.ty + 18, '', 'flow-value', n.anchor);
+    const note = svgText(n.tx, n.ty + 34, '', 'flow-note', n.anchor);
     g.append(
       svgEl('circle', { cx: n.x, cy: n.y, r: 31, filter: 'url(#flow-blur-lg)' }, 'flow-halo'),
       svgEl('circle', { cx: n.x, cy: n.y, r: 28 }, 'flow-disc'),
@@ -438,19 +446,6 @@
       icon.g, label, value, note,
     );
     return { g, value, note, ...icon.parts };
-  }
-
-  /** Inverter hub in the middle; its ring pulses while anything flows. */
-  function flowHub() {
-    const { x, y, half } = FLOW_HUB, s = half * 2;
-    const g = svgEl('g', {}, 'flow-hub');
-    const ring = svgEl('rect', { x: x - half, y: y - half, width: s, height: s, rx: 14 }, 'flow-pulse');
-    g.append(
-      ring,
-      svgEl('rect', { x: x - half, y: y - half, width: s, height: s, rx: 14 }, 'flow-hub-body'),
-      svgEl('path', { d: `M${x - 12} ${y}q6-12 12 0t12 0`, 'stroke-linecap': 'round' }, 'flow-hub-wave'),
-    );
-    return g;
   }
 
   /** Dots per flow and seconds per traversal for a flow of `w` watts. */
@@ -476,6 +471,7 @@
     }
     f.key = key; f.secs = pace.secs; f.motions = [];
     f.holder.replaceChildren();
+    if (on) flowColour(f.holder, w < 0 && f.rev ? f.rev : f.colour);
     if (!on) return false;
     f.holder.append(
       svgEl('path', { d: f.d, filter: 'url(#flow-blur-sm)' }, 'flow-line-glow'),
@@ -501,19 +497,18 @@
 
   /** Builds the static diagram skeleton once. */
   function flowBuild() {
-    const root = svgEl('svg', { viewBox: '0 -6 360 348', role: 'img' }, 'flow');
-    const view = { root, flows: {}, nodes: {}, hub: flowHub() };
+    const root = svgEl('svg', { viewBox: '0 0 400 366', role: 'img' }, 'flow');
+    const view = { root, flows: {}, nodes: {} };
     root.appendChild(flowDefs());
-    for (const kind in FLOW_NODES) {
-      const g = flowColour(svgEl('g', {}), FLOW_NODES[kind].colour);
-      const id = `flow-p-${kind}`;
-      g.appendChild(svgEl('path', { id, d: FLOW_NODES[kind].path }, 'flow-track'));
+    for (const kind in FLOW_EDGES) {
+      const e = FLOW_EDGES[kind], id = `flow-p-${kind}`;
+      const g = flowColour(svgEl('g', {}), e.colour);
+      g.appendChild(svgEl('path', { id, d: e.d }, 'flow-track'));
       const holder = svgEl('g', {});
       g.appendChild(holder);
       root.appendChild(g);
-      view.flows[kind] = { id, d: FLOW_NODES[kind].path, holder, key: '', motions: [], secs: 0 };
+      view.flows[kind] = { id, d: e.d, colour: e.colour, rev: e.rev, holder, key: '', motions: [], secs: 0 };
     }
-    root.appendChild(view.hub);
     for (const kind in FLOW_NODES) {
       view.nodes[kind] = flowNode(kind);
       root.appendChild(view.nodes[kind].g);
@@ -521,7 +516,26 @@
     return view;
   }
 
-  /** Animated Solar / Grid / Home / Battery power-flow diagram around the inverter. */
+  /** Splits pv/load/battery/grid watts into the six pairwise flows (pv first to home, then battery, then grid; battery discharge serves home before export). */
+  function splitFlows(s) {
+    const pos = (w) => Math.max(w == null ? 0 : w, 0);
+    const pv = pos(s.pv_w), load = pos(s.load_w), charge = pos(s.battery_w), discharge = pos(-s.battery_w);
+    const imp = pos(s.grid_w), exp = pos(-s.grid_w);
+    const pvHome = Math.min(pv, load);
+    let r = pv - pvHome;
+    const pvBat = Math.min(r, charge);
+    r -= pvBat;
+    const pvGrid = Math.min(r, exp);
+    let loadLeft = load - pvHome;
+    const batHome = Math.min(discharge, loadLeft);
+    loadLeft -= batHome;
+    const batGrid = Math.min(discharge - batHome, exp - pvGrid);
+    const gridHome = Math.min(imp, loadLeft);
+    const gridBat = Math.min(imp - gridHome, charge - pvBat);
+    return { pvHome, pvBat, pvGrid, batHome, gridHome, batGrid: batGrid - gridBat };
+  }
+
+  /** Animated Solar / Home / Battery / Grid power-flow diagram in the Sungrow app layout. */
   function flowDiagram(s) {
     if (!flowView) flowView = flowBuild();
     const word = (w, pos, neg) => (w == null || Math.abs(w) < FLOW_MIN_W ? 'idle' : w > 0 ? pos : neg);
@@ -536,18 +550,16 @@
       grid: [gridWord, s.grid_w < 0 ? '--c-export' : '--c-import'],
       battery: [soc ? `${batWord} · ${soc}` : batWord, s.battery_w < 0 ? '--c-discharge' : '--c-charge'],
     };
-    const { root, flows, nodes, hub } = flowView;
-    let any = false;
+    const { root, flows, nodes } = flowView;
+    const split = splitFlows(s);
+    for (const kind in flows) flowUpdate(flows[kind], split[kind]);
     for (const kind in watts) {
       const n = nodes[kind];
-      const on = flowUpdate(flows[kind], watts[kind]);
-      any = any || on;
-      n.g.classList.toggle('on', on);
+      n.g.classList.toggle('on', watts[kind] != null && Math.abs(watts[kind]) >= FLOW_MIN_W);
       n.value.textContent = val(watts[kind]);
       n.note.textContent = notes[kind][0];
       n.note.style.setProperty('--note', `var(${notes[kind][1]})`);
     }
-    hub.classList.toggle('on', any);
     nodes.solar.rays.classList.toggle('spin', s.pv_w != null && s.pv_w >= FLOW_MIN_W);
     const pct = s.soc_pct == null ? 0 : Math.max(0, Math.min(100, s.soc_pct));
     nodes.battery.fill.setAttribute('width', (12.8 * pct / 100).toFixed(2));
