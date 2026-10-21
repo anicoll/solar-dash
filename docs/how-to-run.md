@@ -247,8 +247,11 @@ Which points are fetched and the plant's time zone can be changed with
 It is safe to stop (Ctrl+C) and run again: progress is saved after every
 window, and the next run resumes where the last one stopped. The API returns
 at most 3 hours per call, so a day is 8 calls and three years is about 8,800
-calls, roughly 2.5 hours with the 1 s pause between calls. The command keeps
-itself under the API limits and pauses if it gets close to the hourly limit.
+calls. The command keeps itself under the API limits (it pauses at 1,500 calls
+in an hour, shared with `serve`), so the full history takes about 6 hours.
+
+You can run it while `serve` is running: each keeps its own progress, so
+the live sync carries on from today and the backfill fills in the past.
 
 To check progress:
 
