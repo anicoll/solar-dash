@@ -21,6 +21,10 @@ pub struct Config {
     /// Electricity prices, used to work out costs and savings. `None` (no
     /// `[tariff]` section) means cost features are off.
     pub tariff: Option<Tariff>,
+    /// Plans that applied before `[tariff]`, oldest first, as repeated
+    /// `[[previous_tariff]]` tables. Needs `[tariff]` as well.
+    #[serde(default)]
+    pub previous_tariff: Vec<PreviousTariff>,
     /// What the system cost, for the payback estimate. Optional.
     #[serde(default)]
     pub system: System,
@@ -218,35 +222,70 @@ pub fn parse_hhmm(text: &str) -> Result<u32> {
 }
 
 /// Check one window's two times, naming the field `name` in any error.
-fn check_window(name: &str, from: &str, to: &str) -> Result<()> {
-    let start = parse_hhmm(from).with_context(|| format!("{name}.from in [tariff]"))?;
-    let end = parse_hhmm(to).with_context(|| format!("{name}.to in [tariff]"))?;
+fn check_window(section: &str, name: &str, from: &str, to: &str) -> Result<()> {
+    let start = parse_hhmm(from).with_context(|| format!("{name}.from in {section}"))?;
+    let end = parse_hhmm(to).with_context(|| format!("{name}.to in {section}"))?;
     // Equal times are ambiguous: empty or the whole day?
     anyhow::ensure!(
         start != end,
-        "{name}.from and {name}.to in [tariff] must differ (both are \"{from}\")"
+        "{name}.from and {name}.to in {section} must differ (both are \"{from}\")"
     );
     Ok(())
 }
 
 impl Tariff {
-    /// Check the section for mistakes the TOML parser cannot catch.
-    fn check(&self) -> Result<()> {
+    /// Check the section for mistakes the TOML parser cannot catch. `section`
+    /// names it in errors ("[tariff]" or "[[previous_tariff]] #1").
+    fn check(&self, section: &str) -> Result<()> {
         anyhow::ensure!(
             self.supply_cents_per_day >= 0.0,
-            "supply_cents_per_day in [tariff] must not be negative"
+            "supply_cents_per_day in {section} must not be negative"
         );
         for (i, w) in self.import.iter().enumerate() {
-            check_window(&format!("import[{i}]"), &w.from, &w.to)?;
+            check_window(section, &format!("import[{i}]"), &w.from, &w.to)?;
         }
         for (i, w) in self.export.iter().enumerate() {
-            check_window(&format!("export[{i}]"), &w.from, &w.to)?;
+            check_window(section, &format!("export[{i}]"), &w.from, &w.to)?;
         }
         if let Some(c) = &self.zero_import_credit {
-            check_window("zero_import_credit", &c.from, &c.to)?;
+            check_window(section, "zero_import_credit", &c.from, &c.to)?;
         }
         Ok(())
     }
+}
+
+/// A plan that was in effect before `[tariff]`: the same fields, plus the last
+/// day it applied. Written as repeated `[[previous_tariff]]` tables.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreviousTariff {
+    /// Last local day ("YYYY-MM-DD", inclusive) this plan applied.
+    pub until: String,
+    /// A label for the config file; not used for anything.
+    #[allow(dead_code)]
+    pub name: Option<String>,
+    #[serde(flatten)]
+    pub tariff: Tariff,
+}
+
+/// Check the previous plans: each one like `[tariff]`, `until` dates that
+/// parse and strictly increase down the file, and a current `[tariff]`.
+fn check_previous_tariffs(previous: &[PreviousTariff], has_current: bool) -> Result<()> {
+    anyhow::ensure!(
+        previous.is_empty() || has_current,
+        "[[previous_tariff]] needs a [tariff] section for the plan since the last `until`"
+    );
+    let mut last: Option<NaiveDate> = None;
+    for (i, p) in previous.iter().enumerate() {
+        let section = format!("[[previous_tariff]] #{}", i + 1);
+        let until = parse_date(&p.until).with_context(|| format!("until in {section}"))?;
+        anyhow::ensure!(
+            last.is_none_or(|prev| until > prev),
+            "until in {section} must be later than the one before it"
+        );
+        last = Some(until);
+        p.tariff.check(&section)?;
+    }
+    Ok(())
 }
 
 /// The solar system's purchases, for `/api/payback`; see config.example.toml.
@@ -351,9 +390,11 @@ impl Config {
         }
         if let Some(tariff) = &config.tariff {
             tariff
-                .check()
+                .check("[tariff]")
                 .with_context(|| format!("invalid config file {}", path.display()))?;
         }
+        check_previous_tariffs(&config.previous_tariff, config.tariff.is_some())
+            .with_context(|| format!("invalid config file {}", path.display()))?;
         config
             .system
             .check()
@@ -439,7 +480,7 @@ mod tests {
     /// Parse MINIMAL plus a tariff section and run the tariff check.
     fn check_tariff(section: &str) -> Result<()> {
         let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{section}")).unwrap();
-        cfg.tariff.unwrap().check()
+        cfg.tariff.unwrap().check("[tariff]")
     }
 
     #[test]
@@ -506,6 +547,85 @@ mod tests {
         for (body, field) in cases {
             let err = check_tariff(&format!("[tariff]\n{body}")).unwrap_err();
             assert!(format!("{err:#}").contains(field), "{field}: {err:#}");
+        }
+    }
+
+    /// Parse MINIMAL plus these sections and run the previous-plan checks.
+    fn check_previous(sections: &str) -> Result<()> {
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{sections}")).unwrap();
+        check_previous_tariffs(&cfg.previous_tariff, cfg.tariff.is_some())
+    }
+
+    const CURRENT: &str = "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 30.0\n";
+
+    fn previous(until: &str) -> String {
+        format!(
+            "[[previous_tariff]]\nuntil = \"{until}\"\nname = \"Old\"\n\
+             supply_cents_per_day = 90.0\ndefault_import_cents = 20.0\n\
+             import = [{{ from = \"11:00\", to = \"14:00\", cents = 0.0 }}]\n"
+        )
+    }
+
+    #[test]
+    fn previous_tariffs_parse_with_the_same_fields() {
+        let text = format!(
+            "{CURRENT}{}{}",
+            previous("2025-06-30"),
+            previous("2026-01-31")
+        );
+        check_previous(&text).unwrap();
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{text}")).unwrap();
+        assert_eq!(cfg.previous_tariff.len(), 2);
+        let first = &cfg.previous_tariff[0];
+        assert_eq!(first.until, "2025-06-30");
+        assert_eq!(first.tariff.default_import_cents, 20.0);
+        assert_eq!(first.tariff.import[0].to, "14:00");
+        // A credit table after an entry belongs to that entry.
+        let with_credit = format!(
+            "{CURRENT}{}[previous_tariff.zero_import_credit]\nfrom = \"18:00\"\n\
+             to = \"21:00\"\nmax_kwh = 0.1\ncredit_cents = 50.0\n",
+            previous("2025-06-30")
+        );
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{with_credit}")).unwrap();
+        let credit = cfg.previous_tariff[0].tariff.zero_import_credit.as_ref();
+        assert_eq!(credit.unwrap().credit_cents, 50.0);
+        // None is fine too.
+        check_previous(CURRENT).unwrap();
+    }
+
+    #[test]
+    fn previous_tariff_errors_name_the_plan() {
+        let bad_window = previous("2025-06-30").replace("14:00", "25:00");
+        let cases = [
+            (
+                format!("{CURRENT}{}", previous("2025-13-01")),
+                "until in [[previous_tariff]] #1",
+            ),
+            (
+                format!(
+                    "{CURRENT}{}{}",
+                    previous("2025-06-30"),
+                    previous("2025-06-30")
+                ),
+                "#2 must be later",
+            ),
+            (
+                format!(
+                    "{CURRENT}{}{}",
+                    previous("2025-06-30"),
+                    previous("2025-01-01")
+                ),
+                "#2 must be later",
+            ),
+            (
+                format!("{CURRENT}{bad_window}"),
+                "import[0].to in [[previous_tariff]] #1",
+            ),
+            (previous("2025-06-30"), "needs a [tariff]"),
+        ];
+        for (text, expected) in cases {
+            let err = check_previous(&text).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{expected}: {err:#}");
         }
     }
 

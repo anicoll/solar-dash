@@ -30,7 +30,7 @@ use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
 
 use crate::config::Config;
-use crate::cost::Tariff;
+use crate::cost::TariffSchedule;
 use crate::modbus::Latest;
 use auth::LockoutMap;
 pub use auth::hash_password;
@@ -64,8 +64,8 @@ pub struct AppState {
     cookie_secure: bool,
     /// The newest Modbus sample, kept by the poller.
     latest: Latest,
-    /// The parsed `[tariff]` section; `None` turns the cost API off.
-    tariff: Option<Arc<Tariff>>,
+    /// The parsed `[tariff]` and `[[previous_tariff]]` sections; `None` turns the cost API off.
+    tariff: Option<Arc<TariffSchedule>>,
     /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
     purchases: Arc<[Purchase]>,
 }
@@ -107,8 +107,8 @@ impl AppState {
         self
     }
 
-    /// Turns on the cost API with this tariff.
-    pub fn with_tariff(mut self, tariff: Option<Tariff>) -> Self {
+    /// Turns on the cost API with these plans.
+    pub fn with_tariff(mut self, tariff: Option<TariffSchedule>) -> Self {
         self.tariff = tariff.map(Arc::new);
         self
     }
@@ -148,7 +148,7 @@ impl AppState {
         let tariff = config
             .tariff
             .as_ref()
-            .map(Tariff::from_config)
+            .map(|current| TariffSchedule::from_config(current, &config.previous_tariff))
             .transpose()?;
         let purchases = payback::purchases_from_config(&config.system.purchase)?;
         Ok(Self::new(pool, plant_id, tz, password_hash, key)?
@@ -913,7 +913,7 @@ mod tests {
     }
 
     /// A simple tariff: 100 c supply, `import_cents` import, 5 c export, no windows.
-    fn flat_tariff_with(import_cents: f64) -> Tariff {
+    fn flat_tariff_with(import_cents: f64) -> TariffSchedule {
         #[derive(serde::Deserialize)]
         struct Wrapper {
             tariff: crate::config::Tariff,
@@ -923,16 +923,16 @@ mod tests {
              default_export_cents = 5.0\n"
         );
         let w: Wrapper = toml::from_str(&text).unwrap();
-        Tariff::from_config(&w.tariff).unwrap()
+        TariffSchedule::from_config(&w.tariff, &[]).unwrap()
     }
 
     /// The flat tariff at 25 c import.
-    fn flat_tariff() -> Tariff {
+    fn flat_tariff() -> TariffSchedule {
         flat_tariff_with(25.0)
     }
 
     /// A router over `pool` with this tariff.
-    fn costs_router(pool: &SqlitePool, tariff: Tariff) -> Router {
+    fn costs_router(pool: &SqlitePool, tariff: TariffSchedule) -> Router {
         let hash = hash_password(PASSWORD).unwrap();
         let tz = chrono_tz::Australia::Adelaide;
         let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
@@ -1185,6 +1185,49 @@ mod tests {
             .unwrap();
         let gone = costs_json(&app, range).await;
         assert_eq!(gone["days"], serde_json::json!([]));
+    }
+
+    /// The flat tariff at 35 c import from 2026-09-16, after an earlier plan
+    /// at `old_import_cents` that ran until 2026-09-15 (inclusive).
+    fn two_plans(old_import_cents: f64) -> TariffSchedule {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+            previous_tariff: Vec<crate::config::PreviousTariff>,
+        }
+        let text = format!(
+            "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 35.0\n\
+             default_export_cents = 5.0\n\
+             [[previous_tariff]]\nuntil = \"2026-09-15\"\nsupply_cents_per_day = 100.0\n\
+             default_import_cents = {old_import_cents}\ndefault_export_cents = 5.0\n"
+        );
+        let w: Wrapper = toml::from_str(&text).unwrap();
+        TariffSchedule::from_config(&w.tariff, &w.previous_tariff).unwrap()
+    }
+
+    #[tokio::test]
+    async fn days_are_priced_on_the_plan_in_effect_then() {
+        let (_dir, _app, pool) = costs_app().await;
+        let app = costs_router(&pool, two_plans(25.0));
+        // The same usage on two days either side of the plan change.
+        seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
+        seed_counters(&pool, SEP_15_START + 86_400, &[3600, LAST_READING], 1000.0).await;
+        let range = "from=2026-09-15&to=2026-09-16";
+        let json = costs_json(&app, range).await;
+        // 100 supply + import - 10 export credit: 25 c up to the 15th, 35 c after.
+        assert_eq!(json["days"][0]["actual"], 1.15);
+        assert_eq!(json["days"][1]["actual"], 1.25);
+        // The baseline (load 4 kWh) uses each day's plan too: 100 + 4 * rate.
+        assert_eq!(json["days"][0]["baseline"], 2.0);
+        assert_eq!(json["days"][1]["baseline"], 2.4);
+        assert_eq!(stored_days(&pool).await, 2);
+
+        // Editing the old plan re-prices only its own days.
+        let edited = costs_router(&pool, two_plans(30.0));
+        let json = costs_json(&edited, range).await;
+        assert_eq!(json["days"][0]["actual"], 1.2);
+        assert_eq!(json["days"][1]["actual"], 1.25);
+        assert_eq!(stored_days(&pool).await, 2);
     }
 
     #[tokio::test]

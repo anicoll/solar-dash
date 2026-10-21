@@ -102,6 +102,21 @@ path = "data/solar.db"
 # max_kwh = 0.1
 # credit_cents = 100.0
 
+# Optional: plans you were on before the [tariff] above, so older days are
+# priced on the plan that applied then. Add one [[previous_tariff]] per past
+# plan, oldest first. It takes the same fields as [tariff] (windows and
+# zero_import_credit too), plus `until`: the last local day (inclusive) it
+# applied. The next plan starts the day after, and [tariff] covers every day
+# after the last `until`. `until` must increase down the file; `name` is just
+# a label. A zero_import_credit goes in a [previous_tariff.zero_import_credit]
+# table straight after its entry.
+# [[previous_tariff]]
+# name = "Old flat plan"
+# until = "2025-06-30"
+# supply_cents_per_day = 110.0
+# default_import_cents = 32.0
+# default_export_cents = 5.0
+
 # Optional: what the system cost, for the payback estimate (`/api/payback`).
 # It needs the [tariff] section above too. Add one [[system.purchase]] per
 # payment; the cost is in dollars. The first date is where the savings count

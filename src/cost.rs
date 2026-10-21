@@ -2,7 +2,7 @@
 //! so every rule here can be tested with plain numbers.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike};
+use chrono::{DateTime, NaiveDate, Timelike};
 use chrono_tz::Tz;
 
 use crate::config;
@@ -125,6 +125,61 @@ impl Tariff {
     /// Cents per kWh earned for exporting at this local time.
     pub fn export_cents_at(&self, minute_of_day: u32) -> f64 {
         price_at(&self.export, self.default_export_cents, minute_of_day)
+    }
+}
+
+/// The plans over time: past ones, each with the last day it applied, then the
+/// current one. Build it with [`TariffSchedule::from_config`].
+#[derive(Debug, Clone)]
+pub struct TariffSchedule {
+    /// Oldest first, with strictly increasing `until` days (inclusive).
+    previous: Vec<(NaiveDate, Tariff)>,
+    current: Tariff,
+}
+
+impl TariffSchedule {
+    /// A schedule with one plan for every day.
+    pub fn single(current: Tariff) -> Self {
+        Self {
+            previous: Vec::new(),
+            current,
+        }
+    }
+
+    /// Convert the config. `Config::load` already checks the dates and order,
+    /// so an error here means the config was built some other way.
+    pub fn from_config(
+        current: &config::Tariff,
+        previous: &[config::PreviousTariff],
+    ) -> Result<Self> {
+        let previous = previous
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let until = config::parse_date(&p.until)
+                    .with_context(|| format!("until in [[previous_tariff]] #{}", i + 1))?;
+                let tariff = Tariff::from_config(&p.tariff)
+                    .with_context(|| format!("invalid [[previous_tariff]] #{}", i + 1))?;
+                Ok((until, tariff))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            previous.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "[[previous_tariff]] `until` days must increase"
+        );
+        Ok(Self {
+            previous,
+            current: Tariff::from_config(current)?,
+        })
+    }
+
+    /// The plan in effect on this local day: the first previous plan whose
+    /// `until` is on or after it, otherwise the current one.
+    pub fn for_date(&self, date: NaiveDate) -> &Tariff {
+        self.previous
+            .iter()
+            .find(|(until, _)| *until >= date)
+            .map_or(&self.current, |(_, tariff)| tariff)
     }
 }
 
@@ -440,5 +495,55 @@ mod tests {
         // 2*44 + 1*0 + 2*58.3 + 1*58.3 + 1*58.3 = 321.2, plus supply 173.8.
         assert!(close(day.baseline_cents, 495.0));
         assert!(close(day.savings_cents, 495.0 - 200.1));
+    }
+
+    /// A schedule with plans importing at 10 c (to 2025-06-30), 20 c (to
+    /// 2026-01-31) and then 30 c.
+    fn schedule() -> TariffSchedule {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: config::Tariff,
+            previous_tariff: Vec<config::PreviousTariff>,
+        }
+        let w: Wrapper = toml::from_str(
+            r#"
+            [tariff]
+            supply_cents_per_day = 1.0
+            default_import_cents = 30.0
+            [[previous_tariff]]
+            until = "2025-06-30"
+            supply_cents_per_day = 1.0
+            default_import_cents = 10.0
+            [[previous_tariff]]
+            until = "2026-01-31"
+            supply_cents_per_day = 1.0
+            default_import_cents = 20.0
+            "#,
+        )
+        .unwrap();
+        TariffSchedule::from_config(&w.tariff, &w.previous_tariff).unwrap()
+    }
+
+    #[test]
+    fn the_schedule_picks_the_plan_in_effect_on_each_day() {
+        let schedule = schedule();
+        let rate = |day: &str| schedule.for_date(day.parse().unwrap()).import_cents_at(0);
+        assert_eq!(rate("2020-01-01"), 10.0);
+        // The `until` day is still on its plan; the next day moves on.
+        assert_eq!(rate("2025-06-30"), 10.0);
+        assert_eq!(rate("2025-07-01"), 20.0);
+        assert_eq!(rate("2026-01-31"), 20.0);
+        assert_eq!(rate("2026-02-01"), 30.0);
+        assert_eq!(rate("2030-01-01"), 30.0);
+        // Without previous plans the current one covers every day.
+        let single = TariffSchedule::single(tariff(
+            "[tariff]\nsupply_cents_per_day = 1.0\ndefault_import_cents = 5.0\n",
+        ));
+        assert_eq!(
+            single
+                .for_date("2000-01-01".parse().unwrap())
+                .import_cents_at(0),
+            5.0
+        );
     }
 }
