@@ -64,24 +64,26 @@ path = "data/solar.db"
 
 # Optional: electricity prices, used to work out what each day cost and what
 # the solar and battery saved. Without this section cost features are off.
-# These values are GloBird ZeroHero as on Andrew's September 2026 bill; the
-# peak/shoulder hours still need confirming.
+# These values are Andrew's GloBird ZeroHero plan (plan details, Oct 2026):
+# peak 16:00-23:00, free 11:00-14:00, shoulder the rest of the day; feed-in
+# 2c 16:00-23:00 plus the 8c Super Export top up 18:00-21:00, 0c otherwise.
 # Rates are in cents (per kWh, except the daily supply charge). Times are
 # local "HH:MM". A window includes its start and excludes its end, and may
 # wrap past midnight (for example from = "21:00", to = "06:00"). If windows
 # overlap, the first one listed wins.
 # [tariff]
 # supply_cents_per_day = 173.8
-# # Import price for any time not covered by an `import` window.
+# # Import price for any time not covered by an `import` window (shoulder).
 # default_import_cents = 44.0
 # import = [
-#   { from = "11:00", to = "14:00", cents = 0.0 },
-#   { from = "15:00", to = "23:00", cents = 58.3 },
+#   { from = "11:00", to = "14:00", cents = 0.0 },   # off-peak (free)
+#   { from = "16:00", to = "23:00", cents = 58.3 },  # peak
 # ]
 # # Feed-in price for any time not covered by an `export` window.
 # default_export_cents = 0.0
 # export = [
-#   { from = "18:00", to = "21:00", cents = 10.0 },
+#   { from = "18:00", to = "21:00", cents = 10.0 },  # 2c + 8c Super Export top up
+#   { from = "16:00", to = "23:00", cents = 2.0 },
 # ]
 # # Optional: a credit on days with (almost) no grid import in a window.
 # [tariff.zero_import_credit]
