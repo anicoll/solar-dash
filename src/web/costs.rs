@@ -4,17 +4,22 @@
 //! This file turns stored data into the [`Interval`]s that `cost::day_cost`
 //! prices. The interval builders are pure, so they are tested with plain numbers.
 
+use std::collections::HashMap;
+use std::str::FromStr;
+
 use axum::Json;
 use axum::extract::{Query, State};
 use chrono::NaiveDate;
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
 use super::api::{
-    ApiResult, MAX_HOLD_SECS, Spread, date_range, day_bounds_or_error, live_totals, spread_steps,
+    ApiError, ApiResult, MAX_HOLD_SECS, Spread, date_range, day_bounds_or_error, live_totals,
+    spread_steps, today,
 };
-use crate::cost::{self, Interval};
+use crate::cost::{self, DayCost, Interval, Tariff};
 use crate::db;
 use crate::modbus::Sample;
 
@@ -181,26 +186,67 @@ struct CostDay {
     credit: f64,
 }
 
-#[derive(Deserialize)]
-pub struct CostsParams {
-    from: Option<String>,
-    to: Option<String>,
+/// One priced local day, whether it came from the cache or was just worked out.
+#[derive(Debug, Clone)]
+pub(super) struct CostedDay {
+    pub date: NaiveDate,
+    /// "inverter" or "cloud".
+    pub source: &'static str,
+    pub cost: DayCost,
 }
 
-pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsParams>) -> ApiResult {
-    let (from, count) = date_range(
-        params.from.as_deref(),
-        params.to.as_deref(),
-        state.tz,
-        MAX_COSTS_DAYS,
-    )?;
-    let Some(tariff) = &state.tariff else {
-        return Ok(Json(json!({ "configured": false })));
-    };
+/// The `source` text of a stored row, or `None` for text we do not know (then
+/// the row is ignored and the day is worked out again).
+fn known_source(text: &str) -> Option<&'static str> {
+    match text {
+        "inverter" => Some("inverter"),
+        "cloud" => Some("cloud"),
+        _ => None,
+    }
+}
 
-    let dates: Vec<NaiveDate> = from.iter_days().take(count as usize).collect();
+/// What stored costs are tagged with. The time zone is in it too, because
+/// moving it moves where every local day starts.
+fn cache_key(tz: Tz, tariff: &Tariff) -> String {
+    format!("{tz}|{}", tariff.key())
+}
+
+/// May this day's cost be stored for good? Only a finished day with all its
+/// data: it is before `today`, and either it used the inverter (which already
+/// needs good coverage) or the cloud counters were read in the day's last 10
+/// minutes (23:50 local or later). `newest_counter_ts` is the latest cloud
+/// reading in the day. A day that fails this is worked out again next time, so
+/// a backfill that fills it in later is picked up.
+fn is_cacheable(
+    date: NaiveDate,
+    today: NaiveDate,
+    source: &str,
+    newest_counter_ts: Option<i64>,
+    day_end: i64,
+) -> bool {
+    if date >= today {
+        return false;
+    }
+    // Ten minutes before the end is 23:50 local, even on a daylight saving change.
+    source == "inverter" || newest_counter_ts.is_some_and(|ts| ts >= day_end - 10 * 60)
+}
+
+/// Splits sorted dates into runs of consecutive days, so each run is loaded
+/// with one set of queries instead of one set per day.
+fn consecutive_runs(dates: &[NaiveDate]) -> Vec<&[NaiveDate]> {
+    dates.chunk_by(|a, b| a.succ_opt() == Some(*b)).collect()
+}
+
+/// Works out the costs of consecutive local `dates` from the stored readings.
+/// Days with no data are left out. Each day comes with whether it may be cached.
+async fn compute_days(
+    state: &AppState,
+    tariff: &Tariff,
+    dates: &[NaiveDate],
+    today: NaiveDate,
+) -> Result<Vec<(CostedDay, bool)>, ApiError> {
     let mut bounds = Vec::with_capacity(dates.len());
-    for &date in &dates {
+    for &date in dates {
         bounds.push(day_bounds_or_error(date, state.tz)?);
     }
     let range_start = bounds[0].0;
@@ -230,7 +276,6 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
     let live_range = db::live_ts_range(&state.pool).await?;
     let now = db::now();
     let mut days = Vec::new();
-    let (mut actual, mut baseline, mut credit_days) = (0.0, 0.0, 0);
 
     for (chunk_dates, chunk_bounds) in dates
         .chunks(LIVE_CHUNK_DAYS)
@@ -248,7 +293,7 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
             _ => Vec::new(),
         };
 
-        for (date, &(start, end)) in chunk_dates.iter().zip(chunk_bounds) {
+        for (&date, &(start, end)) in chunk_dates.iter().zip(chunk_bounds) {
             let day = DayData {
                 start,
                 end,
@@ -260,24 +305,115 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
             let Some((source, intervals)) = day_intervals(&day, now) else {
                 continue;
             };
+            let newest_counter_ts = [day.import, day.export, day.load]
+                .iter()
+                .filter_map(|c| c.last().map(|r| r.0))
+                .max();
+            let cacheable = is_cacheable(date, today, source, newest_counter_ts, end);
             let cost = cost::day_cost(tariff, state.tz, &intervals);
-            actual += cost.actual_cents;
-            baseline += cost.baseline_cents;
-            if cost.zero_import_credit_cents > 0.0 {
-                credit_days += 1;
-            }
-            days.push(CostDay {
-                date: date.to_string(),
-                source,
-                actual: dollars(cost.actual_cents),
-                baseline: dollars(cost.baseline_cents),
-                savings: dollars(cost.savings_cents),
-                import_kwh: round2(cost.import_kwh),
-                export_kwh: round2(cost.export_kwh),
-                load_kwh: round2(cost.load_kwh),
-                credit: dollars(cost.zero_import_credit_cents),
-            });
+            days.push((CostedDay { date, source, cost }, cacheable));
         }
+    }
+    Ok(days)
+}
+
+/// The cost of every day in `dates` (sorted, consecutive) that has data,
+/// oldest first. Finished days come from the `daily_cost` table when it has
+/// them for the current tariff; only the rest are worked out, in a few
+/// queries, and the finished ones are stored for next time.
+pub(super) async fn costed_days(
+    state: &AppState,
+    tariff: &Tariff,
+    dates: &[NaiveDate],
+) -> Result<Vec<CostedDay>, ApiError> {
+    let (Some(first), Some(last)) = (dates.first(), dates.last()) else {
+        return Ok(Vec::new());
+    };
+    let key = cache_key(state.tz, tariff);
+    let stored =
+        db::daily_costs_in_range(&state.pool, &first.to_string(), &last.to_string(), &key).await?;
+    let mut by_date: HashMap<String, CostedDay> = HashMap::new();
+    for row in stored {
+        let parsed = (NaiveDate::from_str(&row.date), known_source(&row.source));
+        if let (Ok(date), Some(source)) = parsed {
+            by_date.insert(
+                row.date,
+                CostedDay {
+                    date,
+                    source,
+                    cost: row.cost,
+                },
+            );
+        }
+    }
+
+    let missing: Vec<NaiveDate> = dates
+        .iter()
+        .copied()
+        .filter(|date| !by_date.contains_key(&date.to_string()))
+        .collect();
+    let today = today(state.tz);
+    let mut to_store = Vec::new();
+    for run in consecutive_runs(&missing) {
+        for (day, cacheable) in compute_days(state, tariff, run, today).await? {
+            if cacheable {
+                to_store.push(db::CachedDayCost {
+                    date: day.date.to_string(),
+                    source: day.source.to_string(),
+                    cost: day.cost.clone(),
+                });
+            }
+            by_date.insert(day.date.to_string(), day);
+        }
+    }
+    db::save_daily_costs(&state.pool, &to_store, &key).await?;
+
+    // Back in date order, which `HashMap` does not keep.
+    Ok(dates
+        .iter()
+        .filter_map(|date| by_date.remove(&date.to_string()))
+        .collect())
+}
+
+#[derive(Deserialize)]
+pub struct CostsParams {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsParams>) -> ApiResult {
+    let (from, count) = date_range(
+        params.from.as_deref(),
+        params.to.as_deref(),
+        state.tz,
+        MAX_COSTS_DAYS,
+    )?;
+    let Some(tariff) = &state.tariff else {
+        return Ok(Json(json!({ "configured": false })));
+    };
+
+    let dates: Vec<NaiveDate> = from.iter_days().take(count as usize).collect();
+    let costed = costed_days(&state, tariff, &dates).await?;
+
+    let (mut actual, mut baseline, mut credit_days) = (0.0, 0.0, 0);
+    let mut days = Vec::with_capacity(costed.len());
+    for CostedDay { date, source, cost } in costed {
+        actual += cost.actual_cents;
+        baseline += cost.baseline_cents;
+        if cost.zero_import_credit_cents > 0.0 {
+            credit_days += 1;
+        }
+        days.push(CostDay {
+            date: date.to_string(),
+            source,
+            actual: dollars(cost.actual_cents),
+            baseline: dollars(cost.baseline_cents),
+            savings: dollars(cost.savings_cents),
+            import_kwh: round2(cost.import_kwh),
+            export_kwh: round2(cost.export_kwh),
+            load_kwh: round2(cost.load_kwh),
+            credit: dollars(cost.zero_import_credit_cents),
+        });
     }
 
     // Totals are added up from the unrounded cents, so they do not drift from
@@ -415,5 +551,71 @@ mod tests {
         assert_eq!(dollars(12345.0), 123.45);
         assert_eq!(dollars(-19.9), -0.2);
         assert_eq!(round2(1.005_f64 + 0.0004), 1.01);
+    }
+
+    fn date(text: &str) -> NaiveDate {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn only_finished_complete_days_are_cached() {
+        let (today, end) = (date("2026-09-16"), 100_000);
+        let yesterday = date("2026-09-15");
+        // The cloud counters must be read in the last 10 minutes of the day.
+        assert!(is_cacheable(
+            yesterday,
+            today,
+            "cloud",
+            Some(end - 600),
+            end
+        ));
+        assert!(!is_cacheable(
+            yesterday,
+            today,
+            "cloud",
+            Some(end - 601),
+            end
+        ));
+        assert!(!is_cacheable(yesterday, today, "cloud", None, end));
+        // Inverter days already passed the coverage test.
+        assert!(is_cacheable(yesterday, today, "inverter", None, end));
+        // Today is never cached, nor is the future.
+        assert!(!is_cacheable(today, today, "inverter", Some(end), end));
+        assert!(!is_cacheable(
+            date("2026-09-17"),
+            today,
+            "cloud",
+            Some(end),
+            end
+        ));
+    }
+
+    #[test]
+    fn missing_days_group_into_consecutive_runs() {
+        let dates = [
+            "2026-09-01",
+            "2026-09-02",
+            "2026-09-05",
+            "2026-09-07",
+            "2026-09-08",
+        ]
+        .map(date);
+        let runs = consecutive_runs(&dates);
+        let lengths: Vec<usize> = runs.iter().map(|run| run.len()).collect();
+        assert_eq!(lengths, vec![2, 1, 2]);
+        assert!(consecutive_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_cache_key_follows_the_zone_and_rates() {
+        let make = |cents: &str| {
+            let text = format!("supply_cents_per_day = 1.0\ndefault_import_cents = {cents}\n");
+            Tariff::from_config(&toml::from_str(&text).unwrap()).unwrap()
+        };
+        let adelaide = chrono_tz::Australia::Adelaide;
+        let key = cache_key(adelaide, &make("30.0"));
+        assert_eq!(key, cache_key(adelaide, &make("30.0")));
+        assert_ne!(key, cache_key(adelaide, &make("31.0")));
+        assert_ne!(key, cache_key(chrono_tz::Australia::Perth, &make("30.0")));
     }
 }

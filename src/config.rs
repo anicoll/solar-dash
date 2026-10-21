@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -144,7 +144,7 @@ impl Modbus {
 /// Electricity prices; see config.example.toml. Rates are in cents (per kWh,
 /// except `supply_cents_per_day`). This is the raw file shape: `cost::Tariff`
 /// turns it into something quick to look up.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tariff {
     /// Fixed daily supply charge.
     pub supply_cents_per_day: f64,
@@ -166,7 +166,7 @@ pub struct Tariff {
 /// A daily time window with a price. `from` is inclusive and `to` exclusive,
 /// both local "HH:MM". If `to` is earlier than `from` the window wraps past
 /// midnight (for example "21:00" to "06:00").
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PriceWindow {
     pub from: String,
     pub to: String,
@@ -175,7 +175,7 @@ pub struct PriceWindow {
 
 /// A credit earned on days when the grid import inside the window stays at or
 /// under `max_kwh`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ZeroImportCredit {
     pub from: String,
     pub to: String,
