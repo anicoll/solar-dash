@@ -1111,7 +1111,7 @@
   /** The hash for a view, carrying that view's current date or range. */
   function viewHash(v) {
     return v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}`
-      : v === 'year' ? `year=${state.year}` : v === 'savings' ? `savings=${state.range}` : 'now';
+      : v === 'year' ? `year=${state.year}` : v === 'savings' ? `savings=${state.range}` : v;
   }
 
   function setHash() {
