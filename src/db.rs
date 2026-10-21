@@ -518,6 +518,158 @@ pub async fn save_daily_costs(
     Ok(())
 }
 
+/// What we know about a charging session so far.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChargeProgress {
+    pub energy_added_kwh: Option<f64>,
+    /// The latest battery level, 0 to 100.
+    pub soc_pct: Option<f64>,
+    pub max_power_kw: Option<f64>,
+}
+
+/// A session that has started but not ended, as stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenCharge {
+    pub id: i64,
+    pub progress: ChargeProgress,
+}
+
+/// Starts a session and returns its id. If the car already has an open
+/// session (the table allows only one), nothing is added and that
+/// session's id is returned.
+pub async fn start_charge_session(
+    pool: &SqlitePool,
+    car_id: i64,
+    started_at: i64,
+    start_soc_pct: Option<f64>,
+    geofence: Option<&str>,
+) -> Result<i64> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO ev_charge_session (car_id, started_at, start_soc_pct, geofence)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(car_id)
+    .bind(started_at)
+    .bind(start_soc_pct)
+    .bind(geofence)
+    .execute(pool)
+    .await
+    .context("could not start charge session")?;
+    // Either the row just added or the one that was already open.
+    sqlx::query_scalar("SELECT id FROM ev_charge_session WHERE car_id = ? AND ended_at IS NULL")
+        .bind(car_id)
+        .fetch_one(pool)
+        .await
+        .context("could not read charge session")
+}
+
+/// `ev_charge_session` columns as sqlx reads them for [`OpenCharge`].
+#[derive(sqlx::FromRow)]
+struct OpenChargeRow {
+    id: i64,
+    energy_added_kwh: Option<f64>,
+    end_soc_pct: Option<f64>,
+    max_power_kw: Option<f64>,
+}
+
+/// The car's open session, or `None` if it is not charging.
+pub async fn open_charge_session(pool: &SqlitePool, car_id: i64) -> Result<Option<OpenCharge>> {
+    let row: Option<OpenChargeRow> = sqlx::query_as(
+        "SELECT id, energy_added_kwh, end_soc_pct, max_power_kw
+         FROM ev_charge_session WHERE car_id = ? AND ended_at IS NULL",
+    )
+    .bind(car_id)
+    .fetch_optional(pool)
+    .await
+    .context("could not read open charge session")?;
+    Ok(row.map(|row| OpenCharge {
+        id: row.id,
+        progress: ChargeProgress {
+            energy_added_kwh: row.energy_added_kwh,
+            soc_pct: row.end_soc_pct,
+            max_power_kw: row.max_power_kw,
+        },
+    }))
+}
+
+/// Saves a running session's latest values. A value we do not have keeps
+/// what is stored.
+pub async fn update_charge_session(
+    pool: &SqlitePool,
+    id: i64,
+    progress: &ChargeProgress,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ev_charge_session
+         SET energy_added_kwh = COALESCE(?, energy_added_kwh),
+             end_soc_pct = COALESCE(?, end_soc_pct),
+             max_power_kw = COALESCE(?, max_power_kw)
+         WHERE id = ?",
+    )
+    .bind(progress.energy_added_kwh)
+    .bind(progress.soc_pct)
+    .bind(progress.max_power_kw)
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("could not update charge session")?;
+    Ok(())
+}
+
+/// Saves the final values and closes the session.
+pub async fn end_charge_session(
+    pool: &SqlitePool,
+    id: i64,
+    ended_at: i64,
+    progress: &ChargeProgress,
+) -> Result<()> {
+    update_charge_session(pool, id, progress).await?;
+    sqlx::query("UPDATE ev_charge_session SET ended_at = ? WHERE id = ?")
+        .bind(ended_at)
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("could not end charge session")?;
+    Ok(())
+}
+
+/// A charging session as sent by `/api/ev/sessions`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow, serde::Serialize)]
+pub struct ChargeSession {
+    pub id: i64,
+    pub started_at: i64,
+    /// `None` while the car is still charging.
+    pub ended_at: Option<i64>,
+    pub energy_added_kwh: Option<f64>,
+    pub start_soc_pct: Option<f64>,
+    pub end_soc_pct: Option<f64>,
+    pub max_power_kw: Option<f64>,
+    pub geofence: Option<String>,
+}
+
+/// Sessions that overlap `from..=to`, oldest first. A session that has not
+/// ended counts as running until `now`.
+pub async fn charge_sessions_in_range(
+    pool: &SqlitePool,
+    from: i64,
+    to: i64,
+    now: i64,
+) -> Result<Vec<ChargeSession>> {
+    sqlx::query_as(
+        "SELECT id, started_at, ended_at, energy_added_kwh, start_soc_pct, end_soc_pct,
+                max_power_kw, geofence
+         FROM ev_charge_session
+         WHERE started_at <= ? AND COALESCE(ended_at, ?) >= ?
+         ORDER BY started_at",
+    )
+    .bind(to)
+    .bind(now)
+    .bind(from)
+    .fetch_all(pool)
+    .await
+    .context("could not read charge sessions")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,12 +706,135 @@ mod tests {
         let (_dir, pool) = test_db().await;
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
-             ('point', 'reading', 'sync_state', 'api_call', 'daily_cost')",
+             ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 5);
+        assert_eq!(tables.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn charge_session_runs_from_start_to_end() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(open_charge_session(&pool, 1).await.unwrap(), None);
+
+        let id = start_charge_session(&pool, 1, 1000, Some(40.0), Some("Home"))
+            .await
+            .unwrap();
+        let open = open_charge_session(&pool, 1).await.unwrap().unwrap();
+        assert_eq!(open.id, id);
+        assert_eq!(open.progress, ChargeProgress::default());
+
+        let progress = ChargeProgress {
+            energy_added_kwh: Some(3.5),
+            soc_pct: Some(45.0),
+            max_power_kw: Some(7.4),
+        };
+        update_charge_session(&pool, id, &progress).await.unwrap();
+        assert_eq!(
+            open_charge_session(&pool, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .progress,
+            progress
+        );
+
+        // Unknown values keep what is stored.
+        let later = ChargeProgress {
+            soc_pct: Some(50.0),
+            ..ChargeProgress::default()
+        };
+        end_charge_session(&pool, id, 5000, &later).await.unwrap();
+        assert_eq!(open_charge_session(&pool, 1).await.unwrap(), None);
+
+        let rows = charge_sessions_in_range(&pool, 0, 10_000, 6000)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![ChargeSession {
+                id,
+                started_at: 1000,
+                ended_at: Some(5000),
+                energy_added_kwh: Some(3.5),
+                start_soc_pct: Some(40.0),
+                end_soc_pct: Some(50.0),
+                max_power_kw: Some(7.4),
+                geofence: Some("Home".to_string()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_car_never_gets_two_open_sessions() {
+        let (_dir, pool) = test_db().await;
+        let first = start_charge_session(&pool, 1, 1000, None, None)
+            .await
+            .unwrap();
+        // Starting again hands back the open one instead of adding a row.
+        let again = start_charge_session(&pool, 1, 2000, None, None)
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        // Another car is separate.
+        let other = start_charge_session(&pool, 2, 2000, None, None)
+            .await
+            .unwrap();
+        assert_ne!(first, other);
+
+        // Once closed, a new session can start.
+        end_charge_session(&pool, first, 3000, &ChargeProgress::default())
+            .await
+            .unwrap();
+        let next = start_charge_session(&pool, 1, 4000, None, None)
+            .await
+            .unwrap();
+        assert_ne!(first, next);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ev_charge_session")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn charge_sessions_in_range_picks_the_overlapping_ones() {
+        let (_dir, pool) = test_db().await;
+        // 100..200 (done), 300..400 (done), and one still open from 500.
+        for (car, start, end) in [(1, 100, Some(200)), (1, 300, Some(400)), (1, 500, None)] {
+            let id = start_charge_session(&pool, car, start, None, None)
+                .await
+                .unwrap();
+            if let Some(end) = end {
+                end_charge_session(&pool, id, end, &ChargeProgress::default())
+                    .await
+                    .unwrap();
+            }
+        }
+        let starts =
+            |rows: Vec<ChargeSession>| -> Vec<i64> { rows.iter().map(|r| r.started_at).collect() };
+        let all = charge_sessions_in_range(&pool, 0, 1000, 600).await.unwrap();
+        assert_eq!(starts(all), vec![100, 300, 500]);
+        // Touching a session's end or start counts as overlapping.
+        let some = charge_sessions_in_range(&pool, 200, 300, 600)
+            .await
+            .unwrap();
+        assert_eq!(starts(some), vec![100, 300]);
+        let gap = charge_sessions_in_range(&pool, 201, 299, 600)
+            .await
+            .unwrap();
+        assert!(gap.is_empty());
+        // The open session runs until `now`: it is there at 550 but not before it started.
+        let open = charge_sessions_in_range(&pool, 550, 560, 600)
+            .await
+            .unwrap();
+        assert_eq!(starts(open), vec![500]);
+        let early = charge_sessions_in_range(&pool, 450, 460, 600)
+            .await
+            .unwrap();
+        assert!(early.is_empty());
     }
 
     #[tokio::test]
