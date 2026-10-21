@@ -159,17 +159,22 @@ pub async fn latest(State(state): State<AppState>) -> ApiResult {
     Ok(Json(json!({ "points": points })))
 }
 
-/// The newest Modbus sample, or `{"sample": null}` if there is none or it
-/// is too old to call "live" (for example when Modbus is off). It comes from
-/// memory; the database is only read until the poller's first sample after
-/// a restart.
+/// `{"sample": ..., "car": ...}`. The sample is the newest Modbus one, or
+/// null if there is none or it is too old to call "live" (for example when
+/// Modbus is off). It comes from memory; the database is only read until the
+/// poller's first sample after a restart.
+///
+/// The car is TeslaMate's last known state, or null if TeslaMate is off or
+/// has sent nothing yet. It gets no age limit: TeslaMate's values are
+/// retained and stay true while the car sleeps. `car.updated_ts` says how
+/// old they are.
 pub async fn live(State(state): State<AppState>) -> ApiResult {
     let sample = match state.latest.get() {
         Some(sample) => Some(sample),
         None => db::latest_live_sample(&state.pool).await?,
     };
     let fresh = sample.filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
-    Ok(Json(json!({ "sample": fresh })))
+    Ok(Json(json!({ "sample": fresh, "car": state.car.get() })))
 }
 
 #[derive(Deserialize)]
@@ -809,6 +814,8 @@ mod tests {
         let Json(json) = live(State(state.clone())).await.unwrap();
         assert_eq!(json["sample"]["ts"], sample.ts);
         assert_eq!(json["sample"]["soc_pct"], 67.4);
+        // TeslaMate is off, so there is no car.
+        assert!(json["car"].is_null());
 
         // A sample that has gone stale in memory is still not "live".
         state.latest().set(Sample {

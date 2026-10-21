@@ -4,6 +4,7 @@ mod db;
 mod ingest;
 mod isolar;
 mod modbus;
+mod teslamate;
 mod web;
 
 use std::path::PathBuf;
@@ -163,6 +164,17 @@ async fn run_serve(config: Config) -> Result<()> {
             None => Ok(()),
         }
     };
+    // The TeslaMate reader works the same way: it only runs if there is a
+    // [teslamate] section, and its errors are only logged.
+    let car = state.car();
+    let follow_car = async {
+        if let Some(teslamate) = config.teslamate.clone()
+            && let Err(err) = teslamate::run(teslamate, car, shutdown_signal()).await
+        {
+            error!("TeslaMate reader stopped: {err:#}; the dashboard keeps running");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     // The live sync must never take the others down: if it fails for a
     // fatal reason (say a database error) we log it and keep serving.
     let live_sync = async {
@@ -173,14 +185,15 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
-    // Run all three until Ctrl+C. `try_join!` polls them together on this
-    // task and returns early if one fails (neither the live sync nor the
-    // Modbus poller does: their errors are only logged). Each gets its own
-    // `ctrl_c` future; one Ctrl+C wakes them all.
+    // Run all four until Ctrl+C. `try_join!` polls them together on this
+    // task and returns early if one fails (neither the live sync, the
+    // Modbus poller nor the TeslaMate reader does: their errors are only
+    // logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
     tokio::try_join!(
         live_sync,
         web::serve(listener, state, shutdown_signal()),
         poll_modbus,
+        follow_car,
     )?;
     Ok(())
 }

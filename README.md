@@ -14,6 +14,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Dashboard UI (Now, Day, Month, Year views; ECharts from cdnjs)
 - [x] Local Modbus reader (`modbus-test`) for live power from the inverter
 - [x] `serve` polls Modbus when configured and stores live samples (`/api/live`, `/api/live/series`)
+- [x] `serve` follows the Tesla's charge state from TeslaMate over MQTT when configured (`/api/live`)
 - [x] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
 
 ## Architecture
@@ -32,6 +33,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/db.rs` - SQLite storage: opening, migrations and typed queries
 - `migrations/` - SQL schema, applied automatically on startup
 - `src/modbus.rs` - Modbus TCP reader for live inverter data, and its poll loop
+- `src/teslamate.rs` - TeslaMate MQTT reader for the car's charge state
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
 - `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
 - `static/` - the dashboard (`index.html`, `app.js`, `style.css`), compiled into the binary

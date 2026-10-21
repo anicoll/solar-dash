@@ -18,6 +18,9 @@ pub struct Config {
     pub database: Database,
     /// Local Modbus reader. `None` (no `[modbus]` section) means it is off.
     pub modbus: Option<Modbus>,
+    /// TeslaMate's MQTT broker, for the car's charge state. `None` (no
+    /// `[teslamate]` section) means it is off.
+    pub teslamate: Option<Teslamate>,
     /// Electricity prices, used to work out costs and savings. `None` (no
     /// `[tariff]` section) means cost features are off.
     pub tariff: Option<Tariff>,
@@ -154,6 +157,37 @@ impl Modbus {
         anyhow::ensure!(
             self.interval_secs >= 1,
             "interval_secs in [modbus] must be at least 1"
+        );
+        Ok(())
+    }
+}
+
+/// How to reach TeslaMate's MQTT broker; see config.example.toml.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Teslamate {
+    /// IP address or host name of the MQTT broker. No default, so the
+    /// section is only valid when you say where it is.
+    pub host: String,
+    #[serde(default = "default_teslamate_port")]
+    pub port: u16,
+    /// Which car to follow (TeslaMate numbers its cars from 1).
+    #[serde(default = "default_teslamate_car_id")]
+    pub car_id: u32,
+    /// The start of every topic name. TeslaMate uses "teslamate" unless its
+    /// `MQTT_NAMESPACE` setting says otherwise.
+    #[serde(default = "default_teslamate_topic_prefix")]
+    pub topic_prefix: String,
+    /// Broker login. Give both or neither.
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl Teslamate {
+    fn check(&self) -> Result<()> {
+        // A login needs both parts; one alone is almost certainly a typo.
+        anyhow::ensure!(
+            self.username.is_some() == self.password.is_some(),
+            "[teslamate] needs both username and password, or neither"
         );
         Ok(())
     }
@@ -364,6 +398,18 @@ fn default_modbus_interval() -> u64 {
     15
 }
 
+fn default_teslamate_port() -> u16 {
+    1883
+}
+
+fn default_teslamate_car_id() -> u32 {
+    1
+}
+
+fn default_teslamate_topic_prefix() -> String {
+    "teslamate".to_string()
+}
+
 fn default_gateway() -> String {
     "https://augateway.isolarcloud.com".to_string()
 }
@@ -407,6 +453,11 @@ impl Config {
             .with_context(|| format!("invalid config file {}", path.display()))?;
         if let Some(modbus) = &config.modbus {
             modbus
+                .check()
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+        }
+        if let Some(teslamate) = &config.teslamate {
+            teslamate
                 .check()
                 .with_context(|| format!("invalid config file {}", path.display()))?;
         }
@@ -484,6 +535,47 @@ mod tests {
         let text = format!("{MINIMAL}\n[modbus]\nhost = \"h\"\ninterval_secs = 0\n");
         let cfg: Config = toml::from_str(&text).unwrap();
         assert!(cfg.modbus.unwrap().check().is_err());
+    }
+
+    #[test]
+    fn teslamate_is_off_without_a_section() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.teslamate.is_none());
+    }
+
+    #[test]
+    fn teslamate_defaults_apply() {
+        let cfg: Config =
+            toml::from_str(&format!("{MINIMAL}\n[teslamate]\nhost = \"10.0.0.9\"\n")).unwrap();
+        let teslamate = cfg.teslamate.unwrap();
+        assert_eq!(teslamate.host, "10.0.0.9");
+        assert_eq!(teslamate.port, 1883);
+        assert_eq!(teslamate.car_id, 1);
+        assert_eq!(teslamate.topic_prefix, "teslamate");
+        assert_eq!(teslamate.username, None);
+        assert_eq!(teslamate.password, None);
+        assert!(teslamate.check().is_ok());
+    }
+
+    #[test]
+    fn teslamate_section_needs_a_host() {
+        let text = format!("{MINIMAL}\n[teslamate]\nport = 1883\n");
+        assert!(toml::from_str::<Config>(&text).is_err());
+    }
+
+    #[test]
+    fn teslamate_username_and_password_go_together() {
+        let parse = |extra: &str| -> Teslamate {
+            let text = format!("{MINIMAL}\n[teslamate]\nhost = \"h\"\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().teslamate.unwrap()
+        };
+        assert!(
+            parse("username = \"u\"\npassword = \"p\"\n")
+                .check()
+                .is_ok()
+        );
+        assert!(parse("username = \"u\"\n").check().is_err());
+        assert!(parse("password = \"p\"\n").check().is_err());
     }
 
     const TARIFF: &str = r#"
