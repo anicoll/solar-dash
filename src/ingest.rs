@@ -24,7 +24,8 @@ const JOB: &str = "backfill";
 /// The history has one row every 5 minutes.
 const STEP_SECS: i64 = 5 * 60;
 /// First window size to try. It is halved if the API rejects it.
-const START_WINDOW_SECS: i64 = 24 * 3600;
+/// The real API rejected 24, 12 and 6 hours but accepted 3, so start there.
+const START_WINDOW_SECS: i64 = 3 * 3600;
 /// One hour is confirmed to work, so never go below it.
 const MIN_WINDOW_SECS: i64 = 3600;
 

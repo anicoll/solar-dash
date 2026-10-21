@@ -86,8 +86,9 @@ Which points are fetched and the plant's time zone can be changed with
 `points` and `timezone` (see `config.example.toml`).
 
 It is safe to stop (Ctrl+C) and run again: progress is saved after every
-window, and the next run resumes where the last one stopped. A day of data is
-about one API call, so three years is about 1,100 calls. The command keeps
+window, and the next run resumes where the last one stopped. The API returns
+at most 3 hours per call, so a day is 8 calls and three years is about 8,800
+calls, roughly 2.5 hours with the 1 s pause between calls. The command keeps
 itself under the API limits and pauses if it gets close to the hourly limit.
 
 To check progress:
