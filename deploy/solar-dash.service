@@ -1,0 +1,45 @@
+[Unit]
+Description=solar-dash (solar, battery and grid dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solar-dash
+Group=solar-dash
+WorkingDirectory=/var/lib/solar-dash
+ExecStart=/opt/solar-dash/solar-dash serve --config /etc/solar-dash/config.toml
+Environment=RUST_LOG=info
+# solar-dash stops cleanly on Ctrl+C (SIGINT), so ask systemd to stop it that way.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+
+# Creates /var/lib/solar-dash owned by the service user if it is missing.
+StateDirectory=solar-dash
+
+# Hardening. The service can only write to /var/lib/solar-dash, and can still
+# make outbound HTTPS calls and listen on 127.0.0.1:8080.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/solar-dash
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
