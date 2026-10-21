@@ -165,11 +165,12 @@ async fn run_serve(config: Config) -> Result<()> {
         }
     };
     // The TeslaMate reader works the same way: it only runs if there is a
-    // [teslamate] section, and its errors are only logged.
+    // [teslamate] section, and its errors are only logged. It saves charging
+    // sessions, so it gets the pool.
     let car = state.car();
     let follow_car = async {
         if let Some(teslamate) = config.teslamate.clone()
-            && let Err(err) = teslamate::run(teslamate, car, shutdown_signal()).await
+            && let Err(err) = teslamate::run(teslamate, car, pool.clone(), shutdown_signal()).await
         {
             error!("TeslaMate reader stopped: {err:#}; the dashboard keeps running");
         }

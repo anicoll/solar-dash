@@ -163,6 +163,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}, "car": {...}}`. `sample` is from Modbus, or `null` if there is none or it is over 5 minutes old. `car` is the Tesla's charge state from TeslaMate (see [TeslaMate](#teslamate-optional)), or `null` if that is off or nothing has arrived yet |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
+| `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence},...]}`. A session still charging has `ended_at` `null` and counts as running until now. At most 400 days. Empty without a `[teslamate]` section |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days. Each day has a `source` (see [Modbus in `serve`](#modbus-in-serve)) |
 | `GET /api/costs?from=YYYY-MM-DD&to=YYYY-MM-DD` | Dollars per local day from the `[tariff]` section: `actual`, `baseline` (no solar or battery), `savings`, zero-import `credit`, and import, export and load kWh, plus `totals`. Default: the last 30 days. At most 1,500 days. Days with no data are left out. Finished days are stored in the database, so repeat requests are fast; editing the `[tariff]` rates makes them be worked out again (editing a `[[previous_tariff]]` only redoes the days on that plan). Days before the current plan are priced on the `[[previous_tariff]]` entry in effect on that day (its `until` is the last day it applies), if any are configured. Without a `[tariff]` section it answers `{"configured":false}` |
 | `GET /api/payback` | How much of the system's cost the savings have covered, from the `[[system.purchase]]` entries and the `[tariff]`: `total_cost`, `saved`, `net`, `recovered_pct`, `rate_per_day` (mean savings over the last 365 days with data), `price_rise_percent` (the `[system]` setting, default 3, that grows that rate each year in the projection), `projected_payback` (`"YYYY-MM"`, `null` once paid back, or `"never"`), the `purchases`, a monthly `series` of cumulative `saved` and `net`, and `by_year` (`partial` when a year has fewer days of data than days). Counts from the first purchase date to today. Without purchases or a `[tariff]` section it answers `{"configured":false}` |
@@ -282,8 +283,16 @@ Tesla itself. It is optional: without a `[teslamate]` section nothing changes.
    `time_to_full_charge_h`, `geofence` and `updated_ts` (unix seconds of the
    last message). A value TeslaMate has not sent, or sent empty, is `null`.
 
-The state is only kept in memory (the broker keeps the latest values, so they
-come back after a restart). Unlike the Modbus sample, `car` is not hidden
+Charging sessions are saved in the database (table `ev_charge_session`, shown
+by `GET /api/ev/sessions`). A session starts when `charging_state` becomes
+"Charging" and ends when it becomes anything else. While charging, its energy,
+battery level and top power are saved every 5 minutes, so the SSD sees only a
+few writes an hour. If solar-dash restarts mid-charge it carries on with the
+open session; if the car stopped charging in the meantime, the session ends at
+the time solar-dash noticed.
+
+The rest of the state is only kept in memory (the broker keeps the latest
+values, so they come back after a restart). Unlike the Modbus sample, `car` is not hidden
 when it gets old: TeslaMate's values stay true while the car sleeps. Use
 `updated_ts` to see how fresh they are.
 

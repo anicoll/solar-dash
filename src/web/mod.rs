@@ -202,6 +202,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/latest", get(api::latest))
         .route("/api/live", get(api::live))
         .route("/api/live/series", get(api::live_series))
+        .route("/api/ev/sessions", get(api::ev_sessions))
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
@@ -829,6 +830,73 @@ mod tests {
         assert_eq!(json["car"]["battery_level_pct"], 43.0);
         assert_eq!(json["car"]["plugged_in"], true);
         assert!(json["car"]["charger_power_kw"].is_null());
+    }
+
+    #[tokio::test]
+    async fn ev_sessions_validates_input_and_lists_overlapping_sessions() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        let uri = "/api/ev/sessions?from=0&to=1";
+        let response = send(&app, get_request(uri, None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let bad = [
+            "/api/ev/sessions",
+            "/api/ev/sessions?from=1",
+            "/api/ev/sessions?from=x&to=2",
+            "/api/ev/sessions?from=2&to=1",
+            // 400 days and 1 second.
+            "/api/ev/sessions?from=0&to=34560001",
+        ];
+        for uri in bad {
+            let response = send(&app, get_request(uri, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert!(body_json(response).await["error"].is_string(), "{uri}");
+        }
+
+        // No sessions yet. An exact 400-day range is allowed.
+        let uri = "/api/ev/sessions?from=0&to=34560000";
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["sessions"], serde_json::json!([]));
+
+        // One finished session, and one still running that began a minute ago.
+        let progress = db::ChargeProgress {
+            energy_added_kwh: Some(12.5),
+            soc_pct: Some(70.0),
+            max_power_kw: Some(7.4),
+        };
+        let id = db::start_charge_session(&pool, 1, 1_800_000_000, Some(40.0), Some("Home"))
+            .await
+            .unwrap();
+        db::end_charge_session(&pool, id, 1_800_003_600, &progress)
+            .await
+            .unwrap();
+        let running = db::now() - 60;
+        db::start_charge_session(&pool, 1, running, None, None)
+            .await
+            .unwrap();
+
+        let uri = "/api/ev/sessions?from=1800000000&to=1800000100";
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["started_at"], 1_800_000_000);
+        assert_eq!(sessions[0]["ended_at"], 1_800_003_600);
+        assert_eq!(sessions[0]["energy_added_kwh"], 12.5);
+        assert_eq!(sessions[0]["start_soc_pct"], 40.0);
+        assert_eq!(sessions[0]["end_soc_pct"], 70.0);
+        assert_eq!(sessions[0]["max_power_kw"], 7.4);
+        assert_eq!(sessions[0]["geofence"], "Home");
+
+        // The open session is found by a range around now.
+        let uri = format!("/api/ev/sessions?from={}&to={}", running + 30, running + 40);
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0]["ended_at"].is_null());
     }
 
     #[tokio::test]

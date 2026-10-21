@@ -21,6 +21,7 @@ const MAX_SERIES_SECS: i64 = 31 * 24 * 3600;
 const LIVE_MAX_AGE_SECS: i64 = 5 * 60;
 const MAX_LIVE_SERIES_SECS: i64 = 2 * 24 * 3600;
 const MAX_DAILY_DAYS: u64 = 400;
+const MAX_EV_SESSIONS_SECS: i64 = MAX_DAILY_DAYS as i64 * 24 * 3600;
 /// Without `from`, `/api/daily` returns this many days.
 const DEFAULT_DAILY_DAYS: u64 = 30;
 /// The longest time one counter step is spread over (see `derive_power`).
@@ -204,6 +205,27 @@ pub async fn live_series(
         .map(|s| json!([s.ts, s.pv_w, s.load_w, s.grid_w, s.battery_w, s.soc_pct]))
         .collect();
     Ok(Json(json!({ "data": data })))
+}
+
+/// Charging sessions that overlap the range, as
+/// `{"sessions":[{id,started_at,ended_at,energy_added_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence},...]}`.
+/// A session that has not ended has `ended_at` null and counts as running
+/// until now. The list is empty when TeslaMate is off.
+pub async fn ev_sessions(
+    State(state): State<AppState>,
+    Query(params): Query<LiveSeriesParams>,
+) -> ApiResult {
+    let from = parse_unix("from", params.from.as_deref())?;
+    let to = parse_unix("to", params.to.as_deref())?;
+    if to < from {
+        return Err(ApiError::bad_request("to must not be before from"));
+    }
+    if to - from > MAX_EV_SESSIONS_SECS {
+        return Err(ApiError::bad_request("the range can be at most 400 days"));
+    }
+
+    let sessions = db::charge_sessions_in_range(&state.pool, from, to, db::now()).await?;
+    Ok(Json(json!({ "sessions": sessions })))
 }
 
 // Every parameter is an `Option<String>` that we parse ourselves. If we asked
