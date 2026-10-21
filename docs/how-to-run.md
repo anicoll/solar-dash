@@ -252,10 +252,10 @@ was connected in the `[isolarcloud]` section of `config.toml`:
 history_from = "2023-02-21"
 ```
 
-After each live sync (every 5 minutes) `serve` fetches up to 10 more days of
+After each live sync (every 5 minutes) `serve` fetches up to 18 more days of
 history, oldest first, until it reaches the day the live sync began. The
 dashboard stays live the whole time, and three years fill in within about
-10 hours. Progress is saved, so restarts carry on where it stopped, and once
+5 hours. Progress is saved, so restarts carry on where it stopped, and once
 the history is complete it makes no more calls for it. It also resumes a
 backfill you started earlier with the command below, even without
 `history_from`.
@@ -274,8 +274,8 @@ Which points are fetched and the plant's time zone can be changed with
 It is safe to stop (Ctrl+C) and run again: progress is saved after every
 window, and the next run resumes where the last one stopped. The API returns
 at most 3 hours per call, so a day is 8 calls and three years is about 8,800
-calls. The command keeps itself under the API limits (it pauses at 1,500 calls
-in an hour, shared with `serve`), so the full history takes about 6 hours.
+calls. The command keeps itself under the API limits (it pauses at 1,800 calls
+in an hour, shared with `serve`), so the full history takes about 5 hours.
 
 There is no need to run it alongside `serve`, which already fills in the
 history: both work from the same saved progress, so running them together
