@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
+use crate::cost::DayCost;
 use crate::modbus::Sample;
 
 /// A measuring point (a kind of value, such as "battery power").
@@ -400,6 +401,117 @@ pub async fn live_samples_raw(pool: &SqlitePool, from: i64, to: i64) -> Result<V
     .context("could not read live samples")
 }
 
+/// A finished local day's cost as stored in `daily_cost`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedDayCost {
+    /// Local day, `YYYY-MM-DD`.
+    pub date: String,
+    /// "inverter" or "cloud".
+    pub source: String,
+    pub cost: DayCost,
+}
+
+/// `daily_cost` columns as sqlx reads them; [`CachedDayCost`] is the tidy form.
+#[derive(sqlx::FromRow)]
+struct DailyCostRow {
+    date: String,
+    source: String,
+    import_cents: f64,
+    export_cents: f64,
+    supply_cents: f64,
+    credit_cents: f64,
+    actual_cents: f64,
+    baseline_cents: f64,
+    savings_cents: f64,
+    import_kwh: f64,
+    export_kwh: f64,
+    load_kwh: f64,
+}
+
+impl From<DailyCostRow> for CachedDayCost {
+    fn from(row: DailyCostRow) -> Self {
+        Self {
+            date: row.date,
+            source: row.source,
+            cost: DayCost {
+                import_kwh: row.import_kwh,
+                export_kwh: row.export_kwh,
+                load_kwh: row.load_kwh,
+                import_cents: row.import_cents,
+                export_cents: row.export_cents,
+                supply_cents: row.supply_cents,
+                zero_import_credit_cents: row.credit_cents,
+                actual_cents: row.actual_cents,
+                baseline_cents: row.baseline_cents,
+                savings_cents: row.savings_cents,
+            },
+        }
+    }
+}
+
+/// Stored day costs with `from <= date <= to` (`YYYY-MM-DD` text sorts like
+/// dates) that were worked out with `tariff_key`. Rows made with other rates
+/// are skipped, so they count as missing and get replaced.
+pub async fn daily_costs_in_range(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+    tariff_key: &str,
+) -> Result<Vec<CachedDayCost>> {
+    let rows: Vec<DailyCostRow> = sqlx::query_as(
+        "SELECT date, source, import_cents, export_cents, supply_cents, credit_cents,
+                actual_cents, baseline_cents, savings_cents, import_kwh, export_kwh, load_kwh
+         FROM daily_cost WHERE date >= ? AND date <= ? AND tariff_key = ? ORDER BY date",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(tariff_key)
+    .fetch_all(pool)
+    .await
+    .context("could not read stored day costs")?;
+    Ok(rows.into_iter().map(CachedDayCost::from).collect())
+}
+
+/// Saves finished days' costs (replacing any row for the same date), all in
+/// one transaction so a long backfill is one disk sync, not one per day.
+pub async fn save_daily_costs(
+    pool: &SqlitePool,
+    days: &[CachedDayCost],
+    tariff_key: &str,
+) -> Result<()> {
+    let computed_at = now();
+    let mut tx = pool.begin().await?;
+    for day in days {
+        let c = &day.cost;
+        sqlx::query(
+            "INSERT OR REPLACE INTO daily_cost
+               (date, source, import_cents, export_cents, supply_cents, credit_cents,
+                actual_cents, baseline_cents, savings_cents, import_kwh, export_kwh, load_kwh,
+                tariff_key, computed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&day.date)
+        .bind(&day.source)
+        .bind(c.import_cents)
+        .bind(c.export_cents)
+        .bind(c.supply_cents)
+        .bind(c.zero_import_credit_cents)
+        .bind(c.actual_cents)
+        .bind(c.baseline_cents)
+        .bind(c.savings_cents)
+        .bind(c.import_kwh)
+        .bind(c.export_kwh)
+        .bind(c.load_kwh)
+        .bind(tariff_key)
+        .bind(computed_at)
+        .execute(&mut *tx)
+        .await
+        .context("could not save day cost")?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,12 +548,12 @@ mod tests {
         let (_dir, pool) = test_db().await;
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
-             ('point', 'reading', 'raw_response', 'sync_state', 'api_call')",
+             ('point', 'reading', 'raw_response', 'sync_state', 'api_call', 'daily_cost')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 5);
+        assert_eq!(tables.len(), 6);
     }
 
     #[tokio::test]
@@ -645,5 +757,47 @@ mod tests {
         assert_eq!(live_ts_range(&pool).await.unwrap(), Some((100, 130)));
         // Not averaged: all three rows come back, and the end is exclusive.
         assert_eq!(live_samples_raw(&pool, 100, 130).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn day_costs_round_trip_and_follow_the_tariff_key() {
+        let (_dir, pool) = test_db().await;
+        let cost = DayCost {
+            import_kwh: 1.5,
+            export_kwh: 2.5,
+            load_kwh: 4.0,
+            import_cents: 10.0,
+            export_cents: 20.0,
+            supply_cents: 100.0,
+            zero_import_credit_cents: 5.0,
+            actual_cents: 85.0,
+            baseline_cents: 200.0,
+            savings_cents: 115.0,
+        };
+        let day = |date: &str| CachedDayCost {
+            date: date.to_string(),
+            source: "cloud".to_string(),
+            cost: cost.clone(),
+        };
+        save_daily_costs(&pool, &[day("2026-09-14"), day("2026-09-15")], "a")
+            .await
+            .unwrap();
+
+        let found = daily_costs_in_range(&pool, "2026-09-15", "2026-09-30", "a")
+            .await
+            .unwrap();
+        assert_eq!(found, vec![day("2026-09-15")]);
+        // Another tariff key sees nothing, and saving again replaces the row.
+        let other = daily_costs_in_range(&pool, "2026-09-01", "2026-09-30", "b")
+            .await
+            .unwrap();
+        assert!(other.is_empty());
+        save_daily_costs(&pool, &[day("2026-09-15")], "b")
+            .await
+            .unwrap();
+        let both = daily_costs_in_range(&pool, "2026-09-01", "2026-09-30", "a")
+            .await
+            .unwrap();
+        assert_eq!(both, vec![day("2026-09-14")]);
     }
 }
