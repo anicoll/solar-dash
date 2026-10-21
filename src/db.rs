@@ -345,6 +345,30 @@ pub async fn live_samples_in_range(pool: &SqlitePool, from: i64, to: i64) -> Res
     .context("could not read live samples")
 }
 
+/// The oldest and newest live sample times, or `None` if there are none.
+pub async fn live_ts_range(pool: &SqlitePool) -> Result<Option<(i64, i64)>> {
+    // With no rows `MIN` and `MAX` are both NULL, so read them as `Option`s.
+    let (min, max): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT MIN(ts), MAX(ts) FROM live_sample")
+            .fetch_one(pool)
+            .await
+            .context("could not read live sample range")?;
+    Ok(min.zip(max))
+}
+
+/// Every live sample with `from <= ts < to`, oldest first, not averaged.
+pub async fn live_samples_raw(pool: &SqlitePool, from: i64, to: i64) -> Result<Vec<Sample>> {
+    sqlx::query_as(
+        "SELECT ts, pv_w, load_w, grid_w, battery_w, soc_pct
+         FROM live_sample WHERE ts >= ? AND ts < ? ORDER BY ts",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read live samples")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +602,17 @@ mod tests {
         // A minute with only NULL PV values keeps PV as None.
         let got = live_samples_in_range(&pool, 170, 171).await.unwrap();
         assert_eq!(got[0].pv_w, None);
+    }
+
+    #[tokio::test]
+    async fn live_range_and_raw_samples() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(live_ts_range(&pool).await.unwrap(), None);
+        for ts in [100, 115, 130] {
+            insert_live_sample(&pool, &sample(ts, 1.0)).await.unwrap();
+        }
+        assert_eq!(live_ts_range(&pool).await.unwrap(), Some((100, 130)));
+        // Not averaged: all three rows come back, and the end is exclusive.
+        assert_eq!(live_samples_raw(&pool, 100, 130).await.unwrap().len(), 2);
     }
 }

@@ -228,7 +228,12 @@
       fetchLive(),
       api(`/api/daily?from=${today}&to=${today}`),
     ]);
-    renderTotals($('today-tiles'), daily.days[0] || {});
+    const todayTotals = daily.days[0] || {};
+    renderTotals($('today-tiles'), todayTotals);
+    // Say where today's totals come from (see "source" in /api/daily).
+    $('today-source').textContent =
+      todayTotals.source === 'inverter' ? '(inverter)'
+      : todayTotals.source === 'cloud' ? '(iSolarCloud)' : '';
     if (sample) {
       renderLiveTiles(sample);
       return LIVE_REFRESH_MS;
