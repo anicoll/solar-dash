@@ -440,6 +440,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["date"], "2027-01-15");
+        // Adelaide is UTC+10:30 in January, so the local day starts at 13:30 UTC the day before.
+        assert_eq!(json["start"], 1_799_933_400);
+        assert_eq!(json["end"], 1_799_933_400 + 24 * 3600);
         let pv = &json["series"][0];
         assert_eq!(pv["key"], "pv_w");
         assert_eq!(pv["data"].as_array().unwrap().len(), 3);

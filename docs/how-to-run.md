@@ -115,13 +115,21 @@ The page has four tabs, and the address keeps the view (for example
 `#day=2026-10-20`, `#month=2026-10`, `#year=2026`), so refresh and bookmarks
 work. All times are shown in Australia/Adelaide.
 
-- **Now**: solar and load power, battery charge, and today's energy totals.
-  It refreshes every minute and shows how old the newest reading is.
+- **Now**: solar and load power, battery, and today's energy totals. With
+  [Modbus](#local-modbus-optional) running it shows the inverter's live values
+  (solar, load, grid importing or exporting, battery charging or discharging,
+  and battery %), refreshed every 15 seconds. Without a sample under 5 minutes
+  old it falls back to the iSolarCloud readings, refreshed every minute. A line
+  at the top says which source it is and how old the reading is.
 - **Day**: a power chart for one day (pick a date or step with the arrows).
   Solar, load, grid import, export (below the axis) and battery charge and
   discharge are in kW, and battery % is on the right axis. 11:00-14:00 is
   shaded as the "Free 11-2" window and 18:00-21:00 as "Peak". Energy totals
-  for the day are underneath.
+  for the day are underneath. The chart uses the inverter's 1-minute data when
+  there is at least 30 minutes of it for that day, and iSolarCloud's 5-minute
+  data otherwise. If Modbus started part way through the day, iSolarCloud fills
+  the time before it. A note under the chart names the source. The totals
+  always come from iSolarCloud.
 - **Month**: daily bars of PV generation and grid import (up) and export
   (down), with a line for load, plus the month's totals.
 - **Year**: the same, summed by month.
@@ -142,7 +150,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /healthz` | `{"ok":true,"last_reading_ts":...}` (public) |
 | `GET /api/latest` | The newest value of every point, with its name and unit |
 | `GET /api/series?points=83033,83106&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per point. At most 20 points and 31 days |
-| `GET /api/day?date=YYYY-MM-DD` | One local day (default today): PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
+| `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}}` from Modbus, or `{"sample": null}` if there is none or it is over 5 minutes old |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days |

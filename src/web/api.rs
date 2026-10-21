@@ -325,7 +325,12 @@ pub async fn day(State(state): State<AppState>, Query(params): Query<DayParams>)
             data: derive_power(&counter),
         });
     }
-    Ok(Json(json!({ "date": date.to_string(), "series": series })))
+    Ok(Json(json!({
+        "date": date.to_string(),
+        "start": start,
+        "end": end,
+        "series": series,
+    })))
 }
 
 #[derive(Deserialize)]
