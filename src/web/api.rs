@@ -16,6 +16,9 @@ use crate::db::{self, LatestReading};
 
 const MAX_SERIES_POINTS: usize = 20;
 const MAX_SERIES_SECS: i64 = 31 * 24 * 3600;
+/// `/api/live` ignores a sample older than this: it would show stale data as current.
+const LIVE_MAX_AGE_SECS: i64 = 5 * 60;
+const MAX_LIVE_SERIES_SECS: i64 = 2 * 24 * 3600;
 const MAX_DAILY_DAYS: u64 = 400;
 /// Without `from`, `/api/daily` returns this many days.
 const DEFAULT_DAILY_DAYS: u64 = 30;
@@ -130,6 +133,43 @@ pub async fn latest(State(state): State<AppState>) -> ApiResult {
         })
         .collect();
     Ok(Json(json!({ "points": points })))
+}
+
+/// The newest Modbus sample, or `{"sample": null}` if there is none or it
+/// is too old to call "live" (for example when Modbus is off).
+pub async fn live(State(state): State<AppState>) -> ApiResult {
+    let sample = db::latest_live_sample(&state.pool).await?;
+    let fresh = sample.filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
+    Ok(Json(json!({ "sample": fresh })))
+}
+
+#[derive(Deserialize)]
+pub struct LiveSeriesParams {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// Live samples averaged per minute, as `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`.
+pub async fn live_series(
+    State(state): State<AppState>,
+    Query(params): Query<LiveSeriesParams>,
+) -> ApiResult {
+    let from = parse_unix("from", params.from.as_deref())?;
+    let to = parse_unix("to", params.to.as_deref())?;
+    if to < from {
+        return Err(ApiError::bad_request("to must not be before from"));
+    }
+    if to - from > MAX_LIVE_SERIES_SECS {
+        return Err(ApiError::bad_request("the range can be at most 2 days"));
+    }
+
+    // `to` is inclusive here; the query's end is exclusive.
+    let samples = db::live_samples_in_range(&state.pool, from, to + 1).await?;
+    let data: Vec<Value> = samples
+        .iter()
+        .map(|s| json!([s.ts, s.pv_w, s.load_w, s.grid_w, s.battery_w, s.soc_pct]))
+        .collect();
+    Ok(Json(json!({ "data": data })))
 }
 
 // Every parameter is an `Option<String>` that we parse ourselves. If we asked

@@ -10,13 +10,17 @@
 //! with a fresh one.
 
 use std::fmt;
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
+use sqlx::SqlitePool;
 use tokio::net::lookup_host;
 use tokio::time::{sleep, timeout};
 use tokio_modbus::Slave;
 use tokio_modbus::client::{Context as ModbusContext, Reader as _, tcp};
+use tracing::{info, warn};
 
 use crate::config::Modbus;
 use crate::db;
@@ -47,7 +51,7 @@ const UNAVAILABLE: u32 = 0x7FFF_FFFF;
 ///
 /// The signs are chosen to read naturally, which means two of them are the
 /// opposite of what the inverter sends.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, sqlx::FromRow)]
 pub struct Sample {
     /// Unix seconds, UTC, when the read finished.
     pub ts: i64,
@@ -219,6 +223,81 @@ impl Reader {
     }
 }
 
+/// While Modbus keeps failing, the first failure is logged and then one in
+/// every this many, so a switched-off dongle does not fill the log.
+const LOG_EVERY_N_FAILURES: u32 = 20;
+
+/// Decides which poll results are worth a log line. It is a plain struct
+/// with no logging of its own, so it can be unit tested.
+#[derive(Debug, Default)]
+struct FailureLog {
+    /// Failures in a row since the last success.
+    in_a_row: u32,
+}
+
+impl FailureLog {
+    /// Call after a failed read. Returns `true` if this one should be logged:
+    /// the 1st, 21st, 41st... failure in a row.
+    fn failed(&mut self) -> bool {
+        self.in_a_row += 1;
+        (self.in_a_row - 1).is_multiple_of(LOG_EVERY_N_FAILURES)
+    }
+
+    /// Call after a good read. Returns how many failures came before it if
+    /// we are recovering from some, so "Modbus back" can be logged.
+    fn succeeded(&mut self) -> Option<u32> {
+        // `take` swaps the value for 0 and gives back the old one.
+        let failures = std::mem::take(&mut self.in_a_row);
+        (failures > 0).then_some(failures)
+    }
+}
+
+/// Reads a sample every `interval_secs` and saves it, until `shutdown`
+/// completes. Failures are logged (throttled) and never end the loop: the
+/// dongle is flaky, and the rest of `serve` must keep going without it.
+pub async fn run_poll(
+    config: Modbus,
+    pool: &SqlitePool,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_secs(config.interval_secs));
+    // After a slow read, don't make up for it with a burst of reads.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reader = Reader::new(config);
+    let mut failures = FailureLog::default();
+
+    tokio::pin!(shutdown);
+    info!("Modbus polling started");
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = ticker.tick() => {}
+        }
+        // Dropping an unfinished read on Ctrl+C is fine; nothing is half-saved.
+        let result = tokio::select! {
+            _ = &mut shutdown => break,
+            result = reader.read_sample() => result,
+        };
+        match result {
+            Ok(sample) => {
+                if let Some(count) = failures.succeeded() {
+                    info!(failed_reads = count, "Modbus back");
+                }
+                if let Err(err) = db::insert_live_sample(pool, &sample).await {
+                    warn!("could not save Modbus sample: {err:#}");
+                }
+            }
+            Err(err) => {
+                if failures.failed() {
+                    warn!("Modbus read failed: {err:#}");
+                }
+            }
+        }
+    }
+    info!("Modbus polling stopped");
+    Ok(())
+}
+
 /// Opens a TCP connection to the inverter, with a timeout.
 async fn connect(config: &Modbus) -> Result<ModbusContext> {
     let target = format!("{}:{}", config.host, config.port);
@@ -338,6 +417,25 @@ mod tests {
         assert!(text.starts_with("PV n/a, "));
         assert!(text.contains("grid 1.50 kW (export)"));
         assert!(text.contains("battery 2.00 kW (discharging)"));
+    }
+
+    #[test]
+    fn failure_log_throttles_and_reports_recovery() {
+        let mut log = FailureLog::default();
+        // Nothing to report while all is well.
+        assert_eq!(log.succeeded(), None);
+
+        // Logged: failure 1, then 21, 41... Not logged: the ones between.
+        let logged: Vec<u32> = (1..=45).filter(|_| log.failed()).collect();
+        assert_eq!(logged, vec![1, 21, 41]);
+
+        // Recovery reports how many failed, once.
+        assert_eq!(log.succeeded(), Some(45));
+        assert_eq!(log.succeeded(), None);
+
+        // A new outage logs its first failure again.
+        assert!(log.failed());
+        assert!(!log.failed());
     }
 
     #[test]

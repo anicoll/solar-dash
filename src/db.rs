@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
+use crate::modbus::Sample;
+
 /// A measuring point (a kind of value, such as "battery power").
 #[derive(Debug, Clone, PartialEq)]
 pub struct Point {
@@ -291,6 +293,58 @@ pub async fn max_value_in_range(
     Ok(max)
 }
 
+/// Saves one live Modbus sample. A second sample with the same second
+/// replaces the first.
+pub async fn insert_live_sample(pool: &SqlitePool, sample: &Sample) -> Result<()> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO live_sample (ts, pv_w, load_w, grid_w, battery_w, soc_pct)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(sample.ts)
+    .bind(sample.pv_w)
+    .bind(sample.load_w)
+    .bind(sample.grid_w)
+    .bind(sample.battery_w)
+    .bind(sample.soc_pct)
+    .execute(pool)
+    .await
+    .context("could not save live sample")?;
+    Ok(())
+}
+
+/// The newest live sample, or `None` if there are none.
+pub async fn latest_live_sample(pool: &SqlitePool) -> Result<Option<Sample>> {
+    sqlx::query_as(
+        "SELECT ts, pv_w, load_w, grid_w, battery_w, soc_pct
+         FROM live_sample ORDER BY ts DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("could not read latest live sample")
+}
+
+/// Live samples with `from <= ts < to`, averaged into 1-minute buckets,
+/// oldest first. Each returned `ts` is the start of its minute. A column
+/// that is NULL for the whole minute stays `None`.
+pub async fn live_samples_in_range(pool: &SqlitePool, from: i64, to: i64) -> Result<Vec<Sample>> {
+    // `ts / 60 * 60` is integer division, so it rounds down to the minute.
+    // `AVG` skips NULLs.
+    sqlx::query_as(
+        "SELECT ts / 60 * 60 AS ts,
+                AVG(pv_w) AS pv_w, AVG(load_w) AS load_w, AVG(grid_w) AS grid_w,
+                AVG(battery_w) AS battery_w, AVG(soc_pct) AS soc_pct
+         FROM live_sample
+         WHERE ts >= ? AND ts < ?
+         GROUP BY ts / 60 * 60
+         ORDER BY 1",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read live samples")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +503,80 @@ mod tests {
         assert_eq!(latest.len(), 1);
         assert_eq!((latest[0].ts, latest[0].value), (200, 5.0));
         assert_eq!(latest[0].name.as_deref(), Some("Power"));
+    }
+
+    fn sample(ts: i64, pv_w: f64) -> Sample {
+        Sample {
+            ts,
+            pv_w: Some(pv_w),
+            load_w: Some(700.0),
+            grid_w: Some(-50.0),
+            battery_w: Some(200.0),
+            soc_pct: Some(43.4),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_samples_round_trip() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(latest_live_sample(&pool).await.unwrap(), None);
+
+        insert_live_sample(&pool, &sample(100, 1.0)).await.unwrap();
+        insert_live_sample(&pool, &sample(115, 2.0)).await.unwrap();
+        // The same second again replaces the row.
+        insert_live_sample(&pool, &sample(115, 3.0)).await.unwrap();
+        // NULLs are kept as NULLs.
+        let unavailable = Sample {
+            pv_w: None,
+            ..sample(130, 0.0)
+        };
+        insert_live_sample(&pool, &unavailable).await.unwrap();
+
+        assert_eq!(latest_live_sample(&pool).await.unwrap(), Some(unavailable));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM live_sample")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn live_samples_are_averaged_per_minute() {
+        let (_dir, pool) = test_db().await;
+        // Minute 120: three samples, one with no PV value. Minute 180: one.
+        // 240 is outside the range.
+        let rows = [
+            sample(125, 100.0),
+            sample(140, 300.0),
+            Sample {
+                pv_w: None,
+                load_w: Some(900.0),
+                ..sample(170, 0.0)
+            },
+            sample(180, 50.0),
+            sample(240, 9.0),
+        ];
+        for row in &rows {
+            insert_live_sample(&pool, row).await.unwrap();
+        }
+
+        let got = live_samples_in_range(&pool, 100, 240).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].ts, 120);
+        // AVG ignores the NULL: (100 + 300) / 2.
+        assert_eq!(got[0].pv_w, Some(200.0));
+        assert_eq!(got[0].load_w, Some((700.0 + 700.0 + 900.0) / 3.0));
+        assert_eq!(got[1], sample(180, 50.0));
+
+        // Nothing was stored before 100.
+        assert!(
+            live_samples_in_range(&pool, 0, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A minute with only NULL PV values keeps PV as None.
+        let got = live_samples_in_range(&pool, 170, 171).await.unwrap();
+        assert_eq!(got[0].pv_w, None);
     }
 }

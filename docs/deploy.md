@@ -70,7 +70,10 @@ apt update && apt full-upgrade -y
 apt install -y git curl ca-certificates sqlite3
 ```
 
-The LXC only needs outbound internet. The dashboard listens on
+The LXC needs outbound internet. If you use [Modbus](how-to-run.md#local-modbus-optional),
+it must also be on the same LAN as the WiNet-S dongle and able to reach its IP
+address on TCP port 502 (check with `nc -vz <winet-ip> 502`; the systemd unit
+already allows `AF_INET`, so no change is needed there). The dashboard listens on
 `127.0.0.1:8080`, and the tunnel connects to it from inside the container, so
 nothing needs to reach the container from outside.
 
