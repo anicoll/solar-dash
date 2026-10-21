@@ -15,6 +15,8 @@ pub struct Config {
     pub server: Server,
     #[serde(default)]
     pub database: Database,
+    /// Local Modbus reader. `None` (no `[modbus]` section) means it is off.
+    pub modbus: Option<Modbus>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -109,6 +111,45 @@ impl Default for Database {
     }
 }
 
+/// How to reach the inverter over Modbus TCP; see config.example.toml.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Modbus {
+    /// IP address or host name of the WiNet-S dongle. No default, so the
+    /// section is only valid when you say where the inverter is.
+    pub host: String,
+    #[serde(default = "default_modbus_port")]
+    pub port: u16,
+    /// The Modbus unit (slave) id.
+    #[serde(default = "default_modbus_unit")]
+    pub unit: u8,
+    /// Seconds between reads.
+    #[serde(default = "default_modbus_interval")]
+    pub interval_secs: u64,
+}
+
+impl Modbus {
+    fn check(&self) -> Result<()> {
+        // A zero interval would make the timer loop panic later.
+        anyhow::ensure!(
+            self.interval_secs >= 1,
+            "interval_secs in [modbus] must be at least 1"
+        );
+        Ok(())
+    }
+}
+
+fn default_modbus_port() -> u16 {
+    502
+}
+
+fn default_modbus_unit() -> u8 {
+    1
+}
+
+fn default_modbus_interval() -> u64 {
+    15
+}
+
 fn default_gateway() -> String {
     "https://augateway.isolarcloud.com".to_string()
 }
@@ -144,7 +185,14 @@ impl Config {
                 path.display()
             )
         })?;
-        toml::from_str(&text).with_context(|| format!("invalid config file {}", path.display()))
+        let config: Self = toml::from_str(&text)
+            .with_context(|| format!("invalid config file {}", path.display()))?;
+        if let Some(modbus) = &config.modbus {
+            modbus
+                .check()
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+        }
+        Ok(config)
     }
 }
 
@@ -177,6 +225,36 @@ mod tests {
         assert_eq!(cfg.isolarcloud.timezone, "Australia/Adelaide");
         assert_eq!(cfg.isolarcloud.points.len(), 13);
         assert!(cfg.isolarcloud.points.contains(&83252));
+    }
+
+    #[test]
+    fn modbus_is_off_without_a_section() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.modbus.is_none());
+    }
+
+    #[test]
+    fn modbus_defaults_apply() {
+        let cfg: Config =
+            toml::from_str(&format!("{MINIMAL}\n[modbus]\nhost = \"10.0.0.5\"\n")).unwrap();
+        let modbus = cfg.modbus.unwrap();
+        assert_eq!(modbus.host, "10.0.0.5");
+        assert_eq!(modbus.port, 502);
+        assert_eq!(modbus.unit, 1);
+        assert_eq!(modbus.interval_secs, 15);
+    }
+
+    #[test]
+    fn modbus_section_needs_a_host() {
+        let text = format!("{MINIMAL}\n[modbus]\nport = 502\n");
+        assert!(toml::from_str::<Config>(&text).is_err());
+    }
+
+    #[test]
+    fn modbus_interval_must_be_positive() {
+        let text = format!("{MINIMAL}\n[modbus]\nhost = \"h\"\ninterval_secs = 0\n");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert!(cfg.modbus.unwrap().check().is_err());
     }
 
     #[test]

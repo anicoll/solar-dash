@@ -153,6 +153,51 @@ curl -c cookies.txt -d 'password=YOUR_PASSWORD' http://127.0.0.1:8080/login
 curl -b cookies.txt http://127.0.0.1:8080/api/latest
 ```
 
+## Local Modbus (optional)
+
+Besides the iSolarCloud data, solar-dash can read live power straight from the
+inverter over your home network (Modbus TCP, through the WiNet-S dongle). It
+is optional: without a `[modbus]` section nothing changes.
+
+1. Enable Modbus TCP on the WiNet-S. Open the dongle's own web page (its IP
+   address in a browser), go to the advanced/communication settings and turn
+   on Modbus TCP with **port 502**, **SSL/TLS off**, and the **IP whitelist
+   off** or including the machine running solar-dash. Menu names differ a
+   little between firmware versions.
+2. Add the section to `config.toml` (see `config.example.toml`). Only `host`
+   is required; the rest are the defaults:
+
+   ```toml
+   [modbus]
+   host = "192.168.1.60"   # the WiNet-S IP address
+   port = 502
+   unit = 1
+   interval_secs = 15
+   ```
+
+3. Try one read:
+
+   ```sh
+   cargo run -- modbus-test
+   ```
+
+   It prints one line like
+   `PV 4.90 kW, load 0.71 kW, grid 0.00 kW (import), battery 4.23 kW (charging), SOC 43.4%`.
+   Grid is "import" when buying from the grid and "export" when selling.
+
+4. Test how stable the dongle is by leaving this running for a few hours:
+
+   ```sh
+   cargo run -- modbus-test --watch
+   ```
+
+   It reads every `interval_secs` and prints a line with the time for each
+   sample. A failed read prints `FAILED: ...`, then it reconnects and carries
+   on. Ctrl+C stops it and prints a summary such as `240 ok, 3 failed (1.2%)`.
+
+The dongle is known to stall or drop connections, so each request has a 3
+second timeout and a failure just means a reconnect on the next read.
+
 ## Backfill history
 
 Download the 5-minute history into the database, starting from the day your

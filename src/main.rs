@@ -2,9 +2,11 @@ mod config;
 mod db;
 mod ingest;
 mod isolar;
+mod modbus;
 mod web;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
@@ -43,6 +45,12 @@ enum Command {
     HashPassword,
     /// Check that the iSolarCloud credentials work.
     LoginTest,
+    /// Read the inverter over Modbus TCP and print what it says (needs a [modbus] section).
+    ModbusTest {
+        /// Keep reading every interval_secs until Ctrl+C, then print a summary.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Call any iSolarCloud endpoint and print the result (for exploring the API).
     Api {
         /// Endpoint path, e.g. /openapi/getPowerStationList.
@@ -98,6 +106,12 @@ async fn main() -> Result<()> {
             // `{:#}` prints the whole error chain on one line.
             if let Err(err) = login_test(config).await {
                 eprintln!("Login test failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::ModbusTest { watch } => {
+            if let Err(err) = modbus_test(config, watch).await {
+                eprintln!("Modbus test failed: {err:#}");
                 std::process::exit(1);
             }
         }
@@ -196,6 +210,60 @@ fn with_leading_slash(path: &str) -> String {
     } else {
         format!("/{path}")
     }
+}
+
+/// Reads the inverter once, or with `watch` every `interval_secs` until Ctrl+C.
+/// Failed reads are printed and counted, and reading carries on. This is the
+/// stability test for the WiNet-S dongle.
+async fn modbus_test(config: Config, watch: bool) -> Result<()> {
+    let modbus = config
+        .modbus
+        .context("modbus-test needs a [modbus] section in config.toml (see config.example.toml)")?;
+    let interval = Duration::from_secs(modbus.interval_secs);
+    let mut reader = modbus::Reader::new(modbus);
+
+    if !watch {
+        let sample = reader.read_sample().await?;
+        println!("{}", modbus::describe(&sample));
+        return Ok(());
+    }
+
+    let mut tally = modbus::Tally::default();
+    let mut ticker = tokio::time::interval(interval);
+    // If a read is slow, don't try to catch up with a burst of reads.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    println!(
+        "Reading every {}s. Press Ctrl+C to stop.",
+        interval.as_secs()
+    );
+    // Pinning lets `select!` poll the same future in every round.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        // The first tick completes at once, so the first read is immediate.
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = ticker.tick() => {}
+        }
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        // Stop at once on Ctrl+C even if the read is in progress.
+        let result = tokio::select! {
+            _ = &mut shutdown => break,
+            result = reader.read_sample() => result,
+        };
+        match result {
+            Ok(sample) => {
+                tally.ok += 1;
+                println!("{now}  {}", modbus::describe(&sample));
+            }
+            Err(err) => {
+                tally.failed += 1;
+                println!("{now}  FAILED: {err:#}");
+            }
+        }
+    }
+    println!("{tally}");
+    Ok(())
 }
 
 /// Logs in, lists the plants and prints a short summary.
