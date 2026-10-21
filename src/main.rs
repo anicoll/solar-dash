@@ -61,10 +61,20 @@ enum Command {
     },
 }
 
-// `#[tokio::main]` turns this async fn into a normal `main` that starts the
-// async runtime for us.
-#[tokio::main]
-async fn main() -> Result<()> {
+// This runs on a 1-2 core LXC, so build the async runtime by hand instead of
+// using `#[tokio::main]` (which starts one worker per core and allows up to 512
+// blocking threads). Two workers is plenty, and the blocking pool (argon2
+// password checks, sqlx) only needs a few threads.
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(8)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // RUST_LOG controls verbosity, e.g. RUST_LOG=debug. Default is info.
