@@ -271,6 +271,37 @@ pub async fn readings_in_range(
     .context("could not read readings")
 }
 
+/// The `(point_id, ts, value)` rows of several points with `from <= ts < to`,
+/// ordered by point and then time. One query for all of them, so a long range
+/// does not cost a query per day. Rows without a value are left out.
+pub async fn readings_for_points(
+    pool: &SqlitePool,
+    plant_id: i64,
+    point_ids: &[i64],
+    from: i64,
+    to: i64,
+) -> Result<Vec<(i64, i64, f64)>> {
+    // `QueryBuilder` adds the `?` for each point id, so no value is pasted into the SQL.
+    let mut query =
+        sqlx::QueryBuilder::new("SELECT point_id, ts, value FROM reading WHERE plant_id = ");
+    query.push_bind(plant_id).push(" AND point_id IN (");
+    let mut ids = query.separated(", ");
+    for point_id in point_ids {
+        ids.push_bind(point_id);
+    }
+    query
+        .push(") AND ts >= ")
+        .push_bind(from)
+        .push(" AND ts < ")
+        .push_bind(to)
+        .push(" AND value IS NOT NULL ORDER BY point_id, ts");
+    query
+        .build_query_as()
+        .fetch_all(pool)
+        .await
+        .context("could not read readings")
+}
+
 /// The largest value of one point with `from <= ts < to`, or `None` if there is none.
 pub async fn max_value_in_range(
     pool: &SqlitePool,

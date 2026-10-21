@@ -1,9 +1,6 @@
 //! Electricity cost calculation. Pure functions only: no database, no network,
 //! so every rule here can be tested with plain numbers.
 
-// Nothing calls this module yet: the API that uses it comes in a later commit.
-#![allow(dead_code)]
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike};
 use chrono_tz::Tz;
