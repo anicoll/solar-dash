@@ -617,17 +617,26 @@
     return session.cost == null || !(total > 0) ? null : Math.round(session.solar_kwh / total * 100);
   }
 
-  /** The session shown on the car line: the one still charging, else the latest one that ended today. Null if none, or if the request fails. */
-  async function fetchCarSession() {
+  const CAR_SESSION_MS = 5 * 60 * 1000;  // costing a session reads its live samples, so not on every 15 s refresh
+  let carSession = { at: 0, charging: null, value: null };
+
+  /** The session shown on the car line: the one still charging, else the latest one that ended today. Null if none, or if the request fails.
+   * Reused for 5 minutes, or until the car starts or stops charging. */
+  async function fetchCarSession(car) {
+    const charging = car.charging_state === 'Charging';
+    if (Date.now() - carSession.at < CAR_SESSION_MS && charging === carSession.charging) return carSession.value;
     const now = Math.floor(Date.now() / 1000), today = todayStr();
+    let value = null;
     try {
       const { sessions } = await api(`/api/ev/sessions?from=${now - 36 * 3600}&to=${now}`);
       const todays = sessions.filter((c) => c.ended_at == null || fmtDate.format(new Date(c.ended_at * 1000)) === today);
-      return todays.length ? todays[todays.length - 1] : null;
+      value = todays.length ? todays[todays.length - 1] : null;
     } catch (err) {
       if (err.message === 'Not logged in.') throw err;
       return null;
     }
+    carSession = { at: Date.now(), charging, value };
+    return value;
   }
 
   /** One-line summary of the car under the power diagram; hidden when there is no car. `session` is from fetchCarSession. */
@@ -733,7 +742,7 @@
     } else {
       renderCloudTiles(await api('/api/latest'));
     }
-    renderCarTile(car, car ? await fetchCarSession() : null);
+    renderCarTile(car, car ? await fetchCarSession(car) : null);
     // The chart needs two heavier requests, so it refreshes on the slower cadence.
     if (Date.now() - lastNowChartAt >= REFRESH_MS - 1000) {
       lastNowChartAt = Date.now();
