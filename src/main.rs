@@ -14,7 +14,7 @@ use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
@@ -147,9 +147,11 @@ async fn run_serve(config: Config) -> Result<()> {
         .await
         .with_context(|| format!("could not listen on {}", config.server.bind))?;
 
-    let mut client = Client::new(config.isolarcloud.clone())?;
-    // Failing here, with a clear error, beats failing every 5 minutes.
-    client.login().await.context("login failed at startup")?;
+    // Settings that no retry can fix fail here, before anything starts. The
+    // login itself happens in the live sync, which retries with backoff: the
+    // dashboard and Modbus data do not need iSolarCloud to be up.
+    ingest::check_sync_config(&config.isolarcloud)?;
+    let client = Client::new(config.isolarcloud.clone())?;
 
     info!(address = %config.server.bind, "web server started");
     // The Modbus poller only runs if there is a [modbus] section. Otherwise
@@ -161,12 +163,22 @@ async fn run_serve(config: Config) -> Result<()> {
             None => Ok(()),
         }
     };
+    // The live sync must never take the others down: if it fails for a
+    // fatal reason (say a database error) we log it and keep serving.
+    let live_sync = async {
+        if let Err(err) =
+            ingest::run_live_sync(client, &pool, &config.isolarcloud, shutdown_signal()).await
+        {
+            error!("live sync stopped: {err:#}; the dashboard keeps running");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     // Run all three until Ctrl+C. `try_join!` polls them together on this
-    // task and returns early if one fails (the Modbus poller never does: its
-    // errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C
-    // wakes them all.
+    // task and returns early if one fails (neither the live sync nor the
+    // Modbus poller does: their errors are only logged). Each gets its own
+    // `ctrl_c` future; one Ctrl+C wakes them all.
     tokio::try_join!(
-        ingest::run_live_sync(client, &pool, &config.isolarcloud, shutdown_signal()),
+        live_sync,
         web::serve(listener, state, shutdown_signal()),
         poll_modbus,
     )?;
