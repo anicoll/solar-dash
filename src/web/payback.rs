@@ -26,6 +26,8 @@ const RATE_DAYS: usize = 365;
 const MAX_PAYBACK_DAYS: u64 = 4000;
 /// A payback date further away than this (about 100 years) is reported as "never".
 const MAX_PROJECTED_DAYS: f64 = 36_500.0;
+/// Mean length of a year, for turning the yearly price rise into days.
+const DAYS_PER_YEAR: f64 = 365.25;
 
 /// One thing bought for the system, with its date already parsed.
 #[derive(Debug, Clone)]
@@ -142,15 +144,25 @@ fn rate_per_day(days: &[DaySavings]) -> f64 {
 }
 
 /// When `net` (savings minus cost, so negative until paid back) reaches zero
-/// if savings keep coming at `rate` dollars a day from `today`.
-fn projected_payback(net: f64, rate: f64, today: NaiveDate) -> Projection {
+/// if savings keep coming at `rate` dollars a day from `today`, growing
+/// continuously by `price_rise_percent` a year. With g = ln(1 + p/100), the
+/// savings after T years are rate * 365.25 * (e^(gT) - 1) / g; solving that
+/// for the remaining cost gives T = ln(1 + remaining * g / (rate * 365.25)) / g.
+fn projected_payback(net: f64, rate: f64, price_rise_percent: f64, today: NaiveDate) -> Projection {
     if net >= 0.0 {
         return Projection::PaidBack;
     }
     if rate <= 0.0 {
         return Projection::Never;
     }
-    let days = (-net / rate).ceil();
+    let remaining = -net;
+    let growth = (1.0 + price_rise_percent / 100.0).ln();
+    let days = if growth > 0.0 {
+        (1.0 + remaining * growth / (rate * DAYS_PER_YEAR)).ln() / growth * DAYS_PER_YEAR
+    } else {
+        remaining / rate
+    }
+    .ceil();
     if days > MAX_PROJECTED_DAYS {
         return Projection::Never;
     }
@@ -205,7 +217,7 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
     let saved: f64 = days.iter().map(|d| d.1).sum();
     let net = saved - total_cost;
     let rate = rate_per_day(&days);
-    let projected: Value = match projected_payback(net, rate, today) {
+    let projected: Value = match projected_payback(net, rate, state.price_rise_percent, today) {
         Projection::PaidBack => Value::Null,
         Projection::Never => json!("never"),
         Projection::On(date) => json!(date.format("%Y-%m").to_string()),
@@ -224,6 +236,7 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
         "recovered_pct": if total_cost > 0.0 { round2(saved / total_cost * 100.0) } else { 0.0 },
         "projected_payback": projected,
         "rate_per_day": round2(rate),
+        "price_rise_percent": state.price_rise_percent,
         "purchases": purchases,
         "series": monthly_series(&days, &state.purchases, start, today),
         "by_year": by_year(&days),
@@ -300,17 +313,56 @@ mod tests {
     #[test]
     fn projection_covers_paid_back_never_and_a_date() {
         let today = date("2026-10-21");
-        assert_eq!(projected_payback(0.0, 5.0, today), Projection::PaidBack);
-        assert_eq!(projected_payback(50.0, -1.0, today), Projection::PaidBack);
-        assert_eq!(projected_payback(-100.0, 0.0, today), Projection::Never);
-        assert_eq!(projected_payback(-100.0, -2.0, today), Projection::Never);
+        assert_eq!(
+            projected_payback(0.0, 5.0, 0.0, today),
+            Projection::PaidBack
+        );
+        assert_eq!(
+            projected_payback(50.0, -1.0, 3.0, today),
+            Projection::PaidBack
+        );
+        assert_eq!(
+            projected_payback(-100.0, 0.0, 3.0, today),
+            Projection::Never
+        );
+        assert_eq!(
+            projected_payback(-100.0, -2.0, 3.0, today),
+            Projection::Never
+        );
         // 100 / 3 = 33.3, so 34 whole days.
         assert_eq!(
-            projected_payback(-100.0, 3.0, today),
+            projected_payback(-100.0, 3.0, 0.0, today),
             Projection::On(date("2026-11-24"))
         );
         // Too far away to mean anything.
-        assert_eq!(projected_payback(-1e9, 0.01, today), Projection::Never);
+        assert_eq!(projected_payback(-1e9, 0.01, 0.0, today), Projection::Never);
+    }
+
+    #[test]
+    fn price_rise_brings_the_payback_forward() {
+        let today = date("2026-10-21");
+        // 10 years of savings at 10 a day is 36525, so the linear answer is
+        // 10 years out; 3% a year growth gets there sooner.
+        let linear = projected_payback(-36_525.0, 10.0, 0.0, today);
+        let rising = projected_payback(-36_525.0, 10.0, 3.0, today);
+        let (Projection::On(linear), Projection::On(rising)) = (linear, rising) else {
+            panic!("expected dates");
+        };
+        assert_eq!(linear, today + Days::new(3653));
+        // ln(1 + 36525 * ln(1.03) / 3652.5) / ln(1.03) is about 8.8 years.
+        assert!(
+            rising < date("2035-08-31") && rising > date("2035-06-01"),
+            "{rising}"
+        );
+        // Still capped when far away, and still never without savings.
+        assert_eq!(
+            projected_payback(-1e12, 0.01, 3.0, today),
+            Projection::Never
+        );
+        assert_eq!(
+            projected_payback(-100.0, 0.0, 3.0, today),
+            Projection::Never
+        );
     }
 
     #[test]
