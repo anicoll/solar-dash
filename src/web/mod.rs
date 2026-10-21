@@ -32,6 +32,7 @@ use tower_http::compression::CompressionLayer;
 use crate::config::Config;
 use crate::cost::TariffSchedule;
 use crate::modbus::Latest;
+use crate::teslamate::Car;
 use auth::LockoutMap;
 pub use auth::hash_password;
 use payback::Purchase;
@@ -64,6 +65,8 @@ pub struct AppState {
     cookie_secure: bool,
     /// The newest Modbus sample, kept by the poller.
     latest: Latest,
+    /// The car's charge state from TeslaMate, kept by the MQTT task.
+    car: Car,
     /// The parsed `[tariff]` and `[[previous_tariff]]` sections; `None` turns the cost API off.
     tariff: Option<Arc<TariffSchedule>>,
     /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
@@ -98,6 +101,7 @@ impl AppState {
             verify_gate: Arc::new(Semaphore::new(1)),
             cookie_secure: true,
             latest: Latest::default(),
+            car: Car::default(),
             tariff: None,
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
@@ -131,6 +135,11 @@ impl AppState {
     /// The slot the Modbus poller writes its newest sample to.
     pub fn latest(&self) -> Latest {
         self.latest.clone()
+    }
+
+    /// The slot the TeslaMate task writes the car's state to.
+    pub fn car(&self) -> Car {
+        self.car.clone()
     }
 
     /// Builds the state from the config, with clear errors for missing settings.
@@ -321,6 +330,7 @@ mod tests {
     use super::*;
     use crate::db::{self, Point, Reading};
     use crate::modbus::Sample;
+    use crate::teslamate::CarState;
 
     const PLANT: i64 = 7;
     const PASSWORD: &str = "correct horse";
@@ -788,8 +798,37 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             body_json(response).await,
-            serde_json::json!({ "sample": null })
+            serde_json::json!({ "sample": null, "car": null })
         );
+    }
+
+    #[tokio::test]
+    async fn live_includes_the_car_once_teslamate_has_sent_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool, PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_cookie_secure(true);
+        let app = router(state.clone());
+        let cookie = log_in(&app).await;
+
+        // Even a very old car state is shown: TeslaMate's values are retained.
+        state.car().set(CarState {
+            battery_level_pct: Some(43.0),
+            plugged_in: Some(true),
+            updated_ts: db::now() - 86_400,
+            ..CarState::default()
+        });
+        let response = send(&app, get_request("/api/live", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert!(json["sample"].is_null());
+        assert_eq!(json["car"]["battery_level_pct"], 43.0);
+        assert_eq!(json["car"]["plugged_in"], true);
+        assert!(json["car"]["charger_power_kw"].is_null());
     }
 
     #[tokio::test]

@@ -72,6 +72,21 @@ path = "data/solar.db"
 # Seconds between reads. The dongle is slow, so don't go much below 5.
 # interval_secs = 15
 
+# Optional: show the Tesla's charge state on /api/live. solar-dash reads it
+# from TeslaMate's MQTT broker (the one TeslaMate publishes to), so TeslaMate
+# must already be running. Without this section the feature is off.
+# [teslamate]
+# IP address (or host name) of the MQTT broker. Required in this section.
+# host = "192.168.10.84"
+# port = 1883
+# Which car to follow. TeslaMate numbers its cars from 1.
+# car_id = 1
+# The start of TeslaMate's topic names (its MQTT_NAMESPACE setting).
+# topic_prefix = "teslamate"
+# Only if the broker needs a login. Give both or neither.
+# username = "mqtt-user"
+# password = "mqtt-password"
+
 # Optional: electricity prices, used to work out what each day cost and what
 # the solar and battery saved. Without this section cost features are off.
 # These values are Andrew's GloBird ZeroHero plan (plan details, Oct 2026):
