@@ -40,7 +40,7 @@ bind = "127.0.0.1:8080"
 # and paste the line it prints here.
 # password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 # Signs the login cookie: base64 of at least 64 random bytes. Make one with
-#   openssl rand -base64 64 | tr -d '\n'
+#   openssl rand -base64 64 | tr -d '\n'; echo
 # If unset, a random one is made on every start, so logins reset on restart.
 # session_secret = "..."
 

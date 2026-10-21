@@ -97,8 +97,11 @@ Also add a `session_secret` so you stay logged in across restarts (see
 `config.example.toml`):
 
 ```sh
-openssl rand -base64 64 | tr -d '\n'
+openssl rand -base64 64 | tr -d '\n'; echo
 ```
+
+It prints 88 characters ending in `=`; copy just those. (The `echo` stops
+zsh adding a `%` after the output, which isn't part of the secret.)
 
 Without it, `serve` makes a new one on each start and logs a warning, which
 logs everyone out whenever it restarts.
