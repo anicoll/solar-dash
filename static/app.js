@@ -746,6 +746,23 @@
     }
   }
 
+  /**
+   * The car's charging sessions overlapping [start, end) (unix seconds) and the
+   * car's name. The sessions are [] if the request fails (or TeslaMate is off):
+   * the chart is drawn without them.
+   */
+  async function fetchCharging(start, end) {
+    const { car } = await fetchLive();
+    const name = (car && car.display_name) || 'Car';
+    try {
+      const sessions = (await api(`/api/ev/sessions?from=${start}&to=${end - 1}`)).sessions || [];
+      return { name, sessions };
+    } catch (err) {
+      if (err.message === 'Not logged in.') throw err;
+      return { name, sessions: [] };
+    }
+  }
+
   /** One `[ts, value]` series from inverter rows; `pick(row)` gives the value or null. */
   function liveSeries(rows, pick) {
     const out = [];
@@ -818,7 +835,10 @@
     day = day || await api(`/api/day?date=${date}`);
     const start = day.start * 1000;
     const end = day.end * 1000;
-    const live = await fetchLiveDay(day.start, day.end);
+    const [live, charging] = await Promise.all([
+      fetchLiveDay(day.start, day.end),
+      fetchCharging(day.start, day.end),
+    ]);
     if (!current()) return;
     const { byKey, source } = mergeDay(day.series, live);
     const hasData = Object.values(byKey).some((d) => d.length > 0);
@@ -859,6 +879,29 @@
       ],
     };
 
+    // Charging sessions are bands along the bottom of the plot, on a hidden
+    // 0-1 axis, so they stay clear of the Free and Peak shading. A session that
+    // is still running ends now.
+    const ev = css('--c-ev');
+    const chargingName = `${charging.name} charging`;
+    const nowMs = Date.now();
+    const bands = charging.sessions.map((c) => ({
+      from: Math.max(c.started_at * 1000, start),
+      to: Math.min(c.ended_at == null ? nowMs : c.ended_at * 1000, end),
+    }));
+    if (bands.length) {
+      series.push({
+        name: chargingName, type: 'line', yAxisIndex: 2, data: [],
+        lineStyle: { width: 2, color: ev }, itemStyle: { color: ev },
+        markArea: {
+          silent: true, z: 1,
+          itemStyle: { color: ev, opacity: 0.55 },
+          label: { color: th.fg, fontSize: 11, position: 'insideLeft' },
+          data: bands.map((b) => [{ name: chargingName, xAxis: b.from, yAxis: 0 }, { xAxis: b.to, yAxis: 0.07 }]),
+        },
+      });
+    }
+
     const option = {
       animation: false,
       grid: { left: 8, right: 8, top: narrow ? 108 : 56, bottom: 8, containLabel: true },
@@ -876,7 +919,12 @@
             return `<div style="display:flex;justify-content:space-between;gap:16px">`
               + `<span>${p.marker}${p.seriesName}</span><b>${txt}</b></div>`;
           });
-          return `<div style="margin-bottom:4px">${clock(params[0].value[0])}</div>${rows.join('')}`;
+          const t = params[0].value[0];
+          if (bands.some((b) => t >= b.from && t <= b.to)) {
+            rows.push(`<div><span style="display:inline-block;margin-right:4px;border-radius:10px;`
+              + `width:10px;height:10px;background:${ev}"></span>${esc(chargingName)}</div>`);
+          }
+          return `<div style="margin-bottom:4px">${clock(t)}</div>${rows.join('')}`;
         },
       },
       xAxis: {
@@ -894,6 +942,8 @@
           type: 'value', name: 'SOC %', min: 0, max: 100, nameTextStyle: { color: th.muted },
           axisLabel: { color: th.muted, fontFamily: css('--mono') }, splitLine: { show: false },
         },
+        // Holds the charging bands only.
+        { type: 'value', min: 0, max: 1, show: false },
       ],
       series,
     };
