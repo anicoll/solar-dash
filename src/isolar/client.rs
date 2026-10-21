@@ -217,7 +217,7 @@ mod tests {
 
     /// A throwaway public key in the format the config expects.
     fn test_public_key() -> String {
-        let private = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let private = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let der = private.to_public_key().to_public_key_der().unwrap();
         base64::engine::general_purpose::URL_SAFE.encode(der.as_bytes())
     }
