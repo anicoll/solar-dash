@@ -24,10 +24,10 @@ const MAX_DAILY_DAYS: u64 = 400;
 /// Without `from`, `/api/daily` returns this many days.
 const DEFAULT_DAILY_DAYS: u64 = 30;
 /// The longest time one counter step is spread over (see `derive_power`).
-const MAX_SPREAD_SECS: i64 = 30 * 60;
+pub(super) const MAX_SPREAD_SECS: i64 = 30 * 60;
 /// The longest time one live sample is held (see `integrate`). Samples come
 /// every ~15 s, so a longer step means the dongle dropped out.
-const MAX_HOLD_SECS: i64 = 120;
+pub(super) const MAX_HOLD_SECS: i64 = 120;
 /// A day (or the elapsed part of today) needs this share covered by live
 /// samples before we trust them over the iSolarCloud counters.
 const MIN_LIVE_COVERAGE: f64 = 0.9;
@@ -72,7 +72,7 @@ impl ApiError {
         }
     }
 
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
@@ -97,7 +97,7 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-type ApiResult = Result<Json<Value>, ApiError>;
+pub(super) type ApiResult = Result<Json<Value>, ApiError>;
 
 /// A series as sent to the client.
 #[derive(Debug, Serialize)]
@@ -282,46 +282,76 @@ fn day_bounds(date: NaiveDate, tz: Tz) -> Option<(i64, i64)> {
     Some((local_midnight(date, tz)?, local_midnight(next, tz)?))
 }
 
-fn day_bounds_or_error(date: NaiveDate, tz: Tz) -> Result<(i64, i64), ApiError> {
+pub(super) fn day_bounds_or_error(date: NaiveDate, tz: Tz) -> Result<(i64, i64), ApiError> {
     day_bounds(date, tz).ok_or_else(|| ApiError::bad_request("date is out of range"))
 }
 
-fn today(tz: Tz) -> NaiveDate {
+pub(super) fn today(tz: Tz) -> NaiveDate {
     chrono::Utc::now().with_timezone(&tz).date_naive()
+}
+
+/// One step of a daily energy counter, spread over the time it covers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Spread {
+    /// Unix seconds. The energy is taken to flow evenly from `start` to `end`.
+    pub start: i64,
+    pub end: i64,
+    /// The counter's rise, in Wh.
+    pub wh: f64,
+}
+
+/// Finds each step of a daily energy counter (`(ts, Wh)` pairs, oldest first)
+/// and the time to spread it over.
+///
+/// iSolarCloud counters only move in 100 Wh steps, so a counter can sit still
+/// for half an hour and then jump. A step is spread evenly over the time since
+/// the counter last moved, at most [`MAX_SPREAD_SECS`]. The spans never
+/// overlap, so the energies add up to the counter's total rise.
+///
+/// A drop is the counter resetting at midnight: it adds no energy and
+/// counting starts again from the new value.
+pub(super) fn spread_steps(counter: &[(i64, f64)]) -> Vec<Spread> {
+    let Some(&(first_ts, first_value)) = counter.first() else {
+        return Vec::new();
+    };
+    let mut steps = Vec::new();
+    // When the counter last moved, and its value then.
+    let (mut last_ts, mut last_value) = (first_ts, first_value);
+
+    for &(ts, value) in &counter[1..] {
+        if value > last_value {
+            steps.push(Spread {
+                start: last_ts.max(ts - MAX_SPREAD_SECS),
+                end: ts,
+                wh: value - last_value,
+            });
+        }
+        if value != last_value {
+            (last_ts, last_value) = (ts, value);
+        }
+    }
+    steps
 }
 
 /// Turns a daily energy counter (Wh, `(ts, value)` pairs) into average power
 /// (W) at each row after the first, oldest first.
 ///
-/// iSolarCloud counters only move in 100 Wh steps, so a counter can sit still
-/// for half an hour and then jump. Turning each 5-minute change straight into
-/// power would show 0 W and then a 1.2 kW spike. Instead each step is spread
-/// evenly over the time since the counter last moved, at most
-/// [`MAX_SPREAD_SECS`]: `W = ΔWh * 3600 / seconds`.
+/// Turning each 5-minute change straight into power would show 0 W and then a
+/// 1.2 kW spike, so each step is spread out as [`spread_steps`] describes:
+/// `W = ΔWh * 3600 / seconds`.
 ///
-/// - A negative change is the counter resetting at midnight: that row is 0
-///   and counting starts again from the new value.
+/// - A negative change is the counter resetting at midnight: that row is 0.
 /// - Rows after the last step stay at 0 until the counter moves again.
-fn derive_power(counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
-    let Some(&(first_ts, first_value)) = counter.first() else {
-        return Vec::new();
-    };
-    let mut power: Vec<(i64, f64)> = Vec::new();
-    // When the counter last moved, and its value then.
-    let (mut last_ts, mut last_value) = (first_ts, first_value);
-
-    for &(ts, value) in &counter[1..] {
-        power.push((ts, 0.0));
-        if value < last_value {
-            (last_ts, last_value) = (ts, value);
-        } else if value > last_value {
-            let spread_from = last_ts.max(ts - MAX_SPREAD_SECS);
-            let watts = (value - last_value) * 3600.0 / (ts - spread_from) as f64;
-            // This row and the earlier rows the step covers share the energy.
-            for row in power.iter_mut().rev().take_while(|row| row.0 > spread_from) {
-                row.1 = watts;
-            }
-            (last_ts, last_value) = (ts, value);
+pub(super) fn derive_power(counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
+    let mut power: Vec<(i64, f64)> = counter.iter().skip(1).map(|&(ts, _)| (ts, 0.0)).collect();
+    for step in spread_steps(counter) {
+        let watts = step.wh * 3600.0 / (step.end - step.start) as f64;
+        // This row and the earlier rows the step covers share the energy.
+        // `partition_point` finds where the rows (sorted by time) pass a time.
+        let first = power.partition_point(|row| row.0 <= step.start);
+        let last = power.partition_point(|row| row.0 <= step.end);
+        for row in &mut power[first..last] {
+            row.1 = watts;
         }
     }
     power
@@ -379,7 +409,12 @@ fn use_live(covered_secs: i64, start: i64, end: i64, now: i64) -> bool {
 
 /// Energy of one local day from the live samples, or `None` if they do not
 /// cover enough of it (see [`use_live`]).
-fn live_totals(samples: &[Sample], start: i64, end: i64, now: i64) -> Option<LiveTotals> {
+pub(super) fn live_totals(
+    samples: &[Sample],
+    start: i64,
+    end: i64,
+    now: i64,
+) -> Option<LiveTotals> {
     // Each column is integrated alone, skipping rows where it is missing.
     let column = |get: fn(&Sample) -> Option<f64>| {
         let pairs: Vec<(i64, f64)> = samples
@@ -407,7 +442,7 @@ fn live_totals(samples: &[Sample], start: i64, end: i64, now: i64) -> Option<Liv
     })
 }
 
-struct LiveTotals {
+pub(super) struct LiveTotals {
     pv_kwh: f64,
     load_kwh: f64,
     import_kwh: f64,
@@ -528,12 +563,20 @@ async fn day_totals(
     })
 }
 
-pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyParams>) -> ApiResult {
-    let to = match params.to.as_deref() {
+/// Reads the optional `from` and `to` dates (default: the last
+/// [`DEFAULT_DAILY_DAYS`] days ending today) and checks the range. Gives the
+/// first date and how many days the range has, at most `max_days`.
+pub(super) fn date_range(
+    from: Option<&str>,
+    to: Option<&str>,
+    tz: Tz,
+    max_days: u64,
+) -> Result<(NaiveDate, u64), ApiError> {
+    let to = match to {
         Some(text) => parse_date("to", text)?,
-        None => today(state.tz),
+        None => today(tz),
     };
-    let from = match params.from.as_deref() {
+    let from = match from {
         Some(text) => parse_date("from", text)?,
         None => to - Days::new(DEFAULT_DAILY_DAYS - 1),
     };
@@ -541,11 +584,21 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
         return Err(ApiError::bad_request("to must not be before from"));
     }
     let count = (to - from).num_days() as u64 + 1;
-    if count > MAX_DAILY_DAYS {
+    if count > max_days {
         return Err(ApiError::bad_request(format!(
-            "the range can be at most {MAX_DAILY_DAYS} days"
+            "the range can be at most {max_days} days"
         )));
     }
+    Ok((from, count))
+}
+
+pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyParams>) -> ApiResult {
+    let (from, count) = date_range(
+        params.from.as_deref(),
+        params.to.as_deref(),
+        state.tz,
+        MAX_DAILY_DAYS,
+    )?;
 
     let live_range = db::live_ts_range(&state.pool).await?;
     let now = db::now();
