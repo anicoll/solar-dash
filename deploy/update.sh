@@ -77,6 +77,20 @@ if [ "${1:-}" = "--check" ]; then
     exit 0
 fi
 
+# Database migrations only go forward, so take an online backup first. If a
+# migration ran, restore this file after --rollback. The database path comes
+# from the config; override it with SOLAR_DASH_DB.
+db="${SOLAR_DASH_DB:-$(sed -n 's/^path *= *"\(.*\)"/\1/p' /etc/solar-dash/config.toml 2>/dev/null | head -n 1)}"
+db="${db:-/var/lib/solar-dash/solar.db}"
+if [ -f "$db" ]; then
+    install -d -m 750 -o solar-dash -g solar-dash /var/backups/solar-dash
+    backup="/var/backups/solar-dash/pre-update-$(date +%Y%m%d-%H%M%S).db"
+    echo "Backing up the database to $backup"
+    runuser -u solar-dash -- sqlite3 "$db" ".backup '$backup'"
+else
+    echo "No database at $db yet, skipping the pre-update backup."
+fi
+
 echo "Updating $current -> $latest"
 if [ -x "$opt/solar-dash" ]; then
     cp -p "$opt/solar-dash" "$opt/solar-dash.prev"

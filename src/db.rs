@@ -209,6 +209,7 @@ pub struct LatestReading {
 }
 
 /// The newest timestamp of any reading in the plant, or `None` if there are none.
+#[cfg(test)]
 pub async fn max_reading_ts(pool: &SqlitePool, plant_id: i64) -> Result<Option<i64>> {
     // `MAX` gives one row holding NULL when the table is empty, hence `Option`.
     let ts = sqlx::query_scalar("SELECT MAX(ts) FROM reading WHERE plant_id = ?")

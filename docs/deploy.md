@@ -212,7 +212,7 @@ inside the LXC:
 curl http://127.0.0.1:8080/healthz
 ```
 
-It should print `{"ok":true,"last_reading_ts":...}`. If it fails, see
+It should print `{"ok":true}`. If it fails, see
 [Troubleshooting](#troubleshooting).
 
 ## 6. Cloudflare Tunnel
@@ -291,8 +291,14 @@ automatically on startup. Other options:
 cat /opt/solar-dash/VERSION           # the commit that is installed
 ```
 
+Before installing, the update takes an online backup of the database to
+`/var/backups/solar-dash/pre-update-<timestamp>.db` (these are not deleted
+automatically; remove old ones by hand). If your database is not at the `path`
+in `/etc/solar-dash/config.toml`, set `SOLAR_DASH_DB=/path/to/solar.db`.
+
 Rollback swaps the program back. A database change made by the newer version
-stays, so if an update included one, restore last night's backup too (section 8).
+stays, so if an update included one, restore the latest `pre-update-*.db`
+backup too (section 8).
 
 If you built inside the LXC (option B), update with `git pull`,
 `cargo build --release`, `./deploy/install.sh` and `systemctl restart solar-dash`

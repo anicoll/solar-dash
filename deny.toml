@@ -1,0 +1,3 @@
+# Advisories only: fail CI on known RustSec vulnerabilities.
+[advisories]
+version = 2
