@@ -141,12 +141,22 @@ async fn run_serve(config: Config) -> Result<()> {
     client.login().await.context("login failed at startup")?;
 
     info!(address = %config.server.bind, "web server started");
-    // Run both until Ctrl+C. `try_join!` polls them together on this task and
-    // returns early if either fails. Each gets its own `ctrl_c` future; one
-    // Ctrl+C wakes them both.
+    // The Modbus poller only runs if there is a [modbus] section. Otherwise
+    // this future finishes at once, which `try_join!` is happy with.
+    let poll_modbus = async {
+        match config.modbus.clone() {
+            Some(modbus) => modbus::run_poll(modbus, &pool, shutdown_signal()).await,
+            None => Ok(()),
+        }
+    };
+    // Run all three until Ctrl+C. `try_join!` polls them together on this
+    // task and returns early if one fails (the Modbus poller never does: its
+    // errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C
+    // wakes them all.
     tokio::try_join!(
         ingest::run_live_sync(client, &pool, &config.isolarcloud, shutdown_signal()),
         web::serve(listener, state, shutdown_signal()),
+        poll_modbus,
     )?;
     Ok(())
 }

@@ -143,6 +143,8 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/latest` | The newest value of every point, with its name and unit |
 | `GET /api/series?points=83033,83106&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per point. At most 20 points and 31 days |
 | `GET /api/day?date=YYYY-MM-DD` | One local day (default today): PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
+| `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}}` from Modbus, or `{"sample": null}` if there is none or it is over 5 minutes old |
+| `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days |
 
 For example, once logged in with a browser, try
@@ -197,6 +199,23 @@ is optional: without a `[modbus]` section nothing changes.
 
 The dongle is known to stall or drop connections, so each request has a 3
 second timeout and a failure just means a reconnect on the next read.
+
+### Modbus in `serve`
+
+When `[modbus]` is configured, `serve` also polls the inverter every
+`interval_secs` and stores each sample in the `live_sample` table. Failures
+never stop `serve`: the first one is logged as a warning, then one in every 20
+in a row, and `Modbus back` is logged when reads work again. Without a
+`[modbus]` section `serve` behaves exactly as before. The samples are served
+by `/api/live` and `/api/live/series` (see [the API table](#dashboard-views)).
+
+Signs in the samples: `grid_w` is positive when importing and negative when
+exporting, and `battery_w` is positive when charging and negative when
+discharging.
+
+Storage: at the default 15 seconds that is 5,760 rows a day, about 2 million a
+year, roughly 80 MB a year. Everything is kept; nothing is deleted
+automatically.
 
 ## Backfill history
 

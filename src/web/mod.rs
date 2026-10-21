@@ -125,6 +125,8 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/static/{*path}", get(static_file))
         .route("/api/latest", get(api::latest))
+        .route("/api/live", get(api::live))
+        .route("/api/live/series", get(api::live_series))
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
@@ -183,12 +185,19 @@ mod tests {
 
     use super::*;
     use crate::db::{self, Point, Reading};
+    use crate::modbus::Sample;
 
     const PLANT: i64 = 7;
     const PASSWORD: &str = "correct horse";
 
     /// A router over a temp database with a few seeded rows.
     async fn test_app() -> (tempfile::TempDir, Router) {
+        let (dir, app, _pool) = test_app_with_pool().await;
+        (dir, app)
+    }
+
+    /// Like `test_app`, but also gives back the pool, for seeding more rows.
+    async fn test_app_with_pool() -> (tempfile::TempDir, Router, SqlitePool) {
         let dir = tempfile::tempdir().unwrap();
         let pool = db::open(dir.path().join("test.db").to_str().unwrap())
             .await
@@ -211,8 +220,8 @@ mod tests {
 
         let hash = hash_password(PASSWORD).unwrap();
         let tz = chrono_tz::Australia::Adelaide;
-        let state = AppState::new(pool, PLANT, tz, &hash, Key::generate()).unwrap();
-        (dir, router(state))
+        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate()).unwrap();
+        (dir, router(state), pool)
     }
 
     async fn send(app: &Router, request: Request<Body>) -> Response {
@@ -441,5 +450,99 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["days"][0]["date"], "2027-01-15");
         assert!(json["days"][0]["pv_kwh"].is_null());
+    }
+
+    fn live_sample(ts: i64) -> Sample {
+        Sample {
+            ts,
+            pv_w: Some(4895.0),
+            load_w: Some(708.0),
+            grid_w: Some(0.0),
+            battery_w: Some(4228.0),
+            soc_pct: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_needs_a_session_and_is_null_without_data() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/live", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/live", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "sample": null })
+        );
+    }
+
+    #[tokio::test]
+    async fn live_returns_a_fresh_sample_but_not_a_stale_one() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        let cookie = log_in(&app).await;
+
+        // 10 minutes old: too stale to be "live".
+        let stale = live_sample(db::now() - 600);
+        db::insert_live_sample(&pool, &stale).await.unwrap();
+        let response = send(&app, get_request("/api/live", Some(&cookie))).await;
+        assert!(body_json(response).await["sample"].is_null());
+
+        let fresh = live_sample(db::now() - 10);
+        db::insert_live_sample(&pool, &fresh).await.unwrap();
+        let response = send(&app, get_request("/api/live", Some(&cookie))).await;
+        let json = body_json(response).await;
+        let sample = &json["sample"];
+        assert_eq!(sample["ts"], fresh.ts);
+        assert_eq!(sample["pv_w"], 4895.0);
+        assert_eq!(sample["load_w"], 708.0);
+        assert_eq!(sample["grid_w"], 0.0);
+        assert_eq!(sample["battery_w"], 4228.0);
+        assert!(sample["soc_pct"].is_null());
+    }
+
+    #[tokio::test]
+    async fn live_series_validates_input_and_returns_minute_averages() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        let cookie = log_in(&app).await;
+        let bad = [
+            "/api/live/series",
+            "/api/live/series?from=1",
+            "/api/live/series?from=x&to=2",
+            "/api/live/series?from=2&to=1",
+            // 2 days and 1 second.
+            "/api/live/series?from=0&to=172801",
+        ];
+        for uri in bad {
+            let response = send(&app, get_request(uri, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert!(body_json(response).await["error"].is_string(), "{uri}");
+        }
+
+        // Two samples in the minute starting at 1_800_000_000 (a multiple of 60).
+        for (ts, pv) in [(1_800_000_005, 100.0), (1_800_000_035, 300.0)] {
+            let row = Sample {
+                pv_w: Some(pv),
+                ..live_sample(ts)
+            };
+            db::insert_live_sample(&pool, &row).await.unwrap();
+        }
+        let uri = "/api/live/series?from=1800000000&to=1800000059";
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let rows = json["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            serde_json::json!([1_800_000_000, 200.0, 708.0, 0.0, 4228.0, null])
+        );
+
+        // An exact 2-day range is allowed and may be empty.
+        let uri = "/api/live/series?from=0&to=172800";
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["data"], serde_json::json!([]));
     }
 }
