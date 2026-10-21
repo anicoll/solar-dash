@@ -3,8 +3,27 @@ Description=Back up the solar-dash SQLite database
 
 [Service]
 Type=oneshot
+# Run as the service user so SQLite never creates root-owned solar.db-wal or
+# solar.db-shm files that would stop solar-dash opening the database.
+User=solar-dash
+Group=solar-dash
 # sqlite3 ".backup" is an online backup, so it is safe while solar-dash is
 # running (the database uses WAL). In a systemd unit, % must be written as %%.
 ExecStart=/bin/sh -c 'sqlite3 /var/lib/solar-dash/solar.db ".backup /var/backups/solar-dash/solar-$(date +%%F).db"'
 # Keep 14 days of backups.
 ExecStart=/bin/sh -c 'find /var/backups/solar-dash -name "solar-*.db" -mtime +14 -delete'
+
+# Hardening. Only the database directory (SQLite needs to write the -wal/-shm
+# files there) and the backup directory are writable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/solar-dash /var/backups/solar-dash
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+UMask=0077

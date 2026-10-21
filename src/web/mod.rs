@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["ok"], true);
-        assert_eq!(json["last_reading_ts"], 1_800_000_600);
+        assert_eq!(json, serde_json::json!({ "ok": true }));
     }
 
     #[tokio::test]

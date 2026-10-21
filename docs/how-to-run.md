@@ -147,7 +147,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /healthz` | `{"ok":true,"last_reading_ts":...}` (public) |
+| `GET /healthz` | `{"ok":true}` (public) |
 | `GET /api/latest` | The newest value of every point, with its name and unit |
 | `GET /api/series?points=83033,83106&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per point. At most 20 points and 31 days |
 | `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
