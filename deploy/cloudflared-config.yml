@@ -1,0 +1,15 @@
+# Example cloudflared config. Copy to /etc/cloudflared/config.yml and edit.
+# See docs/deploy.md.
+
+# Replace <TUNNEL_ID> with the id printed by `cloudflared tunnel create solar-dash`.
+tunnel: <TUNNEL_ID>
+# The credentials file is named after the tunnel id. After `tunnel create` it is
+# in ~/.cloudflared/; copy it to /etc/cloudflared/ and use that path here.
+credentials-file: /etc/cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  # Replace solar.example.com with your real subdomain.
+  - hostname: solar.example.com
+    service: http://127.0.0.1:8080
+  # Required catch-all: anything else gets a 404.
+  - service: http_status:404

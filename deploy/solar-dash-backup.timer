@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly solar-dash database backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+# Run at next boot if the LXC was off at 03:30.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

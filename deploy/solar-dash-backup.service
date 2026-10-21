@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up the solar-dash SQLite database
+
+[Service]
+Type=oneshot
+# sqlite3 ".backup" is an online backup, so it is safe while solar-dash is
+# running (the database uses WAL). In a systemd unit, % must be written as %%.
+ExecStart=/bin/sh -c 'sqlite3 /var/lib/solar-dash/solar.db ".backup /var/backups/solar-dash/solar-$(date +%%F).db"'
+# Keep 14 days of backups.
+ExecStart=/bin/sh -c 'find /var/backups/solar-dash -name "solar-*.db" -mtime +14 -delete'

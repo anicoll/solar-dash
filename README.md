@@ -12,7 +12,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Live sync (`serve` keeps the database current every 5 minutes)
 - [x] Web server with password login and JSON API
 - [x] Dashboard UI (Now, Day, Month, Year views; ECharts from cdnjs)
-- [ ] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel (next)
+- [x] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
 
 ## Architecture
 
@@ -20,7 +20,7 @@ One binary does everything. A background sync task fetches data from iSolarCloud
 
 ## Running it
 
-See [docs/how-to-run.md](docs/how-to-run.md).
+See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC, systemd, Cloudflare Tunnel), see [docs/deploy.md](docs/deploy.md).
 
 ## Layout
 
@@ -33,6 +33,7 @@ See [docs/how-to-run.md](docs/how-to-run.md).
 - `static/` - the dashboard (`index.html`, `app.js`, `style.css`), compiled into the binary
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`
+- `deploy/` - systemd units, backup timer, cloudflared example and `install.sh`
 - `docs/` - documentation
 - `.vscode/` - recommended extensions and debug config
 - `.github/workflows/ci.yml` - CI (fmt, clippy, tests)
