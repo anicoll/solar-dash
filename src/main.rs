@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod ingest;
 mod isolar;
+mod web;
 
 use std::path::PathBuf;
 
@@ -9,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
+use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -37,6 +39,8 @@ enum Command {
         #[arg(long)]
         from: String,
     },
+    /// Make the password hash for the web dashboard (needs no config file).
+    HashPassword,
     /// Check that the iSolarCloud credentials work.
     LoginTest,
     /// Call any iSolarCloud endpoint and print the result (for exploring the API).
@@ -61,6 +65,15 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // This command runs before the config is loaded, so it works without a config.toml.
+    if matches!(cli.command, Command::HashPassword) {
+        if let Err(err) = hash_password_command() {
+            eprintln!("Hashing failed: {err:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // `?` returns early with the error if loading fails.
     let config = Config::load(&cli.config)?;
     info!(config = %cli.config.display(), "config loaded");
@@ -79,6 +92,8 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        // Handled above, before the config was loaded.
+        Command::HashPassword => unreachable!("handled before loading the config"),
         Command::LoginTest => {
             // `{:#}` prints the whole error chain on one line.
             if let Err(err) = login_test(config).await {
@@ -96,23 +111,55 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Opens the database, logs in and keeps it up to date until Ctrl+C.
-/// (The web server will join this later.)
+/// Opens the database, serves the web dashboard and keeps the data up to date
+/// until Ctrl+C.
 async fn run_serve(config: Config) -> Result<()> {
     let pool = db::open(&config.database.path).await?;
     info!(path = %config.database.path, "database ready");
+    // Check the web settings and the port first, so mistakes fail before any network call.
+    let state = web::AppState::from_config(pool.clone(), &config)?;
+    let listener = TcpListener::bind(&config.server.bind)
+        .await
+        .with_context(|| format!("could not listen on {}", config.server.bind))?;
+
     let mut client = Client::new(config.isolarcloud.clone())?;
     // Failing here, with a clear error, beats failing every 5 minutes.
     client.login().await.context("login failed at startup")?;
 
-    // Completes when Ctrl+C is pressed.
-    let shutdown = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            warn!("could not listen for Ctrl+C: {err}");
-        }
-        info!("Ctrl+C received; stopping");
-    };
-    ingest::run_live_sync(client, &pool, &config.isolarcloud, shutdown).await
+    info!(address = %config.server.bind, "web server started");
+    // Run both until Ctrl+C. `try_join!` polls them together on this task and
+    // returns early if either fails. Each gets its own `ctrl_c` future; one
+    // Ctrl+C wakes them both.
+    tokio::try_join!(
+        ingest::run_live_sync(client, &pool, &config.isolarcloud, shutdown_signal()),
+        web::serve(listener, state, shutdown_signal()),
+    )?;
+    Ok(())
+}
+
+/// Completes when Ctrl+C is pressed.
+async fn shutdown_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!("could not listen for Ctrl+C: {err}");
+    }
+    info!("Ctrl+C received; stopping");
+}
+
+/// Asks for a password twice (nothing is echoed) and prints its hash.
+fn hash_password_command() -> Result<()> {
+    let password = rpassword::prompt_password("Password: ")?;
+    let again = rpassword::prompt_password("Repeat password: ")?;
+    if password != again {
+        bail!("the passwords do not match");
+    }
+    if password.is_empty() {
+        bail!("the password must not be empty");
+    }
+    let hash = web::hash_password(&password)?;
+    println!("Paste this line into the [server] section of config.toml:");
+    println!();
+    println!("password_hash = \"{hash}\"");
+    Ok(())
 }
 
 /// Opens the database, logs in and downloads history starting at `from`.

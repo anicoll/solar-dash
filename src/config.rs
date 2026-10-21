@@ -6,8 +6,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-// Not read yet; a later PR will use it. Remove this then.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub isolarcloud: IsolarCloud,
@@ -60,19 +58,40 @@ impl fmt::Debug for IsolarCloud {
     }
 }
 
-// Not read yet; a later PR will use it. Remove this then.
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct Server {
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Argon2 hash of the dashboard password; make one with `hash-password`.
+    pub password_hash: Option<String>,
+    /// Base64 of at least 64 random bytes, used to sign login cookies.
+    pub session_secret: Option<String>,
 }
 
 impl Default for Server {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            password_hash: None,
+            session_secret: None,
         }
+    }
+}
+
+// Written by hand for the same reason as `IsolarCloud`: keep secrets out of logs.
+impl fmt::Debug for Server {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Server")
+            .field("bind", &self.bind)
+            .field(
+                "password_hash",
+                &self.password_hash.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_secret",
+                &self.session_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
     }
 }
 
@@ -165,6 +184,12 @@ mod tests {
         let cfg: Config = toml::from_str(MINIMAL).unwrap();
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("hunter2"));
+        let with_server = format!(
+            "{MINIMAL}\n[server]\npassword_hash = \"HASHVALUE\"\nsession_secret = \"SECRETVALUE\"\n"
+        );
+        let cfg: Config = toml::from_str(&with_server).unwrap();
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("HASHVALUE") && !shown.contains("SECRETVALUE"));
         assert!(!shown.contains("\"s\""));
         assert!(shown.contains("<redacted>"));
     }

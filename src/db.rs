@@ -196,6 +196,101 @@ pub async fn api_calls_since(pool: &SqlitePool, since_ts: i64) -> Result<i64> {
     Ok(count)
 }
 
+/// The newest value of one point, with the point's name and unit.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct LatestReading {
+    pub point_id: i64,
+    pub name: Option<String>,
+    pub unit: Option<String>,
+    pub ts: i64,
+    pub value: f64,
+}
+
+/// The newest timestamp of any reading in the plant, or `None` if there are none.
+pub async fn max_reading_ts(pool: &SqlitePool, plant_id: i64) -> Result<Option<i64>> {
+    // `MAX` gives one row holding NULL when the table is empty, hence `Option`.
+    let ts = sqlx::query_scalar("SELECT MAX(ts) FROM reading WHERE plant_id = ?")
+        .bind(plant_id)
+        .fetch_one(pool)
+        .await
+        .context("could not read newest timestamp")?;
+    Ok(ts)
+}
+
+/// For each point, its most recent reading that has a value.
+pub async fn latest_readings(pool: &SqlitePool, plant_id: i64) -> Result<Vec<LatestReading>> {
+    sqlx::query_as(
+        "SELECT p.point_id, p.name, p.unit, r.ts, r.value
+         FROM point p
+         JOIN reading r ON r.plant_id = ? AND r.point_id = p.point_id
+          AND r.ts = (SELECT MAX(ts) FROM reading
+                      WHERE plant_id = r.plant_id AND point_id = r.point_id
+                        AND value IS NOT NULL)
+         ORDER BY p.point_id",
+    )
+    .bind(plant_id)
+    .fetch_all(pool)
+    .await
+    .context("could not read latest readings")
+}
+
+/// Name and unit of a point, or `None` if the point is unknown.
+pub async fn point_info(
+    pool: &SqlitePool,
+    point_id: i64,
+) -> Result<Option<(Option<String>, Option<String>)>> {
+    sqlx::query_as("SELECT name, unit FROM point WHERE point_id = ?")
+        .bind(point_id)
+        .fetch_optional(pool)
+        .await
+        .context("could not read point")
+}
+
+/// The `(ts, value)` pairs of one point with `from <= ts < to`, oldest first.
+/// Rows without a value are left out.
+pub async fn readings_in_range(
+    pool: &SqlitePool,
+    plant_id: i64,
+    point_id: i64,
+    from: i64,
+    to: i64,
+) -> Result<Vec<(i64, f64)>> {
+    sqlx::query_as(
+        "SELECT ts, value FROM reading
+         WHERE plant_id = ? AND point_id = ? AND ts >= ? AND ts < ? AND value IS NOT NULL
+         ORDER BY ts",
+    )
+    .bind(plant_id)
+    .bind(point_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read readings")
+}
+
+/// The largest value of one point with `from <= ts < to`, or `None` if there is none.
+pub async fn max_value_in_range(
+    pool: &SqlitePool,
+    plant_id: i64,
+    point_id: i64,
+    from: i64,
+    to: i64,
+) -> Result<Option<f64>> {
+    let max = sqlx::query_scalar(
+        "SELECT MAX(value) FROM reading
+         WHERE plant_id = ? AND point_id = ? AND ts >= ? AND ts < ?",
+    )
+    .bind(plant_id)
+    .bind(point_id)
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await
+    .context("could not read maximum")?;
+    Ok(max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +419,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn range_queries_read_back_readings() {
+        let (_dir, pool) = test_db().await;
+        upsert_point(&pool, &point(1)).await.unwrap();
+        let null_reading = Reading {
+            point_id: 1,
+            ts: 300,
+            value: None,
+        };
+        let rows = [reading(1, 100, 1.0), reading(1, 200, 5.0), null_reading];
+        upsert_readings(&pool, 7, &rows).await.unwrap();
+
+        assert_eq!(max_reading_ts(&pool, 7).await.unwrap(), Some(300));
+        assert_eq!(max_reading_ts(&pool, 8).await.unwrap(), None);
+        // The end is exclusive and NULL values are skipped.
+        let got = readings_in_range(&pool, 7, 1, 100, 300).await.unwrap();
+        assert_eq!(got, vec![(100, 1.0), (200, 5.0)]);
+        assert_eq!(
+            max_value_in_range(&pool, 7, 1, 0, 1000).await.unwrap(),
+            Some(5.0)
+        );
+        assert_eq!(max_value_in_range(&pool, 7, 1, 0, 100).await.unwrap(), None);
+
+        // The newest reading that has a value is 200, not the NULL at 300.
+        let latest = latest_readings(&pool, 7).await.unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!((latest[0].ts, latest[0].value), (200, 5.0));
+        assert_eq!(latest[0].name.as_deref(), Some("Power"));
     }
 }

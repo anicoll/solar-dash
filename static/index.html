@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>solar-dash</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f5f6f8; --fg: #1b1f24; --card: #fff; --line: #d8dce2; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111418; --fg: #e6e8eb; --card: #1b2026; --line: #343b44; }
+  }
+  body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg);
+         font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+        padding: 12px; overflow-x: auto; font-size: 13px; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; cursor: pointer;
+           border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <h1>solar-dash</h1>
+  <p>Dashboard coming soon.</p>
+  <form method="post" action="/logout"><button type="submit">Log out</button></form>
+  <h2>/api/latest</h2>
+  <pre id="latest">loading...</pre>
+</main>
+<script>
+  fetch("/api/latest")
+    .then((r) => r.json())
+    .then((data) => { document.getElementById("latest").textContent = JSON.stringify(data, null, 2); })
+    .catch((err) => { document.getElementById("latest").textContent = String(err); });
+</script>
+</body>
+</html>
