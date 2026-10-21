@@ -471,13 +471,17 @@ async fn sync_once(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> 
     Ok(())
 }
 
-/// A sync that logs in again and retries once if iSolarCloud reports an error.
-/// The token-expiry codes are not confirmed, so any `ApiError` gets one retry.
+/// A sync that logs in first if there is no token yet, and logs in again and
+/// retries once if iSolarCloud reports an error. The token-expiry codes are not
+/// confirmed, so any `ApiError` gets one retry.
 async fn sync_with_relogin(
     client: &mut Client,
     pool: &SqlitePool,
     config: &IsolarCloud,
 ) -> Result<()> {
+    if !client.is_logged_in() {
+        client.login().await?;
+    }
     match sync_once(client, pool, config).await {
         Err(err) if err.downcast_ref::<ApiError>().is_some() => {
             warn!("iSolarCloud returned an error ({err:#}); logging in again");
@@ -488,7 +492,30 @@ async fn sync_with_relogin(
     }
 }
 
+/// First wait after a failed attempt to reach iSolarCloud.
+const BACKOFF_START: Duration = Duration::from_secs(60);
+/// The wait never grows beyond this.
+const BACKOFF_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// How long to wait after the `failures`-th failure in a row (1-based):
+/// 1 min, then doubling, capped at 30 min.
+fn backoff_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    (BACKOFF_START * 2u32.pow(doublings)).min(BACKOFF_CAP)
+}
+
+/// Checks the sync settings without touching the network, so `serve` can fail
+/// fast on a config mistake that no retry would fix.
+pub fn check_sync_config(config: &IsolarCloud) -> Result<()> {
+    PlantSetup::from_config(config).map(|_| ())
+}
+
 /// Keeps the database up to date until `shutdown` completes.
+///
+/// Cloud trouble never ends the loop: a failed login or sync is logged and
+/// retried (logins with [`backoff_delay`]). Only a setting that can never work
+/// (see [`check_sync_config`]) or a database error while setting up returns
+/// `Err`, before any network call.
 ///
 /// The loop takes the `Client` by value because `login` needs `&mut self`.
 /// Nothing else uses the client while we sync, so owning it is simpler than
@@ -507,18 +534,40 @@ pub async fn run_live_sync(
     // round. Pinning lets `select!` poll it by `&mut` without moving it.
     tokio::pin!(shutdown);
     info!("live sync started");
+    // Failed attempts to log in since the last success.
+    let mut login_failures: u32 = 0;
     loop {
         // Dropping an unfinished sync is safe: each window is saved
         // atomically, along with its cursor.
+        let logged_in_before = client.is_logged_in();
         tokio::select! {
             _ = &mut shutdown => break,
             result = sync_with_relogin(&mut client, pool, config) => {
                 // A failed tick is not fatal: try again on the next one.
                 if let Err(err) = result {
+                    if !client.is_logged_in() {
+                        // Not logged in: iSolarCloud is down or slow, or the
+                        // login is wrong. Back off instead of hammering it.
+                        login_failures += 1;
+                        let wait = backoff_delay(login_failures);
+                        warn!(
+                            "login to iSolarCloud failed ({err:#}); retrying in {}s",
+                            wait.as_secs()
+                        );
+                        tokio::select! {
+                            _ = &mut shutdown => break,
+                            _ = tokio::time::sleep(wait) => {}
+                        }
+                        continue;
+                    }
                     warn!("sync failed: {err:#}");
                 }
             }
         }
+        if !logged_in_before && client.is_logged_in() {
+            info!("logged in to iSolarCloud");
+        }
+        login_failures = 0;
 
         let delay = next_tick_delay(db::now());
         debug!(seconds = delay.as_secs(), "sleeping until next sync");
@@ -534,6 +583,45 @@ pub async fn run_live_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_doubles_to_the_cap() {
+        let secs: Vec<u64> = (1..=8).map(|n| backoff_delay(n).as_secs()).collect();
+        assert_eq!(secs, [60, 120, 240, 480, 960, 1800, 1800, 1800]);
+        assert_eq!(backoff_delay(0).as_secs(), 60);
+        assert_eq!(backoff_delay(u32::MAX).as_secs(), 1800);
+    }
+
+    #[tokio::test]
+    async fn live_sync_survives_a_failing_login_and_stops_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!("solar-dash-test-{}", std::process::id()));
+        let path = dir.join("test.db");
+        let pool = db::open(path.to_str().unwrap()).await.unwrap();
+        // Nothing listens on port 1, so every login fails at once.
+        let config = IsolarCloud {
+            gateway: "http://127.0.0.1:1".into(),
+            appkey: "k".into(),
+            access_key: "a".into(),
+            rsa_public_key: String::new(),
+            encrypt: false,
+            username: "u".into(),
+            password: "p".into(),
+            plant_id: Some(1),
+            points: vec![83022],
+            timezone: "Australia/Adelaide".into(),
+        };
+        let client = Client::new(config.clone()).unwrap();
+        // The first backoff is a minute; shutdown must cut it short.
+        let shutdown = tokio::time::sleep(Duration::from_millis(500));
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_live_sync(client, &pool, &config, shutdown),
+        )
+        .await;
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.expect("did not stop promptly on shutdown").is_ok());
+    }
 
     const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
     const KEY: &str = "1204811_11_0_0";

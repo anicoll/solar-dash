@@ -66,7 +66,7 @@ if you want older history):
 cargo run -- serve
 ```
 
-`serve` logs in, then syncs straight away and every 5 minutes after that
+`serve` logs in. If iSolarCloud is down or the login fails, `serve` keeps running (dashboard and Modbus included) and retries the login after 1 minute, doubling up to every 30 minutes. Once logged in it syncs straight away and every 5 minutes after that
 (about a minute after each 5-minute mark, when the data has landed). Stop it
 with Ctrl+C. It makes about 12 calls an hour, about 8,900 a month, well inside
 the API limits. If it was stopped for a while it catches up from where it left
