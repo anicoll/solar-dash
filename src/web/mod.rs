@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(point["ts"], 1_800_000_600);
         assert_eq!(point["value"], 1002.0);
 
-        // The placeholder page and the logout flow work with the cookie.
+        // The dashboard page loads with the cookie.
         let response = send(&app, get_request("/", Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
@@ -306,6 +306,28 @@ mod tests {
                 .unwrap()
                 .starts_with("text/html")
         );
+    }
+
+    #[tokio::test]
+    async fn static_files_are_served_after_login() {
+        let (_dir, app) = test_app().await;
+
+        // Static files need a session like everything else.
+        let response = send(&app, get_request("/static/app.js", None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let cookie = log_in(&app).await;
+        for (uri, content_type) in [
+            ("/static/app.js", "javascript"),
+            ("/static/style.css", "text/css"),
+        ] {
+            let response = send(&app, get_request(uri, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let actual = response.headers()[header::CONTENT_TYPE].to_str().unwrap();
+            assert!(actual.contains(content_type), "{uri}: {actual}");
+        }
+        let response = send(&app, get_request("/static/missing.js", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
