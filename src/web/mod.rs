@@ -11,9 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
+use axum::body::Body;
+use axum::extract::Request;
 use axum::extract::{FromRef, Path};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum_extra::extract::cookie::Key;
@@ -22,6 +25,7 @@ use chrono_tz::Tz;
 use rust_embed::RustEmbed;
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
 use tracing::warn;
 
 use crate::config::Config;
@@ -181,7 +185,47 @@ pub fn router(state: AppState) -> Router {
         .route("/login", get(auth::login_page).post(auth::login))
         .route("/logout", post(auth::logout));
 
-    protected.merge(public).with_state(state)
+    // Compression is outermost so it sees every response; the security
+    // headers sit just inside it and cover every route, including 401s.
+    protected
+        .merge(public)
+        .with_state(state)
+        .layer(middleware::from_fn(security_headers))
+        .layer(CompressionLayer::new())
+}
+
+/// Content-Security-Policy: everything comes from this origin, except ECharts
+/// from cdnjs. Inline styles are allowed (the login page has a `<style>`).
+const CSP: &str = "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; \
+                   style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; \
+                   frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
+/// Adds the security headers to every response, and `Cache-Control: no-store`
+/// to the (private) `/api/` ones.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let is_api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    if is_api {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 /// Serves requests on `listener` until `shutdown` completes.
@@ -196,24 +240,47 @@ pub async fn serve(
         .context("web server failed")
 }
 
-async fn index() -> Response {
-    serve_asset("index.html")
+async fn index(headers: HeaderMap) -> Response {
+    serve_asset("index.html", &headers)
 }
 
-async fn static_file(Path(path): Path<String>) -> Response {
-    serve_asset(&path)
+async fn static_file(Path(path): Path<String>, headers: HeaderMap) -> Response {
+    serve_asset(&path, &headers)
 }
 
-/// Looks `path` up in the embedded files and sends it with the right content type.
-fn serve_asset(path: &str) -> Response {
-    match Assets::get(path) {
-        Some(file) => (
-            [(header::CONTENT_TYPE, file.metadata.mimetype().to_string())],
-            file.data.into_owned(),
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+/// Looks `path` up in the embedded files and sends it with the right content
+/// type. The ETag is the file's hash and `no-cache` makes browsers revalidate
+/// every time, so a new build shows at once and an unchanged file costs a 304.
+fn serve_asset(path: &str, request_headers: &HeaderMap) -> Response {
+    let Some(file) = Assets::get(path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let etag = format!("\"{}\"", hex::encode(file.metadata.sha256_hash()));
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+
+    let matches = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_start_matches("W/"))
+                .any(|t| t == "*" || t == etag)
+        });
+    if matches {
+        return (StatusCode::NOT_MODIFIED, response_headers).into_response();
     }
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(file.metadata.mimetype()).unwrap(),
+    );
+    // Release builds embed the bytes in the binary; borrow them instead of copying.
+    let body = match file.data {
+        std::borrow::Cow::Borrowed(bytes) => Body::from(bytes),
+        std::borrow::Cow::Owned(bytes) => Body::from(bytes),
+    };
+    (response_headers, body).into_response()
 }
 
 #[cfg(test)]
@@ -588,6 +655,68 @@ mod tests {
         let response = send(&app, get_request(uri, Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["data"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_pages_and_api() {
+        let (_dir, app) = test_app().await;
+        let cookie = log_in(&app).await;
+        for (uri, no_store) in [("/login", false), ("/api/latest", true)] {
+            let response = send(&app, get_request(uri, Some(&cookie))).await;
+            let h = response.headers();
+            assert!(
+                h[header::CONTENT_SECURITY_POLICY]
+                    .to_str()
+                    .unwrap()
+                    .contains("frame-ancestors 'none'")
+            );
+            assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+            assert_eq!(h["x-frame-options"], "DENY");
+            assert_eq!(
+                h.get(header::CACHE_CONTROL)
+                    .is_some_and(|v| v == "no-store"),
+                no_store
+            );
+        }
+        // Errors get them too.
+        let response = send(&app, get_request("/api/latest", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn responses_are_gzipped_when_accepted() {
+        let (_dir, app) = test_app().await;
+        let cookie = log_in(&app).await;
+        let request = Request::get("/static/app.js")
+            .header(header::COOKIE, &cookie)
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let response = send(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+    }
+
+    #[tokio::test]
+    async fn static_files_use_etags() {
+        let (_dir, app) = test_app().await;
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/static/app.js", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let etag = response.headers()[header::ETAG].clone();
+
+        let request = Request::get("/static/app.js")
+            .header(header::COOKIE, &cookie)
+            .header(header::IF_NONE_MATCH, &etag)
+            .body(Body::empty())
+            .unwrap();
+        let response = send(&app, request).await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()[header::ETAG], etag);
+        assert!(body_text(response).await.is_empty());
     }
 
     /// A simple tariff: 100 c supply, `import_cents` import, 5 c export, no windows.
