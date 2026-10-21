@@ -679,6 +679,49 @@ pub async fn charge_sessions_in_range(
     .context("could not read charge sessions")
 }
 
+/// Saves the odometer reading (km) for a local day, replacing the day's
+/// earlier one.
+pub async fn save_odometer(
+    pool: &SqlitePool,
+    date: &str,
+    odometer_km: f64,
+    now: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO ev_odometer_daily (date, odometer_km, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT (date) DO UPDATE SET odometer_km = excluded.odometer_km,
+                                          updated_at = excluded.updated_at",
+    )
+    .bind(date)
+    .bind(odometer_km)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("could not save odometer")?;
+    Ok(())
+}
+
+/// The odometer rows (local date, km) from `from` to `to`, oldest first, plus
+/// the last row before `from`, so the first day's km can be worked out.
+pub async fn odometer_in_range(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+) -> Result<Vec<(String, f64)>> {
+    sqlx::query_as(
+        "SELECT date, odometer_km FROM ev_odometer_daily
+         WHERE date >= COALESCE((SELECT MAX(date) FROM ev_odometer_daily WHERE date < ?), ?)
+           AND date <= ?
+         ORDER BY date",
+    )
+    .bind(from)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read odometer")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,12 +758,13 @@ mod tests {
         let (_dir, pool) = test_db().await;
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
-             ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session')",
+             ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session',
+              'ev_odometer_daily')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 6);
+        assert_eq!(tables.len(), 7);
     }
 
     #[tokio::test]
@@ -1134,5 +1178,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(both, vec![day("2026-09-14")]);
+    }
+
+    #[tokio::test]
+    async fn odometer_keeps_the_latest_reading_of_each_day() {
+        let (_dir, pool) = test_db().await;
+        save_odometer(&pool, "2026-10-01", 1000.0, 1).await.unwrap();
+        save_odometer(&pool, "2026-10-03", 1050.5, 2).await.unwrap();
+        save_odometer(&pool, "2026-10-03", 1060.0, 3).await.unwrap();
+        save_odometer(&pool, "2026-10-05", 1100.0, 4).await.unwrap();
+        let dates = |rows: Vec<(String, f64)>| -> Vec<String> {
+            rows.into_iter().map(|(date, _)| date).collect()
+        };
+        // From the 3rd: the row before it comes along as the starting point.
+        let got = odometer_in_range(&pool, "2026-10-03", "2026-10-31")
+            .await
+            .unwrap();
+        assert_eq!(got[1], ("2026-10-03".to_string(), 1060.0));
+        assert_eq!(dates(got), vec!["2026-10-01", "2026-10-03", "2026-10-05"]);
+        // A day with no row of its own still finds the one before it.
+        let got = odometer_in_range(&pool, "2026-10-04", "2026-10-04")
+            .await
+            .unwrap();
+        assert_eq!(dates(got), vec!["2026-10-03"]);
+        // Nothing before the first row, and the end is respected.
+        let got = odometer_in_range(&pool, "2026-09-01", "2026-10-02")
+            .await
+            .unwrap();
+        assert_eq!(dates(got), vec!["2026-10-01"]);
     }
 }

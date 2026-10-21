@@ -180,6 +180,15 @@ pub struct Teslamate {
     /// Broker login. Give both or neither.
     pub username: Option<String>,
     pub password: Option<String>,
+    /// What petrol costs, in cents per litre. No default: without it the
+    /// car-versus-petrol comparison is off.
+    pub petrol_cents_per_litre: Option<f64>,
+    /// How much petrol the comparison car uses per 100 km.
+    #[serde(default = "default_petrol_litres_per_100km")]
+    pub petrol_litres_per_100km: f64,
+    /// A flat price per kWh for charging away from home. Without it, away
+    /// sessions are left uncosted.
+    pub away_cents_per_kwh: Option<f64>,
 }
 
 impl Teslamate {
@@ -189,6 +198,20 @@ impl Teslamate {
             self.username.is_some() == self.password.is_some(),
             "[teslamate] needs both username and password, or neither"
         );
+        // `> 0.0` is false for NaN too.
+        anyhow::ensure!(
+            self.petrol_litres_per_100km > 0.0,
+            "petrol_litres_per_100km in [teslamate] must be more than 0"
+        );
+        for (name, value) in [
+            ("petrol_cents_per_litre", self.petrol_cents_per_litre),
+            ("away_cents_per_kwh", self.away_cents_per_kwh),
+        ] {
+            anyhow::ensure!(
+                value.is_none_or(|v| v > 0.0),
+                "{name} in [teslamate] must be more than 0"
+            );
+        }
         Ok(())
     }
 }
@@ -410,6 +433,10 @@ fn default_teslamate_topic_prefix() -> String {
     "teslamate".to_string()
 }
 
+fn default_petrol_litres_per_100km() -> f64 {
+    7.5
+}
+
 fn default_gateway() -> String {
     "https://augateway.isolarcloud.com".to_string()
 }
@@ -554,6 +581,9 @@ mod tests {
         assert_eq!(teslamate.topic_prefix, "teslamate");
         assert_eq!(teslamate.username, None);
         assert_eq!(teslamate.password, None);
+        assert_eq!(teslamate.petrol_cents_per_litre, None);
+        assert_eq!(teslamate.petrol_litres_per_100km, 7.5);
+        assert_eq!(teslamate.away_cents_per_kwh, None);
         assert!(teslamate.check().is_ok());
     }
 
@@ -576,6 +606,31 @@ mod tests {
         );
         assert!(parse("username = \"u\"\n").check().is_err());
         assert!(parse("password = \"p\"\n").check().is_err());
+    }
+
+    #[test]
+    fn teslamate_petrol_and_away_prices_must_be_positive() {
+        let parse = |extra: &str| -> Teslamate {
+            let text = format!("{MINIMAL}\n[teslamate]\nhost = \"h\"\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().teslamate.unwrap()
+        };
+        let good = parse(
+            "petrol_cents_per_litre = 195.0\npetrol_litres_per_100km = 6.5\naway_cents_per_kwh = 65.0\n",
+        );
+        assert!(good.check().is_ok());
+        assert_eq!(good.petrol_cents_per_litre, Some(195.0));
+        assert_eq!(good.petrol_litres_per_100km, 6.5);
+        assert_eq!(good.away_cents_per_kwh, Some(65.0));
+        for bad in [
+            "petrol_cents_per_litre = 0.0",
+            "petrol_cents_per_litre = -190.0",
+            "petrol_litres_per_100km = 0.0",
+            "petrol_litres_per_100km = nan",
+            "away_cents_per_kwh = -1.0",
+        ] {
+            let err = parse(bad).check().unwrap_err();
+            assert!(format!("{err:#}").contains("more than 0"), "{bad}: {err:#}");
+        }
     }
 
     const TARIFF: &str = r#"

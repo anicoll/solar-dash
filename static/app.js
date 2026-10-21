@@ -1180,10 +1180,58 @@
     };
   }
 
+  const NOT_CONFIGURED_PETROL =
+    'Set petrol_cents_per_litre in the [teslamate] section of the config file to compare the car with petrol.';
+
+  /** "1,234 km", or a dash when there is no figure. */
+  const kmText = (km) => (km == null ? '–' : `${Math.round(km).toLocaleString('en-AU')} km`);
+
+  /** A cost per km in cents, or a dash. */
+  const centsText = (c) => (c == null ? '–' : `${c.toFixed(1)} c`);
+
+  /**
+   * The "Car vs petrol" panel: this month and the last 12 months from
+   * /api/ev/summary. It stays hidden when there is no car data at all (for
+   * example TeslaMate is off), and says what to set when petrol has no price.
+   */
+  async function loadEvCompare() {
+    const today = todayStr();
+    // The first day of the month 11 months ago, so the months shown are whole.
+    const from = new Date(Date.UTC(+today.slice(0, 4), +today.slice(5, 7) - 12, 1)).toISOString().slice(0, 10);
+    const data = await api(`/api/ev/summary?from=${from}&to=${today}`);
+    if (state.view !== 'savings') return;
+    const t = data.total;
+    const hasData = t.km > 0 || t.home_kwh > 0 || t.away_kwh > 0;
+    $('ev-compare').hidden = !hasData;
+    if (!hasData) return;
+    setConfigured('ev-compare', data.configured, NOT_CONFIGURED_PETROL);
+    if (!data.configured) return;
+    const month = data.months.find((m) => m.month === today.slice(0, 7));
+    const rows = [
+      ['Driven', (p) => kmText(p && p.km)],
+      ['Charging cost', (p) => money(p && p.charging_cost)],
+      ['Petrol would cost', (p) => money(p && p.petrol_cost)],
+      ['Saved', (p) => money(p && p.saved), 'save'],
+      ['EV cost per km', (p) => centsText(p && p.ev_cents_per_km)],
+      ['Petrol cost per km', (p) => centsText(p && p.petrol_cents_per_km)],
+    ];
+    fillTable('ev-compare-table', rows.map(([label, text, cls]) => [
+      [label], [text(month), cls], [text(t), cls],
+    ]));
+    let note = `Compared with a petrol car using ${data.petrol_litres_per_100km} L/100km at ${data.petrol_cents_per_litre} c/L.`;
+    if (t.away_kwh > 0 && t.away_cost == null) {
+      note += ` ${Math.round(t.away_kwh)} kWh charged away from home is not counted: set away_cents_per_kwh to include it.`;
+    }
+    $('ev-compare-note').textContent = note;
+  }
+
   async function loadSavingsView(range) {
     for (const b of document.querySelectorAll('[data-range]')) {
       b.setAttribute('aria-pressed', String(b.dataset.range === range));
     }
+    // The panel does not depend on the tariff or the range, and a failure
+    // here only hides it.
+    loadEvCompare().catch(() => { $('ev-compare').hidden = true; });
     const data = await loadSavings();
     if (state.view !== 'savings' || state.range !== range) return;
     setConfigured('savings', data.configured, NOT_CONFIGURED_TARIFF);

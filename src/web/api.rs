@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use chrono::{Days, LocalResult, NaiveDate, TimeZone};
+use chrono::{DateTime, Days, LocalResult, NaiveDate, TimeZone};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,7 +25,9 @@ const MAX_LIVE_SERIES_SECS: i64 = 2 * 24 * 3600;
 const MAX_DAILY_DAYS: u64 = 400;
 const MAX_EV_SESSIONS_SECS: i64 = MAX_DAILY_DAYS as i64 * 24 * 3600;
 /// Without `from`, `/api/daily` returns this many days.
-const DEFAULT_DAILY_DAYS: u64 = 30;
+pub(super) const DEFAULT_DAILY_DAYS: u64 = 30;
+/// Without `from`, `/api/ev/summary` covers this many days (about 12 months).
+const DEFAULT_SUMMARY_DAYS: u64 = 365;
 /// The longest time one counter step is spread over (see `derive_power`).
 pub(super) const MAX_SPREAD_SECS: i64 = 30 * 60;
 /// The longest time one live sample is held (see `integrate`). Samples come
@@ -226,6 +228,24 @@ struct CostedSession {
     coverage: Option<f64>,
 }
 
+/// What a session at home cost, worked out from the live samples. `None`
+/// without a `[tariff]` or for a session with no energy.
+async fn home_session_cost(
+    state: &AppState,
+    session: &db::ChargeSession,
+    now: i64,
+) -> Result<Option<ev_cost::SessionCost>, ApiError> {
+    let Some(schedule) = &state.tariff else {
+        return Ok(None);
+    };
+    // `to` is exclusive in the query, so add a second to include the end.
+    let end = session.ended_at.unwrap_or(now);
+    let samples = db::live_samples_raw(&state.pool, session.started_at, end + 1).await?;
+    Ok(ev_cost::session_cost(
+        session, &samples, schedule, state.tz, now,
+    ))
+}
+
 /// Charging sessions that overlap the range, as
 /// `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`.
 /// A session that has not ended has `ended_at` null and counts as running
@@ -250,16 +270,10 @@ pub async fn ev_sessions(
     let now = db::now();
     let mut costed = Vec::new();
     for session in db::charge_sessions_in_range(&state.pool, from, to, now).await? {
-        let at_home = matches!(session.geofence.as_deref(), None | Some("Home"));
-        let cost = match &state.tariff {
-            Some(schedule) if at_home => {
-                // `to` is exclusive in the query, so add a second to include the end.
-                let end = session.ended_at.unwrap_or(now);
-                let samples =
-                    db::live_samples_raw(&state.pool, session.started_at, end + 1).await?;
-                ev_cost::session_cost(&session, &samples, schedule, state.tz, now)
-            }
-            _ => None,
+        let cost = if ev_cost::is_home(&session) {
+            home_session_cost(&state, &session, now).await?
+        } else {
+            None
         };
         costed.push(CostedSession {
             solar_kwh: cost.as_ref().map(|c| round2(c.solar_kwh)),
@@ -324,6 +338,78 @@ pub async fn series(
         series.push(stored_series(&state, None, point_id, from, to + 1).await?);
     }
     Ok(Json(json!({ "series": series })))
+}
+
+/// Charging, km and petrol for each month of the range, as
+/// `{"configured":bool,"months":[{month,km,home_kwh,home_cost,away_kwh,away_cost,charging_cost,petrol_litres,petrol_cost,saved,ev_cents_per_km,petrol_cents_per_km},...],"total":{...},"petrol_cents_per_litre":..,"petrol_litres_per_100km":..}`.
+/// The dates are local, `from` and `to` included, at most 400 days; without
+/// `from` it covers the last [`DEFAULT_SUMMARY_DAYS`] days. Money is in dollars.
+///
+/// km come from the daily odometer readings, and each session counts in the
+/// month it started. Home sessions are costed like `/api/ev/sessions` does;
+/// away sessions at `away_cents_per_kwh` (see `ev_cost::summarise`).
+/// `configured` is false, and the money fields are null, without a
+/// `petrol_cents_per_litre` in `[teslamate]`.
+pub async fn ev_summary(
+    State(state): State<AppState>,
+    Query(params): Query<DailyParams>,
+) -> ApiResult {
+    let (from, count) = date_range(
+        params.from.as_deref(),
+        params.to.as_deref(),
+        state.tz,
+        MAX_DAILY_DAYS,
+        DEFAULT_SUMMARY_DAYS,
+    )?;
+    let to = from + Days::new(count - 1);
+    let (start, _) = day_bounds_or_error(from, state.tz)?;
+    let (_, end) = day_bounds_or_error(to, state.tz)?;
+
+    let odometer = db::odometer_in_range(&state.pool, &from.to_string(), &to.to_string()).await?;
+    let km_by_month = ev_cost::monthly_km(&odometer, &from.to_string());
+
+    let prices = state.ev_prices;
+    let now = db::now();
+    let mut sessions = Vec::new();
+    // The query includes sessions that began before the range and are still
+    // going; they belong to an earlier month.
+    for session in db::charge_sessions_in_range(&state.pool, start, end - 1, now).await? {
+        let (Some(kwh), Some(started)) = (
+            ev_cost::session_energy_kwh(&session),
+            DateTime::from_timestamp(session.started_at, 0),
+        ) else {
+            continue;
+        };
+        if session.started_at < start {
+            continue;
+        }
+        let at_home = ev_cost::is_home(&session);
+        let cost_cents = if !at_home {
+            prices.away_cents_per_kwh.map(|cents| cents * kwh)
+        } else if prices.petrol_cents_per_litre.is_some() {
+            home_session_cost(&state, &session, now)
+                .await?
+                .map(|cost| cost.cost_cents)
+        } else {
+            // Without a petrol price the money is not shown, so skip the work.
+            None
+        };
+        sessions.push(ev_cost::SessionEnergy {
+            month: started.with_timezone(&state.tz).format("%Y-%m").to_string(),
+            at_home,
+            kwh,
+            cost_cents,
+        });
+    }
+
+    let summary = ev_cost::summarise(&prices, &km_by_month, &sessions);
+    Ok(Json(json!({
+        "configured": summary.configured,
+        "months": summary.months,
+        "total": summary.total,
+        "petrol_cents_per_litre": prices.petrol_cents_per_litre,
+        "petrol_litres_per_100km": prices.petrol_litres_per_100km,
+    })))
 }
 
 fn parse_date(name: &str, text: &str) -> Result<NaiveDate, ApiError> {
@@ -637,13 +723,14 @@ async fn day_totals(
 }
 
 /// Reads the optional `from` and `to` dates (default: the last
-/// [`DEFAULT_DAILY_DAYS`] days ending today) and checks the range. Gives the
+/// `default_days` days ending today) and checks the range. Gives the
 /// first date and how many days the range has, at most `max_days`.
 pub(super) fn date_range(
     from: Option<&str>,
     to: Option<&str>,
     tz: Tz,
     max_days: u64,
+    default_days: u64,
 ) -> Result<(NaiveDate, u64), ApiError> {
     let to = match to {
         Some(text) => parse_date("to", text)?,
@@ -651,7 +738,7 @@ pub(super) fn date_range(
     };
     let from = match from {
         Some(text) => parse_date("from", text)?,
-        None => to - Days::new(DEFAULT_DAILY_DAYS - 1),
+        None => to - Days::new(default_days - 1),
     };
     if to < from {
         return Err(ApiError::bad_request("to must not be before from"));
@@ -671,6 +758,7 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
         params.to.as_deref(),
         state.tz,
         MAX_DAILY_DAYS,
+        DEFAULT_DAILY_DAYS,
     )?;
 
     let live_range = db::live_ts_range(&state.pool).await?;

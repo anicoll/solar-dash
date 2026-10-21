@@ -16,8 +16,8 @@ use serde_json::json;
 
 use super::AppState;
 use super::api::{
-    ApiError, ApiResult, MAX_HOLD_SECS, Spread, date_range, day_bounds_or_error, live_totals,
-    spread_steps, today,
+    ApiError, ApiResult, DEFAULT_DAILY_DAYS, MAX_HOLD_SECS, Spread, date_range,
+    day_bounds_or_error, live_totals, spread_steps, today,
 };
 use crate::cost::{self, DayCost, Interval, Tariff, TariffSchedule};
 use crate::db;
@@ -403,6 +403,7 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
         params.to.as_deref(),
         state.tz,
         MAX_COSTS_DAYS,
+        DEFAULT_DAILY_DAYS,
     )?;
     let Some(tariff) = &state.tariff else {
         return Ok(Json(json!({ "configured": false })));
