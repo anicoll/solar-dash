@@ -10,7 +10,8 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] SQLite storage (schema, migrations, typed queries)
 - [x] Backfill of historical data (`backfill --from`)
 - [x] Live sync (`serve` keeps the database current every 5 minutes)
-- [ ] Web dashboard
+- [x] Web server with password login and JSON API
+- [ ] Dashboard UI (next)
 - [ ] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
 
 ## Architecture
@@ -28,6 +29,8 @@ See [docs/how-to-run.md](docs/how-to-run.md).
 - `src/db.rs` - SQLite storage: opening, migrations and typed queries
 - `migrations/` - SQL schema, applied automatically on startup
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
+- `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`) and embedded static files
+- `static/` - files served by the web server, compiled into the binary
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`
 - `docs/` - documentation

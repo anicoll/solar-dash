@@ -70,14 +70,65 @@ cargo run -- serve
 (about a minute after each 5-minute mark, when the data has landed). Stop it
 with Ctrl+C. It makes about 12 calls an hour, about 8,900 a month, well inside
 the API limits. If it was stopped for a while it catches up from where it left
-off; without a backfill it starts from midnight today. The web dashboard will
-be added to `serve` later.
+off; without a backfill it starts from midnight today.  `serve` also runs the
+[web dashboard](#web-dashboard).
 
 Use a different config file with `--config path/to/file.toml`.
 For more logging:
 
 ```sh
 RUST_LOG=debug cargo run -- serve
+```
+
+## Web dashboard
+
+`serve` also starts a web server (on `bind` in the `[server]` section, by
+default `127.0.0.1:8080`). It is protected by a password, which you set once:
+
+```sh
+cargo run -- hash-password
+```
+
+Type the password twice (nothing is shown as you type). Paste the
+`password_hash = "..."` line it prints into the `[server]` section of
+`config.toml`. This command needs no config file, so you can run it first.
+
+Also add a `session_secret` so you stay logged in across restarts (see
+`config.example.toml`):
+
+```sh
+openssl rand -base64 64 | tr -d '\n'; echo
+```
+
+It prints 88 characters ending in `=`; copy just those. (The `echo` stops
+zsh adding a `%` after the output, which isn't part of the secret.)
+
+Without it, `serve` makes a new one on each start and logs a warning, which
+logs everyone out whenever it restarts.
+
+Then run `cargo run -- serve` and open <http://127.0.0.1:8080>. For now the
+page is a placeholder that shows the latest values; the real dashboard comes
+next. After 5 wrong passwords in 15 minutes, logins are refused for 15
+minutes. A login lasts 30 days.
+
+The JSON API (all of it needs a login, except `/healthz`; without one `/api/*`
+answers 401). Times are unix seconds (UTC), dates are local dates in your
+`timezone`:
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /healthz` | `{"ok":true,"last_reading_ts":...}` (public) |
+| `GET /api/latest` | The newest value of every point, with its name and unit |
+| `GET /api/series?points=83033,83106&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per point. At most 20 points and 31 days |
+| `GET /api/day?date=YYYY-MM-DD` | One local day (default today): PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
+| `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days |
+
+For example, once logged in with a browser, try
+<http://127.0.0.1:8080/api/latest>. With curl, log in and keep the cookie:
+
+```sh
+curl -c cookies.txt -d 'password=YOUR_PASSWORD' http://127.0.0.1:8080/login
+curl -b cookies.txt http://127.0.0.1:8080/api/latest
 ```
 
 ## Backfill history
