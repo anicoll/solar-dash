@@ -331,27 +331,247 @@
     return row;
   }
 
-  /** Power tile in kW with a direction word: positive means `pos`, negative `neg`. */
-  function flowTile(label, w, pos, neg, colourVar, extra) {
-    if (w == null) return powerTile(label, '–', 'kW', colourVar, extra);
-    const word = w > 0 ? pos : w < 0 ? neg : 'idle';
-    return powerTile(`${label} · ${word}`, kw(Math.abs(w)), 'kW', colourVar, extra);
-  }
-
   function setStatus(text, stale) {
     $('updated-text').textContent = text;
     $('updated').classList.toggle('stale', !!stale);
   }
 
-  function renderLiveTiles(sample) {
-    const kwTile = (label, w, colourVar) => powerTile(label, w == null ? '–' : kw(w), 'kW', colourVar);
-    $('live-tiles').replaceChildren(
-      kwTile('Solar', sample.pv_w, '--c-pv'),
-      kwTile('Home', sample.load_w, '--c-load'),
-      flowTile('Battery', sample.battery_w, 'charging', 'discharging', '--c-battery',
-        sample.soc_pct == null ? null : socBar(sample.soc_pct)),
-      flowTile('Grid', sample.grid_w, 'importing', 'exporting', '--c-grid'),
+  const FLOW_MIN_W = 20;     // below this a flow counts as idle
+  const FLOW_FULL_W = 5000;  // flows at or above this animate at full speed
+  // Sungrow-style layout: solar on top, home in the middle, battery bottom-left, grid bottom-right.
+  // tx/ty/anchor place the three text lines (label, value, note) beside or below each node.
+  const FLOW_NODES = {
+    solar: { x: 200, y: 64, colour: '--c-pv', label: 'Solar', tx: 238, ty: 22, anchor: 'start' },
+    home: { x: 200, y: 188, colour: '--c-load', label: 'Home', tx: 238, ty: 154, anchor: 'start' },
+    battery: { x: 70, y: 280, colour: '--c-battery', label: 'Battery', tx: 70, ty: 324, anchor: 'middle' },
+    grid: { x: 330, y: 280, colour: '--c-grid', label: 'Grid', tx: 330, ty: 324, anchor: 'middle' },
+  };
+  // Rounded right-angle routes. Each path runs in its positive direction (from -> to); `rev` is the colour when it runs backwards.
+  const FLOW_EDGES = {
+    pvHome: { d: 'M200 92V160', colour: '--c-pv' },
+    pvBat: { d: 'M172 64H84Q70 64 70 78V252', colour: '--c-pv' },
+    pvGrid: { d: 'M228 64H316Q330 64 330 78V252', colour: '--c-pv' },
+    batHome: { d: 'M94.6 268H171Q185 268 185 254V212', colour: '--c-battery' },
+    gridHome: { d: 'M305.4 268H229Q215 268 215 254V212', colour: '--c-grid' },
+    batGrid: { d: 'M94.6 292H305.4', colour: '--c-battery', rev: '--c-grid' },
+  };
+  const FLOW_ICONS = {
+    home: ['M3 11.5L12 3.5l9 8', 'M5.5 10v10.5h13V10', 'M10 20.5v-6h4v6', 'M16.5 7V4h2v5'],
+    grid: ['M12 2L7.5 22M12 2l4.5 20', 'M9 5h6', 'M6 8.5h12', 'M8.2 15h7.6', 'M9.4 8.5l5.7 6.5M14.6 8.5L8.9 15', 'M6 8.5v2M18 8.5v2'],
+  };
+
+  /** SVG element with the given attributes and optional class. */
+  function svgEl(tag, attrs, cls) {
+    const e = document.createElementNS(SVG_NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (cls) e.setAttribute('class', cls);
+    return e;
+  }
+
+  /** SVG <text> at (x, y). */
+  function svgText(x, y, text, cls, anchor) {
+    const t = svgEl('text', { x, y, 'text-anchor': anchor }, cls);
+    t.textContent = text;
+    return t;
+  }
+
+  /** Sets the --flow colour of an SVG element to a theme colour token. */
+  function flowColour(e, colourVar) {
+    e.style.setProperty('--flow', `var(${colourVar})`);
+    return e;
+  }
+
+  /** Stroked icon group from a list of path strings. */
+  function flowPaths(list, cls) {
+    const g = svgEl('g', {}, cls);
+    for (const d of list) g.appendChild(svgEl('path', { d }));
+    return g;
+  }
+
+  /** Line icon for a node on a 24x24 grid; returns the group plus the parts that animate. */
+  function flowIcon(kind) {
+    const g = svgEl('g', {}, 'flow-icon');
+    const parts = {};
+    if (kind === 'solar') {
+      const rays = svgEl('g', {}, 'flow-rays');
+      for (let i = 0; i < 8; i++) {
+        const a = i * Math.PI / 4, c = Math.cos(a), s = Math.sin(a);
+        rays.appendChild(svgEl('path', { d: `M${(12 + 7.6 * c).toFixed(2)} ${(12 + 7.6 * s).toFixed(2)}L${(12 + 10 * c).toFixed(2)} ${(12 + 10 * s).toFixed(2)}` }));
+      }
+      parts.rays = rays;
+      g.append(svgEl('circle', { cx: 12, cy: 12, r: 4.2 }), rays);
+    } else if (kind === 'battery') {
+      parts.fill = svgEl('rect', { x: 4.6, y: 9, width: 0, height: 6, rx: 0.8 }, 'flow-soc');
+      g.append(svgEl('rect', { x: 2.5, y: 6.5, width: 17, height: 11, rx: 2.4 }),
+        svgEl('path', { d: 'M21.5 10.5v3' }), parts.fill);
+    } else {
+      g.appendChild(flowPaths(FLOW_ICONS[kind]));
+    }
+    return { g, parts };
+  }
+
+  /** Shared gradients and glow filters; ids are prefixed flow- (there is one diagram per page). */
+  function flowDefs() {
+    const defs = svgEl('defs', {});
+    for (const [id, dev] of [['flow-blur-lg', 7], ['flow-blur-sm', 2.2]]) {
+      const f = svgEl('filter', { id, filterUnits: 'userSpaceOnUse', x: -40, y: -40, width: 480, height: 460 });
+      f.appendChild(svgEl('feGaussianBlur', { stdDeviation: dev }));
+      defs.appendChild(f);
+    }
+    for (const kind in FLOW_NODES) {
+      const g = svgEl('radialGradient', { id: `flow-g-${kind}`, cx: 0.5, cy: 0.38, r: 0.75 });
+      for (const [off, op] of [[0, 0.5], [1, 0.07]]) {
+        const stop = svgEl('stop', { offset: off, 'stop-opacity': op });
+        stop.style.setProperty('stop-color', `var(${FLOW_NODES[kind].colour})`);
+        g.appendChild(stop);
+      }
+      defs.appendChild(g);
+    }
+    return defs;
+  }
+
+  /** Card-like round node: glow, tinted disc, icon and its three text lines. */
+  function flowNode(kind) {
+    const n = FLOW_NODES[kind];
+    const g = flowColour(svgEl('g', {}, 'flow-node'), n.colour);
+    const icon = flowIcon(kind);
+    icon.g.setAttribute('transform', `translate(${n.x - 18} ${n.y - 18}) scale(1.5)`);
+    const label = svgText(n.tx, n.ty, n.label, 'flow-label', n.anchor);
+    const value = svgText(n.tx, n.ty + 18, '', 'flow-value', n.anchor);
+    const note = svgText(n.tx, n.ty + 34, '', 'flow-note', n.anchor);
+    g.append(
+      svgEl('circle', { cx: n.x, cy: n.y, r: 31, filter: 'url(#flow-blur-lg)' }, 'flow-halo'),
+      svgEl('circle', { cx: n.x, cy: n.y, r: 28 }, 'flow-disc'),
+      svgEl('circle', { cx: n.x, cy: n.y, r: 28, fill: `url(#flow-g-${kind})` }, 'flow-tint'),
+      icon.g, label, value, note,
     );
+    return { g, value, note, ...icon.parts };
+  }
+
+  /** Dots per flow and seconds per traversal for a flow of `w` watts. */
+  function flowPace(w) {
+    const a = Math.min(1, Math.abs(w) / FLOW_FULL_W);
+    return { n: a >= 0.7 ? 4 : a >= 0.3 ? 3 : 2, secs: 3.5 - 2.5 * a };
+  }
+
+  /** Sets dur on every animation in a flow. */
+  function flowSetDur(motions, secs) {
+    for (const m of motions) m.setAttribute('dur', `${secs.toFixed(2)}s`);
+  }
+
+  /** Glowing line plus staggered travelling dots for a flow; reuses the current ones when only the speed changed. */
+  function flowUpdate(f, w) {
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const on = w != null && Math.abs(w) >= FLOW_MIN_W;
+    const pace = on ? flowPace(w) : { n: 0, secs: 0 };
+    const key = on ? `${w < 0 ? '-' : '+'}${reduce ? 0 : pace.n}` : 'off';
+    if (key === f.key) {
+      if (f.motions.length && Math.abs(pace.secs - f.secs) > 0.15 * f.secs) { f.secs = pace.secs; flowSetDur(f.motions, pace.secs); }
+      return on;
+    }
+    f.key = key; f.secs = pace.secs; f.motions = [];
+    f.holder.replaceChildren();
+    if (on) flowColour(f.holder, w < 0 && f.rev ? f.rev : f.colour);
+    if (!on) return false;
+    f.holder.append(
+      svgEl('path', { d: f.d, filter: 'url(#flow-blur-sm)' }, 'flow-line-glow'),
+      svgEl('path', { d: f.d }, 'flow-line'),
+    );
+    const dur = `${pace.secs.toFixed(2)}s`;
+    for (let i = 0; !reduce && i < pace.n; i++) {
+      const begin = `${(-pace.secs * i / pace.n).toFixed(2)}s`;
+      const dot = svgEl('g', { opacity: 0 }, 'flow-dot');
+      dot.append(svgEl('circle', { r: 6, filter: 'url(#flow-blur-sm)' }, 'flow-dot-halo'), svgEl('circle', { r: 2.6 }, 'flow-dot-core'));
+      const move = svgEl('animateMotion', { dur, begin, repeatCount: 'indefinite', calcMode: 'linear' });
+      if (w < 0) { move.setAttribute('keyPoints', '1;0'); move.setAttribute('keyTimes', '0;1'); }
+      move.appendChild(svgEl('mpath', { href: `#${f.id}` }));
+      const fade = svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0', keyTimes: '0;0.12;0.88;1', dur, begin, repeatCount: 'indefinite' });
+      dot.append(move, fade);
+      f.motions.push(move, fade);
+      f.holder.appendChild(dot);
+    }
+    return true;
+  }
+
+  let flowView = null;  // the one live diagram, updated in place so animations keep running between refreshes
+
+  /** Builds the static diagram skeleton once. */
+  function flowBuild() {
+    const root = svgEl('svg', { viewBox: '0 0 400 366', role: 'img' }, 'flow');
+    const view = { root, flows: {}, nodes: {} };
+    root.appendChild(flowDefs());
+    for (const kind in FLOW_EDGES) {
+      const e = FLOW_EDGES[kind], id = `flow-p-${kind}`;
+      const g = flowColour(svgEl('g', {}), e.colour);
+      g.appendChild(svgEl('path', { id, d: e.d }, 'flow-track'));
+      const holder = svgEl('g', {});
+      g.appendChild(holder);
+      root.appendChild(g);
+      view.flows[kind] = { id, d: e.d, colour: e.colour, rev: e.rev, holder, key: '', motions: [], secs: 0 };
+    }
+    for (const kind in FLOW_NODES) {
+      view.nodes[kind] = flowNode(kind);
+      root.appendChild(view.nodes[kind].g);
+    }
+    return view;
+  }
+
+  /** Splits pv/load/battery/grid watts into the six pairwise flows (pv first to home, then battery, then grid; battery discharge serves home before export). */
+  function splitFlows(s) {
+    const pos = (w) => Math.max(w == null ? 0 : w, 0);
+    const pv = pos(s.pv_w), load = pos(s.load_w), charge = pos(s.battery_w), discharge = pos(-s.battery_w);
+    const imp = pos(s.grid_w), exp = pos(-s.grid_w);
+    const pvHome = Math.min(pv, load);
+    let r = pv - pvHome;
+    const pvBat = Math.min(r, charge);
+    r -= pvBat;
+    const pvGrid = Math.min(r, exp);
+    let loadLeft = load - pvHome;
+    const batHome = Math.min(discharge, loadLeft);
+    loadLeft -= batHome;
+    const batGrid = Math.min(discharge - batHome, exp - pvGrid);
+    const gridHome = Math.min(imp, loadLeft);
+    const gridBat = Math.min(imp - gridHome, charge - pvBat);
+    return { pvHome, pvBat, pvGrid, batHome, gridHome, batGrid: batGrid - gridBat };
+  }
+
+  /** Animated Solar / Home / Battery / Grid power-flow diagram in the Sungrow app layout. */
+  function flowDiagram(s) {
+    if (!flowView) flowView = flowBuild();
+    const word = (w, pos, neg) => (w == null || Math.abs(w) < FLOW_MIN_W ? 'idle' : w > 0 ? pos : neg);
+    const val = (w) => (w == null ? '–' : `${kw(Math.abs(w))} kW`);
+    const batWord = word(s.battery_w, 'charging', 'discharging');
+    const gridWord = word(s.grid_w, 'importing', 'exporting');
+    const soc = s.soc_pct == null ? '' : `${Math.round(s.soc_pct)}%`;
+    const watts = { solar: s.pv_w, home: s.load_w, grid: s.grid_w, battery: s.battery_w };
+    const notes = {
+      solar: [word(s.pv_w, 'generating', 'generating'), '--c-pv'],
+      home: [word(s.load_w, 'consuming', 'consuming'), '--c-load'],
+      grid: [gridWord, s.grid_w < 0 ? '--c-export' : '--c-import'],
+      battery: [soc ? `${batWord} · ${soc}` : batWord, s.battery_w < 0 ? '--c-discharge' : '--c-charge'],
+    };
+    const { root, flows, nodes } = flowView;
+    const split = splitFlows(s);
+    for (const kind in flows) flowUpdate(flows[kind], split[kind]);
+    for (const kind in watts) {
+      const n = nodes[kind];
+      n.g.classList.toggle('on', watts[kind] != null && Math.abs(watts[kind]) >= FLOW_MIN_W);
+      n.value.textContent = val(watts[kind]);
+      n.note.textContent = notes[kind][0];
+      n.note.style.setProperty('--note', `var(${notes[kind][1]})`);
+    }
+    nodes.solar.rays.classList.toggle('spin', s.pv_w != null && s.pv_w >= FLOW_MIN_W);
+    const pct = s.soc_pct == null ? 0 : Math.max(0, Math.min(100, s.soc_pct));
+    nodes.battery.fill.setAttribute('width', (12.8 * pct / 100).toFixed(2));
+    nodes.battery.fill.classList.toggle('low', pct <= 15);
+    root.setAttribute('aria-label', `Solar ${val(s.pv_w)}, home ${val(s.load_w)}, battery ${batWord} ${val(s.battery_w)}` +
+      `${soc ? ` at ${soc}` : ''}, grid ${gridWord} ${val(s.grid_w)}`);
+    return root;
+  }
+
+  function renderLiveTiles(sample) {
+    const host = $('live-tiles'), diagram = flowDiagram(sample);
+    if (diagram.parentNode !== host || host.childNodes.length !== 1) host.replaceChildren(diagram);
     setStatus(`Live from inverter · updated ${ageText(Date.now() / 1000 - sample.ts)}`, false);
   }
 
