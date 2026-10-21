@@ -304,6 +304,7 @@ table.data td { padding: 8px; text-align: right; border-top: 1px solid var(--bor
 table.data th:first-child, table.data td:first-child { text-align: left; }
 table.data td:first-child { font-family: var(--font); }
 table.data td.save { color: var(--save); }
+table.data.compact { min-width: 0; }
 .kpi.positive .value { color: var(--save); }
 .page-title { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
 @media (min-width: 760px) { .page-title { font-size: 34px; } }

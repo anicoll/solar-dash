@@ -9,13 +9,16 @@
 //! be unit tested. [`run`] does the network part. The car's state is not
 //! stored: the topics are retained, so the broker hands us the latest values
 //! again after every restart. Only charging sessions go in the database, a
-//! few writes per charge (see [`Recorder`]).
+//! few writes per charge (see [`Recorder`]), and the odometer once in a while
+//! (see [`Odometer`]).
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::DateTime;
+use chrono_tz::Tz;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -35,6 +38,9 @@ const SAVE_EVERY_SECS: i64 = 5 * 60;
 /// The longest time one charger power reading is held when adding up the
 /// energy used. A longer gap between messages is not counted.
 const MAX_HOLD_SECS: i64 = 5 * 60;
+/// The odometer row of the day is rewritten at most this often. It sits on
+/// an SSD too.
+const ODOMETER_EVERY_SECS: i64 = 30 * 60;
 
 /// What we know about the car. A field is `None` when TeslaMate has not sent
 /// it yet, sent an empty value, or sent something we could not read.
@@ -66,6 +72,8 @@ pub struct CarState {
     pub time_to_full_charge_h: Option<f64>,
     /// The named place the car is at (for example "Home"), if it is at one.
     pub geofence: Option<String>,
+    /// The odometer, km.
+    pub odometer_km: Option<f64>,
     /// Unix seconds, UTC, when the last message was applied.
     pub updated_ts: i64,
 }
@@ -140,6 +148,7 @@ pub fn apply(state: &mut CarState, name: &str, payload: &str) -> bool {
         "charge_limit_soc" => state.charge_limit_soc_pct = parse_number(name, payload),
         "time_to_full_charge" => state.time_to_full_charge_h = parse_number(name, payload),
         "geofence" => state.geofence = parse_text(payload),
+        "odometer" => state.odometer_km = parse_number(name, payload),
         _ => return false,
     }
     true
@@ -307,6 +316,41 @@ async fn record(
     }
 }
 
+/// Decides when to save the odometer. Like [`Recorder`] it only decides
+/// (and so can be unit tested); [`run`] does the writing. The latest reading
+/// of each local day is kept, and a write happens on the first reading of a
+/// new day, then at most every [`ODOMETER_EVERY_SECS`], and never for a
+/// reading that has not changed (the car's odometer sits still while parked).
+struct Odometer {
+    tz: Tz,
+    /// The local day, km and unix seconds of the last write.
+    last: Option<(String, f64, i64)>,
+}
+
+impl Odometer {
+    fn new(tz: Tz) -> Self {
+        Self { tz, last: None }
+    }
+
+    /// Looks at the car's newest state at time `now`. Gives the local date
+    /// ("YYYY-MM-DD") and km to write, if it is time to.
+    fn next(&mut self, state: &CarState, now: i64) -> Option<(String, f64)> {
+        let km = state.odometer_km?;
+        let date = DateTime::from_timestamp(now, 0)?
+            .with_timezone(&self.tz)
+            .date_naive()
+            .to_string();
+        if let Some((last_date, last_km, saved_at)) = &self.last
+            && *last_date == date
+            && (*last_km == km || now - saved_at < ODOMETER_EVERY_SECS)
+        {
+            return None;
+        }
+        self.last = Some((date.clone(), km, now));
+        Some((date, km))
+    }
+}
+
 /// The pause after each failed connection attempt: it doubles up to a
 /// limit, and starts over once a connection works. A plain struct with no
 /// sleeping of its own, so it can be unit tested.
@@ -334,13 +378,16 @@ impl Backoff {
 }
 
 /// Follows the car's topics on the broker and keeps `car` up to date, and
-/// records its charging sessions in the database, until `shutdown` completes. Connection errors are logged (the first one, and
+/// records its charging sessions and odometer in the database, until
+/// `shutdown` completes. `tz` decides where a day ends for the odometer.
+/// Connection errors are logged (the first one, and
 /// when it recovers) and never end the loop: TeslaMate may be down, and the
 /// rest of `serve` must keep going without it.
 pub async fn run(
     config: Teslamate,
     car: Car,
     pool: SqlitePool,
+    tz: Tz,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let mut options = MqttOptions::new("solar-dash", &config.host, config.port);
@@ -365,6 +412,7 @@ pub async fn run(
             None
         });
     let mut recorder = Recorder::new(open, db::now());
+    let mut odometer = Odometer::new(tz);
     // Whether the last attempt failed, so the log gets one line per outage.
     let mut failing = false;
 
@@ -392,7 +440,13 @@ pub async fn run(
             Ok(Event::Incoming(Packet::Publish(message))) => {
                 handle_publish(&car, &base, &message.topic, &message.payload);
                 if let Some(state) = car.get() {
-                    record(&pool, &mut recorder, car_id, &state, db::now()).await;
+                    let now = db::now();
+                    record(&pool, &mut recorder, car_id, &state, now).await;
+                    if let Some((date, km)) = odometer.next(&state, now)
+                        && let Err(err) = db::save_odometer(&pool, &date, km, now).await
+                    {
+                        warn!("could not save the odometer: {err:#}");
+                    }
                 }
             }
             Ok(_) => {}
@@ -451,6 +505,7 @@ mod tests {
             applied("time_to_full_charge", "1.5").time_to_full_charge_h,
             Some(1.5)
         );
+        assert_eq!(applied("odometer", "12345.6").odometer_km, Some(12345.6));
         assert_eq!(applied("charger_power", "0").charger_power_kw, Some(0.0));
         assert_eq!(
             applied("charger_power", "-1.5").charger_power_kw,
@@ -522,7 +577,7 @@ mod tests {
     #[test]
     fn unknown_topic_changes_nothing() {
         let mut state = CarState::default();
-        assert!(!apply(&mut state, "odometer", "12345"));
+        assert!(!apply(&mut state, "odometer_extra", "12345"));
         assert!(!apply(&mut state, "", "x"));
         assert!(!apply(&mut state, "charger_power_extra", "1"));
         assert_eq!(state, CarState::default());
@@ -564,7 +619,7 @@ mod tests {
     fn publish_for_unknown_or_other_topics_is_ignored() {
         let car = Car::default();
         let base = "teslamate/cars/1/";
-        handle_publish(&car, base, "teslamate/cars/1/odometer", b"1");
+        handle_publish(&car, base, "teslamate/cars/1/healthy", b"true");
         // Another car, and a different namespace.
         handle_publish(&car, base, "teslamate/cars/2/battery_level", b"43");
         handle_publish(&car, base, "other/cars/1/battery_level", b"43");
@@ -750,6 +805,51 @@ mod tests {
             recorder.next(&state, 2002),
             Some(Step::End(9, open.progress))
         );
+    }
+
+    fn driven(km: f64) -> CarState {
+        CarState {
+            odometer_km: Some(km),
+            ..CarState::default()
+        }
+    }
+
+    /// Unix time of a local Adelaide clock time in September 2026 (+09:30).
+    fn adelaide(day: u32, hour: u32, minute: u32) -> i64 {
+        use chrono::TimeZone;
+        chrono_tz::Australia::Adelaide
+            .with_ymd_and_hms(2026, 9, day, hour, minute, 0)
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn odometer_is_saved_at_most_every_half_hour() {
+        let mut odometer = Odometer::new(chrono_tz::Australia::Adelaide);
+        // Nothing to save until the car has sent its odometer.
+        assert_eq!(
+            odometer.next(&CarState::default(), adelaide(15, 8, 0)),
+            None
+        );
+        let first = Some(("2026-09-15".to_string(), 1000.0));
+        assert_eq!(odometer.next(&driven(1000.0), adelaide(15, 8, 0)), first);
+        // It moved, but a write was just made.
+        assert_eq!(odometer.next(&driven(1010.0), adelaide(15, 8, 29)), None);
+        let later = Some(("2026-09-15".to_string(), 1012.0));
+        assert_eq!(odometer.next(&driven(1012.0), adelaide(15, 8, 30)), later);
+        // Parked: the same reading is not written again, however long it is.
+        assert_eq!(odometer.next(&driven(1012.0), adelaide(15, 14, 0)), None);
+    }
+
+    #[test]
+    fn odometer_saves_at_once_on_a_new_local_day() {
+        let mut odometer = Odometer::new(chrono_tz::Australia::Adelaide);
+        odometer.next(&driven(1000.0), adelaide(15, 23, 50));
+        // Ten minutes later, past local midnight (still the 15th in UTC).
+        let next_day = Some(("2026-09-16".to_string(), 1000.0));
+        assert_eq!(odometer.next(&driven(1000.0), adelaide(16, 0, 0)), next_day);
+        // Even a parked car gets a row for each day it is seen on.
+        assert_eq!(odometer.next(&driven(1000.0), adelaide(16, 0, 5)), None);
     }
 
     #[test]

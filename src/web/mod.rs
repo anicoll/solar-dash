@@ -31,6 +31,7 @@ use tower_http::compression::CompressionLayer;
 
 use crate::config::Config;
 use crate::cost::TariffSchedule;
+use crate::ev_cost::EvPrices;
 use crate::modbus::Latest;
 use crate::teslamate::Car;
 use auth::LockoutMap;
@@ -69,6 +70,8 @@ pub struct AppState {
     car: Car,
     /// The parsed `[tariff]` and `[[previous_tariff]]` sections; `None` turns the cost API off.
     tariff: Option<Arc<TariffSchedule>>,
+    /// The petrol and away-from-home prices from `[teslamate]`.
+    ev_prices: EvPrices,
     /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
     purchases: Arc<[Purchase]>,
     /// Assumed yearly electricity price rise (percent) in the payback projection.
@@ -103,6 +106,7 @@ impl AppState {
             latest: Latest::default(),
             car: Car::default(),
             tariff: None,
+            ev_prices: EvPrices::default(),
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
         })
@@ -117,6 +121,12 @@ impl AppState {
     /// Turns on the cost API with these plans.
     pub fn with_tariff(mut self, tariff: Option<TariffSchedule>) -> Self {
         self.tariff = tariff.map(Arc::new);
+        self
+    }
+
+    /// Sets the prices the car-versus-petrol summary uses.
+    pub fn with_ev_prices(mut self, prices: EvPrices) -> Self {
+        self.ev_prices = prices;
         self
     }
 
@@ -140,6 +150,11 @@ impl AppState {
     /// The slot the TeslaMate task writes the car's state to.
     pub fn car(&self) -> Car {
         self.car.clone()
+    }
+
+    /// The plant's time zone, which decides where a day ends.
+    pub fn tz(&self) -> Tz {
+        self.tz
     }
 
     /// Builds the state from the config, with clear errors for missing settings.
@@ -169,9 +184,19 @@ impl AppState {
             .map(|current| TariffSchedule::from_config(current, &config.previous_tariff))
             .transpose()?;
         let purchases = payback::purchases_from_config(&config.system.purchase)?;
+        let ev_prices = config
+            .teslamate
+            .as_ref()
+            .map(|t| EvPrices {
+                petrol_cents_per_litre: t.petrol_cents_per_litre,
+                petrol_litres_per_100km: t.petrol_litres_per_100km,
+                away_cents_per_kwh: t.away_cents_per_kwh,
+            })
+            .unwrap_or_default();
         Ok(Self::new(pool, plant_id, tz, password_hash, key)?
             .with_cookie_secure(config.server.cookie_secure)
             .with_tariff(tariff)
+            .with_ev_prices(ev_prices)
             .with_purchases(purchases)
             .with_price_rise_percent(config.system.price_rise_percent))
     }
@@ -203,6 +228,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/live", get(api::live))
         .route("/api/live/series", get(api::live_series))
         .route("/api/ev/sessions", get(api::ev_sessions))
+        .route("/api/ev/summary", get(api::ev_summary))
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
@@ -965,6 +991,123 @@ mod tests {
         let json = body_json(response).await;
         assert!(json["sessions"][0]["cost"].is_null());
         assert_eq!(json["sessions"][0]["energy_used_kwh"], 7.4);
+    }
+
+    #[tokio::test]
+    async fn ev_summary_compares_charging_with_petrol() {
+        let (_dir, _app, pool) = costs_app().await;
+        let router_with = |prices: EvPrices| {
+            let hash = hash_password(PASSWORD).unwrap();
+            let tz = chrono_tz::Australia::Adelaide;
+            router(
+                AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+                    .unwrap()
+                    .with_tariff(Some(flat_tariff()))
+                    .with_ev_prices(prices),
+            )
+        };
+        let petrol = EvPrices {
+            petrol_cents_per_litre: Some(195.0),
+            petrol_litres_per_100km: 8.0,
+            away_cents_per_kwh: Some(60.0),
+        };
+        let app = router_with(petrol);
+        let uri = "/api/ev/summary?from=2026-09-01&to=2026-09-30";
+        let response = send(&app, get_request(uri, None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let bad = [
+            "/api/ev/summary?from=x",
+            "/api/ev/summary?from=2026-09-02&to=2026-09-01",
+            // 401 days.
+            "/api/ev/summary?from=2025-01-01&to=2026-02-05",
+        ];
+        for uri in bad {
+            let response = send(&app, get_request(uri, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert!(body_json(response).await["error"].is_string(), "{uri}");
+        }
+        // Nothing recorded yet. Without dates it covers the last 12 months.
+        let response = send(&app, get_request("/api/ev/summary", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["months"], serde_json::json!([]));
+        assert_eq!(json["total"]["km"], 0.0);
+
+        // 100 km in September (the August reading is the starting point), a
+        // home session of 7.4 kWh at 25 c, and 10 kWh away at 60 c.
+        db::save_odometer(&pool, "2026-08-31", 1000.0, 1)
+            .await
+            .unwrap();
+        db::save_odometer(&pool, "2026-09-20", 1100.0, 2)
+            .await
+            .unwrap();
+        let start = SEP_15_START + 10 * 3600;
+        for (offset, geofence, kwh) in [(0, "Home", 7.4), (86_400, "Servo", 10.0)] {
+            let progress = db::ChargeProgress {
+                energy_used_kwh: Some(kwh),
+                ..db::ChargeProgress::default()
+            };
+            let id = db::start_charge_session(&pool, 1, start + offset, None, Some(geofence))
+                .await
+                .unwrap();
+            db::end_charge_session(&pool, id, start + offset + 3600, &progress)
+                .await
+                .unwrap();
+        }
+        for ts in (start..=start + 3600).step_by(15) {
+            let mut sample = live_sample(ts);
+            (sample.pv_w, sample.load_w) = (Some(0.0), Some(8000.0));
+            (sample.grid_w, sample.battery_w) = (Some(8000.0), Some(0.0));
+            db::insert_live_sample(&pool, &sample).await.unwrap();
+        }
+
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["petrol_cents_per_litre"], 195.0);
+        assert_eq!(json["petrol_litres_per_100km"], 8.0);
+        let months = json["months"].as_array().unwrap();
+        assert_eq!(months.len(), 1);
+        assert_eq!(months[0]["month"], "2026-09");
+        assert_eq!(months[0]["saved"], 7.75);
+        let total = &json["total"];
+        assert_eq!(total["km"], 100.0);
+        assert_eq!(total["home_kwh"], 7.4);
+        assert_eq!(total["home_cost"], 1.85);
+        assert_eq!(total["away_kwh"], 10.0);
+        assert_eq!(total["away_cost"], 6.0);
+        assert_eq!(total["charging_cost"], 7.85);
+        // 100 km at 8 L/100km is 8 L, at $1.95.
+        assert_eq!(total["petrol_litres"], 8.0);
+        assert_eq!(total["petrol_cost"], 15.6);
+        assert_eq!(total["saved"], 7.75);
+        assert_eq!(total["ev_cents_per_km"], 7.85);
+        assert_eq!(total["petrol_cents_per_km"], 15.6);
+
+        // Without an away price the away sessions are listed but not costed.
+        let app = router_with(EvPrices {
+            away_cents_per_kwh: None,
+            ..petrol
+        });
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["total"]["away_kwh"], 10.0);
+        assert!(json["total"]["away_cost"].is_null());
+        assert_eq!(json["total"]["charging_cost"], 1.85);
+
+        // Without a petrol price the comparison is off.
+        let app = router_with(EvPrices::default());
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], false);
+        assert_eq!(json["total"]["km"], 100.0);
+        for key in ["home_cost", "charging_cost", "petrol_cost", "saved"] {
+            assert!(json["total"][key].is_null(), "{key}");
+        }
     }
 
     #[tokio::test]

@@ -164,6 +164,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}, "car": {...}}`. `sample` is from Modbus, or `null` if there is none or it is over 5 minutes old. `car` is the Tesla's charge state from TeslaMate (see [TeslaMate](#teslamate-optional)), or `null` if that is off or nothing has arrived yet |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
 | `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`. A session still charging has `ended_at` `null` and counts as running until now. `energy_used_kwh` is taken from the wall, `energy_added_kwh` reaches the battery. The last six fields (kWh by source, dollars, and the share 0 to 1 of the session the inverter samples cover) are `null` without a `[tariff]`, away from home (geofence not "Home") or with no energy. At most 400 days. Empty without a `[teslamate]` section |
+| `GET /api/ev/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` | The car against petrol, by month and in total: `{"configured":true,"months":[{month,km,home_kwh,home_cost,away_kwh,away_cost,charging_cost,petrol_litres,petrol_cost,saved,ev_cents_per_km,petrol_cents_per_km},...],"total":{...},"petrol_cents_per_litre":...,"petrol_litres_per_100km":...}`. Local dates, both included, at most 400 days; without `from` it covers the last 365 days. Money is in dollars. `away_cost` is `null` when there were away sessions and no `away_cents_per_kwh`, and the `*_cents_per_km` fields are `null` for 0 km. `configured` is `false`, and the money fields `null`, without a `petrol_cents_per_litre`. See [TeslaMate](#teslamate-optional) |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days. Each day has a `source` (see [Modbus in `serve`](#modbus-in-serve)) |
 | `GET /api/costs?from=YYYY-MM-DD&to=YYYY-MM-DD` | Dollars per local day from the `[tariff]` section: `actual`, `baseline` (no solar or battery), `savings`, zero-import `credit`, and import, export and load kWh, plus `totals`. Default: the last 30 days. At most 1,500 days. Days with no data are left out. Finished days are stored in the database, so repeat requests are fast; editing the `[tariff]` rates makes them be worked out again (editing a `[[previous_tariff]]` only redoes the days on that plan). Days before the current plan are priced on the `[[previous_tariff]]` entry in effect on that day (its `until` is the last day it applies), if any are configured. Without a `[tariff]` section it answers `{"configured":false}` |
 | `GET /api/payback` | How much of the system's cost the savings have covered, from the `[[system.purchase]]` entries and the `[tariff]`: `total_cost`, `saved`, `net`, `recovered_pct`, `rate_per_day` (mean savings over the last 365 days with data), `price_rise_percent` (the `[system]` setting, default 3, that grows that rate each year in the projection), `projected_payback` (`"YYYY-MM"`, `null` once paid back, or `"never"`), the `purchases`, a monthly `series` of cumulative `saved` and `net`, and `by_year` (`partial` when a year has fewer days of data than days). Counts from the first purchase date to today. Without purchases or a `[tariff]` section it answers `{"configured":false}` |
@@ -302,6 +303,39 @@ grid part is priced at that time's import price, so a midday charge in a
 free window costs $0. `solar_value` is what that solar would have earned
 exported instead, and is not part of `cost`. Gaps in the samples over 2
 minutes are left out, and `coverage` says how much of the session was seen.
+
+### Car versus petrol
+
+The car's odometer is saved as one row per local day (table
+`ev_odometer_daily`, in the plant's time zone): the first reading of a new day
+is written at once, then the day's row is updated at most every 30 minutes,
+and only when the reading changed, so a parked car writes nothing. The km on a
+day are its reading minus the previous saved day's. A day with no reading has
+no row; its km land on the next day with one.
+
+To compare charging with petrol, add these to `[teslamate]`:
+
+```toml
+petrol_cents_per_litre = 195.0   # no default: the comparison is off without it
+petrol_litres_per_100km = 7.5    # a comparable petrol car (the default)
+# away_cents_per_kwh = 65.0      # a flat price for charging away from home
+```
+
+South Australian unleaded averages roughly 190-200 c/L in 2026; check a fuel
+price app for what you pay. The Savings view then shows a "Car vs petrol"
+panel with this month and the last 12 months. It is hidden until the car has
+km or charging recorded, and it says which key to set if there is no petrol
+price. `GET /api/ev/summary` gives the same numbers.
+
+- Charging cost is the home sessions (costed as above, so it needs a
+  `[tariff]`) plus the away sessions at `away_cents_per_kwh` times the energy
+  used (or added, if used is missing). Without `away_cents_per_kwh` away
+  sessions are listed in `away_kwh` but not costed, and they do not count in
+  `charging_cost`, so the saving is a little generous if you charge away.
+- Petrol cost is the km times `petrol_litres_per_100km` times the price.
+  Saved is petrol cost minus charging cost. The cents per km are those
+  costs over the km.
+- A session counts in the month it started.
 
 The rest of the state is only kept in memory (the broker keeps the latest
 values, so they come back after a restart). Unlike the Modbus sample, `car` is not hidden

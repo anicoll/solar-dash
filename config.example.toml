@@ -86,6 +86,17 @@ path = "data/solar.db"
 # Only if the broker needs a login. Give both or neither.
 # username = "mqtt-user"
 # password = "mqtt-password"
+# Optional: compare what charging cost with petrol for the same km. Without
+# petrol_cents_per_litre the comparison is off. The South Australian average
+# for unleaded is roughly 190-200 c/L in 2026; check a fuel price app for
+# what you really pay.
+# petrol_cents_per_litre = 195.0
+# How much petrol a comparable petrol car uses per 100 km.
+# petrol_litres_per_100km = 7.5
+# A flat price per kWh for charging away from home (a public charger, say).
+# Without it, away sessions are listed as uncosted. Home is the geofence
+# "Home" (or no geofence at all).
+# away_cents_per_kwh = 65.0
 
 # Optional: electricity prices, used to work out what each day cost and what
 # the solar and battery saved. Without this section cost features are off.
