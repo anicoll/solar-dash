@@ -121,6 +121,10 @@ path = "data/solar.db"
 # It needs the [tariff] section above too. Add one [[system.purchase]] per
 # payment; the cost is in dollars. The first date is where the savings count
 # from.
+# The payback date assumes savings grow with electricity prices by
+# price_rise_percent a year (0 to 20, default 3).
+# [system]
+# price_rise_percent = 3.0
 # [[system.purchase]]
 # name = "Solar, inverter and battery 1"
 # date = "2023-02-21"
