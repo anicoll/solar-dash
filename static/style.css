@@ -236,3 +236,31 @@ input[type="number"] { width: 6.5em; }
   color: var(--muted); background: var(--panel); border-radius: 12px;
 }
 .panel .card.flat .empty { background: var(--panel); }
+
+/* ---------- Savings, Payback, Cost ---------- */
+.view-body { display: flex; flex-direction: column; gap: 16px; }
+@media (min-width: 760px) { .view-body { gap: 24px; } }
+.notice { color: var(--fg-soft); margin: 0; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+@media (min-width: 760px) { .cards { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); } }
+@media (min-width: 760px) { .cards { gap: 16px; } .kpi { padding: 20px; } }
+.kpi {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 16px;
+  display: flex; flex-direction: column; gap: 4px; min-width: 0;
+}
+.kpi .label, .kpi .note { font-size: 13px; color: var(--muted); }
+.kpi .value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 32px; font-weight: 600; line-height: 1.1; }
+@media (min-width: 760px) { .kpi .value { font-size: 36px; } }
+.kpi .unit { font-size: 15px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+.kpi.save { background: var(--save-panel); border-color: var(--save-border); }
+.kpi.save .label, .kpi.save .note { color: var(--save-soft); }
+.kpi.save .value { color: var(--save); }
+.kpi.cost .value { color: var(--cost); }
+
+.table-wrap { overflow-x: auto; }
+table.data { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 520px; }
+table.data th { color: var(--muted); font-weight: 500; padding: 8px; text-align: right; }
+table.data td { padding: 8px; text-align: right; border-top: 1px solid var(--border); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+table.data th:first-child, table.data td:first-child { text-align: left; }
+table.data td:first-child { font-family: var(--font); }
+table.data td.save { color: var(--save); }

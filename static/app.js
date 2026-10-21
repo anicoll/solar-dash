@@ -206,7 +206,8 @@
       const costs = await api(`/api/costs?from=${from}&to=${today}`);
       if (!costs.configured) return { configured: false };
       const saved = payback && payback.configured ? payback.saved : costs.totals.savings;
-      return { configured: true, saved, days: costs.days, totals: costs.totals };
+      const purchases = payback && payback.configured ? payback.purchases : [];
+      return { configured: true, saved, days: costs.days, totals: costs.totals, purchases };
     })();
     savingsCache.promise = p;
     p.catch(() => { savingsCache.at = 0; });
@@ -692,9 +693,157 @@
       `Monthly energy for ${year}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
   }
 
+  // ---------- shared bits for the money views ----------
+
+  /** A big-number card. `cls` is "save", "cost" or "". */
+  function kpi(cls, label, valueText, unit, note) {
+    const k = el('div', `kpi ${cls}`.trim());
+    const v = el('div', 'value', valueText);
+    if (unit) v.appendChild(el('span', 'unit', unit));
+    k.append(el('div', 'label', label), v);
+    if (note) k.appendChild(el('div', 'note', note));
+    return k;
+  }
+
+  /** Shows the "add this to the config" message instead of a view's content. */
+  function setConfigured(prefix, ok, message) {
+    const note = $(`${prefix}-unconfigured`);
+    note.textContent = message;
+    note.hidden = ok;
+    $(`${prefix}-body`).hidden = !ok;
+  }
+
+  /** Groups costed days by month ("YYYY-MM"), or by day, oldest first. */
+  function bucketDays(days, byDay) {
+    const map = new Map();
+    for (const d of days) {
+      const key = byDay ? d.date : d.date.slice(0, 7);
+      let b = map.get(key);
+      if (!b) map.set(key, (b = { key, actual: 0, baseline: 0, savings: 0, credit: 0, creditDays: 0, days: 0 }));
+      b.actual += d.actual;
+      b.baseline += d.baseline;
+      b.savings += d.savings;
+      b.credit += d.credit;
+      if (d.credit > 0) b.creditDays++;
+      b.days++;
+    }
+    return [...map.values()];
+  }
+
+  /** Label for a bucket key: "Feb 2023" for months, "21 Oct" for days. */
+  function bucketLabel(key) {
+    return key.length === 7 ? monthYear(`${key}-01`) : `${+key.slice(8)} ${MONTHS[+key.slice(5, 7) - 1]}`;
+  }
+
+  /** Tooltip HTML from `[marker, name, text]` rows; every API-derived string is escaped. */
+  function moneyTooltip(rows, title) {
+    return `<div style="margin-bottom:4px">${esc(title)}</div>${rows.map(([marker, name, text]) =>
+      `<div style="display:flex;justify-content:space-between;gap:16px"><span>${marker}${esc(name)}</span><b>${esc(text)}</b></div>`).join('')}`;
+  }
+
+  /** Fills a `<table class="data">`'s body from arrays of `[text, className]` cells. */
+  function fillTable(tableId, rows) {
+    const body = $(tableId).tBodies[0];
+    body.replaceChildren(...rows.map((cells) => {
+      const tr = document.createElement('tr');
+      for (const [text, cls] of cells) tr.appendChild(el('td', cls || '', text));
+      return tr;
+    }));
+  }
+
+  // ---------- Savings ----------
+
+  const RANGES = ['month', 'year', 'all'];
+
+  function inRange(days, range) {
+    const today = todayStr();
+    if (range === 'month') return days.filter((d) => d.date.startsWith(today.slice(0, 7)));
+    if (range === 'year') return days.filter((d) => d.date.startsWith(today.slice(0, 4)));
+    return days;
+  }
+
+  function savingsOption(buckets, byDay, purchases) {
+    const th = baseTheme();
+    let run = 0;
+    const cumulative = buckets.map((b) => +(run += b.savings).toFixed(2));
+    const unit = byDay ? 'day' : 'month';
+    const marks = purchases
+      .map((p) => ({ name: p.name, key: byDay ? p.date : p.date.slice(0, 7) }))
+      .filter((p) => buckets.some((b) => b.key === p.key))
+      .slice(1) // the first purchase is where the line starts
+      .map((p) => ({ name: p.name, xAxis: bucketLabel(p.key) }));
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 16, top: 64, bottom: 8, containLabel: true },
+      legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        formatter: (params) => moneyTooltip(
+          params.map((p) => [p.marker, p.seriesName, money(p.value)]), params[0].axisValueLabel),
+      },
+      xAxis: {
+        type: 'category', data: buckets.map((b) => bucketLabel(b.key)),
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
+        axisLine: { lineStyle: { color: th.line } },
+      },
+      yAxis: {
+        type: 'value', name: 'Dollars ($)', nameTextStyle: { color: th.muted },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series: [
+        { name: `Saved per ${unit}`, type: 'bar', data: buckets.map((b) => +b.savings.toFixed(2)), itemStyle: { color: css('--save-bar') }, barMaxWidth: 28 },
+        {
+          name: 'Saved (cumulative)', type: 'line', data: cumulative, showSymbol: false,
+          lineStyle: { width: 3, color: css('--save') }, itemStyle: { color: css('--save') }, z: 5,
+          markLine: marks.length ? {
+            silent: true, symbol: 'none', lineStyle: { color: css('--save-label'), type: 'dashed' },
+            label: { color: css('--save-label'), formatter: '{b}' }, data: marks,
+          } : undefined,
+        },
+      ],
+    };
+  }
+
+  async function loadSavingsView(range) {
+    for (const b of document.querySelectorAll('[data-range]')) {
+      b.setAttribute('aria-pressed', String(b.dataset.range === range));
+    }
+    const data = await loadSavings();
+    if (state.view !== 'savings' || state.range !== range) return;
+    setConfigured('savings', data.configured, NOT_CONFIGURED_TARIFF);
+    if (!data.configured) return;
+    const days = inRange(data.days, range);
+    const sumOf = (key) => days.reduce((a, d) => a + d[key], 0);
+    const saved = range === 'all' ? data.saved : sumOf('savings');
+    const creditDays = days.filter((d) => d.credit > 0).length;
+    $('savings-cards').replaceChildren(
+      kpi('save', 'Saved', money(saved, 0), '', days.length ? `about ${money(saved / days.length)} a day` : ''),
+      kpi('', 'What you paid', money(sumOf('actual'), 0), '', 'supply charge, imports, minus credits'),
+      kpi('', 'Without solar or battery', money(sumOf('baseline'), 0), '', 'same usage at your tariff'),
+      kpi('', 'Evening credit earned', creditDays.toLocaleString('en-AU'), 'days', `of ${days.length.toLocaleString('en-AU')} · ${money(sumOf('credit'), 0)} in credits`),
+    );
+    const byDay = range === 'month';
+    const buckets = bucketDays(days, byDay);
+    showChart('savings-chart', buckets.length > 0, savingsOption(buckets, byDay, data.purchases || []),
+      buckets.length
+        ? `Running total of savings, rising to ${money(saved, 0)}, with savings per ${byDay ? 'day' : 'month'} as bars, in dollars.`
+        : 'Running total of savings: no data');
+    $('savings-table-title').textContent = byDay ? 'By day' : 'By month';
+    $('savings-table').tHead.rows[0].cells[0].textContent = byDay ? 'Day' : 'Month';
+    const nowKey = byDay ? todayStr() : todayStr().slice(0, 7);
+    fillTable('savings-table', buckets.slice().reverse().map((b) => [
+      [bucketLabel(b.key) + (b.key === nowKey && !byDay ? ' (so far)' : '')],
+      [money(b.actual)], [money(b.baseline)], [money(b.savings), 'save'],
+      [byDay ? (b.creditDays ? 'yes' : 'no') : `${b.creditDays} / ${b.days}`],
+    ]));
+  }
+
   // ---------- routing (hash) ----------
 
-  const state = { view: 'now', day: '', month: '', year: 0 };
+  const VIEWS = ['now', 'day', 'month', 'year', 'savings'];
+  const state = { view: 'now', day: '', month: '', year: 0, range: 'all' };
   let timer = null;
   let pollToken = 0;
 
@@ -715,15 +864,22 @@
     try { raw = decodeURIComponent(raw); } catch (e) { raw = ''; } // malformed escapes: fall back to Now
     const [view, value] = raw.split('=');
     const today = todayStr();
-    state.view = ['now', 'day', 'month', 'year'].includes(view) ? view : 'now';
+    state.view = VIEWS.includes(view) ? view : 'now';
+    state.range = view === 'savings' && RANGES.includes(value) ? value : 'all';
     state.day = /^\d{4}-\d{2}-\d{2}$/.test(value || '') && view === 'day' ? value : today;
     state.month = /^\d{4}-\d{2}$/.test(value || '') && view === 'month' ? value : today.slice(0, 7);
     state.year = /^\d{4}$/.test(value || '') && view === 'year' ? +value : +today.slice(0, 4);
   }
 
+  /** The hash for a view, carrying that view's current date or range. */
+  function viewHash(v) {
+    return v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}`
+      : v === 'year' ? `year=${state.year}` : v === 'savings' ? `savings=${state.range}` : 'now';
+  }
+
   function setHash() {
     const v = state.view;
-    const h = v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}` : v === 'year' ? `year=${state.year}` : 'now';
+    const h = viewHash(v);
     if (window.location.hash !== '#' + h) window.location.hash = h; // triggers render via hashchange
     else render();
   }
@@ -735,7 +891,7 @@
       if (tab.dataset.view === state.view) tab.setAttribute('aria-current', 'page');
       else tab.removeAttribute('aria-current');
       const v = tab.dataset.view;
-      tab.setAttribute('href', '#' + (v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}` : v === 'year' ? `year=${state.year}` : 'now'));
+      tab.setAttribute('href', '#' + viewHash(v));
     }
     clearTimeout(timer);
     timer = null;
@@ -744,6 +900,7 @@
     if (state.view === 'now') pollNow();
     else if (state.view === 'day') guarded(() => loadDay(state.day));
     else if (state.view === 'month') guarded(() => loadMonth(state.month));
+    else if (state.view === 'savings') guarded(() => loadSavingsView(state.range));
     else guarded(() => loadYear(state.year));
   }
 
@@ -773,6 +930,7 @@
     $('year-today').onclick = () => go({ year: +todayStr().slice(0, 4) });
     $('year-input').onchange = (e) => { const y = +e.target.value; if (y >= 2000 && y <= 2100) go({ year: y }); };
 
+    for (const b of document.querySelectorAll('[data-range]')) b.onclick = () => go({ range: b.dataset.range });
     window.addEventListener('hashchange', render);
     window.addEventListener('resize', () => { for (const c of Object.values(charts)) c.resize(); });
     document.addEventListener('visibilitychange', () => {
