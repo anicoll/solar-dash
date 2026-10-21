@@ -1,4 +1,5 @@
 mod config;
+mod cost;
 mod db;
 mod ingest;
 mod isolar;
