@@ -1,6 +1,6 @@
 # Deploy solar-dash on Proxmox
 
-This guide runs solar-dash in a Debian 12 (bookworm) LXC container on Proxmox,
+This guide runs solar-dash in a Debian 13 (trixie) LXC container on Proxmox,
 managed by systemd, with a nightly database backup. It is published to the
 internet through a Cloudflare Tunnel, so you do not open or forward any ports
 on your router.
@@ -16,37 +16,39 @@ The files used here are in [`deploy/`](../deploy):
 | `solar-dash-backup.service` / `.timer` | nightly SQLite backup at 03:30, keeps 14 days |
 | `cloudflared-config.yml` | example Cloudflare Tunnel config |
 | `install.sh` | sets up the user, folders, binary and units |
+| `update.sh` | updates to the latest build from GitHub, with rollback |
 
 Where things end up inside the LXC:
 
 | Path | Contents |
 | --- | --- |
-| `/opt/solar-dash/solar-dash` | the program |
+| `/opt/solar-dash/solar-dash` | the program (and `update.sh`, `VERSION`) |
 | `/etc/solar-dash/config.toml` | your config and secrets (only root and the service can read it) |
 | `/var/lib/solar-dash/solar.db` | the database |
 | `/var/backups/solar-dash/` | nightly backups |
 
 ## 1. Create the LXC
 
-You need a Debian 12 template on Proxmox. Download it once on the Proxmox host:
+You need a Debian 13 template on Proxmox. Download it once on the Proxmox host:
 
 ```sh
 pveam update
-pveam available --section system | grep debian-12
-pveam download local debian-12-standard_12.7-1_amd64.tar.zst
+pveam available --section system | grep debian-13
+pveam download local debian-13-standard_<version>_amd64.tar.zst
 ```
 
 (Use the exact file name that `pveam available` shows; the version number may differ.)
 
 Create the container. Change the id `120`, storage names, bridge and the
 address to suit your network. This is unprivileged, with 1 core, 512 MB RAM
-(use 2048 while you build inside it, see below) and 4 GB disk:
+and 4 GB disk, which is plenty when you install the prebuilt release (use
+2048 MB if you build inside the LXC instead, see below):
 
 ```sh
-pct create 120 local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst \
+pct create 120 local:vztmpl/debian-13-standard_<version>_amd64.tar.zst \
   --hostname solar-dash \
   --unprivileged 1 \
-  --cores 1 --memory 1024 --swap 512 \
+  --cores 1 --memory 512 --swap 512 \
   --rootfs local-lvm:4 \
   --net0 name=eth0,bridge=vmbr0,ip=192.168.1.50/24,gw=192.168.1.1 \
   --nameserver 1.1.1.1 \
@@ -60,7 +62,7 @@ For DHCP use `ip=dhcp` instead and add a DHCP reservation for the container on
 your router. Either way, give it an address that does not change.
 
 Via the web UI instead: **Create CT**, tick **Unprivileged container**, pick
-the Debian 12 template, set Cores 1, Memory 2048 MB, Disk 4 GB, and on the
+the Debian 13 template, set Cores 1, Memory 512 MB, Disk 4 GB, and on the
 Network tab set a static IPv4/CIDR and gateway (or DHCP). Tick **Start at boot**.
 
 Inside the container, as root:
@@ -77,46 +79,50 @@ already allows `AF_INET`, so no change is needed there). The dashboard listens o
 `127.0.0.1:8080`, and the tunnel connects to it from inside the container, so
 nothing needs to reach the container from outside.
 
-## 2. Build
+## 2. Get the program
 
-### Option A (simplest): build inside the LXC
+### Option A (recommended): download the latest build
 
-This keeps the binary matched to Debian 12. A release build can use more than 1 GB of RAM,
-so give it 2048 MB while building. You can lower it to 512 MB afterwards.
+Every merge to `main` is built on GitHub for Debian 13 and published as the
+[Latest build](https://github.com/anicoll/solar-dash/releases/tag/latest)
+release. In the LXC, as root:
+
+```sh
+cd /root
+curl -fsSLO https://github.com/anicoll/solar-dash/releases/download/latest/solar-dash-linux-x86_64.tar.gz
+curl -fsSLO https://github.com/anicoll/solar-dash/releases/download/latest/solar-dash-linux-x86_64.tar.gz.sha256
+sha256sum --check solar-dash-linux-x86_64.tar.gz.sha256
+tar xzf solar-dash-linux-x86_64.tar.gz
+```
+
+That gives you `/root/solar-dash/` with the program, `deploy/` and
+`config.example.toml`. No Rust or build tools are needed in the LXC.
+
+### Option B: build inside the LXC
+
+A release build can use more than 1 GB of RAM, so give the LXC 2048 MB while
+building. You can lower it to 512 MB afterwards.
 
 ```sh
 apt install -y build-essential pkg-config
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
-git clone <your-repo-url> /root/solar-dash
+git clone https://github.com/anicoll/solar-dash.git /root/solar-dash
 cd /root/solar-dash
 cargo build --release
 ```
 
 The first build takes a few minutes. The result is `target/release/solar-dash`.
-
-### Option B: build elsewhere and copy it
-
-You can build on your Ubuntu laptop (`cargo build --release`) and copy it:
-
-```sh
-scp target/release/solar-dash root@192.168.1.50:/root/solar-dash-bin
-```
-
-Be careful: a binary built on a newer Ubuntu may need a newer glibc than
-Debian 12 has and fail with `GLIBC_2.xx not found`. Debian 12 has glibc 2.36.
-Building in the LXC (option A) avoids this. If you use option B you still need
-the repo's `deploy/` folder and `config.example.toml` in the LXC, so clone the
-repo there too.
+A binary built on your Ubuntu laptop may also work if your Ubuntu's glibc is no
+newer than Debian 13's (2.41); if not it fails with `GLIBC_2.xx not found`.
 
 ## 3. Install and configure
 
-From the repo checkout in the LXC, as root:
+In the LXC, as root (both options):
 
 ```sh
 cd /root/solar-dash
-./deploy/install.sh                      # option A
-# ./deploy/install.sh /root/solar-dash-bin   # option B
+./deploy/install.sh
 ```
 
 It creates the `solar-dash` user and the folders, copies the program and the
@@ -267,21 +273,30 @@ Security notes:
 
 ## 7. Updating
 
-In the LXC, as root:
+After a PR is merged, wait for the **Release** workflow on GitHub to finish
+(a few minutes), then in the LXC, as root:
 
 ```sh
-cd /root/solar-dash
-git pull
-cargo build --release
-systemctl stop solar-dash
-install -m 755 target/release/solar-dash /opt/solar-dash/solar-dash
-systemctl start solar-dash
-journalctl -u solar-dash -f
+/opt/solar-dash/update.sh
 ```
 
-or build, then rerun `./deploy/install.sh` (it keeps your config and database)
-and `systemctl restart solar-dash`. Database changes are applied automatically
-on startup.
+It downloads the latest build, checks its checksum, installs it (keeping your
+config and database), restarts solar-dash and checks `/healthz`. It also
+updates the systemd units and itself. Database changes are applied
+automatically on startup. Other options:
+
+```sh
+/opt/solar-dash/update.sh --check     # is there a newer build?
+/opt/solar-dash/update.sh --rollback  # go back to the version before the last update
+cat /opt/solar-dash/VERSION           # the commit that is installed
+```
+
+Rollback swaps the program back. A database change made by the newer version
+stays, so if an update included one, restore last night's backup too (section 8).
+
+If you built inside the LXC (option B), update with `git pull`,
+`cargo build --release`, `./deploy/install.sh` and `systemctl restart solar-dash`
+instead.
 
 ## 8. Backups and restore
 
@@ -334,8 +349,8 @@ Better still, send these to a different disk or machine.
 - **"unable to open database file" / permission denied**: the database folder
   or file is not owned by the service user. Run
   `chown -R solar-dash:solar-dash /var/lib/solar-dash`.
-- **`GLIBC_2.xx not found`**: the binary was built on a newer system. Build it
-  inside the LXC (option A).
+- **`GLIBC_2.xx not found`**: the binary was built on a newer system. Use the
+  release build (option A) or build inside the LXC (option B).
 - **Logged out after every restart**: `session_secret` is not set.
 - **Site not reachable**: check `systemctl status cloudflared` and
   `journalctl -u cloudflared -n 50`, that the tunnel id and hostname in

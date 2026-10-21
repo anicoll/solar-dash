@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Installs solar-dash in a Debian 12 LXC. Run as root, from a checkout:
+# Installs solar-dash in a Debian 13 LXC. Run as root, from a checkout or an
+# unpacked release tarball:
 #
 #   sudo ./deploy/install.sh                 # uses target/release/solar-dash
 #   sudo ./deploy/install.sh /path/to/binary # uses a prebuilt binary
+#
+# From an unpacked release tarball it uses the binary that came with it.
 #
 # Safe to run again (for example to update the binary). It never overwrites an
 # existing config and does not start solar-dash; see docs/deploy.md.
@@ -14,7 +17,14 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-binary="${1:-$repo_dir/target/release/solar-dash}"
+if [ -n "${1:-}" ]; then
+    binary="$1"
+elif [ -f "$repo_dir/solar-dash" ]; then
+    # An unpacked release tarball: the binary sits next to deploy/.
+    binary="$repo_dir/solar-dash"
+else
+    binary="$repo_dir/target/release/solar-dash"
+fi
 
 if [ ! -x "$binary" ]; then
     echo "Binary not found: $binary" >&2
@@ -37,6 +47,13 @@ install -d -m 750 -o solar-dash -g solar-dash /var/backups/solar-dash
 
 echo "Installing binary and systemd units..."
 install -m 755 "$binary" /opt/solar-dash/solar-dash
+install -m 755 "$repo_dir/deploy/update.sh" /opt/solar-dash/update.sh
+if [ -f "$repo_dir/VERSION" ]; then
+    install -m 644 "$repo_dir/VERSION" /opt/solar-dash/VERSION
+else
+    # Built from a checkout: record the commit, if git knows it.
+    git -C "$repo_dir" rev-parse HEAD >/opt/solar-dash/VERSION 2>/dev/null || echo unknown >/opt/solar-dash/VERSION
+fi
 install -m 644 "$repo_dir/deploy/solar-dash.service" /etc/systemd/system/
 install -m 644 "$repo_dir/deploy/solar-dash-backup.service" /etc/systemd/system/
 install -m 644 "$repo_dir/deploy/solar-dash-backup.timer" /etc/systemd/system/
