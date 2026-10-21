@@ -68,6 +68,8 @@ pub struct AppState {
     tariff: Option<Arc<Tariff>>,
     /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
     purchases: Arc<[Purchase]>,
+    /// Assumed yearly electricity price rise (percent) in the payback projection.
+    price_rise_percent: f64,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -98,6 +100,7 @@ impl AppState {
             latest: Latest::default(),
             tariff: None,
             purchases: Arc::from([]),
+            price_rise_percent: 3.0,
         })
     }
 
@@ -116,6 +119,12 @@ impl AppState {
     /// Turns on the payback API with these purchases (oldest first).
     pub fn with_purchases(mut self, purchases: Vec<Purchase>) -> Self {
         self.purchases = purchases.into();
+        self
+    }
+
+    /// Sets the yearly price rise (percent) the payback projection assumes.
+    pub fn with_price_rise_percent(mut self, percent: f64) -> Self {
+        self.price_rise_percent = percent;
         self
     }
 
@@ -154,7 +163,8 @@ impl AppState {
         Ok(Self::new(pool, plant_id, tz, password_hash, key)?
             .with_cookie_secure(config.server.cookie_secure)
             .with_tariff(tariff)
-            .with_purchases(purchases))
+            .with_purchases(purchases)
+            .with_price_rise_percent(config.system.price_rise_percent))
     }
 }
 

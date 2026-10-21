@@ -888,8 +888,12 @@
       months.push(...extra);
       projected = months.map(() => null);
       projected[pb.series.length - 1] = last.net;
+      // The same growth curve as the server: savings so far follow (e^(gt) - 1),
+      // scaled so the line reaches zero in the projected month.
+      const g = Math.log(1 + (pb.price_rise_percent || 0) / 100);
+      const grown = (months) => (g > 0 ? Math.expm1(g * months / 12) : months);
       extra.forEach((_, i) => {
-        projected[pb.series.length + i] = +(last.net * (1 - (i + 1) / extra.length)).toFixed(2);
+        projected[pb.series.length + i] = +(last.net * (1 - grown(i + 1) / grown(extra.length))).toFixed(2);
       });
     }
     const dots = pb.purchases
@@ -965,7 +969,7 @@
     const projText = proj === null ? 'Paid back' : proj === 'never' ? 'Not at this rate' : ymLabel(proj);
     const projNote = proj === null ? 'savings now cover the cost'
       : proj === 'never' ? 'savings are not keeping up'
-      : `at about ${money(pb.rate_per_day)} a day (last 12 months)`;
+      : `at about ${money(pb.rate_per_day)} a day (last 12 months), rising ${pb.price_rise_percent}% a year`;
     const recovered = el('div', 'kpi');
     const rv = el('div', 'value', `${pb.recovered_pct.toFixed(1)}%`);
     recovered.append(el('div', 'label', 'Cost recovered'), rv, meter(pb.recovered_pct, '--save'),

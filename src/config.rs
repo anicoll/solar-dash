@@ -251,10 +251,27 @@ impl Tariff {
 
 /// The solar system's purchases, for `/api/payback`; see config.example.toml.
 /// Written as repeated `[[system.purchase]]` tables.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct System {
     #[serde(default)]
     pub purchase: Vec<Purchase>,
+    /// Assumed yearly rise in electricity prices, in percent, which makes the
+    /// savings grow in the payback projection.
+    #[serde(default = "default_price_rise_percent")]
+    pub price_rise_percent: f64,
+}
+
+impl Default for System {
+    fn default() -> Self {
+        System {
+            purchase: Vec::new(),
+            price_rise_percent: default_price_rise_percent(),
+        }
+    }
+}
+
+fn default_price_rise_percent() -> f64 {
+    3.0
 }
 
 /// One thing bought for the system: the panels and inverter, a second battery.
@@ -275,6 +292,11 @@ pub fn parse_date(text: &str) -> Result<NaiveDate> {
 impl System {
     /// Check the purchases, naming the field in any error.
     fn check(&self) -> Result<()> {
+        // The range check is false for NaN too.
+        anyhow::ensure!(
+            (0.0..=20.0).contains(&self.price_rise_percent),
+            "price_rise_percent in [system] must be between 0 and 20"
+        );
         for (i, p) in self.purchase.iter().enumerate() {
             anyhow::ensure!(
                 !p.name.trim().is_empty(),
@@ -534,6 +556,18 @@ mod tests {
         let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{PURCHASES}")).unwrap();
         assert_eq!(cfg.system.purchase.len(), 2);
         assert_eq!(cfg.system.purchase[1].cost_dollars, 7690.20);
+    }
+
+    #[test]
+    fn price_rise_defaults_and_is_checked() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert_eq!(cfg.system.price_rise_percent, 3.0);
+        check_system("[system]\nprice_rise_percent = 0").unwrap();
+        check_system("[system]\nprice_rise_percent = 20").unwrap();
+        for bad in ["-1", "20.5", "nan"] {
+            let err = check_system(&format!("[system]\nprice_rise_percent = {bad}")).unwrap_err();
+            assert!(format!("{err:#}").contains("price_rise_percent"), "{err:#}");
+        }
     }
 
     #[test]

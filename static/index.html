@@ -181,7 +181,7 @@
       </section>
       <details class="panel how">
         <summary>How this is calculated</summary>
-        <p>Each day's saving is what that day's usage would have cost on your tariff with no solar or battery, minus what you actually paid, including credits and feed-in. Purchases are entered in the config file. The projection extends the last 12 months of savings.</p>
+        <p>Each day's saving is what that day's usage would have cost on your tariff with no solar or battery, minus what you actually paid, including credits and feed-in. Purchases are entered in the config file. The projection extends the last 12 months of savings, assuming electricity prices (and so the savings) rise by a set percentage each year: <code>price_rise_percent</code> in the <code>[system]</code> section of the config file, 3 by default.</p>
       </details>
     </div>
   </section>
