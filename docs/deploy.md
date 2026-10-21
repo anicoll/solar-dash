@@ -152,7 +152,9 @@ Fill in:
   `/opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml login-test`.
 - `[server]`: `bind = "127.0.0.1:8080"`, the `password_hash = "..."` line from
   `hash-password`, and `session_secret = "..."` (the 88 characters printed by
-  the `openssl` command, ending in `=`; leave out any `%`).
+  the `openssl` command, ending in `=`; leave out any `%`). `serve` will not
+  start without it. Leave `cookie_secure` at its default (`true`): visitors
+  reach the site over https through the tunnel.
 - `[database]`: `path = "/var/lib/solar-dash/solar.db"` (install.sh already
   sets this in a new config).
 
@@ -351,7 +353,9 @@ Better still, send these to a different disk or machine.
   `chown -R solar-dash:solar-dash /var/lib/solar-dash`.
 - **`GLIBC_2.xx not found`**: the binary was built on a newer system. Use the
   release build (option A) or build inside the LXC (option B).
-- **Logged out after every restart**: `session_secret` is not set.
+- **`serve` exits asking for `session_secret`**: add it to `[server]`.
+- **Login works but you bounce back to the login page** (plain http only):
+  `cookie_secure` is true; set it to false for http testing.
 - **Site not reachable**: check `systemctl status cloudflared` and
   `journalctl -u cloudflared -n 50`, that the tunnel id and hostname in
   `/etc/cloudflared/config.yml` are right, that the DNS route exists

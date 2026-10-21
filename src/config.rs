@@ -70,7 +70,12 @@ pub struct Server {
     /// Argon2 hash of the dashboard password; make one with `hash-password`.
     pub password_hash: Option<String>,
     /// Base64 of at least 64 random bytes, used to sign login cookies.
+    /// Required by `serve`.
     pub session_secret: Option<String>,
+    /// Whether the session cookie gets the `Secure` flag. Keep this true
+    /// (the default) behind https; set false only for plain-http LAN testing.
+    #[serde(default = "default_cookie_secure")]
+    pub cookie_secure: bool,
 }
 
 impl Default for Server {
@@ -79,6 +84,7 @@ impl Default for Server {
             bind: default_bind(),
             password_hash: None,
             session_secret: None,
+            cookie_secure: default_cookie_secure(),
         }
     }
 }
@@ -96,6 +102,7 @@ impl fmt::Debug for Server {
                 "session_secret",
                 &self.session_secret.as_ref().map(|_| "<redacted>"),
             )
+            .field("cookie_secure", &self.cookie_secure)
             .finish()
     }
 }
@@ -263,6 +270,10 @@ fn default_points() -> Vec<i64> {
 
 fn default_timezone() -> String {
     "Australia/Adelaide".to_string()
+}
+
+fn default_cookie_secure() -> bool {
+    true
 }
 
 fn default_bind() -> String {
