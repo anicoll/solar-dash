@@ -3,6 +3,7 @@
 
 mod api;
 mod auth;
+mod costs;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -24,6 +25,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
+use crate::cost::Tariff;
 use crate::modbus::Latest;
 use auth::LockoutMap;
 pub use auth::hash_password;
@@ -56,6 +58,8 @@ pub struct AppState {
     cookie_secure: bool,
     /// The newest Modbus sample, kept by the poller.
     latest: Latest,
+    /// The parsed `[tariff]` section; `None` turns the cost API off.
+    tariff: Option<Arc<Tariff>>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -84,12 +88,19 @@ impl AppState {
             verify_gate: Arc::new(Semaphore::new(1)),
             cookie_secure: true,
             latest: Latest::default(),
+            tariff: None,
         })
     }
 
     /// Sets the cookie `Secure` flag (on by default).
     pub fn with_cookie_secure(mut self, secure: bool) -> Self {
         self.cookie_secure = secure;
+        self
+    }
+
+    /// Turns on the cost API with this tariff.
+    pub fn with_tariff(mut self, tariff: Option<Tariff>) -> Self {
+        self.tariff = tariff.map(Arc::new);
         self
     }
 
@@ -119,8 +130,14 @@ impl AppState {
              (make one with `openssl rand -base64 64 | tr -d '\\n'; echo`)",
         )?;
         let key = key_from_secret(secret)?;
+        let tariff = config
+            .tariff
+            .as_ref()
+            .map(Tariff::from_config)
+            .transpose()?;
         Ok(Self::new(pool, plant_id, tz, password_hash, key)?
-            .with_cookie_secure(config.server.cookie_secure))
+            .with_cookie_secure(config.server.cookie_secure)
+            .with_tariff(tariff))
     }
 }
 
@@ -152,6 +169,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
+        .route("/api/costs", get(costs::costs))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
@@ -749,5 +767,173 @@ mod tests {
         let response = send(&app, get_request(uri, Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["data"], serde_json::json!([]));
+    }
+
+    /// A simple tariff: 100 c supply, 25 c import, 5 c export, no windows.
+    fn flat_tariff() -> Tariff {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+        }
+        let text = "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 25.0\n\
+                    default_export_cents = 5.0\n";
+        let w: Wrapper = toml::from_str(text).unwrap();
+        Tariff::from_config(&w.tariff).unwrap()
+    }
+
+    /// A router with the flat tariff over an empty database (plus a pool for seeding).
+    async fn costs_app() -> (tempfile::TempDir, Router, SqlitePool) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        // Readings need their points to exist first.
+        for point_id in [83102, 83072, 83118] {
+            let point = Point {
+                point_id,
+                code: None,
+                name: None,
+                unit: Some("Wh".to_string()),
+            };
+            db::upsert_point(&pool, &point).await.unwrap();
+        }
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_tariff(Some(flat_tariff()));
+        (dir, router(state), pool)
+    }
+
+    /// Unix time of local Adelaide midnight on 2026-09-15 (+09:30, no DST change).
+    const SEP_15_START: i64 = 1_789_396_200;
+
+    #[tokio::test]
+    async fn costs_are_off_without_a_tariff() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/costs", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/costs", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "configured": false })
+        );
+    }
+
+    #[tokio::test]
+    async fn costs_validate_the_date_range() {
+        let (_dir, app, _pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        let bad = [
+            "/api/costs?from=yesterday",
+            "/api/costs?to=2026-13-01",
+            "/api/costs?from=2026-09-15&to=2026-09-14",
+            // 1,501 days.
+            "/api/costs?from=2022-01-01&to=2026-02-09",
+        ];
+        for uri in bad {
+            let response = send(&app, get_request(uri, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert!(body_json(response).await["error"].is_string(), "{uri}");
+        }
+        // Exactly 1,500 days is fine, and an empty database gives no days.
+        let uri = "/api/costs?from=2022-01-01&to=2026-02-08";
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["days"], serde_json::json!([]));
+        assert_eq!(json["totals"]["days"], 0);
+    }
+
+    #[tokio::test]
+    async fn costs_for_a_cloud_day() {
+        let (_dir, app, pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        // Import 1 kWh, export 2 kWh and load 4 kWh, each reached by 01:00 and
+        // then flat. A neighbouring day without data is left out.
+        let mut readings = Vec::new();
+        for (point_id, wh) in [(83102, 1000.0), (83072, 2000.0), (83118, 4000.0)] {
+            for ts in [SEP_15_START + 3600, SEP_15_START + 3900] {
+                readings.push(Reading {
+                    point_id,
+                    ts,
+                    value: Some(wh),
+                });
+            }
+        }
+        db::upsert_readings(&pool, PLANT, &readings).await.unwrap();
+
+        let uri = "/api/costs?from=2026-09-14&to=2026-09-16";
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["days"].as_array().unwrap().len(), 1);
+        // Actual: 100 supply + 1 kWh * 25 - 2 kWh * 5 = 115 c.
+        // Baseline: 100 supply + 4 kWh * 25 = 200 c.
+        assert_eq!(
+            json["days"][0],
+            serde_json::json!({
+                "date": "2026-09-15",
+                "source": "cloud",
+                "actual": 1.15,
+                "baseline": 2.0,
+                "savings": 0.85,
+                "import_kwh": 1.0,
+                "export_kwh": 2.0,
+                "load_kwh": 4.0,
+                "credit": 0.0,
+            })
+        );
+        assert_eq!(
+            json["totals"],
+            serde_json::json!({
+                "actual": 1.15,
+                "baseline": 2.0,
+                "savings": 0.85,
+                "credit_days": 0,
+                "days": 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn costs_for_a_live_day() {
+        let (_dir, app, pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        // A sample every minute all day, importing 1 kW to feed a 1 kW load:
+        // 1439 held minutes, since the last sample has no next one.
+        for ts in (SEP_15_START..SEP_15_START + 86_400).step_by(60) {
+            let sample = Sample {
+                grid_w: Some(1000.0),
+                load_w: Some(1000.0),
+                ..live_sample(ts)
+            };
+            db::insert_live_sample(&pool, &sample).await.unwrap();
+        }
+        // Cloud numbers for the same day must be ignored.
+        let reading = Reading {
+            point_id: 83102,
+            ts: SEP_15_START + 3600,
+            value: Some(99_000.0),
+        };
+        db::upsert_readings(&pool, PLANT, &[reading]).await.unwrap();
+
+        let uri = "/api/costs?from=2026-09-15&to=2026-09-15";
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        let day = &json["days"][0];
+        assert_eq!(day["source"], "inverter");
+        // 1439/60 = 23.98 kWh at 25 c, plus 100 c supply: 6.9958 dollars.
+        assert_eq!(day["import_kwh"], 23.98);
+        assert_eq!(day["load_kwh"], 23.98);
+        assert_eq!(day["export_kwh"], 0.0);
+        assert_eq!(day["actual"], 7.0);
+        assert_eq!(day["baseline"], 7.0);
+        assert_eq!(day["savings"], 0.0);
     }
 }

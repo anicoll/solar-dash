@@ -163,6 +163,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}}` from Modbus, or `{"sample": null}` if there is none or it is over 5 minutes old |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days. Each day has a `source` (see [Modbus in `serve`](#modbus-in-serve)) |
+| `GET /api/costs?from=YYYY-MM-DD&to=YYYY-MM-DD` | Dollars per local day from the `[tariff]` section: `actual`, `baseline` (no solar or battery), `savings`, zero-import `credit`, and import, export and load kWh, plus `totals`. Default: the last 30 days. At most 1,500 days. Days with no data are left out. Without a `[tariff]` section it answers `{"configured":false}` |
 
 For example, once logged in with a browser, try
 <http://127.0.0.1:8080/api/latest>. With curl, log in and keep the cookie (needs `cookie_secure = false` over plain http):
