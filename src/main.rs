@@ -143,9 +143,10 @@ async fn run_serve(config: Config) -> Result<()> {
     info!(address = %config.server.bind, "web server started");
     // The Modbus poller only runs if there is a [modbus] section. Otherwise
     // this future finishes at once, which `try_join!` is happy with.
+    let latest = state.latest();
     let poll_modbus = async {
         match config.modbus.clone() {
-            Some(modbus) => modbus::run_poll(modbus, &pool, shutdown_signal()).await,
+            Some(modbus) => modbus::run_poll(modbus, &pool, latest, shutdown_signal()).await,
             None => Ok(()),
         }
     };

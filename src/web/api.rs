@@ -160,9 +160,14 @@ pub async fn latest(State(state): State<AppState>) -> ApiResult {
 }
 
 /// The newest Modbus sample, or `{"sample": null}` if there is none or it
-/// is too old to call "live" (for example when Modbus is off).
+/// is too old to call "live" (for example when Modbus is off). It comes from
+/// memory; the database is only read until the poller's first sample after
+/// a restart.
 pub async fn live(State(state): State<AppState>) -> ApiResult {
-    let sample = db::latest_live_sample(&state.pool).await?;
+    let sample = match state.latest.get() {
+        Some(sample) => Some(sample),
+        None => db::latest_live_sample(&state.pool).await?,
+    };
     let fresh = sample.filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
     Ok(Json(json!({ "sample": fresh })))
 }
@@ -728,6 +733,37 @@ mod tests {
         assert!(!use_live(19_439, start, end, now));
         // A future day has nothing elapsed, so it never uses live.
         assert!(!use_live(0, start, end, -1));
+    }
+
+    #[tokio::test]
+    async fn live_answers_from_memory_once_the_poller_has_a_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let sample = Sample {
+            ts: db::now() - 5,
+            pv_w: Some(5000.0),
+            load_w: Some(700.0),
+            grid_w: Some(-300.0),
+            battery_w: Some(4000.0),
+            soc_pct: Some(67.4),
+        };
+        // Only in memory, not in the database.
+        state.latest().set(sample);
+        let Json(json) = live(State(state.clone())).await.unwrap();
+        assert_eq!(json["sample"]["ts"], sample.ts);
+        assert_eq!(json["sample"]["soc_pct"], 67.4);
+
+        // A sample that has gone stale in memory is still not "live".
+        state.latest().set(Sample {
+            ts: db::now() - 600,
+            ..sample
+        });
+        let Json(json) = live(State(state)).await.unwrap();
+        assert!(json["sample"].is_null());
     }
 
     #[tokio::test]
