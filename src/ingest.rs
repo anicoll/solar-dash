@@ -8,7 +8,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone};
 use chrono_tz::Tz;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -39,6 +39,8 @@ const MAX_CALLS_PER_30_DAYS: i64 = 80_000;
 const BUDGET_RECHECK: Duration = Duration::from_secs(60);
 /// Pause between calls, to be polite to the server.
 const CALL_PAUSE: Duration = Duration::from_secs(1);
+/// How often the live loop prunes old `api_call` rows.
+const PRUNE_EVERY_SECS: i64 = 24 * 3600;
 
 /// Data lands a little after each 5-minute mark, so live sync waits this long.
 const TICK_LAG_SECS: i64 = 60;
@@ -71,17 +73,58 @@ pub fn parse_local(s: &str, tz: Tz) -> Option<i64> {
     }
 }
 
-/// Splits `start..end` into consecutive windows of at most `step` seconds.
-/// Each window ends where the next begins, so there are no gaps or overlaps.
-pub fn windows(start: i64, end: i64, step: i64) -> Vec<(i64, i64)> {
-    let mut result = Vec::new();
-    let mut from = start;
-    while from < end {
-        let to = (from + step).min(end);
-        result.push((from, to));
-        from = to;
+/// Like [`parse_local`], but a local time that happened twice is resolved with
+/// the UTC offset in force at `near_ts` (normally the start of the window the
+/// text came from). A window never crosses a clock change (see
+/// [`next_window_end`]), so this picks the right one of the two copies.
+pub fn parse_local_near(s: &str, tz: Tz, near_ts: i64) -> Option<i64> {
+    let naive = NaiveDateTime::parse_from_str(s, LOCAL_FORMAT).ok()?;
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(t) => Some(t.timestamp()),
+        LocalResult::Ambiguous(earliest, latest) => {
+            let want = offset_secs(near_ts, tz);
+            if latest.offset().fix().local_minus_utc() == want
+                && earliest.offset().fix().local_minus_utc() != want
+            {
+                Some(latest.timestamp())
+            } else {
+                Some(earliest.timestamp())
+            }
+        }
+        LocalResult::None => None,
     }
-    result
+}
+
+/// The UTC offset, in seconds, in force at a unix timestamp.
+fn offset_secs(ts_utc: i64, tz: Tz) -> i32 {
+    let t = DateTime::from_timestamp(ts_utc, 0).expect("timestamp out of range");
+    tz.offset_from_utc_datetime(&t.naive_utc())
+        .fix()
+        .local_minus_utc()
+}
+
+/// End (exclusive) of the window that starts at `start`: at most `step` long,
+/// at most `end`, and never past a clock change. Every instant the window asks
+/// for (up to one step before its end) then shares one UTC offset, so the
+/// local start and end strings are in order and unambiguous.
+pub fn next_window_end(start: i64, end: i64, step: i64, tz: Tz) -> i64 {
+    let to = (start + step).min(end);
+    let base = offset_secs(start, tz);
+    if offset_secs(to - STEP_SECS, tz) == base {
+        return to;
+    }
+    // Bisect for the first instant whose offset differs from the start's.
+    // Invariant: `lo` has the start's offset, `hi` does not.
+    let (mut lo, mut hi) = (start, to - STEP_SECS);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if offset_secs(mid, tz) == base {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
 }
 
 /// "p83022" becomes 83022. Anything else (such as "time_stamp") gives `None`.
@@ -101,7 +144,9 @@ fn parse_value(value: &Value) -> Option<f64> {
 /// Turns the history `result_data` into readings for one device (`ps_key`).
 /// Rows whose local time does not exist are skipped. Points missing from a
 /// row are simply not stored; points present but empty are stored as `None`.
-pub fn parse_history(result_data: &Value, ps_key: &str, tz: Tz) -> Vec<Reading> {
+/// `window_start` (unix seconds) is where the window began; it decides which
+/// copy of a repeated local time (clocks going back) is meant.
+pub fn parse_history(result_data: &Value, ps_key: &str, tz: Tz, window_start: i64) -> Vec<Reading> {
     let mut readings = Vec::new();
     let Some(rows) = result_data[ps_key].as_array() else {
         return readings; // no data for this device in the window
@@ -113,7 +158,7 @@ pub fn parse_history(result_data: &Value, ps_key: &str, tz: Tz) -> Vec<Reading> 
         let Some(ts) = object
             .get("time_stamp")
             .and_then(Value::as_str)
-            .and_then(|s| parse_local(s, tz))
+            .and_then(|s| parse_local_near(s, tz, window_start))
         else {
             debug!(?row, "skipping row with a missing or invalid time_stamp");
             continue;
@@ -315,7 +360,7 @@ pub async fn sync_range(
     while start < end_ts {
         // `window_end` is exclusive. The API includes its end time, so we ask
         // for one step less; the next window then starts right after.
-        let (_, window_end) = windows(start, end_ts, window)[0];
+        let window_end = next_window_end(start, end_ts, window, tz);
         let params = json!({
             "ps_key_list": [&plant.ps_key],
             "points": plant.points,
@@ -341,15 +386,7 @@ pub async fn sync_range(
             Err(err) => return Err(err),
         };
 
-        db::save_raw_response(
-            pool,
-            HISTORY_ENDPOINT,
-            Some(start),
-            Some(window_end),
-            &data.to_string(),
-        )
-        .await?;
-        let readings = parse_history(&data, &plant.ps_key, tz);
+        let readings = parse_history(&data, &plant.ps_key, tz, start);
         db::upsert_readings(pool, plant.plant_id, &readings).await?;
         db::set_cursor(pool, job, window_end).await?;
         stats.rows += readings.len();
@@ -471,13 +508,17 @@ async fn sync_once(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> 
     Ok(())
 }
 
-/// A sync that logs in again and retries once if iSolarCloud reports an error.
-/// The token-expiry codes are not confirmed, so any `ApiError` gets one retry.
+/// A sync that logs in first if there is no token yet, and logs in again and
+/// retries once if iSolarCloud reports an error. The token-expiry codes are not
+/// confirmed, so any `ApiError` gets one retry.
 async fn sync_with_relogin(
     client: &mut Client,
     pool: &SqlitePool,
     config: &IsolarCloud,
 ) -> Result<()> {
+    if !client.is_logged_in() {
+        client.login().await?;
+    }
     match sync_once(client, pool, config).await {
         Err(err) if err.downcast_ref::<ApiError>().is_some() => {
             warn!("iSolarCloud returned an error ({err:#}); logging in again");
@@ -488,7 +529,30 @@ async fn sync_with_relogin(
     }
 }
 
+/// First wait after a failed attempt to reach iSolarCloud.
+const BACKOFF_START: Duration = Duration::from_secs(60);
+/// The wait never grows beyond this.
+const BACKOFF_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// How long to wait after the `failures`-th failure in a row (1-based):
+/// 1 min, then doubling, capped at 30 min.
+fn backoff_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    (BACKOFF_START * 2u32.pow(doublings)).min(BACKOFF_CAP)
+}
+
+/// Checks the sync settings without touching the network, so `serve` can fail
+/// fast on a config mistake that no retry would fix.
+pub fn check_sync_config(config: &IsolarCloud) -> Result<()> {
+    PlantSetup::from_config(config).map(|_| ())
+}
+
 /// Keeps the database up to date until `shutdown` completes.
+///
+/// Cloud trouble never ends the loop: a failed login or sync is logged and
+/// retried (logins with [`backoff_delay`]). Only a setting that can never work
+/// (see [`check_sync_config`]) or a database error while setting up returns
+/// `Err`, before any network call.
 ///
 /// The loop takes the `Client` by value because `login` needs `&mut self`.
 /// Nothing else uses the client while we sync, so owning it is simpler than
@@ -507,18 +571,49 @@ pub async fn run_live_sync(
     // round. Pinning lets `select!` poll it by `&mut` without moving it.
     tokio::pin!(shutdown);
     info!("live sync started");
+    let mut last_prune = 0;
+    // Failed attempts to log in since the last success.
+    let mut login_failures: u32 = 0;
     loop {
+        // Once at startup, then about once a day.
+        if db::now() - last_prune >= PRUNE_EVERY_SECS {
+            last_prune = db::now();
+            match db::prune_api_calls(pool).await {
+                Ok(rows) => info!(rows, "pruned old API call records"),
+                Err(err) => warn!("pruning API calls failed: {err:#}"),
+            }
+        }
         // Dropping an unfinished sync is safe: each window is saved
         // atomically, along with its cursor.
+        let logged_in_before = client.is_logged_in();
         tokio::select! {
             _ = &mut shutdown => break,
             result = sync_with_relogin(&mut client, pool, config) => {
                 // A failed tick is not fatal: try again on the next one.
                 if let Err(err) = result {
+                    if !client.is_logged_in() {
+                        // Not logged in: iSolarCloud is down or slow, or the
+                        // login is wrong. Back off instead of hammering it.
+                        login_failures += 1;
+                        let wait = backoff_delay(login_failures);
+                        warn!(
+                            "login to iSolarCloud failed ({err:#}); retrying in {}s",
+                            wait.as_secs()
+                        );
+                        tokio::select! {
+                            _ = &mut shutdown => break,
+                            _ = tokio::time::sleep(wait) => {}
+                        }
+                        continue;
+                    }
                     warn!("sync failed: {err:#}");
                 }
             }
         }
+        if !logged_in_before && client.is_logged_in() {
+            info!("logged in to iSolarCloud");
+        }
+        login_failures = 0;
 
         let delay = next_tick_delay(db::now());
         debug!(seconds = delay.as_secs(), "sleeping until next sync");
@@ -534,6 +629,45 @@ pub async fn run_live_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_doubles_to_the_cap() {
+        let secs: Vec<u64> = (1..=8).map(|n| backoff_delay(n).as_secs()).collect();
+        assert_eq!(secs, [60, 120, 240, 480, 960, 1800, 1800, 1800]);
+        assert_eq!(backoff_delay(0).as_secs(), 60);
+        assert_eq!(backoff_delay(u32::MAX).as_secs(), 1800);
+    }
+
+    #[tokio::test]
+    async fn live_sync_survives_a_failing_login_and_stops_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!("solar-dash-test-{}", std::process::id()));
+        let path = dir.join("test.db");
+        let pool = db::open(path.to_str().unwrap()).await.unwrap();
+        // Nothing listens on port 1, so every login fails at once.
+        let config = IsolarCloud {
+            gateway: "http://127.0.0.1:1".into(),
+            appkey: "k".into(),
+            access_key: "a".into(),
+            rsa_public_key: String::new(),
+            encrypt: false,
+            username: "u".into(),
+            password: "p".into(),
+            plant_id: Some(1),
+            points: vec![83022],
+            timezone: "Australia/Adelaide".into(),
+        };
+        let client = Client::new(config.clone()).unwrap();
+        // The first backoff is a minute; shutdown must cut it short.
+        let shutdown = tokio::time::sleep(Duration::from_millis(500));
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_live_sync(client, &pool, &config, shutdown),
+        )
+        .await;
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.expect("did not stop promptly on shutdown").is_ok());
+    }
 
     const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
     const KEY: &str = "1204811_11_0_0";
@@ -554,7 +688,7 @@ mod tests {
             { "p83022": "--", "p83033": "", "time_stamp": "20261020110500" },
             { "p83022": null, "time_stamp": "20261020111000", "other": "x" },
         ]});
-        let readings = parse_history(&data, KEY, ADELAIDE);
+        let readings = parse_history(&data, KEY, ADELAIDE, 0);
 
         // 11:00 local on 20 Oct is ACDT (UTC+10:30).
         let t0 = parse_local("20261020110000", ADELAIDE).unwrap();
@@ -577,8 +711,8 @@ mod tests {
     #[test]
     fn history_for_other_or_missing_device_is_empty() {
         let data = json!({ "999_11_0_0": [] });
-        assert!(parse_history(&data, KEY, ADELAIDE).is_empty());
-        assert!(parse_history(&Value::Null, KEY, ADELAIDE).is_empty());
+        assert!(parse_history(&data, KEY, ADELAIDE, 0).is_empty());
+        assert!(parse_history(&Value::Null, KEY, ADELAIDE, 0).is_empty());
     }
 
     #[test]
@@ -589,7 +723,7 @@ mod tests {
             { "p83022": "3" },
             { "p83022": "4", "time_stamp": "20261004030000" },
         ]});
-        let readings = parse_history(&data, KEY, ADELAIDE);
+        let readings = parse_history(&data, KEY, ADELAIDE, 0);
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].value, Some(4.0));
     }
@@ -618,6 +752,74 @@ mod tests {
     }
 
     #[test]
+    fn window_is_split_at_fall_back() {
+        // Change at 2026-04-05 03:00 ACDT = 2026-04-04 16:30 UTC.
+        let change = 1_775_320_200;
+        let start = parse_local("20260405010000", ADELAIDE).unwrap();
+        let end = start + 6 * 3600;
+        let mut from = start;
+        let mut spans = Vec::new();
+        while from < end {
+            let to = next_window_end(from, end, START_WINDOW_SECS, ADELAIDE);
+            assert!(to > from);
+            spans.push((from, to));
+            from = to;
+        }
+        assert!(spans.iter().any(|&(f, _)| f == change));
+        for &(f, t) in &spans {
+            assert!(f >= change || t <= change, "window crosses the change");
+            let (a, b) = (
+                format_local(f, ADELAIDE),
+                format_local(t - STEP_SECS, ADELAIDE),
+            );
+            assert!(a <= b, "{a} > {b}");
+        }
+        assert_eq!(
+            format_local(spans[0].1 - STEP_SECS, ADELAIDE),
+            "20260405025500"
+        );
+        assert_eq!(format_local(spans[1].0, ADELAIDE), "20260405020000");
+    }
+
+    #[test]
+    fn repeated_hour_is_kept_in_both_windows() {
+        let change = 1_775_320_200;
+        let pre = parse_local_near("20260405023000", ADELAIDE, change - 3600).unwrap();
+        let post = parse_local_near("20260405023000", ADELAIDE, change).unwrap();
+        assert_eq!(post - pre, 3600);
+        assert_eq!(pre, 1_775_318_400); // 02:30 ACDT
+        // parse_history applies the window's offset to every row.
+        let data = json!({ KEY: [{ "p1": "1", "time_stamp": "20260405023000" }] });
+        assert_eq!(parse_history(&data, KEY, ADELAIDE, change)[0].ts, post);
+        assert_eq!(
+            parse_history(&data, KEY, ADELAIDE, change - 3600)[0].ts,
+            pre
+        );
+    }
+
+    #[test]
+    fn windows_split_at_spring_forward() {
+        // Change at 2026-10-04 02:00 ACST = 2026-10-03 16:30 UTC.
+        let change = 1_791_045_000;
+        let start = change - 3600;
+        let to = next_window_end(start, start + 3 * 3600, START_WINDOW_SECS, ADELAIDE);
+        assert_eq!(to, change);
+        assert_eq!(format_local(to - STEP_SECS, ADELAIDE), "20261004015500");
+        let to2 = next_window_end(change, change + 3 * 3600, START_WINDOW_SECS, ADELAIDE);
+        assert_eq!(to2, change + 3 * 3600);
+        assert_eq!(format_local(change, ADELAIDE), "20261004030000");
+    }
+
+    #[test]
+    fn window_end_respects_range_end() {
+        let start = parse_local("20261020110000", ADELAIDE).unwrap();
+        assert_eq!(
+            next_window_end(start, start + 600, 3 * 3600, ADELAIDE),
+            start + 600
+        );
+    }
+
+    #[test]
     fn spring_forward_time_does_not_exist() {
         // 2026-10-04: at 02:00 ACST clocks jump to 03:00 ACDT.
         assert_eq!(parse_local("20261004020000", ADELAIDE), None);
@@ -625,16 +827,6 @@ mod tests {
         let before = parse_local("20261004015500", ADELAIDE).unwrap();
         let after = parse_local("20261004030000", ADELAIDE).unwrap();
         assert_eq!(after - before, 300); // only 5 real minutes apart
-    }
-
-    #[test]
-    fn windows_cover_range_exactly() {
-        let w = windows(0, 250, 100);
-        assert_eq!(w, vec![(0, 100), (100, 200), (200, 250)]);
-        assert_eq!(windows(0, 200, 100), vec![(0, 100), (100, 200)]);
-        assert_eq!(windows(5, 6, 100), vec![(5, 6)]);
-        assert!(windows(10, 10, 100).is_empty());
-        assert!(windows(10, 5, 100).is_empty());
     }
 
     #[test]

@@ -137,9 +137,9 @@ async fn stored_series(
     })
 }
 
-pub async fn healthz(State(state): State<AppState>) -> ApiResult {
-    let last = db::max_reading_ts(&state.pool, state.plant_id).await?;
-    Ok(Json(json!({ "ok": true, "last_reading_ts": last })))
+/// Public liveness check. It deliberately reveals nothing about the data.
+pub async fn healthz() -> Json<Value> {
+    Json(json!({ "ok": true }))
 }
 
 pub async fn latest(State(state): State<AppState>) -> ApiResult {

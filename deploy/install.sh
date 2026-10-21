@@ -32,9 +32,11 @@ if [ ! -x "$binary" ]; then
     exit 1
 fi
 
-echo "Installing packages..."
-apt-get update -qq
-apt-get install -y -qq sqlite3 ca-certificates >/dev/null
+if ! command -v sqlite3 >/dev/null 2>&1 || [ ! -e /etc/ssl/certs/ca-certificates.crt ]; then
+    echo "Installing packages..."
+    apt-get update -qq
+    apt-get install -y -qq sqlite3 ca-certificates >/dev/null
+fi
 
 echo "Creating user and directories..."
 if ! id -u solar-dash >/dev/null 2>&1; then

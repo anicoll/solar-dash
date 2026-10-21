@@ -66,7 +66,7 @@ if you want older history):
 cargo run -- serve
 ```
 
-`serve` logs in, then syncs straight away and every 5 minutes after that
+`serve` logs in. If iSolarCloud is down or the login fails, `serve` keeps running (dashboard and Modbus included) and retries the login after 1 minute, doubling up to every 30 minutes. Once logged in it syncs straight away and every 5 minutes after that
 (about a minute after each 5-minute mark, when the data has landed). Stop it
 with Ctrl+C. It makes about 12 calls an hour, about 8,900 a month, well inside
 the API limits. If it was stopped for a while it catches up from where it left
@@ -156,14 +156,15 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /healthz` | `{"ok":true,"last_reading_ts":...}` (public) |
+| `GET /healthz` | `{"ok":true}` (public) |
 | `GET /api/latest` | The newest value of every point, with its name and unit |
 | `GET /api/series?points=83033,83106&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per point. At most 20 points and 31 days |
 | `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}}` from Modbus, or `{"sample": null}` if there is none or it is over 5 minutes old |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days. Each day has a `source` (see [Modbus in `serve`](#modbus-in-serve)) |
-| `GET /api/costs?from=YYYY-MM-DD&to=YYYY-MM-DD` | Dollars per local day from the `[tariff]` section: `actual`, `baseline` (no solar or battery), `savings`, zero-import `credit`, and import, export and load kWh, plus `totals`. Default: the last 30 days. At most 1,500 days. Days with no data are left out. Without a `[tariff]` section it answers `{"configured":false}` |
+| `GET /api/costs?from=YYYY-MM-DD&to=YYYY-MM-DD` | Dollars per local day from the `[tariff]` section: `actual`, `baseline` (no solar or battery), `savings`, zero-import `credit`, and import, export and load kWh, plus `totals`. Default: the last 30 days. At most 1,500 days. Days with no data are left out. Finished days are stored in the database, so repeat requests are fast; editing the `[tariff]` rates makes them be worked out again. Without a `[tariff]` section it answers `{"configured":false}` |
+| `GET /api/payback` | How much of the system's cost the savings have covered, from the `[[system.purchase]]` entries and the `[tariff]`: `total_cost`, `saved`, `net`, `recovered_pct`, `rate_per_day` (mean savings over the last 365 days with data), `projected_payback` (`"YYYY-MM"`, `null` once paid back, or `"never"`), the `purchases`, a monthly `series` of cumulative `saved` and `net`, and `by_year` (`partial` when a year has fewer days of data than days). Counts from the first purchase date to today. Without purchases or a `[tariff]` section it answers `{"configured":false}` |
 
 For example, once logged in with a browser, try
 <http://127.0.0.1:8080/api/latest>. With curl, log in and keep the cookie (needs `cookie_secure = false` over plain http):

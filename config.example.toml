@@ -98,3 +98,17 @@ path = "data/solar.db"
 # to = "21:00"
 # max_kwh = 0.1
 # credit_cents = 100.0
+
+# Optional: what the system cost, for the payback estimate (`/api/payback`).
+# It needs the [tariff] section above too. Add one [[system.purchase]] per
+# payment; the cost is in dollars. The first date is where the savings count
+# from.
+# [[system.purchase]]
+# name = "Solar, inverter and battery 1"
+# date = "2023-02-21"
+# cost_dollars = 19490.00
+# # The day of the month for this one is approximate.
+# [[system.purchase]]
+# name = "Battery 2"
+# date = "2025-10-01"
+# cost_dollars = 7690.20
