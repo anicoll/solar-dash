@@ -10,8 +10,8 @@ use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyInit};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use rand::Rng;
-use rand::distributions::Alphanumeric;
+use rand::RngExt;
+use rand::distr::Alphanumeric;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
@@ -36,7 +36,7 @@ const LENIENT_STANDARD: GeneralPurpose = GeneralPurpose::new(
 
 /// `len` random characters from `[A-Za-z0-9]`.
 fn random_alphanumeric(len: usize) -> String {
-    rand::thread_rng()
+    rand::rng()
         .sample_iter(Alphanumeric)
         .take(len)
         .map(char::from)
@@ -100,7 +100,7 @@ pub fn rsa_encrypt_key(data: &str, public_key_b64: &str) -> Result<String> {
         RsaPublicKey::from_public_key_der(&der).context("public key is not a valid DER key")?;
 
     let chunk_size = public_key.size() - RSA_PKCS1_OVERHEAD;
-    let mut rng = rand::thread_rng();
+    let mut rng = rsa::rand_core::OsRng;
     let mut output = Vec::new();
     for chunk in data.as_bytes().chunks(chunk_size) {
         let encrypted = public_key
@@ -148,7 +148,7 @@ mod tests {
 
     /// Makes a throwaway 2048-bit key pair; the public half is URL-safe base64 DER.
     fn test_keys() -> (RsaPrivateKey, String) {
-        let private = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let private = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let der = private.to_public_key().to_public_key_der().unwrap();
         let b64 = base64::engine::general_purpose::URL_SAFE.encode(der.as_bytes());
         (private, b64)
