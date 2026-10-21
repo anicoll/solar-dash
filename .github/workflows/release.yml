@@ -20,15 +20,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     # Build on the same Debian as the LXC, so the binary matches its glibc.
-    container: debian:trixie
+    # The official Rust image for Debian 13 already has Rust and a C compiler,
+    # so nothing is downloaded or installed before the build.
+    container: rust:slim-trixie
     steps:
-      - name: Install build tools
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq build-essential curl ca-certificates git >/dev/null
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
+      # Keeps compiled dependencies between runs, so only solar-dash itself is
+      # rebuilt. Its own key keeps it apart from the CI job's debug cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
       - name: Build
         run: cargo build --release --locked
       - name: Package
