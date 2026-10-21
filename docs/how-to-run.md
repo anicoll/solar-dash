@@ -72,6 +72,31 @@ For more logging:
 RUST_LOG=debug cargo run -- serve
 ```
 
+## Backfill history
+
+Download the 5-minute history into the database, starting from the day your
+inverter was connected:
+
+```sh
+cargo run -- backfill --from 2023-02-21
+```
+
+This needs `plant_id` in `config.toml` (run `login-test` to see your plants).
+Which points are fetched and the plant's time zone can be changed with
+`points` and `timezone` (see `config.example.toml`).
+
+It is safe to stop (Ctrl+C) and run again: progress is saved after every
+window, and the next run resumes where the last one stopped. The API returns
+at most 3 hours per call, so a day is 8 calls and three years is about 8,800
+calls, roughly 2.5 hours with the 1 s pause between calls. The command keeps
+itself under the API limits and pauses if it gets close to the hourly limit.
+
+To check progress:
+
+```sh
+sqlite3 data/solar.db "select count(*), datetime(min(ts),'unixepoch'), datetime(max(ts),'unixepoch') from reading"
+```
+
 ## Exploring the API
 
 The `api` subcommand logs in, calls any iSolarCloud endpoint and prints the
