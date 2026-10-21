@@ -300,13 +300,14 @@
     return mins < 120 ? `${mins} min ago` : `${Math.round(mins / 60)} h ago`;
   }
 
-  /** The newest inverter sample, or null if there is none (or the request failed). */
+  /** The newest inverter sample and car state; either is null if there is none (or the request failed). */
   async function fetchLive() {
     try {
-      return (await api('/api/live')).sample || null;
+      const live = await api('/api/live');
+      return { sample: live.sample || null, car: live.car || null };
     } catch (err) {
       if (err.message === 'Not logged in.') throw err;
-      return null;
+      return { sample: null, car: null };
     }
   }
 
@@ -340,11 +341,13 @@
   const FLOW_FULL_W = 5000;  // flows at or above this animate at full speed
   // Sungrow-style layout: solar on top, home in the middle, battery bottom-left, grid bottom-right.
   // tx/ty/anchor place the three text lines (label, value, note) beside or below each node.
+  // r is the disc radius (default 28). The car, left of Home, only shows while it is plugged in.
   const FLOW_NODES = {
     solar: { x: 200, y: 64, colour: '--c-pv', label: 'Solar', tx: 238, ty: 22, anchor: 'start' },
     home: { x: 200, y: 188, colour: '--c-load', label: 'Home', tx: 238, ty: 154, anchor: 'start' },
     battery: { x: 70, y: 280, colour: '--c-battery', label: 'Battery', tx: 70, ty: 324, anchor: 'middle' },
     grid: { x: 330, y: 280, colour: '--c-grid', label: 'Grid', tx: 330, ty: 324, anchor: 'middle' },
+    car: { x: 126, y: 188, r: 24, colour: '--c-ev', label: 'Car', tx: 126, ty: 106, anchor: 'middle' },
   };
   // Rounded right-angle routes. Each path runs in its positive direction (from -> to); `rev` is the colour when it runs backwards.
   const FLOW_EDGES = {
@@ -354,10 +357,12 @@
     batHome: { d: 'M94.6 268H171Q185 268 185 254V212', colour: '--c-battery' },
     gridHome: { d: 'M305.4 268H229Q215 268 215 254V212', colour: '--c-grid' },
     batGrid: { d: 'M94.6 292H305.4', colour: '--c-battery', rev: '--c-grid' },
+    homeCar: { d: 'M172 188H150', colour: '--c-ev' },
   };
   const FLOW_ICONS = {
     home: ['M3 11.5L12 3.5l9 8', 'M5.5 10v10.5h13V10', 'M10 20.5v-6h4v6', 'M16.5 7V4h2v5'],
     grid: ['M12 2L7.5 22M12 2l4.5 20', 'M9 5h6', 'M6 8.5h12', 'M8.2 15h7.6', 'M9.4 8.5l5.7 6.5M14.6 8.5L8.9 15', 'M6 8.5v2M18 8.5v2'],
+    car: ['M2.5 16.5v-3.5l2-1 2-4.5h8l3.5 4.5 3.5 1v3.5h-2', 'M2.5 16.5h2', 'M8.5 16.5h7', 'M7.5 12h11'],
   };
 
   /** SVG element with the given attributes and optional class. */
@@ -404,6 +409,9 @@
       parts.fill = svgEl('rect', { x: 4.6, y: 9, width: 0, height: 6, rx: 0.8 }, 'flow-soc');
       g.append(svgEl('rect', { x: 2.5, y: 6.5, width: 17, height: 11, rx: 2.4 }),
         svgEl('path', { d: 'M21.5 10.5v3' }), parts.fill);
+    } else if (kind === 'car') {
+      g.append(flowPaths(FLOW_ICONS.car),
+        svgEl('circle', { cx: 6.5, cy: 16.5, r: 2 }), svgEl('circle', { cx: 17.5, cy: 16.5, r: 2 }));
     } else {
       g.appendChild(flowPaths(FLOW_ICONS[kind]));
     }
@@ -435,17 +443,18 @@
     const n = FLOW_NODES[kind];
     const g = flowColour(svgEl('g', {}, 'flow-node'), n.colour);
     const icon = flowIcon(kind);
-    icon.g.setAttribute('transform', `translate(${n.x - 18} ${n.y - 18}) scale(1.5)`);
+    const r = n.r || 28, scale = 1.5 * r / 28;
+    icon.g.setAttribute('transform', `translate(${n.x - 12 * scale} ${n.y - 12 * scale}) scale(${scale})`);
     const label = svgText(n.tx, n.ty, n.label, 'flow-label', n.anchor);
     const value = svgText(n.tx, n.ty + 18, '', 'flow-value', n.anchor);
     const note = svgText(n.tx, n.ty + 34, '', 'flow-note', n.anchor);
     g.append(
-      svgEl('circle', { cx: n.x, cy: n.y, r: 31, filter: 'url(#flow-blur-lg)' }, 'flow-halo'),
-      svgEl('circle', { cx: n.x, cy: n.y, r: 28 }, 'flow-disc'),
-      svgEl('circle', { cx: n.x, cy: n.y, r: 28, fill: `url(#flow-g-${kind})` }, 'flow-tint'),
+      svgEl('circle', { cx: n.x, cy: n.y, r: r + 3, filter: 'url(#flow-blur-lg)' }, 'flow-halo'),
+      svgEl('circle', { cx: n.x, cy: n.y, r }, 'flow-disc'),
+      svgEl('circle', { cx: n.x, cy: n.y, r, fill: `url(#flow-g-${kind})` }, 'flow-tint'),
       icon.g, label, value, note,
     );
-    return { g, value, note, ...icon.parts };
+    return { g, label, value, note, ...icon.parts };
   }
 
   /** Dots per flow and seconds per traversal for a flow of `w` watts. */
@@ -507,7 +516,7 @@
       const holder = svgEl('g', {});
       g.appendChild(holder);
       root.appendChild(g);
-      view.flows[kind] = { id, d: e.d, colour: e.colour, rev: e.rev, holder, key: '', motions: [], secs: 0 };
+      view.flows[kind] = { id, g, d: e.d, colour: e.colour, rev: e.rev, holder, key: '', motions: [], secs: 0 };
     }
     for (const kind in FLOW_NODES) {
       view.nodes[kind] = flowNode(kind);
@@ -535,8 +544,16 @@
     return { pvHome, pvBat, pvGrid, batHome, gridHome, batGrid: batGrid - gridBat };
   }
 
-  /** Animated Solar / Home / Battery / Grid power-flow diagram in the Sungrow app layout. */
-  function flowDiagram(s) {
+  /** True while the car's cable is in: it then gets a node in the flow diagram. */
+  const carPlugged = (car) => car.plugged_in === true || car.charging_state === 'Charging';
+
+  /** "charging", "complete" or "plugged in", for a plugged-in car. */
+  function carWord(car) {
+    return car.charging_state === 'Charging' ? 'charging' : car.charging_state === 'Complete' ? 'complete' : 'plugged in';
+  }
+
+  /** Animated Solar / Home / Battery / Grid power-flow diagram in the Sungrow app layout, plus the car while it is plugged in. */
+  function flowDiagram(s, car) {
     if (!flowView) flowView = flowBuild();
     const word = (w, pos, neg) => (w == null || Math.abs(w) < FLOW_MIN_W ? 'idle' : w > 0 ? pos : neg);
     const val = (w) => (w == null ? '–' : `${kw(Math.abs(w))} kW`);
@@ -544,15 +561,28 @@
     const gridWord = word(s.grid_w, 'importing', 'exporting');
     const soc = s.soc_pct == null ? '' : `${Math.round(s.soc_pct)}%`;
     const watts = { solar: s.pv_w, home: s.load_w, grid: s.grid_w, battery: s.battery_w };
+    const showCar = !!car && carPlugged(car), charging = showCar && car.charging_state === 'Charging';
     const notes = {
       solar: [word(s.pv_w, 'generating', 'generating'), '--c-pv'],
-      home: [word(s.load_w, 'consuming', 'consuming'), '--c-load'],
+      // The car sits behind the house meter, so its power is already part of the home load.
+      home: [word(s.load_w, 'consuming', 'consuming') + (charging ? ' · incl. car' : ''), '--c-load'],
       grid: [gridWord, s.grid_w < 0 ? '--c-export' : '--c-import'],
       battery: [soc ? `${batWord} · ${soc}` : batWord, s.battery_w < 0 ? '--c-discharge' : '--c-charge'],
     };
     const { root, flows, nodes } = flowView;
     const split = splitFlows(s);
+    const carW = !charging ? 0 : car.charger_power_kw == null ? null : car.charger_power_kw * 1000;
+    split.homeCar = carW;
     for (const kind in flows) flowUpdate(flows[kind], split[kind]);
+    for (const g of [nodes.car.g, flows.homeCar.g]) g.toggleAttribute('hidden', !showCar);  // SVG elements have no .hidden property
+    let carText = '';
+    if (showCar) {
+      const pct = car.battery_level_pct == null ? '' : `${Math.round(car.battery_level_pct)}%`;
+      watts.car = carW;
+      notes.car = [pct ? `${carWord(car)} · ${pct}` : carWord(car), '--c-ev'];
+      nodes.car.label.textContent = car.display_name || 'Car';
+      carText = `, car ${carWord(car)}${charging ? ` ${val(carW)}` : ''}${pct ? ` at ${pct}` : ''}`;
+    }
     for (const kind in watts) {
       const n = nodes[kind];
       n.g.classList.toggle('on', watts[kind] != null && Math.abs(watts[kind]) >= FLOW_MIN_W);
@@ -565,14 +595,45 @@
     nodes.battery.fill.setAttribute('width', (12.8 * pct / 100).toFixed(2));
     nodes.battery.fill.classList.toggle('low', pct <= 15);
     root.setAttribute('aria-label', `Solar ${val(s.pv_w)}, home ${val(s.load_w)}, battery ${batWord} ${val(s.battery_w)}` +
-      `${soc ? ` at ${soc}` : ''}, grid ${gridWord} ${val(s.grid_w)}`);
+      `${soc ? ` at ${soc}` : ''}, grid ${gridWord} ${val(s.grid_w)}${carText}`);
     return root;
   }
 
-  function renderLiveTiles(sample) {
-    const host = $('live-tiles'), diagram = flowDiagram(sample);
+  function renderLiveTiles(sample, car) {
+    const host = $('live-tiles'), diagram = flowDiagram(sample, car);
     if (diagram.parentNode !== host || host.childNodes.length !== 1) host.replaceChildren(diagram);
     setStatus(`Live from inverter · updated ${ageText(Date.now() / 1000 - sample.ts)}`, false);
+  }
+
+  /** "h m" for a duration in hours: "1 h 30 m", "45 m". */
+  function hoursText(h) {
+    const mins = Math.round(h * 60);
+    return mins >= 60 ? `${Math.floor(mins / 60)} h ${mins % 60} m` : `${mins} m`;
+  }
+
+  /** One-line summary of the car under the power diagram; hidden when there is no car. */
+  function renderCarTile(car) {
+    const host = $('car-tile');
+    host.hidden = !car;
+    if (!car) return;
+    const pct = (v) => (v == null ? null : `${Math.round(v)}%`);
+    const level = pct(car.battery_level_pct), limit = pct(car.charge_limit_soc_pct);
+    let parts;
+    if (carPlugged(car)) {
+      const charging = car.charging_state === 'Charging';
+      parts = [
+        charging && car.charger_power_kw != null ? `charging ${car.charger_power_kw.toFixed(1)} kW` : carWord(car),
+        level && limit ? `${level} → ${limit}` : level,
+        car.charge_energy_added_kwh == null ? null : `+${car.charge_energy_added_kwh.toFixed(1)} kWh`,
+        charging && car.time_to_full_charge_h != null ? `full in ${hoursText(car.time_to_full_charge_h)}` : null,
+      ];
+    } else {
+      parts = [level, car.state, car.geofence];
+    }
+    const line = el('span', 'car-text');
+    line.appendChild(el('span', 'car-name', car.display_name || 'Car'));
+    line.append(...parts.filter(Boolean).map((p) => ` · ${p}`));
+    host.replaceChildren(line, el('span', 'car-age', `updated ${ageText(Date.now() / 1000 - car.updated_ts)}`));
   }
 
   function renderCloudTiles(latest) {
@@ -628,7 +689,7 @@
   /** Loads the Now view. Returns the delay before the next refresh. */
   async function loadNow() {
     const today = todayStr();
-    const [sample, daily, savings] = await Promise.all([
+    const [{ sample, car }, daily, savings] = await Promise.all([
       fetchLive(),
       api(`/api/daily?from=${today}&to=${today}`),
       loadSavings().catch((err) => { if (err.message === 'Not logged in.') throw err; return null; }),
@@ -644,11 +705,12 @@
       : todayTotals.source === 'cloud' ? '(iSolarCloud)' : '';
     let delay = REFRESH_MS;
     if (sample) {
-      renderLiveTiles(sample);
+      renderLiveTiles(sample, car);
       delay = LIVE_REFRESH_MS;
     } else {
       renderCloudTiles(await api('/api/latest'));
     }
+    renderCarTile(car);
     // The chart needs two heavier requests, so it refreshes on the slower cadence.
     if (Date.now() - lastNowChartAt >= REFRESH_MS - 1000) {
       lastNowChartAt = Date.now();

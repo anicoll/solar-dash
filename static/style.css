@@ -20,6 +20,7 @@
   --c-load: #7cc4ff;
   --c-battery: #3dd6b0;
   --c-grid: #c9a0ff;
+  --c-ev: #ff7eb6;
   /* Variants where one flow has two directions */
   --c-import: var(--c-grid);
   --c-export: #8f6fcf;
@@ -186,6 +187,15 @@ input[type="number"] { width: 6.5em; }
 .soc .fill { display: block; height: 100%; border-radius: 3px; background: var(--c-battery); }
 .soc .pct { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12px; }
 @media (min-width: 760px) { .soc .bar { height: 8px; } .soc .pct { font-size: 13px; } }
+
+/* One-line car summary under the tiles. */
+.car-tile {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px;
+  padding: 10px 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--border); font-size: 14px;
+}
+@media (min-width: 760px) { .car-tile { background: var(--panel-2); border-color: transparent; } }
+.car-name { color: var(--c-ev); font-weight: 600; }
+.car-age { color: var(--muted); font-size: 13px; }
 
 /* Power-flow diagram (live view). Each node sets --flow to its colour; .on marks an active node or flow. */
 .flow { grid-column: 1 / -1; justify-self: center; width: 100%; max-width: 560px; height: auto; display: block; overflow: visible; }
