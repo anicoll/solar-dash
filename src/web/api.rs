@@ -19,8 +19,8 @@ const MAX_SERIES_SECS: i64 = 31 * 24 * 3600;
 const MAX_DAILY_DAYS: u64 = 400;
 /// Without `from`, `/api/daily` returns this many days.
 const DEFAULT_DAILY_DAYS: u64 = 30;
-/// The history has one row every 5 minutes.
-const STEP_SECS: i64 = 300;
+/// The longest time one counter step is spread over (see `derive_power`).
+const MAX_SPREAD_SECS: i64 = 30 * 60;
 
 /// Power points shown by `/api/day`: (key, point id).
 const POWER_POINTS: [(&str, i64); 3] = [("pv_w", 83033), ("load_w", 83106), ("soc", 83252)];
@@ -222,21 +222,40 @@ fn today(tz: Tz) -> NaiveDate {
 }
 
 /// Turns a daily energy counter (Wh, `(ts, value)` pairs) into average power
-/// (W) for each 5-minute step: `W = ΔWh * 12`, because 5 minutes is 1/12 hour.
+/// (W) at each row after the first, oldest first.
 ///
-/// - The result is stamped with the end of the step.
-/// - A negative change is the counter resetting at midnight, so it counts as 0.
-/// - Steps that are not exactly 5 minutes (a missing row) are skipped, since
-///   the change would cover a longer time.
+/// iSolarCloud counters only move in 100 Wh steps, so a counter can sit still
+/// for half an hour and then jump. Turning each 5-minute change straight into
+/// power would show 0 W and then a 1.2 kW spike. Instead each step is spread
+/// evenly over the time since the counter last moved, at most
+/// [`MAX_SPREAD_SECS`]: `W = ΔWh * 3600 / seconds`.
+///
+/// - A negative change is the counter resetting at midnight: that row is 0
+///   and counting starts again from the new value.
+/// - Rows after the last step stay at 0 until the counter moves again.
 fn derive_power(counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
-    counter
-        .windows(2)
-        .filter(|pair| pair[1].0 - pair[0].0 == STEP_SECS)
-        .map(|pair| {
-            let delta_wh = (pair[1].1 - pair[0].1).max(0.0);
-            (pair[1].0, delta_wh * 12.0)
-        })
-        .collect()
+    let Some(&(first_ts, first_value)) = counter.first() else {
+        return Vec::new();
+    };
+    let mut power: Vec<(i64, f64)> = Vec::new();
+    // When the counter last moved, and its value then.
+    let (mut last_ts, mut last_value) = (first_ts, first_value);
+
+    for &(ts, value) in &counter[1..] {
+        power.push((ts, 0.0));
+        if value < last_value {
+            (last_ts, last_value) = (ts, value);
+        } else if value > last_value {
+            let spread_from = last_ts.max(ts - MAX_SPREAD_SECS);
+            let watts = (value - last_value) * 3600.0 / (ts - spread_from) as f64;
+            // This row and the earlier rows the step covers share the energy.
+            for row in power.iter_mut().rev().take_while(|row| row.0 > spread_from) {
+                row.1 = watts;
+            }
+            (last_ts, last_value) = (ts, value);
+        }
+    }
+    power
 }
 
 #[derive(Deserialize)]
@@ -352,12 +371,31 @@ mod tests {
 
     #[test]
     fn derives_power_from_counter_deltas() {
-        // +10 Wh in 5 minutes is 120 W.
+        // +10 Wh in 5 minutes is 120 W. +15 Wh over the next 10 minutes is 90 W.
         let counter = [(0, 100.0), (300, 110.0), (600, 110.0), (900, 125.0)];
         assert_eq!(
             derive_power(&counter),
-            vec![(300, 120.0), (600, 0.0), (900, 180.0)]
+            vec![(300, 120.0), (600, 90.0), (900, 90.0)]
         );
+    }
+
+    #[test]
+    fn coarse_steps_are_spread_out() {
+        // A 100 Wh step after 15 still minutes is 400 W over those 15 minutes,
+        // not a 1.2 kW spike.
+        let counter = [(0, 1100.0), (300, 1100.0), (600, 1100.0), (900, 1200.0)];
+        assert_eq!(
+            derive_power(&counter),
+            vec![(300, 400.0), (600, 400.0), (900, 400.0)]
+        );
+        // After a long still spell, the step is spread over the last 30
+        // minutes only (100 Wh in 30 minutes is 200 W).
+        let counter: Vec<_> = (0..=12)
+            .map(|i| (i * 300, if i == 12 { 1200.0 } else { 1100.0 }))
+            .collect();
+        let power = derive_power(&counter);
+        assert!(power[..6].iter().all(|row| row.1 == 0.0));
+        assert!(power[6..].iter().all(|row| row.1 == 200.0));
     }
 
     #[test]
@@ -370,10 +408,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_rows_are_skipped() {
-        // The row at 600 is missing, so the step 300 -> 900 is not 5 minutes.
+    fn missing_rows_use_the_real_gap() {
+        // The row at 600 is missing, so +45 Wh covers 10 minutes: 270 W.
         let counter = [(0, 0.0), (300, 5.0), (900, 50.0), (1200, 51.0)];
-        assert_eq!(derive_power(&counter), vec![(300, 60.0), (1200, 12.0)]);
+        assert_eq!(
+            derive_power(&counter),
+            vec![(300, 60.0), (900, 270.0), (1200, 12.0)]
+        );
         assert!(derive_power(&[]).is_empty());
         assert!(derive_power(&[(0, 1.0)]).is_empty());
     }
