@@ -103,10 +103,32 @@ openssl rand -base64 64 | tr -d '\n'
 Without it, `serve` makes a new one on each start and logs a warning, which
 logs everyone out whenever it restarts.
 
-Then run `cargo run -- serve` and open <http://127.0.0.1:8080>. For now the
-page is a placeholder that shows the latest values; the real dashboard comes
-next. After 5 wrong passwords in 15 minutes, logins are refused for 15
+Then run `cargo run -- serve` and open <http://127.0.0.1:8080>. After 5 wrong passwords in 15 minutes, logins are refused for 15
 minutes. A login lasts 30 days.
+
+### Dashboard views
+
+The page has four tabs, and the address keeps the view (for example
+`#day=2026-10-20`, `#month=2026-10`, `#year=2026`), so refresh and bookmarks
+work. All times are shown in Australia/Adelaide.
+
+- **Now**: solar and load power, battery charge, and today's energy totals.
+  It refreshes every minute and shows how old the newest reading is.
+- **Day**: a power chart for one day (pick a date or step with the arrows).
+  Solar, load, grid import, export (below the axis) and battery charge and
+  discharge are in kW, and battery % is on the right axis. 11:00-14:00 is
+  shaded as the "Free 11-2" window and 18:00-21:00 as "Peak". Energy totals
+  for the day are underneath.
+- **Month**: daily bars of PV generation and grid import (up) and export
+  (down), with a line for load, plus the month's totals.
+- **Year**: the same, summed by month.
+
+The charts use [ECharts](https://echarts.apache.org) 5.6.0 (Apache-2.0),
+loaded from cdnjs by a single pinned `<script>` tag in `static/index.html`. The
+browser therefore needs internet access to cdnjs for the charts; without it
+the tiles and totals still work and a banner says the charts could not load.
+To serve ECharts yourself instead, put `echarts.min.js` in `static/` and change
+that one tag.
 
 The JSON API (all of it needs a login, except `/healthz`; without one `/api/*`
 answers 401). Times are unix seconds (UTC), dates are local dates in your

@@ -11,12 +11,12 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Backfill of historical data (`backfill --from`)
 - [x] Live sync (`serve` keeps the database current every 5 minutes)
 - [x] Web server with password login and JSON API
-- [ ] Dashboard UI (next)
-- [ ] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
+- [x] Dashboard UI (Now, Day, Month, Year views; ECharts from cdnjs)
+- [ ] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel (next)
 
 ## Architecture
 
-One binary does everything. A background sync task fetches data from iSolarCloud and writes it to SQLite. An axum web server reads only from SQLite and serves an embedded static dashboard; the web side never calls iSolarCloud directly. This keeps us well inside the API limits of 2,000 calls per hour and 100,000 per month.
+One binary does everything. A background sync task fetches data from iSolarCloud and writes it to SQLite. An axum web server reads only from SQLite and serves an embedded static dashboard (plain HTML/CSS/JS, no build step); the web side never calls iSolarCloud directly. This keeps us well inside the API limits of 2,000 calls per hour and 100,000 per month.
 
 ## Running it
 
@@ -30,7 +30,7 @@ See [docs/how-to-run.md](docs/how-to-run.md).
 - `migrations/` - SQL schema, applied automatically on startup
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
 - `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`) and embedded static files
-- `static/` - files served by the web server, compiled into the binary
+- `static/` - the dashboard (`index.html`, `app.js`, `style.css`), compiled into the binary
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`
 - `docs/` - documentation
