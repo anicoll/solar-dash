@@ -294,6 +294,16 @@ cat /opt/solar-dash/VERSION           # the commit that is installed
 Rollback swaps the program back. A database change made by the newer version
 stays, so if an update included one, restore last night's backup too (section 8).
 
+The update that removes the `raw_response` table (nothing used it) frees space
+inside the database file but does not shrink the file. To shrink it once, stop
+solar-dash and run `VACUUM` (it cannot run inside a migration):
+
+```sh
+sudo systemctl stop solar-dash && sudo -u solar-dash sqlite3 /var/lib/solar-dash/solar.db 'VACUUM;' && sudo systemctl start solar-dash
+```
+
+Old API call records (kept 40 days) are now pruned automatically.
+
 If you built inside the LXC (option B), update with `git pull`,
 `cargo build --release`, `./deploy/install.sh` and `systemctl restart solar-dash`
 instead.

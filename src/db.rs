@@ -128,29 +128,6 @@ pub async fn upsert_readings(pool: &SqlitePool, plant_id: i64, readings: &[Readi
     Ok(())
 }
 
-/// Keeps the unparsed API response, so data can be re-processed later.
-pub async fn save_raw_response(
-    pool: &SqlitePool,
-    endpoint: &str,
-    window_start: Option<i64>,
-    window_end: Option<i64>,
-    body: &str,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO raw_response (endpoint, window_start, window_end, fetched_at, body)
-         VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(endpoint)
-    .bind(window_start)
-    .bind(window_end)
-    .bind(now())
-    .bind(body)
-    .execute(pool)
-    .await
-    .context("could not save raw response")?;
-    Ok(())
-}
-
 /// How far a sync job has got, or `None` if it has never run.
 pub async fn get_cursor(pool: &SqlitePool, job: &str) -> Result<Option<i64>> {
     let cursor = sqlx::query_scalar("SELECT cursor_ts FROM sync_state WHERE job = ?")
@@ -186,6 +163,20 @@ pub async fn record_api_call(pool: &SqlitePool, endpoint: &str, ok: bool) -> Res
         .await
         .context("could not record API call")?;
     Ok(())
+}
+
+/// How long `api_call` rows are kept. The budget looks back 30 days, so 40
+/// leaves a margin.
+const API_CALL_KEEP_SECS: i64 = 40 * 24 * 3600;
+
+/// Deletes `api_call` rows too old to matter for the budget. Returns how many.
+pub async fn prune_api_calls(pool: &SqlitePool) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM api_call WHERE called_at < ?")
+        .bind(now() - API_CALL_KEEP_SECS)
+        .execute(pool)
+        .await
+        .context("could not prune API calls")?;
+    Ok(result.rows_affected())
 }
 
 /// Number of API calls made at or after `since_ts` (unix seconds).
@@ -405,12 +396,12 @@ mod tests {
         let (_dir, pool) = test_db().await;
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
-             ('point', 'reading', 'raw_response', 'sync_state', 'api_call')",
+             ('point', 'reading', 'sync_state', 'api_call')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 5);
+        assert_eq!(tables.len(), 4);
     }
 
     #[tokio::test]
@@ -487,16 +478,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_response_is_saved() {
+    async fn prune_api_calls_removes_only_old_rows() {
         let (_dir, pool) = test_db().await;
-        save_raw_response(&pool, "/x", Some(1), None, "{}")
+        let old = now() - (API_CALL_KEEP_SECS + 60);
+        sqlx::query("INSERT INTO api_call (endpoint, called_at, ok) VALUES ('/old', ?, 1)")
+            .bind(old)
+            .execute(&pool)
             .await
             .unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_response")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
+        record_api_call(&pool, "/new", true).await.unwrap();
+        assert_eq!(prune_api_calls(&pool).await.unwrap(), 1);
+        assert_eq!(api_calls_since(&pool, 0).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn raw_response_table_is_dropped() {
+        let (_dir, pool) = test_db().await;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'raw_response'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
