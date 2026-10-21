@@ -24,6 +24,9 @@ const POINT_INFO_ENDPOINT: &str = "/openapi/getOpenPointInfo";
 /// so `backfill` can run while `serve` is live-syncing.
 pub const BACKFILL_JOB: &str = "backfill";
 pub const LIVE_JOB: &str = "live";
+/// Where `serve`'s background backfill stops: the live sync covers the rest.
+/// Saved once, the first time the background backfill runs.
+const BACKFILL_UNTIL_JOB: &str = "backfill_until";
 
 /// The history has one row every 5 minutes.
 const STEP_SECS: i64 = 5 * 60;
@@ -41,6 +44,11 @@ const BUDGET_RECHECK: Duration = Duration::from_secs(60);
 const CALL_PAUSE: Duration = Duration::from_secs(1);
 /// How often the live loop prunes old `api_call` rows.
 const PRUNE_EVERY_SECS: i64 = 24 * 3600;
+/// History the background backfill fetches per 5-minute tick: 10 days is
+/// about 80 calls, a couple of minutes, so the live sync keeps its rhythm.
+/// At 12 ticks an hour that stays under the hourly call cap, and three years
+/// of history fill in within about 10 hours.
+const BACKFILL_STEP_SECS: i64 = 10 * 24 * 3600;
 
 /// Data lands a little after each 5-minute mark, so live sync waits this long.
 const TICK_LAG_SECS: i64 = 60;
@@ -306,6 +314,8 @@ struct PlantSetup {
     ps_key: String,
     /// The configured points as the API wants them, e.g. "p83022,p83033".
     points: String,
+    /// Local midnight of `history_from`, where `serve`'s backfill starts.
+    history_from: Option<i64>,
 }
 
 impl PlantSetup {
@@ -323,11 +333,23 @@ impl PlantSetup {
             .map(|id| format!("p{id}"))
             .collect::<Vec<_>>()
             .join(",");
+        let history_from = config
+            .history_from
+            .as_deref()
+            .map(|text| {
+                let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| {
+                    anyhow!("history_from must look like \"2023-02-21\", got {text:?}")
+                })?;
+                parse_local(&date.format("%Y%m%d000000").to_string(), tz)
+                    .ok_or_else(|| anyhow!("{date} has no local midnight in {tz}"))
+            })
+            .transpose()?;
         Ok(Self {
             plant_id,
             tz,
             ps_key: format!("{plant_id}_11_0_0"),
             points,
+            history_from,
         })
     }
 }
@@ -508,6 +530,58 @@ async fn sync_once(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> 
     Ok(())
 }
 
+/// Where `serve`'s background backfill picks up: its saved cursor, but never
+/// before `history_from`. A cursor alone (from an earlier `backfill` run) is
+/// resumed; with neither there is nothing to backfill.
+fn backfill_start(cursor: Option<i64>, history_from: Option<i64>) -> Option<i64> {
+    match (cursor, history_from) {
+        (Some(c), Some(from)) => Some(c.max(from)),
+        (Some(c), None) => Some(c),
+        (None, from) => from,
+    }
+}
+
+/// One step of `serve`'s background backfill: up to [`BACKFILL_STEP_SECS`] of
+/// history, from the backfill cursor towards where the live sync began.
+/// Does nothing once history is complete, so it is cheap to call every tick.
+async fn backfill_step(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> Result<()> {
+    let plant = PlantSetup::from_config(config)?;
+    let cursor = db::get_cursor(pool, BACKFILL_JOB).await?;
+    let Some(start) = backfill_start(cursor, plant.history_from) else {
+        return Ok(());
+    };
+    let until = match db::get_cursor(pool, BACKFILL_UNTIL_JOB).await? {
+        Some(until) => until,
+        None => {
+            // The live sync starts at a local midnight and only moves forward,
+            // so it has everything since midnight today (or since its cursor,
+            // if that is still earlier).
+            let Some(live) = db::get_cursor(pool, LIVE_JOB).await? else {
+                return Ok(());
+            };
+            let midnight = local_midnight(db::now(), plant.tz)
+                .ok_or_else(|| anyhow!("could not work out local midnight in {}", plant.tz))?;
+            let until = live.min(midnight);
+            db::set_cursor(pool, BACKFILL_UNTIL_JOB, until).await?;
+            until
+        }
+    };
+    if start >= until {
+        return Ok(());
+    }
+    let end = (start + BACKFILL_STEP_SECS).min(until);
+    info!(
+        from = %format_local(start, plant.tz),
+        to = %format_local(end, plant.tz),
+        "filling in history"
+    );
+    sync_range(client, pool, config, BACKFILL_JOB, start, end).await?;
+    if end == until {
+        info!("history is complete");
+    }
+    Ok(())
+}
+
 /// A sync that logs in first if there is no token yet, and logs in again and
 /// retries once if iSolarCloud reports an error. The token-expiry codes are not
 /// confirmed, so any `ApiError` gets one retry.
@@ -615,6 +689,17 @@ pub async fn run_live_sync(
         }
         login_failures = 0;
 
+        // Then a slice of older history, if any is missing. A failure is
+        // retried on the next tick; the cursor keeps what was saved.
+        tokio::select! {
+            _ = &mut shutdown => break,
+            result = backfill_step(&client, pool, config) => {
+                if let Err(err) = result {
+                    warn!("backfill failed: {err:#}");
+                }
+            }
+        }
+
         let delay = next_tick_delay(db::now());
         debug!(seconds = delay.as_secs(), "sleeping until next sync");
         tokio::select! {
@@ -638,13 +723,9 @@ mod tests {
         assert_eq!(backoff_delay(u32::MAX).as_secs(), 1800);
     }
 
-    #[tokio::test]
-    async fn live_sync_survives_a_failing_login_and_stops_on_shutdown() {
-        let dir = std::env::temp_dir().join(format!("solar-dash-test-{}", std::process::id()));
-        let path = dir.join("test.db");
-        let pool = db::open(path.to_str().unwrap()).await.unwrap();
-        // Nothing listens on port 1, so every login fails at once.
-        let config = IsolarCloud {
+    /// A config whose logins fail at once: nothing listens on port 1.
+    fn offline_config(history_from: Option<&str>) -> IsolarCloud {
+        IsolarCloud {
             gateway: "http://127.0.0.1:1".into(),
             appkey: "k".into(),
             access_key: "a".into(),
@@ -655,7 +736,52 @@ mod tests {
             plant_id: Some(1),
             points: vec![83022],
             timezone: "Australia/Adelaide".into(),
-        };
+            history_from: history_from.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn history_from_must_be_a_date() {
+        assert!(check_sync_config(&offline_config(Some("2023-02-21"))).is_ok());
+        let err = check_sync_config(&offline_config(Some("21/02/2023"))).unwrap_err();
+        assert!(err.to_string().contains("history_from"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn backfill_step_stops_where_the_live_sync_began() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let client = Client::new(offline_config(None)).unwrap();
+        let now = db::now();
+
+        // Nothing configured and no cursor: nothing to do, nothing saved.
+        db::set_cursor(&pool, LIVE_JOB, now).await.unwrap();
+        backfill_step(&client, &pool, &offline_config(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            db::get_cursor(&pool, BACKFILL_UNTIL_JOB).await.unwrap(),
+            None
+        );
+
+        // History already reaches the live sync: the end point is saved (at
+        // most midnight today) and no call is made, which would fail here.
+        db::set_cursor(&pool, BACKFILL_JOB, now).await.unwrap();
+        let config = offline_config(Some("2023-02-21"));
+        backfill_step(&client, &pool, &config).await.unwrap();
+        let until = db::get_cursor(&pool, BACKFILL_UNTIL_JOB).await.unwrap();
+        let midnight = local_midnight(now, PlantSetup::from_config(&config).unwrap().tz);
+        assert_eq!(until, midnight);
+    }
+
+    #[tokio::test]
+    async fn live_sync_survives_a_failing_login_and_stops_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!("solar-dash-test-{}", std::process::id()));
+        let path = dir.join("test.db");
+        let pool = db::open(path.to_str().unwrap()).await.unwrap();
+        let config = offline_config(None);
         let client = Client::new(config.clone()).unwrap();
         // The first backoff is a minute; shutdown must cut it short.
         let shutdown = tokio::time::sleep(Duration::from_millis(500));
@@ -918,6 +1044,15 @@ mod tests {
             pick_live_start(None, Some(yesterday), midnight, now),
             yesterday - overlap
         );
+    }
+
+    #[test]
+    fn backfill_starts_from_the_cursor_but_not_before_history_from() {
+        assert_eq!(backfill_start(None, None), None);
+        assert_eq!(backfill_start(None, Some(100)), Some(100));
+        assert_eq!(backfill_start(Some(500), None), Some(500));
+        assert_eq!(backfill_start(Some(500), Some(100)), Some(500));
+        assert_eq!(backfill_start(Some(50), Some(100)), Some(100));
     }
 
     #[test]

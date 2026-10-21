@@ -46,6 +46,8 @@ pub struct IsolarCloud {
     /// The plant's time zone (an IANA name). History timestamps are in it.
     #[serde(default = "default_timezone")]
     pub timezone: String,
+    /// First day ("YYYY-MM-DD") of history `serve` fills in by itself.
+    pub history_from: Option<String>,
 }
 
 // Deriving Debug would print the secrets into logs, so we write it by hand
@@ -63,6 +65,7 @@ impl fmt::Debug for IsolarCloud {
             .field("plant_id", &self.plant_id)
             .field("points", &self.points)
             .field("timezone", &self.timezone)
+            .field("history_from", &self.history_from)
             .finish()
     }
 }

@@ -59,8 +59,8 @@ Error codes seen so far:
 | `E912` "Illegal x-access-key" | The access key was not accepted | Copy the app's Secret Key into `access_key` again |
 | `E919` (no message) | Your iSolarCloud account is not on the app's whitelist | Add your account's email to the app's whitelist in the developer portal |
 
-Keep the database up to date (run [backfill](#backfill-history) once first
-if you want older history):
+Keep the database up to date, and fill in older history in the background
+(set `history_from` in `config.toml`, see [Backfill history](#backfill-history)):
 
 ```sh
 cargo run -- serve
@@ -70,7 +70,8 @@ cargo run -- serve
 (about a minute after each 5-minute mark, when the data has landed). Stop it
 with Ctrl+C. It makes about 12 calls an hour, about 8,900 a month, well inside
 the API limits. If it was stopped for a while it catches up from where it left
-off; without a backfill it starts from midnight today.  `serve` also runs the
+off; on a new database it starts from midnight today and the background
+backfill fills in everything before that. `serve` also runs the
 [web dashboard](#web-dashboard).
 
 Use a different config file with `--config path/to/file.toml`.
@@ -244,8 +245,23 @@ automatically.
 
 ## Backfill history
 
-Download the 5-minute history into the database, starting from the day your
-inverter was connected:
+`serve` downloads the 5-minute history by itself. Set the day your inverter
+was connected in the `[isolarcloud]` section of `config.toml`:
+
+```toml
+history_from = "2023-02-21"
+```
+
+After each live sync (every 5 minutes) `serve` fetches up to 10 more days of
+history, oldest first, until it reaches the day the live sync began. The
+dashboard stays live the whole time, and three years fill in within about
+10 hours. Progress is saved, so restarts carry on where it stopped, and once
+the history is complete it makes no more calls for it. It also resumes a
+backfill you started earlier with the command below, even without
+`history_from`.
+
+You can also download history without the dashboard, for example on a
+laptop:
 
 ```sh
 cargo run -- backfill --from 2023-02-21
@@ -261,8 +277,10 @@ at most 3 hours per call, so a day is 8 calls and three years is about 8,800
 calls. The command keeps itself under the API limits (it pauses at 1,500 calls
 in an hour, shared with `serve`), so the full history takes about 6 hours.
 
-You can run it while `serve` is running: each keeps its own progress, so
-the live sync carries on from today and the backfill fills in the past.
+There is no need to run it alongside `serve`, which already fills in the
+history: both work from the same saved progress, so running them together
+just downloads the same days twice. Stop `serve` first if you want the
+command instead.
 
 To check progress:
 

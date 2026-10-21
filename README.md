@@ -8,7 +8,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] iSolarCloud API client: login + plant list (`login-test`)
 - [x] API explorer (`api` subcommand)
 - [x] SQLite storage (schema, migrations, typed queries)
-- [x] Backfill of historical data (`backfill --from`)
+- [x] Backfill of historical data (automatic in `serve` with `history_from`, or `backfill --from`)
 - [x] Live sync (`serve` keeps the database current every 5 minutes)
 - [x] Web server with password login and JSON API
 - [x] Dashboard UI (Now, Day, Month, Year views; ECharts from cdnjs)
