@@ -40,7 +40,7 @@ pveam download local debian-12-standard_12.7-1_amd64.tar.zst
 
 Create the container. Change the id `120`, storage names, bridge and the
 address to suit your network. This is unprivileged, with 1 core, 512 MB RAM
-(use 1024 if you build inside it, see below) and 4 GB disk:
+(use 2048 while you build inside it, see below) and 4 GB disk:
 
 ```sh
 pct create 120 local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst \
@@ -60,7 +60,7 @@ For DHCP use `ip=dhcp` instead and add a DHCP reservation for the container on
 your router. Either way, give it an address that does not change.
 
 Via the web UI instead: **Create CT**, tick **Unprivileged container**, pick
-the Debian 12 template, set Cores 1, Memory 1024 MB, Disk 4 GB, and on the
+the Debian 12 template, set Cores 1, Memory 2048 MB, Disk 4 GB, and on the
 Network tab set a static IPv4/CIDR and gateway (or DHCP). Tick **Start at boot**.
 
 Inside the container, as root:
@@ -78,8 +78,8 @@ nothing needs to reach the container from outside.
 
 ### Option A (simplest): build inside the LXC
 
-This keeps the binary matched to Debian 12. Building needs about 1 GB of RAM,
-so keep the memory at 1024 MB for now. You can lower it afterwards.
+This keeps the binary matched to Debian 12. A release build can use more than 1 GB of RAM,
+so give it 2048 MB while building. You can lower it to 512 MB afterwards.
 
 ```sh
 apt install -y build-essential pkg-config
