@@ -1,0 +1,62 @@
+name: Release
+
+# Builds solar-dash for the Proxmox LXC (Debian 13, x86_64) and publishes it as
+# the "latest" GitHub release, so the LXC can update without a Rust toolchain.
+# Pull requests only build, to check that the release build still works.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Build on the same Debian as the LXC, so the binary matches its glibc.
+    container: debian:trixie
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq build-essential curl ca-certificates git >/dev/null
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          dir=solar-dash
+          mkdir -p "$dir"
+          cp target/release/solar-dash config.example.toml "$dir/"
+          cp -r deploy "$dir/"
+          echo "$GITHUB_SHA" > "$dir/VERSION"
+          tar czf solar-dash-linux-x86_64.tar.gz "$dir"
+          sha256sum solar-dash-linux-x86_64.tar.gz > solar-dash-linux-x86_64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: solar-dash-linux-x86_64.tar.gz*
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+      - name: Replace the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # The tag moves to this commit each time, so delete and recreate.
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest solar-dash-linux-x86_64.tar.gz* \
+            --target "$GITHUB_SHA" \
+            --title "Latest build" \
+            --notes "Built from $GITHUB_SHA. Install or update with deploy/update.sh (see docs/deploy.md)."
