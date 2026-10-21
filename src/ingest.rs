@@ -37,18 +37,20 @@ const START_WINDOW_SECS: i64 = 3 * 3600;
 const MIN_WINDOW_SECS: i64 = 3600;
 
 // The API allows 2,000 calls per hour and 100,000 per month; stay below both.
-const MAX_CALLS_PER_HOUR: i64 = 1500;
+// The hourly margin covers logins, retries and our hour not lining up with
+// iSolarCloud's.
+const MAX_CALLS_PER_HOUR: i64 = 1800;
 const MAX_CALLS_PER_30_DAYS: i64 = 80_000;
 const BUDGET_RECHECK: Duration = Duration::from_secs(60);
 /// Pause between calls, to be polite to the server.
 const CALL_PAUSE: Duration = Duration::from_secs(1);
 /// How often the live loop prunes old `api_call` rows.
 const PRUNE_EVERY_SECS: i64 = 24 * 3600;
-/// History the background backfill fetches per 5-minute tick: 10 days is
-/// about 80 calls, a couple of minutes, so the live sync keeps its rhythm.
-/// At 12 ticks an hour that stays under the hourly call cap, and three years
-/// of history fill in within about 10 hours.
-const BACKFILL_STEP_SECS: i64 = 10 * 24 * 3600;
+/// History the background backfill fetches per 5-minute tick: 18 days is
+/// about 144 calls, three to four minutes, so the live sync keeps its rhythm.
+/// At 12 ticks an hour that is about 1,730 calls with the live sync, just under
+/// the hourly cap, and three years of history fill in within about 5 hours.
+const BACKFILL_STEP_SECS: i64 = 18 * 24 * 3600;
 
 /// Data lands a little after each 5-minute mark, so live sync waits this long.
 const TICK_LAG_SECS: i64 = 60;
@@ -978,10 +980,10 @@ mod tests {
     #[test]
     fn budget_decisions() {
         assert_eq!(check_budget(0, 0), Budget::Go);
-        assert_eq!(check_budget(1499, 10), Budget::Go);
-        assert_eq!(check_budget(1500, 10), Budget::WaitForHour);
+        assert_eq!(check_budget(1799, 10), Budget::Go);
+        assert_eq!(check_budget(1800, 10), Budget::WaitForHour);
         assert_eq!(check_budget(0, 80_000), Budget::MonthlyLimit);
-        assert_eq!(check_budget(1500, 80_000), Budget::MonthlyLimit);
+        assert_eq!(check_budget(1800, 80_000), Budget::MonthlyLimit);
     }
 
     #[test]

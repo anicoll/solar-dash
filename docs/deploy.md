@@ -189,7 +189,7 @@ rm -f /var/lib/solar-dash/solar.db-wal /var/lib/solar-dash/solar.db-shm
 
 Without this step solar-dash starts with an empty database. With
 `history_from = "2023-02-21"` in the `[isolarcloud]` section of the config it
-fills in the history by itself in the background, which takes about 10 hours
+fills in the history by itself in the background, which takes about 5 hours
 for three years.
 
 ## 5. Start it
