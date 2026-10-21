@@ -187,6 +187,26 @@ input[type="number"] { width: 6.5em; }
 .soc .pct { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12px; }
 @media (min-width: 760px) { .soc .bar { height: 8px; } .soc .pct { font-size: 13px; } }
 
+/* Power-flow diagram (live view). Paths are drawn in their positive direction; .rev flips them. */
+.flow { grid-column: 1 / -1; justify-self: center; width: 100%; max-width: 520px; height: auto; display: block; }
+.flow-track { fill: none; stroke: var(--flow); stroke-opacity: 0.2; stroke-width: 3; stroke-linecap: round; }
+.flow-line {
+  fill: none; stroke: var(--flow); stroke-width: 3; stroke-linecap: round; stroke-dasharray: 6 8;
+  animation: flow-dash var(--flow-dur, 3s) linear infinite;
+}
+.flow-line.rev { animation-direction: reverse; }
+@keyframes flow-dash { to { stroke-dashoffset: -14; } }
+@media (prefers-reduced-motion: reduce) {
+  .flow-line { animation: none; stroke-dasharray: none; }
+}
+.flow-disc { fill: var(--panel-2); stroke: var(--flow); stroke-opacity: 0.5; stroke-width: 1.5; }
+.flow-icon { fill: none; stroke: var(--flow); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.flow-hub circle { fill: none; stroke: var(--border-strong); stroke-width: 2; }
+.flow-hub circle + circle { fill: var(--border-strong); stroke: none; }
+.flow-label { fill: var(--muted); font-size: 13px; font-weight: 600; }
+.flow-value { fill: var(--fg); font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 17px; font-weight: 600; }
+.flow-note { fill: var(--flow); font-size: 12px; }
+
 /* ---------- Now: today ---------- */
 .today-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
 .stat {
