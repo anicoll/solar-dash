@@ -3,7 +3,12 @@
   'use strict';
 
   const TZ = 'Australia/Adelaide';
-  const REFRESH_MS = 60 * 1000;
+  const REFRESH_MS = 60 * 1000;      // Now, from iSolarCloud
+  const LIVE_REFRESH_MS = 15 * 1000; // Now, from the inverter
+  // The Day chart uses inverter data when it spans at least this many minutes.
+  const LIVE_MIN_MINUTES = 30;
+  // A longer gap between inverter minutes breaks the line.
+  const LIVE_GAP_SECS = 3 * 60;
 
   // Points shown on the Now tab (see config.example.toml).
   const P_PV = 83033, P_LOAD = 83106, P_SOC = 83252;
@@ -158,12 +163,44 @@
 
   // ---------- Now ----------
 
-  async function loadNow() {
-    const today = todayStr();
-    const [latest, daily] = await Promise.all([
-      api('/api/latest'),
-      api(`/api/daily?from=${today}&to=${today}`),
-    ]);
+  /** "5s ago", "3 min ago", "2 h ago". */
+  function ageText(secs) {
+    const s = Math.max(0, Math.round(secs));
+    if (s < 60) return `${s}s ago`;
+    const mins = Math.round(s / 60);
+    return mins < 120 ? `${mins} min ago` : `${Math.round(mins / 60)} h ago`;
+  }
+
+  /** The newest inverter sample, or null if there is none (or the request failed). */
+  async function fetchLive() {
+    try {
+      return (await api('/api/live')).sample || null;
+    } catch (err) {
+      if (err.message === 'Not logged in.') throw err;
+      return null;
+    }
+  }
+
+  /** Power tile in kW with a direction word: positive means `pos`, negative `neg`. */
+  function flowTile(label, w, pos, neg, colourPos, colourNeg) {
+    if (w == null) return tile(label, '–', 'kW', colourPos);
+    const word = w > 0 ? pos : w < 0 ? neg : 'idle';
+    return tile(`${label} · ${word}`, kw(Math.abs(w)), 'kW', w < 0 ? colourNeg : colourPos);
+  }
+
+  function renderLiveTiles(sample) {
+    const power = (label, w, colour) => tile(label, w == null ? '–' : kw(w), 'kW', colour);
+    $('live-tiles').replaceChildren(
+      power('Solar (PV)', sample.pv_w, '--c-pv'),
+      power('Load', sample.load_w, '--c-load'),
+      flowTile('Grid', sample.grid_w, 'importing', 'exporting', '--c-import', '--c-export'),
+      flowTile('Battery', sample.battery_w, 'charging', 'discharging', '--c-charge', '--c-discharge'),
+      tile('State of charge', sample.soc_pct == null ? '–' : Math.round(sample.soc_pct), '%', '--c-soc'),
+    );
+    $('updated').textContent = `Live from inverter · updated ${ageText(Date.now() / 1000 - sample.ts)}`;
+  }
+
+  function renderCloudTiles(latest) {
     const byId = {};
     for (const p of latest.points) byId[p.point_id] = p;
     const watt = (id) => {
@@ -179,15 +216,25 @@
       tile('Battery', soc == null ? '–' : Math.round(soc), '%', '--c-soc'),
     );
     const ts = Math.max(0, ...[P_PV, P_LOAD, P_SOC].map((id) => (byId[id] ? byId[id].ts : 0)));
-    const upd = $('updated');
-    if (!ts) {
-      upd.textContent = 'No readings yet';
-    } else {
-      const mins = Math.max(0, Math.round((Date.now() / 1000 - ts) / 60));
-      const ago = mins < 1 ? 'just now' : mins === 1 ? '1 min ago' : mins < 120 ? `${mins} min ago` : `${Math.round(mins / 60)} h ago`;
-      upd.textContent = `Last updated ${ago} (${fmtLong.format(new Date(ts * 1000))})`;
-    }
+    $('updated').textContent = ts
+      ? `From iSolarCloud · updated ${ageText(Date.now() / 1000 - ts)} (${fmtLong.format(new Date(ts * 1000))})`
+      : 'No readings yet';
+  }
+
+  /** Loads the Now view. Returns the delay before the next refresh. */
+  async function loadNow() {
+    const today = todayStr();
+    const [sample, daily] = await Promise.all([
+      fetchLive(),
+      api(`/api/daily?from=${today}&to=${today}`),
+    ]);
     renderTotals($('today-tiles'), daily.days[0] || {});
+    if (sample) {
+      renderLiveTiles(sample);
+      return LIVE_REFRESH_MS;
+    }
+    renderCloudTiles(await api('/api/latest'));
+    return REFRESH_MS;
   }
 
   // ---------- Day ----------
@@ -202,6 +249,67 @@
     ['battery_discharge_w', 'Battery discharge', '--c-discharge', 1, 'line'],
   ];
 
+  /** Inverter minute rows for [start, end) (unix seconds), or [] if unavailable. */
+  async function fetchLiveDay(start, end) {
+    try {
+      return (await api(`/api/live/series?from=${start}&to=${end - 1}`)).data || [];
+    } catch (err) {
+      if (err.message === 'Not logged in.') throw err;
+      return [];
+    }
+  }
+
+  /** One `[ts, value]` series from inverter rows; `pick(row)` gives the value or null. */
+  function liveSeries(rows, pick) {
+    const out = [];
+    for (const row of rows) {
+      const v = pick(row);
+      if (v == null) continue;
+      if (out.length && row[0] - out[out.length - 1][0] > LIVE_GAP_SECS) out.push([row[0] - 60, null]);
+      out.push([row[0], v]);
+    }
+    return out;
+  }
+
+  /**
+   * Picks the data for the Day chart: the cloud series, or the inverter's when it
+   * covers at least LIVE_MIN_MINUTES. When the inverter started mid-day, the cloud
+   * series is used up to that moment and the inverter's after it.
+   */
+  function mergeDay(cloudSeries, rows) {
+    const byKey = {};
+    for (const s of cloudSeries) byKey[s.key] = s.data;
+    const hasCloud = Object.values(byKey).some((d) => d.length > 0);
+    const liveRows = rows.filter((r) => r.slice(1).some((v) => v != null));
+    if (liveRows.length < LIVE_MIN_MINUTES) {
+      return { byKey, source: hasCloud ? 'Source: iSolarCloud (5-min)' : '' };
+    }
+    const first = liveRows[0][0];
+    const gridPart = (sign) => (r) => (r[3] == null ? null : Math.max(sign * r[3], 0));
+    const livePart = {
+      pv_w: (r) => r[1],
+      load_w: (r) => r[2],
+      grid_import_w: gridPart(1),
+      grid_export_w: gridPart(-1),
+      battery_charge_w: (r) => (r[4] == null ? null : Math.max(r[4], 0)),
+      battery_discharge_w: (r) => (r[4] == null ? null : Math.max(-r[4], 0)),
+      soc: (r) => r[5],
+    };
+    let usedCloud = false;
+    const merged = {};
+    for (const [key, pick] of Object.entries(livePart)) {
+      const before = (byKey[key] || []).filter((d) => d[0] < first);
+      if (before.length) usedCloud = true;
+      merged[key] = before.concat(liveSeries(liveRows, pick));
+    }
+    return {
+      byKey: merged,
+      source: usedCloud
+        ? `Source: iSolarCloud (5-min) until ${clock(first * 1000)}, then inverter (1-min)`
+        : 'Source: inverter (1-min)',
+    };
+  }
+
   async function loadDay(date) {
     $('day-input').value = date;
     const [day, daily] = await Promise.all([
@@ -209,14 +317,18 @@
       api(`/api/daily?from=${date}&to=${date}`),
     ]);
     if (state.view !== 'day' || state.day !== date) return;
-    const byKey = {};
-    for (const s of day.series) byKey[s.key] = s.data;
-    const hasData = day.series.some((s) => s.data.length > 0);
+    const start = day.start * 1000;
+    const end = day.end * 1000;
+    const live = await fetchLiveDay(day.start, day.end);
+    if (state.view !== 'day' || state.day !== date) return;
+    const { byKey, source } = mergeDay(day.series, live);
+    const hasData = Object.values(byKey).some((d) => d.length > 0);
     renderTotals($('day-totals'), daily.days[0] || {});
+    const note = $('day-source');
+    note.textContent = source;
+    note.hidden = !hasData;
 
     const th = baseTheme();
-    const start = adelaideMs(date, 0);
-    const end = adelaideMs(addDays(date, 1), 0);
     const narrow = window.innerWidth < 560;
     const step = (narrow ? 6 : 3) * 3600 * 1000;
 
@@ -256,6 +368,7 @@
       tooltip: {
         trigger: 'axis', axisPointer: { type: 'line' }, ...tooltipStyle(),
         formatter(params) {
+          params = params.filter((p) => p.value[1] != null);
           if (!params.length) return '';
           const rows = params.map((p) => {
             const v = p.value[1];
@@ -376,6 +489,16 @@
 
   const state = { view: 'now', day: '', month: '', year: 0 };
   let timer = null;
+  let pollToken = 0;
+
+  /** Loads Now, then schedules the next refresh (15 s from the inverter, 60 s from the cloud). */
+  async function pollNow() {
+    clearTimeout(timer);
+    const token = ++pollToken;
+    let delay = REFRESH_MS;
+    await guarded(async () => { delay = await loadNow(); });
+    if (token === pollToken && state.view === 'now') timer = setTimeout(pollNow, delay);
+  }
 
   function parseHash() {
     const raw = decodeURIComponent(window.location.hash.replace(/^#/, ''));
@@ -403,12 +526,11 @@
       const v = tab.dataset.view;
       tab.setAttribute('href', '#' + (v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}` : v === 'year' ? `year=${state.year}` : 'now'));
     }
-    clearInterval(timer);
+    clearTimeout(timer);
     timer = null;
-    if (state.view === 'now') {
-      guarded(loadNow);
-      timer = setInterval(() => guarded(loadNow), REFRESH_MS);
-    } else if (state.view === 'day') guarded(() => loadDay(state.day));
+    pollToken++;
+    if (state.view === 'now') pollNow();
+    else if (state.view === 'day') guarded(() => loadDay(state.day));
     else if (state.view === 'month') guarded(() => loadMonth(state.month));
     else guarded(() => loadYear(state.year));
   }
@@ -442,7 +564,7 @@
     window.addEventListener('hashchange', render);
     window.addEventListener('resize', () => { for (const c of Object.values(charts)) c.resize(); });
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden && state.view === 'now') guarded(loadNow); });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && state.view === 'now') pollNow(); });
     render();
   }
 
