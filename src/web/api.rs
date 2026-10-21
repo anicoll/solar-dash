@@ -13,6 +13,7 @@ use tracing::error;
 
 use super::AppState;
 use crate::db::{self, LatestReading};
+use crate::modbus::Sample;
 
 const MAX_SERIES_POINTS: usize = 20;
 const MAX_SERIES_SECS: i64 = 31 * 24 * 3600;
@@ -24,6 +25,12 @@ const MAX_DAILY_DAYS: u64 = 400;
 const DEFAULT_DAILY_DAYS: u64 = 30;
 /// The longest time one counter step is spread over (see `derive_power`).
 const MAX_SPREAD_SECS: i64 = 30 * 60;
+/// The longest time one live sample is held (see `integrate`). Samples come
+/// every ~15 s, so a longer step means the dongle dropped out.
+const MAX_HOLD_SECS: i64 = 120;
+/// A day (or the elapsed part of today) needs this share covered by live
+/// samples before we trust them over the iSolarCloud counters.
+const MIN_LIVE_COVERAGE: f64 = 0.9;
 
 /// Battery state of charge. iSolarCloud stores it as a fraction (0.674),
 /// but its unit is "%", so the API scales it to a percentage (67.4).
@@ -315,6 +322,95 @@ fn derive_power(counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
     power
 }
 
+/// The result of [`integrate`].
+#[derive(Debug, PartialEq)]
+struct Integral {
+    /// Energy while the value was above zero, in kWh.
+    positive_kwh: f64,
+    /// Energy while the value was below zero, in kWh, as a positive number.
+    negative_kwh: f64,
+    /// Seconds that were counted. Time in a longer gap is not counted.
+    covered_secs: i64,
+}
+
+/// Adds up power samples (`(ts, watts)`, oldest first) into energy.
+///
+/// Each sample's value is held until the next sample (a "left rectangle"),
+/// for at most [`MAX_HOLD_SECS`]. After a longer gap the missing time is
+/// unknown: it adds no energy and no covered seconds. The last sample has no
+/// next sample, so it adds nothing. Positive and negative values are kept
+/// apart, so grid power gives import and export separately.
+fn integrate(samples: &[(i64, f64)]) -> Integral {
+    let mut positive_ws = 0.0; // watt-seconds
+    let mut negative_ws = 0.0;
+    let mut covered_secs = 0;
+    // `windows(2)` gives each pair of neighbouring samples.
+    for pair in samples.windows(2) {
+        let (ts, watts) = pair[0];
+        let secs = (pair[1].0 - ts).min(MAX_HOLD_SECS);
+        if watts >= 0.0 {
+            positive_ws += watts * secs as f64;
+        } else {
+            negative_ws -= watts * secs as f64;
+        }
+        covered_secs += secs;
+    }
+    // 1 kWh is 3,600,000 watt-seconds.
+    Integral {
+        positive_kwh: positive_ws / 3.6e6,
+        negative_kwh: negative_ws / 3.6e6,
+        covered_secs,
+    }
+}
+
+/// Should this day use the live samples? `covered_secs` is the seconds the
+/// samples cover, `[start, end)` is the local day and `now` is the current
+/// time. A finished day needs 90% of its length. Today may instead have 90%
+/// of the time since midnight, so it can use live data before it is over.
+fn use_live(covered_secs: i64, start: i64, end: i64, now: i64) -> bool {
+    let enough = |len: i64| len > 0 && covered_secs as f64 >= MIN_LIVE_COVERAGE * len as f64;
+    enough(end - start) || (start <= now && now < end && enough(now - start))
+}
+
+/// Energy of one local day from the live samples, or `None` if they do not
+/// cover enough of it (see [`use_live`]).
+fn live_totals(samples: &[Sample], start: i64, end: i64, now: i64) -> Option<LiveTotals> {
+    // Each column is integrated alone, skipping rows where it is missing.
+    let column = |get: fn(&Sample) -> Option<f64>| {
+        let pairs: Vec<(i64, f64)> = samples
+            .iter()
+            .filter_map(|s| Some((s.ts, get(s)?)))
+            .collect();
+        integrate(&pairs)
+    };
+    let pv = column(|s| s.pv_w);
+    let load = column(|s| s.load_w);
+    let grid = column(|s| s.grid_w);
+    let battery = column(|s| s.battery_w);
+    // The least-covered column decides, so no total rests on thin data.
+    let covered = [&pv, &load, &grid, &battery]
+        .iter()
+        .map(|i| i.covered_secs)
+        .min()?;
+    use_live(covered, start, end, now).then_some(LiveTotals {
+        pv_kwh: pv.positive_kwh,
+        load_kwh: load.positive_kwh,
+        import_kwh: grid.positive_kwh,
+        export_kwh: grid.negative_kwh,
+        battery_charge_kwh: battery.positive_kwh,
+        battery_discharge_kwh: battery.negative_kwh,
+    })
+}
+
+struct LiveTotals {
+    pv_kwh: f64,
+    load_kwh: f64,
+    import_kwh: f64,
+    export_kwh: f64,
+    battery_charge_kwh: f64,
+    battery_discharge_kwh: f64,
+}
+
 #[derive(Deserialize)]
 pub struct DayParams {
     date: Option<String>,
@@ -360,6 +456,8 @@ pub struct DailyParams {
 #[derive(Debug, Serialize)]
 struct DayTotals {
     date: String,
+    /// Where the numbers come from: "inverter" (live samples) or "cloud".
+    source: &'static str,
     pv_kwh: Option<f64>,
     load_kwh: Option<f64>,
     import_kwh: Option<f64>,
@@ -381,11 +479,40 @@ async fn day_max_kwh(
     Ok(max.map(|wh| wh / 1000.0))
 }
 
-async fn day_totals(state: &AppState, date: NaiveDate) -> Result<DayTotals, ApiError> {
+/// `live_range` is the oldest and newest live sample time (see
+/// `db::live_ts_range`), so days without any live data skip the extra query.
+async fn day_totals(
+    state: &AppState,
+    date: NaiveDate,
+    live_range: Option<(i64, i64)>,
+    now: i64,
+) -> Result<DayTotals, ApiError> {
     // Each day gets its own [start, end), so a 23 or 25 hour day is handled correctly.
     let (start, end) = day_bounds_or_error(date, state.tz)?;
+    if let Some((first, last)) = live_range
+        && first < end
+        && last >= start
+    {
+        let samples = db::live_samples_raw(&state.pool, start, end).await?;
+        if let Some(live) = live_totals(&samples, start, end, now) {
+            return Ok(DayTotals {
+                date: date.to_string(),
+                source: "inverter",
+                pv_kwh: Some(live.pv_kwh),
+                load_kwh: Some(live.load_kwh),
+                import_kwh: Some(live.import_kwh),
+                export_kwh: Some(live.export_kwh),
+                battery_charge_kwh: Some(live.battery_charge_kwh),
+                battery_discharge_kwh: Some(live.battery_discharge_kwh),
+                // Needs a pv-to-battery split we do not have; the cloud's value
+                // would not match the live numbers, so leave it out.
+                self_consumed_kwh: None,
+            });
+        }
+    }
     Ok(DayTotals {
         date: date.to_string(),
+        source: "cloud",
         pv_kwh: day_max_kwh(state, 83022, start, end).await?,
         load_kwh: day_max_kwh(state, 83118, start, end).await?,
         import_kwh: day_max_kwh(state, 83102, start, end).await?,
@@ -415,9 +542,11 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
         )));
     }
 
+    let live_range = db::live_ts_range(&state.pool).await?;
+    let now = db::now();
     let mut days = Vec::new();
     for date in from.iter_days().take(count as usize) {
-        days.push(day_totals(&state, date).await?);
+        days.push(day_totals(&state, date, live_range, now).await?);
     }
     Ok(Json(json!({ "days": days })))
 }
@@ -543,13 +672,129 @@ mod tests {
         let state = AppState::new(pool, 7, ADELAIDE, &hash, key).unwrap();
 
         let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-        let saturday = day_totals(&state, date("2026-04-04")).await.unwrap();
-        let sunday = day_totals(&state, date("2026-04-05")).await.unwrap();
-        let monday = day_totals(&state, date("2026-04-06")).await.unwrap();
+        let saturday = day_totals(&state, date("2026-04-04"), None, 0)
+            .await
+            .unwrap();
+        let sunday = day_totals(&state, date("2026-04-05"), None, 0)
+            .await
+            .unwrap();
+        let monday = day_totals(&state, date("2026-04-06"), None, 0)
+            .await
+            .unwrap();
         assert_eq!(saturday.pv_kwh, Some(100.0));
         assert_eq!(sunday.pv_kwh, Some(9.0));
         assert_eq!(monday.pv_kwh, Some(0.0));
         // No data for the other counters.
         assert_eq!(sunday.load_kwh, None);
+        assert_eq!(sunday.source, "cloud");
+    }
+
+    #[test]
+    fn integrates_steady_power() {
+        // 1000 W with a sample every minute for an hour: 60 steps of 60 s.
+        let samples: Vec<_> = (0..=60).map(|i| (i * 60, 1000.0)).collect();
+        let got = integrate(&samples);
+        assert_eq!(got.covered_secs, 3600);
+        assert!((got.positive_kwh - 1.0).abs() < 1e-9);
+        assert_eq!(got.negative_kwh, 0.0);
+    }
+
+    #[test]
+    fn integration_caps_gaps_and_splits_signs() {
+        // 0..15: +1000 W (15 s). 15..30: -2000 W (15 s).
+        // 30..330 is a 300 s gap: only 120 s of the -500 W counts.
+        // 330 is the last sample and adds nothing.
+        let samples = [(0, 1000.0), (15, -2000.0), (30, -500.0), (330, 800.0)];
+        let got = integrate(&samples);
+        assert_eq!(got.covered_secs, 15 + 15 + 120);
+        // 1000 * 15 = 15,000 Ws.
+        assert!((got.positive_kwh - 15_000.0 / 3.6e6).abs() < 1e-12);
+        // 2000 * 15 + 500 * 120 = 90,000 Ws.
+        assert!((got.negative_kwh - 90_000.0 / 3.6e6).abs() < 1e-12);
+        // Fewer than two samples cover nothing.
+        assert_eq!(integrate(&[(0, 5.0)]).covered_secs, 0);
+        assert_eq!(integrate(&[]).positive_kwh, 0.0);
+    }
+
+    #[test]
+    fn live_is_used_when_coverage_is_high_enough() {
+        let (start, end) = (0, 86_400);
+        let now = 1_000_000; // a later day: only the whole-day rule applies
+        assert!(use_live(77_760, start, end, now)); // exactly 90%
+        assert!(!use_live(77_759, start, end, now));
+        // Today at 06:00: 90% of the 6 hours so far is enough.
+        let now = 6 * 3600;
+        assert!(use_live(19_440, start, end, now));
+        assert!(!use_live(19_439, start, end, now));
+        // A future day has nothing elapsed, so it never uses live.
+        assert!(!use_live(0, start, end, -1));
+    }
+
+    #[tokio::test]
+    async fn daily_prefers_live_samples_when_they_cover_the_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        // Cloud counter for both days: 5 kWh.
+        let point = Point {
+            point_id: 83102,
+            code: None,
+            name: None,
+            unit: Some("Wh".to_string()),
+        };
+        db::upsert_point(&pool, &point).await.unwrap();
+        let state_day = |date: &str| {
+            let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+            day_bounds(date, ADELAIDE).unwrap()
+        };
+        let (start, end) = state_day("2026-10-19");
+        let (start2, _) = state_day("2026-10-20");
+        let cloud: Vec<Reading> = [start + 3600, start2 + 3600]
+            .iter()
+            .map(|&ts| Reading {
+                point_id: 83102,
+                ts,
+                value: Some(5000.0),
+            })
+            .collect();
+        db::upsert_readings(&pool, 7, &cloud).await.unwrap();
+
+        // The 19th has a sample every minute all day: import 1000 W (1 kWh/h),
+        // export 0, so 24 kWh minus the last minute, which has no next sample.
+        for ts in (start..end).step_by(60) {
+            let sample = Sample {
+                ts,
+                pv_w: Some(0.0),
+                load_w: Some(1000.0),
+                grid_w: Some(1000.0),
+                battery_w: Some(0.0),
+                soc_pct: Some(50.0),
+            };
+            db::insert_live_sample(&pool, &sample).await.unwrap();
+        }
+
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let range = db::live_ts_range(&state.pool).await.unwrap();
+        let now = start2 + 12 * 3600;
+
+        let live = day_totals(&state, date("2026-10-19"), range, now)
+            .await
+            .unwrap();
+        assert_eq!(live.source, "inverter");
+        // 1439 steps of 60 s at 1000 W.
+        let expected = 1000.0 * 1439.0 * 60.0 / 3.6e6;
+        assert!((live.import_kwh.unwrap() - expected).abs() < 1e-9);
+        assert_eq!(live.export_kwh, Some(0.0));
+        assert_eq!(live.self_consumed_kwh, None);
+
+        // The 20th has cloud data but no live samples.
+        let cloud_day = day_totals(&state, date("2026-10-20"), range, now)
+            .await
+            .unwrap();
+        assert_eq!(cloud_day.source, "cloud");
+        assert_eq!(cloud_day.import_kwh, Some(5.0));
     }
 }

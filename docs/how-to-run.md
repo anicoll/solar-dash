@@ -153,7 +153,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}}` from Modbus, or `{"sample": null}` if there is none or it is over 5 minutes old |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
-| `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days |
+| `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days. Each day has a `source` (see [Modbus in `serve`](#modbus-in-serve)) |
 
 For example, once logged in with a browser, try
 <http://127.0.0.1:8080/api/latest>. With curl, log in and keep the cookie:
@@ -216,6 +216,12 @@ never stop `serve`: the first one is logged as a warning, then one in every 20
 in a row, and `Modbus back` is logged when reads work again. Without a
 `[modbus]` section `serve` behaves exactly as before. The samples are served
 by `/api/live` and `/api/live/series` (see [the API table](#dashboard-views)).
+
+Daily energy: when the live samples cover at least 90% of a local day (for
+today, 90% of the time since midnight), `/api/daily` adds them up itself
+instead of using the iSolarCloud counters, and sets `"source": "inverter"`
+(otherwise `"cloud"`). Gaps over 2 minutes are not counted, and
+`self_consumed_kwh` is `null` for those days.
 
 Signs in the samples: `grid_w` is positive when importing and negative when
 exporting, and `battery_w` is positive when charging and negative when

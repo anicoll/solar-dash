@@ -94,6 +94,7 @@ input[type="number"] { width: 6.5em; }
 }
 .muted { color: var(--muted); margin: 4px 0 12px; font-size: .95rem; }
 .section { margin: 24px 0 10px; font-size: 1rem; color: var(--muted); font-weight: 600; }
+.source-label { font-weight: 400; font-size: .85rem; }
 
 .picker { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 14px; align-items: center; }
 
