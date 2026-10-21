@@ -1,19 +1,22 @@
 //! Password login: Argon2 password check, a signed session cookie, a lockout
 //! after repeated failures, and the middleware that guards the protected routes.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use anyhow::{Result, anyhow};
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use axum::Extension;
 use axum::Form;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::{Cookie, SameSite, SignedCookieJar};
 use serde::Deserialize;
+use sqlx::SqlitePool;
 use time::Duration;
 
 use super::AppState;
@@ -21,7 +24,11 @@ use super::api::ApiError;
 use crate::db;
 
 const COOKIE_NAME: &str = "session";
-const SESSION_SECS: i64 = 30 * 24 * 3600;
+const SESSION_SECS: i64 = 14 * 24 * 3600;
+/// A session's expiry is pushed out at most this often.
+const REFRESH_SECS: i64 = 3600;
+/// Most client addresses remembered by the lockout map.
+const MAX_TRACKED_IPS: usize = 1000;
 
 /// This many failed logins within `FAILURE_WINDOW_SECS` lock logins.
 const MAX_FAILURES: usize = 5;
@@ -51,6 +58,47 @@ fn verify_password(password: &str, hash: &str) -> bool {
             .verify_password(password.as_bytes(), &parsed)
             .is_ok(),
         Err(_) => false,
+    }
+}
+
+/// One `Lockout` per client address, bounded in size.
+#[derive(Debug, Default)]
+pub struct LockoutMap {
+    /// Each entry also remembers when it was last touched, for eviction.
+    entries: HashMap<IpAddr, (Lockout, i64)>,
+}
+
+impl LockoutMap {
+    pub fn is_locked(&self, ip: IpAddr, now: i64) -> bool {
+        self.entries
+            .get(&ip)
+            .is_some_and(|(lockout, _)| lockout.is_locked(now))
+    }
+
+    pub fn record_failure(&mut self, ip: IpAddr, now: i64) {
+        if !self.entries.contains_key(&ip) && self.entries.len() >= MAX_TRACKED_IPS {
+            self.evict(now);
+        }
+        let entry = self.entries.entry(ip).or_default();
+        entry.0.record_failure(now);
+        entry.1 = now;
+    }
+
+    pub fn record_success(&mut self, ip: IpAddr) {
+        self.entries.remove(&ip);
+    }
+
+    /// Makes room for one entry: drops the least recently touched address,
+    /// preferring ones that are not currently locked out.
+    fn evict(&mut self, now: i64) {
+        let victim = self
+            .entries
+            .iter()
+            .min_by_key(|(_, (lockout, touched))| (lockout.is_locked(now), *touched))
+            .map(|(ip, _)| *ip);
+        if let Some(ip) = victim {
+            self.entries.remove(&ip);
+        }
     }
 }
 
@@ -84,33 +132,94 @@ impl Lockout {
             self.failures.clear();
         }
     }
+}
 
-    pub fn record_success(&mut self) {
-        self.failures.clear();
+/// Where the session cookie's id comes from: 128 random bits as hex.
+fn new_session_id() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
+/// Outcome of looking a session up.
+enum SessionCheck {
+    Invalid,
+    /// Valid; the expiry was just pushed out, so the cookie should be re-sent.
+    Refreshed,
+    Valid,
+}
+
+/// One primary-key lookup. The expiry is only rewritten when `last_seen` is
+/// at least `REFRESH_SECS` old, so most requests do not write.
+async fn check_session(pool: &SqlitePool, id: &str, now: i64) -> Result<SessionCheck> {
+    let row: Option<(i64, i64)> =
+        sqlx::query_as("SELECT last_seen, expires_at FROM session WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((last_seen, expires_at)) = row else {
+        return Ok(SessionCheck::Invalid);
+    };
+    if expires_at <= now {
+        return Ok(SessionCheck::Invalid);
     }
+    if now - last_seen < REFRESH_SECS {
+        return Ok(SessionCheck::Valid);
+    }
+    sqlx::query("UPDATE session SET last_seen = ?, expires_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(now + SESSION_SECS)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(SessionCheck::Refreshed)
 }
 
-/// Whether the request reached us over https. Cloudflare Tunnel terminates
-/// TLS and talks plain http to us, so it tells us with this header.
-fn is_https(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("https"))
+async fn create_session(pool: &SqlitePool, now: i64) -> Result<String> {
+    // Expired rows are useless; clear them out while we are here.
+    sqlx::query("DELETE FROM session WHERE expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    let id = new_session_id();
+    sqlx::query("INSERT INTO session (id, created_at, last_seen, expires_at) VALUES (?, ?, ?, ?)")
+        .bind(&id)
+        .bind(now)
+        .bind(now)
+        .bind(now + SESSION_SECS)
+        .execute(pool)
+        .await?;
+    Ok(id)
 }
 
-/// True if the jar holds a validly signed cookie whose expiry is in the future.
-fn has_valid_session(jar: &SignedCookieJar) -> bool {
-    // `get` returns `None` unless the signature checks out.
-    jar.get(COOKIE_NAME)
-        .and_then(|cookie| cookie.value().parse::<i64>().ok())
-        .is_some_and(|expiry| expiry > db::now())
+fn session_cookie(state: &AppState, id: String) -> Cookie<'static> {
+    Cookie::build((COOKIE_NAME, id))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(state.cookie_secure)
+        .max_age(Duration::seconds(SESSION_SECS))
+        .build()
 }
 
 /// Middleware: lets the request through only with a valid session.
-pub async fn require_session(jar: SignedCookieJar, request: Request, next: Next) -> Response {
-    if has_valid_session(&jar) {
-        return next.run(request).await;
+pub async fn require_session(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    request: Request,
+    next: Next,
+) -> Response {
+    // `get` returns `None` unless the signature checks out.
+    let id = jar.get(COOKIE_NAME).map(|c| c.value().to_string());
+    if let Some(id) = id {
+        match check_session(&state.pool, &id, db::now()).await {
+            Ok(SessionCheck::Valid) => return next.run(request).await,
+            Ok(SessionCheck::Refreshed) => {
+                // Re-send the cookie so the browser's copy slides too.
+                let response = next.run(request).await;
+                return (jar.add(session_cookie(&state, id)), response).into_response();
+            }
+            Ok(SessionCheck::Invalid) => {}
+            Err(err) => return ApiError::from(err).into_response(),
+        }
     }
     if request.uri().path().starts_with("/api/") {
         ApiError::unauthorized().into_response()
@@ -128,21 +237,40 @@ pub struct LoginForm {
     password: String,
 }
 
+/// The address lockouts are keyed on: Cloudflare's `CF-Connecting-IP` when
+/// present and valid, else the socket peer.
+fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> IpAddr {
+    headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+        .or(peer.map(|p| p.ip()))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+}
+
 pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     jar: SignedCookieJar,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let now = db::now();
-    // The guard is a temporary, dropped at the end of the statement, so it is
-    // never held across an `.await`.
-    let locked = state.lockout.lock().unwrap().is_locked(now);
+    let ip = client_ip(&headers, peer.map(|Extension(ConnectInfo(addr))| addr));
+    // Guards are temporaries, dropped at the end of the statement, so they
+    // are never held across an `.await`.
+    let locked = state.lockout.lock().unwrap().is_locked(ip, db::now());
     if locked {
-        return login_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many attempts, try again later",
-        );
+        return too_many_attempts();
+    }
+
+    // One password check at a time: each costs ~19 MiB, and parallel guesses
+    // would all pass the check above before any failure is recorded.
+    let Ok(_permit) = state.verify_gate.acquire().await else {
+        return login_error(StatusCode::INTERNAL_SERVER_ERROR, "Login unavailable");
+    };
+    // Queued requests re-check now that earlier ones have been recorded.
+    if state.lockout.lock().unwrap().is_locked(ip, db::now()) {
+        return too_many_attempts();
     }
 
     // Argon2 is deliberately slow, so keep it off the async threads.
@@ -152,22 +280,34 @@ pub async fn login(
         .unwrap_or(false);
 
     if !ok {
-        state.lockout.lock().unwrap().record_failure(now);
+        state.lockout.lock().unwrap().record_failure(ip, db::now());
         return login_error(StatusCode::UNAUTHORIZED, "Wrong password");
     }
-    state.lockout.lock().unwrap().record_success();
+    state.lockout.lock().unwrap().record_success(ip);
 
-    let expiry = now + SESSION_SECS;
-    let cookie = Cookie::build((COOKIE_NAME, expiry.to_string()))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .secure(is_https(&headers))
-        .max_age(Duration::seconds(SESSION_SECS));
-    (jar.add(cookie), Redirect::to("/")).into_response()
+    match create_session(&state.pool, db::now()).await {
+        Ok(id) => (jar.add(session_cookie(&state, id)), Redirect::to("/")).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
 }
 
-pub async fn logout(jar: SignedCookieJar) -> Response {
+fn too_many_attempts() -> Response {
+    login_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many attempts, try again later",
+    )
+}
+
+pub async fn logout(State(state): State<AppState>, jar: SignedCookieJar) -> Response {
+    if let Some(cookie) = jar.get(COOKIE_NAME)
+        && let Err(err) = sqlx::query("DELETE FROM session WHERE id = ?")
+            .bind(cookie.value())
+            .execute(&state.pool)
+            .await
+    {
+        // Still clear the browser cookie, but make the failure visible.
+        tracing::error!("could not delete session: {err}");
+    }
     (
         jar.remove(Cookie::build(COOKIE_NAME).path("/")),
         Redirect::to("/login"),
@@ -258,13 +398,56 @@ mod tests {
 
     #[test]
     fn success_resets_the_count() {
-        let mut lockout = Lockout::default();
+        let mut map = LockoutMap::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
         for i in 0..4 {
-            lockout.record_failure(1000 + i);
+            map.record_failure(ip, 1000 + i);
         }
-        lockout.record_success();
-        lockout.record_failure(1010);
-        assert!(!lockout.is_locked(1011));
+        map.record_success(ip);
+        map.record_failure(ip, 1010);
+        assert!(!map.is_locked(ip, 1011));
+    }
+
+    #[test]
+    fn lockout_is_per_address() {
+        let mut map = LockoutMap::default();
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        for i in 0..5 {
+            map.record_failure(a, 1000 + i);
+        }
+        assert!(map.is_locked(a, 1010));
+        assert!(!map.is_locked(b, 1010));
+    }
+
+    #[test]
+    fn lockout_map_is_bounded() {
+        let mut map = LockoutMap::default();
+        for i in 0..(MAX_TRACKED_IPS as u32 + 500) {
+            let ip = IpAddr::V4(Ipv4Addr::from(i));
+            map.record_failure(ip, 1000 + i64::from(i));
+        }
+        assert_eq!(map.entries.len(), MAX_TRACKED_IPS);
+        // The oldest were dropped, the newest kept.
+        assert!(!map.entries.contains_key(&IpAddr::V4(Ipv4Addr::from(0))));
+        assert!(
+            map.entries
+                .contains_key(&IpAddr::V4(Ipv4Addr::from(MAX_TRACKED_IPS as u32 + 499)))
+        );
+    }
+
+    #[test]
+    fn cf_header_beats_peer_address() {
+        let peer: SocketAddr = "10.0.0.9:5555".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_ip(&headers, Some(peer)), peer.ip());
+        headers.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(
+            client_ip(&headers, Some(peer)),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        headers.insert("cf-connecting-ip", "garbage".parse().unwrap());
+        assert_eq!(client_ip(&headers, Some(peer)), peer.ip());
     }
 
     #[test]

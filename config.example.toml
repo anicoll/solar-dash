@@ -41,8 +41,15 @@ bind = "127.0.0.1:8080"
 # password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 # Signs the login cookie: base64 of at least 64 random bytes. Make one with
 #   openssl rand -base64 64 | tr -d '\n'; echo
-# If unset, a random one is made on every start, so logins reset on restart.
+# Required by `serve`: without it the app refuses to start (a random key per
+# start would log you out on every restart).
 # session_secret = "..."
+# Adds the `Secure` flag to the login cookie, so browsers only send it over
+# https. Leave this true (the default) when you reach the dashboard through
+# Cloudflare Tunnel. Set it to false ONLY to test over plain http on your LAN
+# (e.g. http://127.0.0.1:8080): browsers drop Secure cookies on http, so
+# logins would not stick otherwise.
+# cookie_secure = true
 
 # Optional section; defaults shown.
 [database]

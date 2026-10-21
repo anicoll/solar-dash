@@ -7,6 +7,7 @@ mod costs;
 mod payback;
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -25,13 +26,13 @@ use chrono_tz::Tz;
 use rust_embed::RustEmbed;
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
-use tracing::warn;
 
 use crate::config::Config;
 use crate::cost::Tariff;
 use crate::modbus::Latest;
-use auth::Lockout;
+use auth::LockoutMap;
 pub use auth::hash_password;
 use payback::Purchase;
 
@@ -55,7 +56,12 @@ pub struct AppState {
     key: Key,
     /// Failed-login bookkeeping. A plain `Mutex` is fine: it is only held for
     /// a moment and never across an `.await`.
-    lockout: Arc<Mutex<Lockout>>,
+    lockout: Arc<Mutex<LockoutMap>>,
+    /// Only one password check runs at a time (each costs ~19 MiB of Argon2
+    /// memory), so parallel guesses queue up and see the lockout.
+    verify_gate: Arc<Semaphore>,
+    /// Whether the session cookie gets the `Secure` flag.
+    cookie_secure: bool,
     /// The newest Modbus sample, kept by the poller.
     latest: Latest,
     /// The parsed `[tariff]` section; `None` turns the cost API off.
@@ -86,11 +92,19 @@ impl AppState {
             tz,
             password_hash: password_hash.into(),
             key,
-            lockout: Arc::new(Mutex::new(Lockout::default())),
+            lockout: Arc::new(Mutex::new(LockoutMap::default())),
+            verify_gate: Arc::new(Semaphore::new(1)),
+            cookie_secure: true,
             latest: Latest::default(),
             tariff: None,
             purchases: Arc::from([]),
         })
+    }
+
+    /// Sets the cookie `Secure` flag (on by default).
+    pub fn with_cookie_secure(mut self, secure: bool) -> Self {
+        self.cookie_secure = secure;
+        self
     }
 
     /// Turns on the cost API with this tariff.
@@ -126,13 +140,11 @@ impl AppState {
                 config.isolarcloud.timezone
             )
         })?;
-        let key = match &config.server.session_secret {
-            Some(secret) => key_from_secret(secret)?,
-            None => {
-                warn!("no session_secret in config.toml; logins will reset on every restart");
-                Key::generate()
-            }
-        };
+        let secret = config.server.session_secret.as_deref().context(
+            "serve needs session_secret in the [server] section of config.toml \
+             (make one with `openssl rand -base64 64 | tr -d '\\n'; echo`)",
+        )?;
+        let key = key_from_secret(secret)?;
         let tariff = config
             .tariff
             .as_ref()
@@ -140,6 +152,7 @@ impl AppState {
             .transpose()?;
         let purchases = payback::purchases_from_config(&config.system.purchase)?;
         Ok(Self::new(pool, plant_id, tz, password_hash, key)?
+            .with_cookie_secure(config.server.cookie_secure)
             .with_tariff(tariff)
             .with_purchases(purchases))
     }
@@ -234,10 +247,14 @@ pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("web server failed")
+    // Connect info gives the login handler the peer address for lockouts.
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("web server failed")
 }
 
 async fn index(headers: HeaderMap) -> Response {
@@ -306,6 +323,10 @@ mod tests {
 
     /// Like `test_app`, but also gives back the pool, for seeding more rows.
     async fn test_app_with_pool() -> (tempfile::TempDir, Router, SqlitePool) {
+        test_app_with_options(true).await
+    }
+
+    async fn test_app_with_options(cookie_secure: bool) -> (tempfile::TempDir, Router, SqlitePool) {
         let dir = tempfile::tempdir().unwrap();
         let pool = db::open(dir.path().join("test.db").to_str().unwrap())
             .await
@@ -328,7 +349,9 @@ mod tests {
 
         let hash = hash_password(PASSWORD).unwrap();
         let tz = chrono_tz::Australia::Adelaide;
-        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate()).unwrap();
+        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_cookie_secure(cookie_secure);
         (dir, router(state), pool)
     }
 
@@ -345,9 +368,25 @@ mod tests {
     }
 
     fn login_request(password: &str) -> Request<Body> {
-        Request::post("/login")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        login_request_from(password, None)
+    }
+
+    /// A login as seen from `ip` (sent as `CF-Connecting-IP`).
+    fn login_request_from(password: &str, ip: Option<&str>) -> Request<Body> {
+        let mut builder = Request::post("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(ip) = ip {
+            builder = builder.header("cf-connecting-ip", ip);
+        }
+        builder
             .body(Body::from(format!("password={password}")))
+            .unwrap()
+    }
+
+    fn logout_request(cookie: &str) -> Request<Body> {
+        Request::post("/logout")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
             .unwrap()
     }
 
@@ -448,24 +487,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cookie_flags_follow_the_request_scheme() {
-        let (_dir, app) = test_app().await;
-        let response = send(&app, login_request("correct%20horse")).await;
-        let plain = response.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(plain.contains("HttpOnly") && plain.contains("SameSite=Lax"));
-        assert!(!plain.contains("Secure"));
+    async fn secure_flag_follows_config() {
+        let set_cookie = |app: Router| async move {
+            let response = send(&app, login_request("correct%20horse")).await;
+            response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
 
+        let (_dir, app, _pool) = test_app_with_options(true).await;
+        let secure = set_cookie(app).await;
+        assert!(secure.contains("Secure"), "{secure}");
+        assert!(secure.contains("HttpOnly") && secure.contains("SameSite=Lax"));
+
+        let (_dir, app, _pool) = test_app_with_options(false).await;
+        let plain = set_cookie(app).await;
+        assert!(!plain.contains("Secure"), "{plain}");
+
+        // A client-supplied header changes nothing.
+        let (_dir, app, _pool) = test_app_with_options(false).await;
         let request = Request::post("/login")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header("x-forwarded-proto", "https")
             .body(Body::from("password=correct%20horse"))
             .unwrap();
         let response = send(&app, request).await;
-        let secure = response.headers()[header::SET_COOKIE].to_str().unwrap();
-        assert!(secure.contains("Secure"));
+        let spoofed = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(!spoofed.contains("Secure"), "{spoofed}");
     }
 
     #[tokio::test]
@@ -494,19 +543,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_clears_cookie() {
+    async fn logout_revokes_the_session() {
         let (_dir, app) = test_app().await;
         let cookie = log_in(&app).await;
-        let request = Request::post("/logout")
-            .header(header::COOKIE, &cookie)
-            .body(Body::empty())
-            .unwrap();
-        let response = send(&app, request).await;
+        let response = send(&app, get_request("/api/latest", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = send(&app, logout_request(&cookie)).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers()[header::LOCATION], "/login");
         // A removal cookie is sent: the same name with an empty value.
         let removal = response.headers()[header::SET_COOKIE].to_str().unwrap();
         assert!(removal.starts_with("session=;"), "{removal}");
+
+        // The copied cookie is still correctly signed, but no longer works.
+        let response = send(&app, get_request("/api/latest", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_rejected() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        let cookie = log_in(&app).await;
+        sqlx::query("UPDATE session SET expires_at = ?")
+            .bind(db::now() - 1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = send(&app, get_request("/api/latest", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn expiry_slides_at_most_once_an_hour() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        let cookie = log_in(&app).await;
+        let row = |pool: SqlitePool| async move {
+            sqlx::query_as::<_, (i64, i64)>("SELECT last_seen, expires_at FROM session")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let (seen, expires) = row(pool.clone()).await;
+
+        // A request right after login does not write.
+        let response = send(&app, get_request("/api/latest", Some(&cookie))).await;
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(row(pool.clone()).await, (seen, expires));
+
+        // Pretend the session was last touched two hours ago.
+        sqlx::query(
+            "UPDATE session SET last_seen = last_seen - 7200, expires_at = expires_at - 7200",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let response = send(&app, get_request("/api/latest", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::SET_COOKIE).is_some());
+        let (new_seen, new_expires) = row(pool).await;
+        assert!(new_seen >= seen && new_expires >= expires);
+    }
+
+    #[tokio::test]
+    async fn login_prunes_expired_sessions() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        log_in(&app).await;
+        sqlx::query("UPDATE session SET expires_at = ?")
+            .bind(db::now() - 1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        log_in(&app).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn locking_out_one_ip_does_not_affect_another() {
+        let (_dir, app) = test_app().await;
+        for _ in 0..5 {
+            send(&app, login_request_from("nope", Some("203.0.113.1"))).await;
+        }
+        let response = send(
+            &app,
+            login_request_from("correct%20horse", Some("203.0.113.1")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let response = send(
+            &app,
+            login_request_from("correct%20horse", Some("203.0.113.2")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn parallel_guesses_are_serialised_and_locked_out() {
+        let (_dir, app) = test_app().await;
+        let handles: Vec<_> = (0..12)
+            .map(|_| {
+                let app = app.clone();
+                tokio::spawn(async move { send(&app, login_request("nope")).await.status() })
+            })
+            .collect();
+        let mut wrong = 0;
+        for handle in handles {
+            if handle.await.unwrap() == StatusCode::UNAUTHORIZED {
+                wrong += 1;
+            }
+        }
+        // Only the first five guesses were actually checked.
+        assert_eq!(wrong, 5);
+    }
+
+    #[tokio::test]
+    async fn missing_session_secret_is_a_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = hash_password(PASSWORD).unwrap();
+        let toml = format!(
+            r#"
+            [isolarcloud]
+            appkey = "k"
+            access_key = "s"
+            rsa_public_key = "r"
+            username = "u"
+            password = "p"
+            plant_id = 7
+            [server]
+            password_hash = "{hash}"
+            "#
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.server.cookie_secure);
+        let err = AppState::from_config(pool.clone(), &config)
+            .err()
+            .expect("should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("session_secret") && msg.contains("openssl rand"),
+            "{msg}"
+        );
+
+        let secret = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
+        let ok = toml.replace(
+            "[server]",
+            &format!("[server]\nsession_secret = \"{secret}\""),
+        );
+        let config: Config = toml::from_str(&ok).unwrap();
+        AppState::from_config(pool, &config).unwrap();
     }
 
     #[tokio::test]

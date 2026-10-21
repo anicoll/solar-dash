@@ -93,8 +93,8 @@ Type the password twice (nothing is shown as you type). Paste the
 `password_hash = "..."` line it prints into the `[server]` section of
 `config.toml`. This command needs no config file, so you can run it first.
 
-Also add a `session_secret` so you stay logged in across restarts (see
-`config.example.toml`):
+Also add a `session_secret` (required: `serve` refuses to start without it,
+see `config.example.toml`). Make one with:
 
 ```sh
 openssl rand -base64 64 | tr -d '\n'; echo
@@ -103,11 +103,20 @@ openssl rand -base64 64 | tr -d '\n'; echo
 It prints 88 characters ending in `=`; copy just those. (The `echo` stops
 zsh adding a `%` after the output, which isn't part of the secret.)
 
-Without it, `serve` makes a new one on each start and logs a warning, which
-logs everyone out whenever it restarts.
+When you open the dashboard at `http://127.0.0.1:8080` (plain http), also set
+this in `[server]`, or the browser will drop the login cookie:
 
-Then run `cargo run -- serve` and open <http://127.0.0.1:8080>. After 5 wrong passwords in 15 minutes, logins are refused for 15
-minutes. A login lasts 30 days.
+```toml
+cookie_secure = false
+```
+
+`cookie_secure` defaults to `true`, which is right behind Cloudflare Tunnel
+(https). Use `false` only for plain-http testing on your own machine or LAN.
+
+Then run `cargo run -- serve` and open <http://127.0.0.1:8080>. After 5 wrong
+passwords in 15 minutes from the same address, logins from it are refused for
+15 minutes. A login lasts 14 days from your last visit, and logging out ends
+it on the server too.
 
 ### Dashboard views
 
@@ -158,7 +167,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/payback` | How much of the system's cost the savings have covered, from the `[[system.purchase]]` entries and the `[tariff]`: `total_cost`, `saved`, `net`, `recovered_pct`, `rate_per_day` (mean savings over the last 365 days with data), `projected_payback` (`"YYYY-MM"`, `null` once paid back, or `"never"`), the `purchases`, a monthly `series` of cumulative `saved` and `net`, and `by_year` (`partial` when a year has fewer days of data than days). Counts from the first purchase date to today. Without purchases or a `[tariff]` section it answers `{"configured":false}` |
 
 For example, once logged in with a browser, try
-<http://127.0.0.1:8080/api/latest>. With curl, log in and keep the cookie:
+<http://127.0.0.1:8080/api/latest>. With curl, log in and keep the cookie (needs `cookie_secure = false` over plain http):
 
 ```sh
 curl -c cookies.txt -d 'password=YOUR_PASSWORD' http://127.0.0.1:8080/login
