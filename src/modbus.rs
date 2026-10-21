@@ -21,7 +21,7 @@ use tokio::net::lookup_host;
 use tokio::time::{sleep, timeout};
 use tokio_modbus::Slave;
 use tokio_modbus::client::{Context as ModbusContext, Reader as _, tcp};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Modbus;
 use crate::db;
@@ -46,6 +46,27 @@ const BLOCK_LEN: u16 = 16;
 
 /// The inverter sends this for a 32-bit value it cannot measure right now.
 const UNAVAILABLE: u32 = 0x7FFF_FFFF;
+/// An unsigned register (or pair) reads all ones when the inverter has no
+/// value for it; the PV register is unsigned, so this is its "unavailable".
+const UNAVAILABLE_U16: u16 = 0xFFFF;
+const UNAVAILABLE_U32_ALL_ONES: u32 = 0xFFFF_FFFF;
+
+// Sanity limits. A reading outside these is a glitch, not a measurement, and
+// is stored as `None` so it cannot reach the daily kWh and cost totals.
+/// Highest believable PV power, W: 7 kW of panels on an 8 kW inverter, so
+/// 20 kW is far more than it can ever produce, yet far below a garbage u32.
+const PV_MAX_W: f64 = 20_000.0;
+/// Highest believable battery power, W (either direction). The 8 kW inverter
+/// limits it well below this; the rest is headroom.
+const BATTERY_MAX_W: f64 = 30_000.0;
+/// Highest believable grid power, W (either direction). A single-phase 63 A
+/// supply is about 15 kW; 30 kW leaves double that as headroom.
+const GRID_MAX_W: f64 = 30_000.0;
+/// Highest believable house load, W. Bounded by the same supply and inverter
+/// as the grid, so the same limit.
+const LOAD_MAX_W: f64 = 30_000.0;
+/// Battery state of charge is a percentage.
+const SOC_MAX_PCT: f64 = 100.0;
 
 /// One reading of the plant. A field is `None` when the inverter said the
 /// value is unavailable.
@@ -107,9 +128,22 @@ fn decode_i32(words: &[u16]) -> Option<i32> {
     (raw != UNAVAILABLE).then_some(raw as i32)
 }
 
-/// Solar power in W from registers 5016..=5017.
+/// Keeps `watts` only if its size is within `max`. Otherwise logs at debug
+/// level (the poll runs every 15 s, so not louder) and gives `None`.
+fn within(name: &str, watts: f64, max: f64) -> Option<f64> {
+    if watts.abs() > max {
+        debug!(value = watts, max, "discarding out-of-range {name} reading");
+        None
+    } else {
+        Some(watts)
+    }
+}
+
+/// Solar power in W from registers 5016..=5017. `0x7FFFFFFF` and
+/// `0xFFFFFFFF` (unavailable), or more than [`PV_MAX_W`], give `None`.
 pub fn decode_pv(words: &[u16]) -> Option<f64> {
-    decode_u32(words).map(f64::from)
+    let raw = decode_u32(words).filter(|&v| v != UNAVAILABLE_U32_ALL_ONES)?;
+    within("PV", f64::from(raw), PV_MAX_W)
 }
 
 /// Battery power in W from registers 5213..=5214, with our sign
@@ -117,19 +151,36 @@ pub fn decode_pv(words: &[u16]) -> Option<f64> {
 pub fn decode_battery(words: &[u16]) -> Option<f64> {
     // Negate as an i64 so that 0 stays 0 (negating the float 0.0 gives -0.0,
     // which prints as "-0.00").
-    decode_i32(words).map(|v| -i64::from(v) as f64)
+    let watts = decode_i32(words).map(|v| -i64::from(v) as f64)?;
+    within("battery", watts, BATTERY_MAX_W)
+}
+
+/// State of charge in % from register 13022 (0.1 % per unit). `0xFFFF`
+/// (unavailable) or a value outside 0 to 100 gives `None`.
+fn decode_soc(raw: u16) -> Option<f64> {
+    if raw == UNAVAILABLE_U16 {
+        return None;
+    }
+    let pct = f64::from(raw) / 10.0;
+    if pct > SOC_MAX_PCT {
+        debug!(value = pct, "discarding out-of-range SOC reading");
+        return None;
+    }
+    Some(pct)
 }
 
 /// Turns the 16-register block starting at 13007 into
 /// `(load_w, grid_w, soc_pct)`.
 pub fn decode_block(words: &[u16]) -> (Option<f64>, Option<f64>, Option<f64>) {
     // Offsets are the register number minus 13007.
-    let load = decode_i32(&words[0..2]).map(f64::from);
+    let load = decode_i32(&words[0..2])
+        .map(f64::from)
+        .and_then(|w| within("load", w, LOAD_MAX_W));
     // Register: positive = exporting. We want positive = importing.
-    let grid = decode_i32(&words[2..4]).map(|v| -i64::from(v) as f64);
-    // 13022 is the last register of the block. 0.1 % per unit.
-    let soc = Some(f64::from(words[15]) * 0.1);
-    (load, grid, soc)
+    let grid = decode_i32(&words[2..4])
+        .map(|v| -i64::from(v) as f64)
+        .and_then(|w| within("grid", w, GRID_MAX_W));
+    (load, grid, decode_soc(words[15]))
 }
 
 /// Builds a [`Sample`] from the three register reads.
@@ -384,6 +435,45 @@ mod tests {
         assert_eq!(grid, Some(0.0));
         assert!(grid.unwrap().is_sign_positive(), "zero must not be -0.0");
         assert!((soc.unwrap() - 43.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn soc_unavailable_or_out_of_range_is_none() {
+        let mut block = BLOCK;
+        block[15] = 0xFFFF;
+        assert_eq!(decode_block(&block).2, None);
+        block[15] = 1000;
+        assert_eq!(decode_block(&block).2, Some(100.0));
+        block[15] = 1001;
+        assert_eq!(decode_block(&block).2, None);
+        block[15] = 0;
+        assert_eq!(decode_block(&block).2, Some(0.0));
+    }
+
+    #[test]
+    fn pv_all_ones_or_too_high_is_none() {
+        assert_eq!(decode_pv(&[0xFFFF, 0xFFFF]), None);
+        assert_eq!(decode_pv(&[20_000, 0]), Some(20_000.0));
+        assert_eq!(decode_pv(&[20_001, 0]), None);
+    }
+
+    #[test]
+    fn out_of_range_power_is_none() {
+        let mut block = BLOCK;
+        // Register says exporting 40 kW: more than a 63 A supply can carry.
+        block[2] = 40_000;
+        block[3] = 0;
+        assert_eq!(decode_block(&block).1, None);
+        // Same size, importing (negative register value).
+        let raw = (-40_000i32) as u32;
+        block[2] = (raw & 0xFFFF) as u16;
+        block[3] = (raw >> 16) as u16;
+        assert_eq!(decode_block(&block).1, None);
+        // Load and battery too.
+        block[0] = 40_000;
+        assert_eq!(decode_block(&block).0, None);
+        assert_eq!(decode_battery(&[40_000, 0]), None);
+        assert_eq!(decode_battery(&[30_000, 0]), Some(-30_000.0));
     }
 
     #[test]

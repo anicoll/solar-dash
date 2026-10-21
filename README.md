@@ -33,7 +33,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `migrations/` - SQL schema, applied automatically on startup
 - `src/modbus.rs` - Modbus TCP reader for live inverter data, and its poll loop
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
-- `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`) and embedded static files
+- `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
 - `static/` - the dashboard (`index.html`, `app.js`, `style.css`), compiled into the binary
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`
