@@ -186,7 +186,7 @@ rm -f /var/lib/solar-dash/solar.db-wal /var/lib/solar-dash/solar.db-shm
 ```
 
 Without this step solar-dash starts with an empty database. You can backfill
-later with
+later, even while solar-dash is running, with
 `sudo -u solar-dash /opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml backfill --from 2023-02-21`.
 
 ## 5. Start it

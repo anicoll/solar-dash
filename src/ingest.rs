@@ -20,9 +20,10 @@ use crate::isolar::client::{ApiError, Client};
 
 const HISTORY_ENDPOINT: &str = "/openapi/getDevicePointMinuteDataList";
 const POINT_INFO_ENDPOINT: &str = "/openapi/getOpenPointInfo";
-/// Name of this job in the `sync_state` table. Backfill and live sync share
-/// it, so the name stays "backfill" (renaming would need a migration).
-const JOB: &str = "backfill";
+/// Names of the jobs in the `sync_state` table. Each keeps its own cursor,
+/// so `backfill` can run while `serve` is live-syncing.
+pub const BACKFILL_JOB: &str = "backfill";
+pub const LIVE_JOB: &str = "live";
 
 /// The history has one row every 5 minutes.
 const STEP_SECS: i64 = 5 * 60;
@@ -296,12 +297,13 @@ pub struct SyncStats {
 }
 
 /// Downloads history for `start_ts..end_ts` (end exclusive, unix seconds) in
-/// windows, saving the cursor after each one. Used by both `backfill` and the
-/// live sync, so they share one cursor. Safe to stop and run again.
+/// windows, saving `job`'s cursor after each one. Used by both `backfill` and
+/// the live sync. Safe to stop and run again.
 pub async fn sync_range(
     client: &Client,
     pool: &SqlitePool,
     config: &IsolarCloud,
+    job: &str,
     start_ts: i64,
     end_ts: i64,
 ) -> Result<SyncStats> {
@@ -349,7 +351,7 @@ pub async fn sync_range(
         .await?;
         let readings = parse_history(&data, &plant.ps_key, tz);
         db::upsert_readings(pool, plant.plant_id, &readings).await?;
-        db::set_cursor(pool, JOB, window_end).await?;
+        db::set_cursor(pool, job, window_end).await?;
         stats.rows += readings.len();
 
         let calls_this_hour = db::api_calls_since(pool, db::now() - 3600).await?;
@@ -379,7 +381,7 @@ pub async fn backfill(
 
     let from_ts = parse_local(&from.format("%Y%m%d000000").to_string(), tz)
         .ok_or_else(|| anyhow!("{from} has no local midnight in {tz}"))?;
-    let cursor = db::get_cursor(pool, JOB).await?;
+    let cursor = db::get_cursor(pool, BACKFILL_JOB).await?;
     let start = cursor.map_or(from_ts, |c| c.max(from_ts));
     let end = round_down_to_step(db::now());
     if start >= end {
@@ -392,7 +394,7 @@ pub async fn backfill(
     }
 
     sync_points(client, pool, &config.points, &plant.ps_key).await?;
-    sync_range(client, pool, config, start, end).await?;
+    sync_range(client, pool, config, BACKFILL_JOB, start, end).await?;
     info!("backfill finished");
     Ok(())
 }
@@ -423,14 +425,32 @@ fn local_midnight(now_ts: i64, tz: Tz) -> Option<i64> {
 /// moved past them; re-reading is safe because writes are upserts.
 const LIVE_OVERLAP_SECS: i64 = 15 * 60;
 
-/// Where the next live sync should start: a little before the saved cursor,
+/// Where the next live sync should start: a little before its saved cursor,
 /// or else local midnight today.
 async fn live_start(pool: &SqlitePool, tz: Tz, now_ts: i64) -> Result<i64> {
-    if let Some(cursor) = db::get_cursor(pool, JOB).await? {
-        return Ok(cursor - LIVE_OVERLAP_SECS);
+    let live = db::get_cursor(pool, LIVE_JOB).await?;
+    let backfill = db::get_cursor(pool, BACKFILL_JOB).await?;
+    let midnight = local_midnight(now_ts, tz)
+        .ok_or_else(|| anyhow!("could not work out local midnight in {tz}"))?;
+    if live.is_none() {
+        info!(
+            "no live sync yet; starting from midnight today. Run backfill to fetch older history"
+        );
     }
-    info!("no history yet; starting from midnight today. Run backfill to fetch older history");
-    local_midnight(now_ts, tz).ok_or_else(|| anyhow!("could not work out local midnight in {tz}"))
+    Ok(pick_live_start(live, backfill, midnight, now_ts))
+}
+
+/// The decision behind [`live_start`], kept pure for testing. Databases from
+/// before the live sync had its own cursor only have the backfill cursor,
+/// which then marked where the live sync got to. A recent one is used to carry
+/// on from there; an old one is a backfill still in progress, which the live
+/// sync must not chase.
+fn pick_live_start(live: Option<i64>, backfill: Option<i64>, midnight: i64, now_ts: i64) -> i64 {
+    match (live, backfill) {
+        (Some(cursor), _) => cursor - LIVE_OVERLAP_SECS,
+        (None, Some(cursor)) if now_ts - cursor <= CATCH_UP_SECS => cursor - LIVE_OVERLAP_SECS,
+        _ => midnight,
+    }
 }
 
 /// One live sync: from the cursor up to now (rounded down to 5 minutes).
@@ -446,7 +466,7 @@ async fn sync_once(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> 
     if end - start > CATCH_UP_SECS {
         info!(since = %format_local(start, tz), "cursor is far behind; catching up");
     }
-    let stats = sync_range(client, pool, config, start, end).await?;
+    let stats = sync_range(client, pool, config, LIVE_JOB, start, end).await?;
     info!(rows = stats.rows, calls = stats.calls, "sync done");
     Ok(())
 }
@@ -676,6 +696,35 @@ mod tests {
         assert_eq!(
             local_midnight(now, ADELAIDE),
             parse_local("20261021000000", ADELAIDE)
+        );
+    }
+
+    #[test]
+    fn live_start_uses_its_own_cursor_and_never_chases_a_backfill() {
+        let now = 1_800_000_000;
+        let midnight = now - 10 * 3600;
+        let overlap = LIVE_OVERLAP_SECS;
+        // Its own cursor always wins.
+        assert_eq!(
+            pick_live_start(Some(now - 600), Some(1), midnight, now),
+            now - 600 - overlap
+        );
+        // A fresh database starts at midnight.
+        assert_eq!(pick_live_start(None, None, midnight, now), midnight);
+        // A backfill in progress (cursor years back) is left alone.
+        assert_eq!(
+            pick_live_start(None, Some(now - 400 * 86400), midnight, now),
+            midnight
+        );
+        // An older database's recent shared cursor is carried on from.
+        assert_eq!(
+            pick_live_start(None, Some(now - 600), midnight, now),
+            now - 600 - overlap
+        );
+        let yesterday = now - 30 * 3600;
+        assert_eq!(
+            pick_live_start(None, Some(yesterday), midnight, now),
+            yesterday - overlap
         );
     }
 
