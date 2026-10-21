@@ -25,8 +25,21 @@ const DEFAULT_DAILY_DAYS: u64 = 30;
 /// The longest time one counter step is spread over (see `derive_power`).
 const MAX_SPREAD_SECS: i64 = 30 * 60;
 
+/// Battery state of charge. iSolarCloud stores it as a fraction (0.674),
+/// but its unit is "%", so the API scales it to a percentage (67.4).
+const SOC_POINT: i64 = 83252;
+
 /// Power points shown by `/api/day`: (key, point id).
-const POWER_POINTS: [(&str, i64); 3] = [("pv_w", 83033), ("load_w", 83106), ("soc", 83252)];
+const POWER_POINTS: [(&str, i64); 3] = [("pv_w", 83033), ("load_w", 83106), ("soc", SOC_POINT)];
+
+/// A stored value as the API shows it (see [`SOC_POINT`]).
+fn display_value(point_id: i64, value: f64) -> f64 {
+    if point_id == SOC_POINT {
+        value * 100.0
+    } else {
+        value
+    }
+}
 
 /// Daily counters (Wh) that `/api/day` turns into power:
 /// (key, counter point id, made-up id for the derived series, name).
@@ -103,7 +116,11 @@ async fn stored_series(
     let (name, unit) = db::point_info(&state.pool, point_id)
         .await?
         .unwrap_or((None, None));
-    let data = db::readings_in_range(&state.pool, state.plant_id, point_id, from, to).await?;
+    let data = db::readings_in_range(&state.pool, state.plant_id, point_id, from, to)
+        .await?
+        .into_iter()
+        .map(|(ts, value)| (ts, display_value(point_id, value)))
+        .collect();
     Ok(Series {
         key,
         point_id,
@@ -128,7 +145,7 @@ pub async fn latest(State(state): State<AppState>) -> ApiResult {
                 "name": r.name,
                 "unit": r.unit,
                 "ts": r.ts,
-                "value": r.value,
+                "value": display_value(r.point_id, r.value),
             })
         })
         .collect();
@@ -413,6 +430,12 @@ mod tests {
     use crate::db::{Point, Reading};
 
     const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+
+    #[test]
+    fn soc_is_shown_as_a_percentage() {
+        assert!((display_value(SOC_POINT, 0.674) - 67.4).abs() < 1e-9);
+        assert_eq!(display_value(83033, 1500.0), 1500.0);
+    }
 
     #[test]
     fn derives_power_from_counter_deltas() {
