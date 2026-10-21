@@ -2378,7 +2378,7 @@ dependencies = [
  "ecb",
  "hex",
  "http-body-util",
- "rand 0.8.8",
+ "rand 0.10.3",
  "reqwest",
  "rpassword",
  "rsa",
