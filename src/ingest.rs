@@ -39,6 +39,8 @@ const MAX_CALLS_PER_30_DAYS: i64 = 80_000;
 const BUDGET_RECHECK: Duration = Duration::from_secs(60);
 /// Pause between calls, to be polite to the server.
 const CALL_PAUSE: Duration = Duration::from_secs(1);
+/// How often the live loop prunes old `api_call` rows.
+const PRUNE_EVERY_SECS: i64 = 24 * 3600;
 
 /// Data lands a little after each 5-minute mark, so live sync waits this long.
 const TICK_LAG_SECS: i64 = 60;
@@ -384,14 +386,6 @@ pub async fn sync_range(
             Err(err) => return Err(err),
         };
 
-        db::save_raw_response(
-            pool,
-            HISTORY_ENDPOINT,
-            Some(start),
-            Some(window_end),
-            &data.to_string(),
-        )
-        .await?;
         let readings = parse_history(&data, &plant.ps_key, tz, start);
         db::upsert_readings(pool, plant.plant_id, &readings).await?;
         db::set_cursor(pool, job, window_end).await?;
@@ -577,9 +571,18 @@ pub async fn run_live_sync(
     // round. Pinning lets `select!` poll it by `&mut` without moving it.
     tokio::pin!(shutdown);
     info!("live sync started");
+    let mut last_prune = 0;
     // Failed attempts to log in since the last success.
     let mut login_failures: u32 = 0;
     loop {
+        // Once at startup, then about once a day.
+        if db::now() - last_prune >= PRUNE_EVERY_SECS {
+            last_prune = db::now();
+            match db::prune_api_calls(pool).await {
+                Ok(rows) => info!(rows, "pruned old API call records"),
+                Err(err) => warn!("pruning API calls failed: {err:#}"),
+            }
+        }
         // Dropping an unfinished sync is safe: each window is saved
         // atomically, along with its cursor.
         let logged_in_before = client.is_logged_in();
