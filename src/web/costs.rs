@@ -19,7 +19,7 @@ use super::api::{
     ApiError, ApiResult, MAX_HOLD_SECS, Spread, date_range, day_bounds_or_error, live_totals,
     spread_steps, today,
 };
-use crate::cost::{self, DayCost, Interval, Tariff};
+use crate::cost::{self, DayCost, Interval, Tariff, TariffSchedule};
 use crate::db;
 use crate::modbus::Sample;
 
@@ -318,10 +318,26 @@ async fn compute_days(
 }
 
 /// The cost of every day in `dates` (sorted, consecutive) that has data,
-/// oldest first. Finished days come from the `daily_cost` table when it has
-/// them for the current tariff; only the rest are worked out, in a few
-/// queries, and the finished ones are stored for next time.
+/// oldest first, each priced on the plan in effect that day. Runs of days on
+/// the same plan are costed together by [`costed_days_on`].
 pub(super) async fn costed_days(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    dates: &[NaiveDate],
+) -> Result<Vec<CostedDay>, ApiError> {
+    let mut costed = Vec::new();
+    // Plans are in date order, so the days on one plan are next to each other.
+    for run in dates.chunk_by(|a, b| std::ptr::eq(schedule.for_date(*a), schedule.for_date(*b))) {
+        costed.extend(costed_days_on(state, schedule.for_date(run[0]), run).await?);
+    }
+    Ok(costed)
+}
+
+/// The cost of every day in `dates` (sorted, consecutive) that has data, all
+/// on `tariff`. Finished days come from the `daily_cost` table when it has
+/// them for this tariff; only the rest are worked out, in a few queries, and
+/// the finished ones are stored for next time.
+async fn costed_days_on(
     state: &AppState,
     tariff: &Tariff,
     dates: &[NaiveDate],
