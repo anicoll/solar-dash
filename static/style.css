@@ -34,7 +34,8 @@
   --save-label: #8fd9b4;
   --save-soft: #a8c9b9;
   --save-bar: #2c5f49;
-  --cost: #ff9a8a;
+  --cost: #ffa3ab;
+  --baseline: #4a5766;
 
   --free: rgba(61, 214, 176, 0.09);
   --peak: rgba(255, 122, 133, 0.08);
@@ -75,7 +76,7 @@ a { color: var(--link); }
 .brand { display: flex; align-items: center; gap: 10px; color: var(--c-pv); }
 .brand h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; color: var(--fg); }
 .logout { margin: 0 0 0 auto; }
-.tabs { display: flex; gap: 4px; order: 3; width: 100%; overflow-x: auto; }
+.tabs { position: relative; display: flex; gap: 4px; order: 3; width: 100%; overflow-x: auto; }
 .tab {
   display: inline-flex; align-items: center; min-height: 44px; padding: 0 14px;
   border-radius: 8px; color: var(--muted); text-decoration: none; font-weight: 500;
@@ -264,3 +265,22 @@ table.data td { padding: 8px; text-align: right; border-top: 1px solid var(--bor
 table.data th:first-child, table.data td:first-child { text-align: left; }
 table.data td:first-child { font-family: var(--font); }
 table.data td.save { color: var(--save); }
+.kpi.positive .value { color: var(--save); }
+.page-title { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
+@media (min-width: 760px) { .page-title { font-size: 34px; } }
+.cards.three { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.meter { height: 10px; border-radius: 5px; background: var(--track); overflow: hidden; margin: 4px 0; }
+.meter span { display: block; height: 100%; border-radius: 5px; }
+.parts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+@media (min-width: 760px) { .parts { gap: 16px; } }
+.part { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 10px; }
+.part-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.part-name { font-weight: 600; }
+.part-date { font-size: 13px; color: var(--muted); }
+.part-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.part-grid > div { display: flex; flex-direction: column; }
+.part-grid .label { font-size: 12px; color: var(--muted); }
+.part-grid .num { font-weight: 600; }
+.how { display: block; padding: 16px 20px; }
+.how summary { cursor: pointer; font-weight: 600; min-height: 24px; }
+.how p { margin: 12px 0 0; color: var(--fg-soft); }

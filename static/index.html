@@ -20,6 +20,8 @@
       <a class="tab" href="#month" data-view="month">Month</a>
       <a class="tab" href="#year" data-view="year">Year</a>
       <a class="tab" href="#savings" data-view="savings">Savings</a>
+      <a class="tab" href="#payback" data-view="payback">Payback</a>
+      <a class="tab" href="#cost" data-view="cost">Cost</a>
     </nav>
     <form method="post" action="/logout" class="logout">
       <button type="submit" class="btn">Log out</button>
@@ -146,6 +148,65 @@
         <div class="table-wrap">
           <table class="data" id="savings-table">
             <thead><tr><th scope="col">Month</th><th scope="col">Paid</th><th scope="col">Without solar</th><th scope="col">Saved</th><th scope="col">Credit days</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </section>
+  <section id="view-payback" class="view" aria-labelledby="h-payback" hidden>
+    <h2 id="h-payback" class="page-title">Has it paid for itself?</h2>
+    <p id="payback-unconfigured" class="panel notice" hidden></p>
+    <div id="payback-body" class="view-body" hidden>
+      <div class="cards three" id="payback-cards"></div>
+      <section class="panel" aria-labelledby="h-net">
+        <h2 id="h-net" class="panel-title">Net position over time</h2>
+        <div class="card flat">
+          <div id="payback-chart" class="chart" role="img" aria-label="Net position over time"></div>
+          <p id="payback-empty" class="empty" hidden>No data yet</p>
+        </div>
+      </section>
+      <section class="stack" aria-labelledby="h-bought">
+        <h2 id="h-bought" class="panel-title">What you bought</h2>
+        <div class="parts" id="payback-parts"></div>
+      </section>
+      <section class="panel" aria-labelledby="h-years">
+        <h2 id="h-years" class="panel-title">Savings by year</h2>
+        <div class="table-wrap">
+          <table class="data" id="payback-years">
+            <thead><tr><th scope="col">Year</th><th scope="col">Saved</th><th scope="col">Days with data</th><th scope="col">Average a day</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <details class="panel how">
+        <summary>How this is calculated</summary>
+        <p>Each day's saving is what that day's usage would have cost on your tariff with no solar or battery, minus what you actually paid, including credits and feed-in. Purchases are entered in the config file. The projection extends the last 12 months of savings.</p>
+      </details>
+    </div>
+  </section>
+
+  <section id="view-cost" class="view" aria-labelledby="h-cost" hidden>
+    <h2 id="h-cost" class="page-title">What power costs</h2>
+    <p id="cost-unconfigured" class="panel notice" hidden></p>
+    <div id="cost-body" class="view-body" hidden>
+      <div class="cards" id="cost-cards"></div>
+      <section class="panel" aria-labelledby="h-cost14">
+        <h2 id="h-cost14" class="panel-title">Last 14 days: paid vs without solar</h2>
+        <div class="card flat">
+          <div id="cost-days-chart" class="chart" role="img" aria-label="Daily cost for the last 14 days"></div>
+          <p id="cost-days-empty" class="empty" hidden>No data for this range</p>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-costm">
+        <h2 id="h-costm" class="panel-title">By month: paid vs without solar</h2>
+        <div class="card flat">
+          <div id="cost-months-chart" class="chart" role="img" aria-label="Monthly cost for the last 12 months"></div>
+          <p id="cost-months-empty" class="empty" hidden>No data for this range</p>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="cost-table">
+            <thead><tr><th scope="col">Month</th><th scope="col">Paid</th><th scope="col">Without solar</th><th scope="col">Paid a day</th><th scope="col">Without solar a day</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>

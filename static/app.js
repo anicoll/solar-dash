@@ -187,17 +187,27 @@
    * configured (it counts from the first purchase) and /api/costs' otherwise.
    * Cached for COSTS_TTL_MS so a 15 s poll does not hit the server every time.
    */
+  const paybackCache = { at: 0, promise: null };
+
+  /** /api/payback, cached like loadSavings. */
+  function loadPayback() {
+    if (paybackCache.promise && Date.now() - paybackCache.at < COSTS_TTL_MS) return paybackCache.promise;
+    paybackCache.at = Date.now();
+    const p = api('/api/payback');
+    paybackCache.promise = p;
+    p.catch(() => { paybackCache.at = 0; });
+    return p;
+  }
+
   function loadSavings() {
     if (savingsCache.promise && Date.now() - savingsCache.at < COSTS_TTL_MS) return savingsCache.promise;
     savingsCache.at = Date.now();
     const p = (async () => {
       const today = todayStr();
-      let payback = null;
-      try {
-        payback = await api('/api/payback');
-      } catch (err) {
+      const payback = await loadPayback().catch((err) => {
         if (err.message === 'Not logged in.') throw err;
-      }
+        return null;
+      });
       const earliest = addDays(today, 1 - COSTS_MAX_DAYS);
       let from = earliest;
       if (payback && payback.configured && payback.purchases.length) {
@@ -788,7 +798,7 @@
         axisLine: { lineStyle: { color: th.line } },
       },
       yAxis: {
-        type: 'value', name: 'Dollars ($)', nameTextStyle: { color: th.muted },
+        type: 'value', name: 'Dollars ($)', nameTextStyle: { color: th.muted, align: 'left' },
         axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
         splitLine: { lineStyle: { color: th.line } },
       },
@@ -840,9 +850,236 @@
     ]));
   }
 
+  // ---------- Payback ----------
+
+  const NOT_CONFIGURED_PAYBACK =
+    'Add a [tariff] section and at least one [[system.purchase]] section to the config file to see when the system pays for itself.';
+
+  /** A thin progress bar. */
+  function meter(pct, colourVar) {
+    const m = el('div', 'meter');
+    const f = el('span');
+    f.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    f.style.background = `var(${colourVar})`;
+    m.appendChild(f);
+    return m;
+  }
+
+  /** "Mar 2028" for "2028-03". */
+  const ymLabel = (ym) => `${MONTHS[+ym.slice(5, 7) - 1]} ${ym.slice(0, 4)}`;
+
+  /** Month after `ym` ("YYYY-MM"). */
+  const nextMonth = (ym) => shiftMonth(ym, 1);
+
+  /**
+   * Chart option for net position: actual month-end points, a dashed line to the
+   * projected payback month, and the purchases as dots.
+   */
+  function paybackOption(pb) {
+    const th = baseTheme();
+    const months = pb.series.map((p) => p.month);
+    const actual = pb.series.map((p) => p.net);
+    const last = pb.series[pb.series.length - 1];
+    const proj = pb.projected_payback;
+    let projected = null;
+    if (typeof proj === 'string' && /^\d{4}-\d{2}$/.test(proj) && last && proj > last.month) {
+      const extra = [];
+      for (let m = nextMonth(last.month); m <= proj; m = nextMonth(m)) extra.push(m);
+      months.push(...extra);
+      projected = months.map(() => null);
+      projected[pb.series.length - 1] = last.net;
+      extra.forEach((_, i) => {
+        projected[pb.series.length + i] = +(last.net * (1 - (i + 1) / extra.length)).toFixed(2);
+      });
+    }
+    const dots = pb.purchases
+      .map((p) => ({ name: p.name, i: months.indexOf(p.date.slice(0, 7)) }))
+      .filter((p) => p.i >= 0 && p.i < pb.series.length)
+      .map((p) => ({ name: p.name, value: [ymLabel(months[p.i]), actual[p.i]] }));
+    const labels = months.map(ymLabel);
+    const series = [
+      {
+        name: 'Actual', type: 'line', data: actual, showSymbol: false,
+        lineStyle: { width: 3, color: css('--save') }, itemStyle: { color: css('--save') }, z: 4,
+        markLine: {
+          silent: true, symbol: 'none', label: { show: false },
+          lineStyle: { color: css('--muted'), width: 1.5, type: 'solid' }, data: [{ yAxis: 0 }],
+        },
+      },
+    ];
+    if (projected) {
+      series.push({
+        name: 'Projected', type: 'line', data: projected, showSymbol: false,
+        lineStyle: { width: 3, type: 'dashed', color: css('--save') }, itemStyle: { color: css('--save') },
+        markPoint: {
+          symbol: 'circle', symbolSize: 12, label: { show: false },
+          itemStyle: { color: css('--bg'), borderColor: css('--save'), borderWidth: 2.5 },
+          data: [{ name: 'Payback', coord: [ymLabel(proj), 0] }],
+        },
+      });
+    }
+    if (dots.length) {
+      series.push({
+        name: 'Purchase', type: 'scatter', data: dots, symbolSize: 12, z: 6,
+        itemStyle: { color: css('--c-pv') },
+        label: { show: true, formatter: (p) => p.name, color: css('--c-pv'), position: 'top', fontSize: 12 },
+      });
+    }
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 24, top: 56, bottom: 28, containLabel: true },
+      legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'line' }, ...tooltipStyle(),
+        formatter: (params) => {
+          const rows = params.filter((p) => p.seriesName !== 'Purchase' && p.value != null)
+            .map((p) => [p.marker, p.seriesName, money(p.value, 0)]);
+          return rows.length ? moneyTooltip(rows, params[0].axisValueLabel) : '';
+        },
+      },
+      xAxis: {
+        type: 'category', data: labels, boundaryGap: false,
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
+        axisLine: { show: false }, axisTick: { show: false },
+      },
+      yAxis: {
+        type: 'value', name: 'Net position ($)', nameTextStyle: { color: th.muted, align: 'left' },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `${v < 0 ? '-' : ''}$${Math.abs(v).toLocaleString('en-AU')}` },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series,
+    };
+  }
+
+  async function loadPaybackView() {
+    const [pb, savings] = await Promise.all([
+      loadPayback(),
+      loadSavings().catch((err) => { if (err.message === 'Not logged in.') throw err; return null; }),
+    ]);
+    if (state.view !== 'payback') return;
+    setConfigured('payback', pb.configured, NOT_CONFIGURED_PAYBACK);
+    if (!pb.configured) return;
+
+    const proj = pb.projected_payback;
+    const projText = proj === null ? 'Paid back' : proj === 'never' ? 'Not at this rate' : ymLabel(proj);
+    const projNote = proj === null ? 'savings now cover the cost'
+      : proj === 'never' ? 'savings are not keeping up'
+      : `at about ${money(pb.rate_per_day)} a day (last 12 months)`;
+    const recovered = el('div', 'kpi');
+    const rv = el('div', 'value', `${pb.recovered_pct.toFixed(1)}%`);
+    recovered.append(el('div', 'label', 'Cost recovered'), rv, meter(pb.recovered_pct, '--save'),
+      el('div', 'note', `${money(pb.saved, 0)} saved of ${money(pb.total_cost, 0)} spent`));
+    const net = kpi('', 'Net position today', money(pb.net, 0), '', 'savings minus what the system cost');
+    net.classList.add(pb.net < 0 ? 'cost' : 'positive');
+    $('payback-cards').replaceChildren(
+      kpi('save', 'Projected payback', projText, '', projNote), recovered, net);
+
+    const hasSeries = pb.series.length > 0;
+    showChart('payback-chart', hasSeries, paybackOption(pb),
+      `Net position over time, in dollars: starts at minus ${money(pb.total_cost, 0)} cost, now ${money(pb.net, 0)}`
+      + (typeof proj === 'string' && proj !== 'never' ? `, projected to reach zero in ${ymLabel(proj)}.` : '.'));
+
+    const days = savings && savings.configured ? savings.days : [];
+    $('payback-parts').replaceChildren(...pb.purchases.map((p) => {
+      const card = el('div', 'part');
+      const head = el('div', 'part-head');
+      head.append(el('span', 'part-name', p.name), el('span', 'part-date', ymLabel(p.date)));
+      const grid = el('div', 'part-grid');
+      const cell = (label, text) => {
+        const c = el('div');
+        c.append(el('span', 'label', label), el('span', 'num', text));
+        return c;
+      };
+      grid.appendChild(cell('Cost', money(p.cost, 0)));
+      if (days.length) {
+        const since = days.filter((d) => d.date >= p.date).reduce((a, d) => a + d.savings, 0);
+        grid.appendChild(cell('Saved since', money(since, 0)));
+      }
+      card.append(head, grid);
+      return card;
+    }));
+
+    fillTable('payback-years', pb.by_year.slice().reverse().map((y) => [
+      [String(y.year) + (y.partial ? ' (partial)' : '')],
+      [money(y.saved, 0), 'save'],
+      [`${y.days}`],
+      [y.days ? money(y.saved / y.days) : '–'],
+    ]));
+  }
+
+  // ---------- Cost ----------
+
+  const NOT_CONFIGURED_COST = 'Add a [tariff] section to the config file to see what your power costs.';
+
+  /** Clustered bars of paid against without-solar cost. `labels`: x labels. */
+  function costOption(labels, actual, baseline, perUnit) {
+    const th = baseTheme();
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 16, top: 48, bottom: 8, containLabel: true },
+      legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 12, itemHeight: 10 },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        formatter: (params) => moneyTooltip(
+          params.map((p) => [p.marker, p.seriesName, money(p.value)]), params[0].axisValueLabel),
+      },
+      xAxis: {
+        type: 'category', data: labels,
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
+        axisLine: { lineStyle: { color: th.line } },
+      },
+      yAxis: {
+        type: 'value', name: `$ per ${perUnit}`, nameTextStyle: { color: th.muted, align: 'left' },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series: [
+        { name: 'Without solar or battery', type: 'bar', data: baseline, itemStyle: { color: css('--baseline') }, barMaxWidth: 26 },
+        { name: 'What you paid', type: 'bar', data: actual, itemStyle: { color: css('--save') }, barMaxWidth: 26 },
+      ],
+    };
+  }
+
+  async function loadCostView() {
+    const data = await loadSavings();
+    if (state.view !== 'cost') return;
+    setConfigured('cost', data.configured, NOT_CONFIGURED_COST);
+    if (!data.configured) return;
+    const today = todayStr();
+    const t = data.days.find((d) => d.date === today);
+    const avg = (rows, key) => (rows.length ? rows.reduce((a, d) => a + d[key], 0) / rows.length : null);
+    const last30 = data.days.filter((d) => d.date > addDays(today, -30));
+    const per = (v) => (v == null ? '–' : money(v));
+    $('cost-cards').replaceChildren(
+      kpi('', 'Today without solar or battery', per(t && t.baseline), '', 'same usage at your tariff'),
+      kpi('save', 'Today it actually cost', per(t && t.actual), '',
+        t ? `${t.import_kwh.toFixed(1)} kWh imported, ${t.export_kwh.toFixed(1)} kWh exported` : 'no data yet today'),
+      kpi('', 'Average a day without solar', per(avg(last30, 'baseline')), '', `last ${last30.length} days`),
+      kpi('save', 'Average a day paid', per(avg(last30, 'actual')), '', `last ${last30.length} days`),
+    );
+
+    const recent = data.days.filter((d) => d.date > addDays(today, -14));
+    showChart('cost-days-chart', recent.length > 0,
+      costOption(recent.map((d) => bucketLabel(d.date)), recent.map((d) => d.actual), recent.map((d) => d.baseline), 'day'),
+      'Daily cost for the last 14 days: what you paid, against what the same usage would have cost without solar or battery, in dollars.');
+
+    const monthStart = shiftMonth(today.slice(0, 7), -11);
+    const buckets = bucketDays(data.days.filter((d) => d.date.slice(0, 7) >= monthStart), false);
+    showChart('cost-months-chart', buckets.length > 0,
+      costOption(buckets.map((b) => bucketLabel(b.key)), buckets.map((b) => +b.actual.toFixed(2)),
+        buckets.map((b) => +b.baseline.toFixed(2)), 'month'),
+      'Monthly cost for the last 12 months: what you paid, against what the same usage would have cost without solar or battery, in dollars.');
+    fillTable('cost-table', buckets.slice().reverse().map((b) => [
+      [bucketLabel(b.key) + (b.key === today.slice(0, 7) ? ' (so far)' : '')],
+      [money(b.actual)], [money(b.baseline)], [money(b.actual / b.days)], [money(b.baseline / b.days)],
+    ]));
+  }
+
   // ---------- routing (hash) ----------
 
-  const VIEWS = ['now', 'day', 'month', 'year', 'savings'];
+  const VIEWS = ['now', 'day', 'month', 'year', 'savings', 'payback', 'cost'];
   const state = { view: 'now', day: '', month: '', year: 0, range: 'all' };
   let timer = null;
   let pollToken = 0;
@@ -888,7 +1125,12 @@
     parseHash();
     for (const v of document.querySelectorAll('.view')) v.hidden = v.id !== `view-${state.view}`;
     for (const tab of document.querySelectorAll('.tab')) {
-      if (tab.dataset.view === state.view) tab.setAttribute('aria-current', 'page');
+      if (tab.dataset.view === state.view) {
+        tab.setAttribute('aria-current', 'page');
+        // On a phone the tab row scrolls; keep the current tab in view.
+        const nav = tab.parentElement;
+        if (tab.offsetLeft + tab.offsetWidth > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = tab.offsetLeft + tab.offsetWidth - nav.clientWidth + 16;
+      }
       else tab.removeAttribute('aria-current');
       const v = tab.dataset.view;
       tab.setAttribute('href', '#' + viewHash(v));
@@ -901,6 +1143,8 @@
     else if (state.view === 'day') guarded(() => loadDay(state.day));
     else if (state.view === 'month') guarded(() => loadMonth(state.month));
     else if (state.view === 'savings') guarded(() => loadSavingsView(state.range));
+    else if (state.view === 'payback') guarded(() => loadPaybackView());
+    else if (state.view === 'cost') guarded(() => loadCostView());
     else guarded(() => loadYear(state.year));
   }
 
