@@ -17,6 +17,9 @@ pub struct Config {
     pub database: Database,
     /// Local Modbus reader. `None` (no `[modbus]` section) means it is off.
     pub modbus: Option<Modbus>,
+    /// Electricity prices, used to work out costs and savings. `None` (no
+    /// `[tariff]` section) means cost features are off.
+    pub tariff: Option<Tariff>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -138,6 +141,100 @@ impl Modbus {
     }
 }
 
+/// Electricity prices; see config.example.toml. Rates are in cents (per kWh,
+/// except `supply_cents_per_day`). This is the raw file shape: `cost::Tariff`
+/// turns it into something quick to look up.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Tariff {
+    /// Fixed daily supply charge.
+    pub supply_cents_per_day: f64,
+    /// Import price for any time not covered by an `import` window.
+    pub default_import_cents: f64,
+    /// Import price windows. The first one that matches a time wins.
+    #[serde(default)]
+    pub import: Vec<PriceWindow>,
+    /// Feed-in price for any time not covered by an `export` window.
+    #[serde(default)]
+    pub default_export_cents: f64,
+    /// Feed-in price windows. The first one that matches a time wins.
+    #[serde(default)]
+    pub export: Vec<PriceWindow>,
+    /// Optional daily credit for (almost) no grid import in a window.
+    pub zero_import_credit: Option<ZeroImportCredit>,
+}
+
+/// A daily time window with a price. `from` is inclusive and `to` exclusive,
+/// both local "HH:MM". If `to` is earlier than `from` the window wraps past
+/// midnight (for example "21:00" to "06:00").
+#[derive(Debug, Clone, Deserialize)]
+pub struct PriceWindow {
+    pub from: String,
+    pub to: String,
+    pub cents: f64,
+}
+
+/// A credit earned on days when the grid import inside the window stays at or
+/// under `max_kwh`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZeroImportCredit {
+    pub from: String,
+    pub to: String,
+    pub max_kwh: f64,
+    pub credit_cents: f64,
+}
+
+/// Parse a local "HH:MM" time into minutes since midnight (0..=1439).
+///
+/// We are strict (two digits each side) so a typo like "9:5" is reported
+/// instead of being guessed at.
+pub fn parse_hhmm(text: &str) -> Result<u32> {
+    let bytes = text.as_bytes();
+    let digits_ok = bytes.len() == 5
+        && bytes[2] == b':'
+        && [0, 1, 3, 4].iter().all(|&i| bytes[i].is_ascii_digit());
+    anyhow::ensure!(digits_ok, "\"{text}\" is not a time in HH:MM form");
+    // The checks above make these slices and parses safe.
+    let hours: u32 = text[0..2].parse()?;
+    let minutes: u32 = text[3..5].parse()?;
+    anyhow::ensure!(
+        hours < 24 && minutes < 60,
+        "\"{text}\" is not a valid time of day"
+    );
+    Ok(hours * 60 + minutes)
+}
+
+/// Check one window's two times, naming the field `name` in any error.
+fn check_window(name: &str, from: &str, to: &str) -> Result<()> {
+    let start = parse_hhmm(from).with_context(|| format!("{name}.from in [tariff]"))?;
+    let end = parse_hhmm(to).with_context(|| format!("{name}.to in [tariff]"))?;
+    // Equal times are ambiguous: empty or the whole day?
+    anyhow::ensure!(
+        start != end,
+        "{name}.from and {name}.to in [tariff] must differ (both are \"{from}\")"
+    );
+    Ok(())
+}
+
+impl Tariff {
+    /// Check the section for mistakes the TOML parser cannot catch.
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.supply_cents_per_day >= 0.0,
+            "supply_cents_per_day in [tariff] must not be negative"
+        );
+        for (i, w) in self.import.iter().enumerate() {
+            check_window(&format!("import[{i}]"), &w.from, &w.to)?;
+        }
+        for (i, w) in self.export.iter().enumerate() {
+            check_window(&format!("export[{i}]"), &w.from, &w.to)?;
+        }
+        if let Some(c) = &self.zero_import_credit {
+            check_window("zero_import_credit", &c.from, &c.to)?;
+        }
+        Ok(())
+    }
+}
+
 fn default_modbus_port() -> u16 {
     502
 }
@@ -189,6 +286,11 @@ impl Config {
             .with_context(|| format!("invalid config file {}", path.display()))?;
         if let Some(modbus) = &config.modbus {
             modbus
+                .check()
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+        }
+        if let Some(tariff) = &config.tariff {
+            tariff
                 .check()
                 .with_context(|| format!("invalid config file {}", path.display()))?;
         }
@@ -255,6 +357,92 @@ mod tests {
         let text = format!("{MINIMAL}\n[modbus]\nhost = \"h\"\ninterval_secs = 0\n");
         let cfg: Config = toml::from_str(&text).unwrap();
         assert!(cfg.modbus.unwrap().check().is_err());
+    }
+
+    const TARIFF: &str = r#"
+        [tariff]
+        supply_cents_per_day = 173.8
+        default_import_cents = 44.0
+        import = [{ from = "11:00", to = "14:00", cents = 0.0 }]
+        export = [{ from = "18:00", to = "21:00", cents = 10.0 }]
+        [tariff.zero_import_credit]
+        from = "18:00"
+        to = "21:00"
+        max_kwh = 0.1
+        credit_cents = 100.0
+    "#;
+
+    /// Parse MINIMAL plus a tariff section and run the tariff check.
+    fn check_tariff(section: &str) -> Result<()> {
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{section}")).unwrap();
+        cfg.tariff.unwrap().check()
+    }
+
+    #[test]
+    fn tariff_is_off_without_a_section() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.tariff.is_none());
+    }
+
+    #[test]
+    fn tariff_parses_and_defaults_apply() {
+        check_tariff(TARIFF).unwrap();
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{TARIFF}")).unwrap();
+        let tariff = cfg.tariff.unwrap();
+        assert_eq!(tariff.import[0].to, "14:00");
+        assert_eq!(tariff.zero_import_credit.unwrap().credit_cents, 100.0);
+        // Only the two required prices are needed.
+        let minimal = "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 30.0\n";
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{minimal}")).unwrap();
+        let tariff = cfg.tariff.unwrap();
+        assert!(tariff.import.is_empty() && tariff.export.is_empty());
+        assert_eq!(tariff.default_export_cents, 0.0);
+        assert!(tariff.zero_import_credit.is_none());
+    }
+
+    #[test]
+    fn parses_times_of_day() {
+        assert_eq!(parse_hhmm("00:00").unwrap(), 0);
+        assert_eq!(parse_hhmm("21:30").unwrap(), 21 * 60 + 30);
+        assert_eq!(parse_hhmm("23:59").unwrap(), 1439);
+        for bad in ["", "9:05", "24:00", "12:60", "12-30", "ab:cd", "12:300"] {
+            assert!(parse_hhmm(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn tariff_errors_name_the_field() {
+        let base = "supply_cents_per_day = 1.0\ndefault_import_cents = 1.0\n";
+        let cases = [
+            (
+                "supply_cents_per_day = -1.0\ndefault_import_cents = 1.0\n",
+                "supply_cents_per_day",
+            ),
+            (
+                &format!("{base}import = [{{ from = \"25:00\", to = \"26:00\", cents = 1.0 }}]"),
+                "import[0].from",
+            ),
+            (
+                &format!(
+                    "{base}export = [{{ from = \"09:00\", to = \"10:00\", cents = 1.0 }}, {{ from = \"09:00\", to = \"nope\", cents = 1.0 }}]"
+                ),
+                "export[1].to",
+            ),
+            (
+                &format!("{base}import = [{{ from = \"09:00\", to = \"09:00\", cents = 1.0 }}]"),
+                "import[0].from and import[0].to",
+            ),
+            (
+                &format!(
+                    "{base}zero_import_credit = {{ from = \"09:00\", to = \"09:00\", max_kwh = 0.1, credit_cents = 1.0 }}"
+                ),
+                "zero_import_credit.from",
+            ),
+        ];
+        for (body, field) in cases {
+            let err = check_tariff(&format!("[tariff]\n{body}")).unwrap_err();
+            assert!(format!("{err:#}").contains(field), "{field}: {err:#}");
+        }
     }
 
     #[test]
