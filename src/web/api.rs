@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tracing::error;
 
 use super::AppState;
+use super::costs::round2;
 use crate::db::{self, LatestReading};
+use crate::ev_cost;
 use crate::modbus::Sample;
 
 const MAX_SERIES_POINTS: usize = 20;
@@ -207,10 +209,31 @@ pub async fn live_series(
     Ok(Json(json!({ "data": data })))
 }
 
+/// A charging session with where its energy came from and what it cost.
+/// The extra fields are null when the session cannot be costed.
+#[derive(Debug, Serialize)]
+struct CostedSession {
+    #[serde(flatten)]
+    session: db::ChargeSession,
+    solar_kwh: Option<f64>,
+    battery_kwh: Option<f64>,
+    grid_kwh: Option<f64>,
+    /// Dollars paid for the grid part.
+    cost: Option<f64>,
+    /// Dollars the solar part would have earned if exported instead.
+    solar_value: Option<f64>,
+    /// The share (0 to 1) of the session that live samples cover.
+    coverage: Option<f64>,
+}
+
 /// Charging sessions that overlap the range, as
-/// `{"sessions":[{id,started_at,ended_at,energy_added_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence},...]}`.
+/// `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`.
 /// A session that has not ended has `ended_at` null and counts as running
 /// until now. The list is empty when TeslaMate is off.
+///
+/// The last six fields are worked out from the live samples on each request
+/// (see `ev_cost`). They are null without a `[tariff]`, for a session away
+/// from home (a geofence other than "Home") and for one with no energy.
 pub async fn ev_sessions(
     State(state): State<AppState>,
     Query(params): Query<LiveSeriesParams>,
@@ -224,8 +247,31 @@ pub async fn ev_sessions(
         return Err(ApiError::bad_request("the range can be at most 400 days"));
     }
 
-    let sessions = db::charge_sessions_in_range(&state.pool, from, to, db::now()).await?;
-    Ok(Json(json!({ "sessions": sessions })))
+    let now = db::now();
+    let mut costed = Vec::new();
+    for session in db::charge_sessions_in_range(&state.pool, from, to, now).await? {
+        let at_home = matches!(session.geofence.as_deref(), None | Some("Home"));
+        let cost = match &state.tariff {
+            Some(schedule) if at_home => {
+                // `to` is exclusive in the query, so add a second to include the end.
+                let end = session.ended_at.unwrap_or(now);
+                let samples =
+                    db::live_samples_raw(&state.pool, session.started_at, end + 1).await?;
+                ev_cost::session_cost(&session, &samples, schedule, state.tz, now)
+            }
+            _ => None,
+        };
+        costed.push(CostedSession {
+            solar_kwh: cost.as_ref().map(|c| round2(c.solar_kwh)),
+            battery_kwh: cost.as_ref().map(|c| round2(c.battery_kwh)),
+            grid_kwh: cost.as_ref().map(|c| round2(c.grid_kwh)),
+            cost: cost.as_ref().map(|c| round2(c.cost_cents / 100.0)),
+            solar_value: cost.as_ref().map(|c| round2(c.solar_value_cents / 100.0)),
+            coverage: cost.as_ref().map(|c| round2(c.coverage)),
+            session,
+        });
+    }
+    Ok(Json(json!({ "sessions": costed })))
 }
 
 // Every parameter is an `Option<String>` that we parse ourselves. If we asked

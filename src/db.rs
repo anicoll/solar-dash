@@ -521,7 +521,11 @@ pub async fn save_daily_costs(
 /// What we know about a charging session so far.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChargeProgress {
+    /// Energy that reached the car's battery, kWh.
     pub energy_added_kwh: Option<f64>,
+    /// Energy drawn from the wall, kWh. More than `energy_added_kwh`: the
+    /// difference is charging losses.
+    pub energy_used_kwh: Option<f64>,
     /// The latest battery level, 0 to 100.
     pub soc_pct: Option<f64>,
     pub max_power_kw: Option<f64>,
@@ -568,6 +572,7 @@ pub async fn start_charge_session(
 struct OpenChargeRow {
     id: i64,
     energy_added_kwh: Option<f64>,
+    energy_used_kwh: Option<f64>,
     end_soc_pct: Option<f64>,
     max_power_kw: Option<f64>,
 }
@@ -575,7 +580,7 @@ struct OpenChargeRow {
 /// The car's open session, or `None` if it is not charging.
 pub async fn open_charge_session(pool: &SqlitePool, car_id: i64) -> Result<Option<OpenCharge>> {
     let row: Option<OpenChargeRow> = sqlx::query_as(
-        "SELECT id, energy_added_kwh, end_soc_pct, max_power_kw
+        "SELECT id, energy_added_kwh, energy_used_kwh, end_soc_pct, max_power_kw
          FROM ev_charge_session WHERE car_id = ? AND ended_at IS NULL",
     )
     .bind(car_id)
@@ -586,6 +591,7 @@ pub async fn open_charge_session(pool: &SqlitePool, car_id: i64) -> Result<Optio
         id: row.id,
         progress: ChargeProgress {
             energy_added_kwh: row.energy_added_kwh,
+            energy_used_kwh: row.energy_used_kwh,
             soc_pct: row.end_soc_pct,
             max_power_kw: row.max_power_kw,
         },
@@ -602,11 +608,13 @@ pub async fn update_charge_session(
     sqlx::query(
         "UPDATE ev_charge_session
          SET energy_added_kwh = COALESCE(?, energy_added_kwh),
+             energy_used_kwh = COALESCE(?, energy_used_kwh),
              end_soc_pct = COALESCE(?, end_soc_pct),
              max_power_kw = COALESCE(?, max_power_kw)
          WHERE id = ?",
     )
     .bind(progress.energy_added_kwh)
+    .bind(progress.energy_used_kwh)
     .bind(progress.soc_pct)
     .bind(progress.max_power_kw)
     .bind(id)
@@ -641,6 +649,7 @@ pub struct ChargeSession {
     /// `None` while the car is still charging.
     pub ended_at: Option<i64>,
     pub energy_added_kwh: Option<f64>,
+    pub energy_used_kwh: Option<f64>,
     pub start_soc_pct: Option<f64>,
     pub end_soc_pct: Option<f64>,
     pub max_power_kw: Option<f64>,
@@ -656,8 +665,8 @@ pub async fn charge_sessions_in_range(
     now: i64,
 ) -> Result<Vec<ChargeSession>> {
     sqlx::query_as(
-        "SELECT id, started_at, ended_at, energy_added_kwh, start_soc_pct, end_soc_pct,
-                max_power_kw, geofence
+        "SELECT id, started_at, ended_at, energy_added_kwh, energy_used_kwh, start_soc_pct,
+                end_soc_pct, max_power_kw, geofence
          FROM ev_charge_session
          WHERE started_at <= ? AND COALESCE(ended_at, ?) >= ?
          ORDER BY started_at",
@@ -728,6 +737,7 @@ mod tests {
 
         let progress = ChargeProgress {
             energy_added_kwh: Some(3.5),
+            energy_used_kwh: Some(3.9),
             soc_pct: Some(45.0),
             max_power_kw: Some(7.4),
         };
@@ -759,6 +769,7 @@ mod tests {
                 started_at: 1000,
                 ended_at: Some(5000),
                 energy_added_kwh: Some(3.5),
+                energy_used_kwh: Some(3.9),
                 start_soc_pct: Some(40.0),
                 end_soc_pct: Some(50.0),
                 max_power_kw: Some(7.4),
