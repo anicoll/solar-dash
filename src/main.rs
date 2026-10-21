@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
@@ -68,9 +68,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Serve => {
-            let _pool = db::open(&config.database.path).await?;
-            info!(path = %config.database.path, "database ready");
-            info!("serve is not implemented yet");
+            if let Err(err) = run_serve(config).await {
+                eprintln!("Serve failed: {err:#}");
+                std::process::exit(1);
+            }
         }
         Command::Backfill { from } => {
             if let Err(err) = run_backfill(config, &from).await {
@@ -93,6 +94,25 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Opens the database, logs in and keeps it up to date until Ctrl+C.
+/// (The web server will join this later.)
+async fn run_serve(config: Config) -> Result<()> {
+    let pool = db::open(&config.database.path).await?;
+    info!(path = %config.database.path, "database ready");
+    let mut client = Client::new(config.isolarcloud.clone())?;
+    // Failing here, with a clear error, beats failing every 5 minutes.
+    client.login().await.context("login failed at startup")?;
+
+    // Completes when Ctrl+C is pressed.
+    let shutdown = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!("could not listen for Ctrl+C: {err}");
+        }
+        info!("Ctrl+C received; stopping");
+    };
+    ingest::run_live_sync(client, &pool, &config.isolarcloud, shutdown).await
 }
 
 /// Opens the database, logs in and downloads history starting at `from`.

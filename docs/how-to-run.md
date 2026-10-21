@@ -59,11 +59,19 @@ Error codes seen so far:
 | `E912` "Illegal x-access-key" | The access key was not accepted | Copy the app's Secret Key into `access_key` again |
 | `E919` (no message) | Your iSolarCloud account is not on the app's whitelist | Add your account's email to the app's whitelist in the developer portal |
 
-Start the server:
+Keep the database up to date (run [backfill](#backfill-history) once first
+if you want older history):
 
 ```sh
 cargo run -- serve
 ```
+
+`serve` logs in, then syncs straight away and every 5 minutes after that
+(about a minute after each 5-minute mark, when the data has landed). Stop it
+with Ctrl+C. It makes about 12 calls an hour, about 8,900 a month, well inside
+the API limits. If it was stopped for a while it catches up from where it left
+off; without a backfill it starts from midnight today. The web dashboard will
+be added to `serve` later.
 
 Use a different config file with `--config path/to/file.toml`.
 For more logging:
