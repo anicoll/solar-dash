@@ -4,6 +4,7 @@
 mod api;
 mod auth;
 mod costs;
+mod payback;
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,7 @@ use crate::cost::Tariff;
 use crate::modbus::Latest;
 use auth::Lockout;
 pub use auth::hash_password;
+use payback::Purchase;
 
 /// The files in `static/`, compiled into the binary.
 // (In debug builds rust-embed reads them from disk instead, so edits show up
@@ -54,6 +56,8 @@ pub struct AppState {
     latest: Latest,
     /// The parsed `[tariff]` section; `None` turns the cost API off.
     tariff: Option<Arc<Tariff>>,
+    /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
+    purchases: Arc<[Purchase]>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -81,12 +85,19 @@ impl AppState {
             lockout: Arc::new(Mutex::new(Lockout::default())),
             latest: Latest::default(),
             tariff: None,
+            purchases: Arc::from([]),
         })
     }
 
     /// Turns on the cost API with this tariff.
     pub fn with_tariff(mut self, tariff: Option<Tariff>) -> Self {
         self.tariff = tariff.map(Arc::new);
+        self
+    }
+
+    /// Turns on the payback API with these purchases (oldest first).
+    pub fn with_purchases(mut self, purchases: Vec<Purchase>) -> Self {
+        self.purchases = purchases.into();
         self
     }
 
@@ -123,7 +134,10 @@ impl AppState {
             .as_ref()
             .map(Tariff::from_config)
             .transpose()?;
-        Ok(Self::new(pool, plant_id, tz, password_hash, key)?.with_tariff(tariff))
+        let purchases = payback::purchases_from_config(&config.system.purchase)?;
+        Ok(Self::new(pool, plant_id, tz, password_hash, key)?
+            .with_tariff(tariff)
+            .with_purchases(purchases))
     }
 }
 
@@ -156,6 +170,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
         .route("/api/costs", get(costs::costs))
+        .route("/api/payback", get(payback::payback))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
@@ -866,5 +881,96 @@ mod tests {
         let complete = costs_json(&app, range).await;
         assert_eq!(complete["days"][0]["import_kwh"], 3.0);
         assert_eq!(stored_days(&pool).await, 1);
+    }
+
+    fn solar_purchase(date: &str, cost_dollars: f64) -> Purchase {
+        Purchase {
+            name: "Solar".to_string(),
+            date: date.parse().unwrap(),
+            cost_dollars,
+        }
+    }
+
+    /// Like `costs_router`, with these purchases as well.
+    fn payback_router(pool: &SqlitePool, purchases: Vec<Purchase>) -> Router {
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_tariff(Some(flat_tariff()))
+            .with_purchases(purchases);
+        router(state)
+    }
+
+    async fn payback_json(app: &Router) -> Value {
+        let cookie = log_in(app).await;
+        let response = send(app, get_request("/api/payback", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await
+    }
+
+    #[tokio::test]
+    async fn payback_needs_a_tariff_and_purchases() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/payback", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let off = serde_json::json!({ "configured": false });
+        assert_eq!(payback_json(&app).await, off);
+
+        // A tariff but no purchases.
+        let (_dir, app, pool) = costs_app().await;
+        assert_eq!(payback_json(&app).await, off);
+        // Purchases but no tariff.
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool, PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_purchases(vec![solar_purchase("2026-09-14", 10.0)]);
+        assert_eq!(payback_json(&router(state)).await, off);
+    }
+
+    #[tokio::test]
+    async fn payback_adds_up_savings_against_purchases() {
+        let (_dir, _app, pool) = costs_app().await;
+        // One finished day saving 85 c (see `costs_for_a_cloud_day`).
+        seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
+        let app = payback_router(
+            &pool,
+            vec![
+                solar_purchase("2026-09-14", 10.0),
+                solar_purchase("2026-10-02", 5.0),
+            ],
+        );
+        let json = payback_json(&app).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["total_cost"], 15.0);
+        assert_eq!(json["saved"], 0.85);
+        assert_eq!(json["net"], -14.15);
+        assert_eq!(json["recovered_pct"], 5.67);
+        assert_eq!(json["rate_per_day"], 0.85);
+        // 14.15 / 0.85 = 17 days from today: some "YYYY-MM" in the future.
+        let projected = json["projected_payback"].as_str().unwrap();
+        assert!(projected.len() == 7 && projected.as_bytes()[4] == b'-');
+        assert_eq!(json["purchases"][1]["date"], "2026-10-02");
+        assert_eq!(json["purchases"][1]["cost"], 5.0);
+        // September: the saving and the first purchase. October: the second purchase too.
+        assert_eq!(
+            json["series"][0],
+            serde_json::json!({ "month": "2026-09", "saved": 0.85, "net": -9.15 })
+        );
+        assert_eq!(
+            json["series"][1],
+            serde_json::json!({ "month": "2026-10", "saved": 0.85, "net": -14.15 })
+        );
+        assert_eq!(
+            json["by_year"],
+            serde_json::json!([{ "year": 2026, "saved": 0.85, "days": 1, "partial": true }])
+        );
+
+        // Already paid back: no projection date.
+        let cheap = payback_router(&pool, vec![solar_purchase("2026-09-14", 0.5)]);
+        let json = payback_json(&cheap).await;
+        assert_eq!(json["net"], 0.35);
+        assert_eq!(json["projected_payback"], Value::Null);
     }
 }

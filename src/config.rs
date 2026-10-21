@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -20,6 +21,9 @@ pub struct Config {
     /// Electricity prices, used to work out costs and savings. `None` (no
     /// `[tariff]` section) means cost features are off.
     pub tariff: Option<Tariff>,
+    /// What the system cost, for the payback estimate. Optional.
+    #[serde(default)]
+    pub system: System,
 }
 
 #[derive(Clone, Deserialize)]
@@ -235,6 +239,48 @@ impl Tariff {
     }
 }
 
+/// The solar system's purchases, for `/api/payback`; see config.example.toml.
+/// Written as repeated `[[system.purchase]]` tables.
+#[derive(Debug, Default, Deserialize)]
+pub struct System {
+    #[serde(default)]
+    pub purchase: Vec<Purchase>,
+}
+
+/// One thing bought for the system: the panels and inverter, a second battery.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Purchase {
+    pub name: String,
+    /// Local date it was paid for, "YYYY-MM-DD".
+    pub date: String,
+    pub cost_dollars: f64,
+}
+
+/// Parse a "YYYY-MM-DD" date. Strict, like [`parse_hhmm`].
+pub fn parse_date(text: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .with_context(|| format!("\"{text}\" is not a date in YYYY-MM-DD form"))
+}
+
+impl System {
+    /// Check the purchases, naming the field in any error.
+    fn check(&self) -> Result<()> {
+        for (i, p) in self.purchase.iter().enumerate() {
+            anyhow::ensure!(
+                !p.name.trim().is_empty(),
+                "purchase[{i}].name in [system] must not be empty"
+            );
+            parse_date(&p.date).with_context(|| format!("purchase[{i}].date in [system]"))?;
+            // `>= 0.0` is false for NaN as well, so that is rejected too.
+            anyhow::ensure!(
+                p.cost_dollars >= 0.0 && p.cost_dollars.is_finite(),
+                "purchase[{i}].cost_dollars in [system] must be zero or more"
+            );
+        }
+        Ok(())
+    }
+}
+
 fn default_modbus_port() -> u16 {
     502
 }
@@ -294,6 +340,10 @@ impl Config {
                 .check()
                 .with_context(|| format!("invalid config file {}", path.display()))?;
         }
+        config
+            .system
+            .check()
+            .with_context(|| format!("invalid config file {}", path.display()))?;
         Ok(config)
     }
 }
@@ -441,6 +491,68 @@ mod tests {
         ];
         for (body, field) in cases {
             let err = check_tariff(&format!("[tariff]\n{body}")).unwrap_err();
+            assert!(format!("{err:#}").contains(field), "{field}: {err:#}");
+        }
+    }
+
+    const PURCHASES: &str = r#"
+        [[system.purchase]]
+        name = "Solar"
+        date = "2023-02-21"
+        cost_dollars = 19490.00
+        [[system.purchase]]
+        name = "Battery 2"
+        date = "2025-10-01"
+        cost_dollars = 7690.20
+    "#;
+
+    /// Parse MINIMAL plus a `[system]` section and run its check.
+    fn check_system(section: &str) -> Result<()> {
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{section}")).unwrap();
+        cfg.system.check()
+    }
+
+    #[test]
+    fn purchases_are_optional_and_parse() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.system.purchase.is_empty());
+        check_system(PURCHASES).unwrap();
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{PURCHASES}")).unwrap();
+        assert_eq!(cfg.system.purchase.len(), 2);
+        assert_eq!(cfg.system.purchase[1].cost_dollars, 7690.20);
+    }
+
+    #[test]
+    fn purchase_errors_name_the_field() {
+        let one = |body: &str| format!("[[system.purchase]]\n{body}");
+        let cases = [
+            (
+                one("name = \" \"\ndate = \"2023-02-21\"\ncost_dollars = 1.0"),
+                "purchase[0].name",
+            ),
+            (
+                one("name = \"a\"\ndate = \"21/02/2023\"\ncost_dollars = 1.0"),
+                "purchase[0].date",
+            ),
+            (
+                one("name = \"a\"\ndate = \"2023-02-30\"\ncost_dollars = 1.0"),
+                "purchase[0].date",
+            ),
+            (
+                one("name = \"a\"\ndate = \"2023-02-21\"\ncost_dollars = -5.0"),
+                "purchase[0].cost_dollars",
+            ),
+            (
+                format!(
+                    "{}\n{}",
+                    one("name = \"a\"\ndate = \"2023-02-21\"\ncost_dollars = 1.0"),
+                    one("name = \"b\"\ndate = \"2023-02-21\"\ncost_dollars = nan")
+                ),
+                "purchase[1].cost_dollars",
+            ),
+        ];
+        for (section, field) in cases {
+            let err = check_system(&section).unwrap_err();
             assert!(format!("{err:#}").contains(field), "{field}: {err:#}");
         }
     }
