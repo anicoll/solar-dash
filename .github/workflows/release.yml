@@ -10,6 +10,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Two quick merges start two runs, and whichever publishes last becomes
+# "latest". Cancel the older run so the newest commit always wins.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
