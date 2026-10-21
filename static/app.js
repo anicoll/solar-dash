@@ -20,6 +20,21 @@
   const kw = (w) => (w / 1000).toFixed(2);
   const kwh = (v) => (v == null ? '–' : v.toFixed(1));
   const pad = (n) => String(n).padStart(2, '0');
+  /** Escapes text for the few places ECharts tooltips take an HTML string. */
+  const esc = (t) => String(t).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  /** Dollars: "$6,912" for `dp` 0, "$186.40" for 2. Negative amounts get a leading minus. */
+  function money(v, dp = 2) {
+    if (v == null || !Number.isFinite(v)) return '–';
+    const t = Math.abs(v).toLocaleString('en-AU', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+    return `${v < 0 ? '-' : ''}$${t}`;
+  }
+  /** Creates an element with optional class and text. */
+  const el = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  };
 
   const fmtDate = new Intl.DateTimeFormat('en-CA', {
     timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -106,14 +121,12 @@
   }
 
   function tile(label, valueText, unit, colour) {
-    const el = document.createElement('div');
-    el.className = 'tile';
-    if (colour) el.style.setProperty('--tile', `var(${colour})`);
-    const l = document.createElement('div'); l.className = 'label'; l.textContent = label;
-    const v = document.createElement('div'); v.className = 'value'; v.textContent = valueText;
-    if (unit) { const u = document.createElement('span'); u.className = 'unit'; u.textContent = unit; v.appendChild(u); }
-    el.append(l, v);
-    return el;
+    const t = el('div', 'tile');
+    if (colour) t.style.setProperty('--tile', `var(${colour})`);
+    const v = el('div', 'value', valueText);
+    if (unit) v.appendChild(el('span', 'unit', unit));
+    t.append(el('div', 'label', label), v);
+    return t;
   }
 
   const TOTALS = [
@@ -142,12 +155,12 @@
   }
 
   function baseTheme() {
-    return { fg: css('--fg'), muted: css('--muted'), line: css('--line') };
+    return { fg: css('--fg'), muted: css('--muted'), line: css('--border') };
   }
 
   function tooltipStyle() {
     return {
-      backgroundColor: css('--card'), borderColor: css('--line'),
+      backgroundColor: css('--panel-2'), borderColor: css('--border-strong'),
       textStyle: { color: css('--fg'), fontSize: 13 },
     };
   }
@@ -159,6 +172,111 @@
     const c = getChart(id);
     if (!c) return;
     if (hasData) { c.setOption(option, true); c.resize(); } else { c.clear(); }
+  }
+
+  // ---------- savings data (shared, fetched at most once a minute) ----------
+
+  const COSTS_TTL_MS = 60 * 1000;
+  // /api/costs allows at most 1500 days per request.
+  const COSTS_MAX_DAYS = 1500;
+  const savingsCache = { at: 0, promise: null };
+
+  /**
+   * All-history costs. Resolves to `{ configured: false }`, or `{ configured: true,
+   * saved, days, totals }` where `saved` is /api/payback's total when that is
+   * configured (it counts from the first purchase) and /api/costs' otherwise.
+   * Cached for COSTS_TTL_MS so a 15 s poll does not hit the server every time.
+   */
+  function loadSavings() {
+    if (savingsCache.promise && Date.now() - savingsCache.at < COSTS_TTL_MS) return savingsCache.promise;
+    savingsCache.at = Date.now();
+    const p = (async () => {
+      const today = todayStr();
+      let payback = null;
+      try {
+        payback = await api('/api/payback');
+      } catch (err) {
+        if (err.message === 'Not logged in.') throw err;
+      }
+      const earliest = addDays(today, 1 - COSTS_MAX_DAYS);
+      let from = earliest;
+      if (payback && payback.configured && payback.purchases.length) {
+        from = payback.purchases[0].date > earliest ? payback.purchases[0].date : earliest;
+      }
+      const costs = await api(`/api/costs?from=${from}&to=${today}`);
+      if (!costs.configured) return { configured: false };
+      const saved = payback && payback.configured ? payback.saved : costs.totals.savings;
+      return { configured: true, saved, days: costs.days, totals: costs.totals };
+    })();
+    savingsCache.promise = p;
+    p.catch(() => { savingsCache.at = 0; });
+    return p;
+  }
+
+  /** Running total of `savings`, as `[date, total]` pairs. */
+  function runningTotal(days) {
+    let total = 0;
+    return days.map((d) => [d.date, (total += d.savings)]);
+  }
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  /** A small filled line of `values` as an SVG, built without HTML strings. */
+  function sparkline(values, label) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 300 70');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', label);
+    if (values.length < 2) return svg;
+    // At most ~120 points is plenty at this size.
+    const stride = Math.max(1, Math.floor(values.length / 120));
+    const pts = values.filter((_, i) => i % stride === 0 || i === values.length - 1);
+    const lo = Math.min(0, ...pts), hi = Math.max(...pts, lo + 1);
+    const xy = pts.map((v, i) => [(i / (pts.length - 1)) * 300, 66 - ((v - lo) / (hi - lo)) * 62]);
+    const line = xy.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join('');
+    const area = document.createElementNS(SVG_NS, 'path');
+    area.setAttribute('d', `${line}L300 70L0 70Z`);
+    area.setAttribute('fill', css('--save'));
+    area.setAttribute('fill-opacity', '0.12');
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', line);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', css('--save'));
+    path.setAttribute('stroke-width', '2.5');
+    path.setAttribute('stroke-linejoin', 'round');
+    path.setAttribute('vector-effect', 'non-scaling-stroke');
+    svg.append(area, path);
+    return svg;
+  }
+
+  /** "Feb 2023" for a YYYY-MM-DD string. */
+  const monthYear = (d) => `${MONTHS[+d.slice(5, 7) - 1]} ${d.slice(0, 4)}`;
+
+  const NOT_CONFIGURED_TARIFF =
+    'Add a [tariff] section to the config file to see what solar and the battery save you.';
+
+  function renderHero(data) {
+    const empty = $('hero-empty'), body = $('hero-body');
+    if (!data || !data.configured) {
+      empty.textContent = data ? NOT_CONFIGURED_TARIFF : 'Savings are unavailable right now.';
+      empty.hidden = false;
+      body.hidden = true;
+      return;
+    }
+    empty.hidden = true;
+    body.hidden = false;
+    const today = todayStr();
+    const month = today.slice(0, 7);
+    const sumOf = (rows) => rows.reduce((a, d) => a + d.savings, 0);
+    $('hero-total').textContent = money(data.saved, 0);
+    $('hero-since').textContent = data.days.length ? `All time, since ${monthYear(data.days[0].date)}` : 'All time';
+    $('hero-month').textContent = money(sumOf(data.days.filter((d) => d.date.startsWith(month))));
+    const t = data.days.find((d) => d.date === today);
+    $('hero-today').textContent = t ? money(t.savings) : money(0);
+    const first = data.days.length ? monthYear(data.days[0].date) : 'the start';
+    $('hero-spark').replaceChildren(sparkline(runningTotal(data.days).map((r) => r[1]),
+      `Running total of savings since ${first}, now ${money(data.saved, 0)}`));
   }
 
   // ---------- Now ----------
@@ -181,23 +299,49 @@
     }
   }
 
+  /** A power tile: coloured label, big value, optional extra node underneath. */
+  function powerTile(label, valueText, unit, colourVar, extra) {
+    const t = el('div', 'ptile');
+    t.style.setProperty('--tile', `var(${colourVar})`);
+    const v = el('div', 'value', valueText);
+    if (unit) v.appendChild(el('span', 'unit', unit));
+    t.append(el('div', 'label', label), v);
+    if (extra) t.appendChild(extra);
+    return t;
+  }
+
+  /** Battery charge bar with a percentage. */
+  function socBar(pct) {
+    const row = el('div', 'soc');
+    const bar = el('div', 'bar'), fill = el('span', 'fill');
+    fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    bar.appendChild(fill);
+    row.append(bar, el('span', 'pct', `${Math.round(pct)}%`));
+    return row;
+  }
+
   /** Power tile in kW with a direction word: positive means `pos`, negative `neg`. */
-  function flowTile(label, w, pos, neg, colourPos, colourNeg) {
-    if (w == null) return tile(label, '–', 'kW', colourPos);
+  function flowTile(label, w, pos, neg, colourVar, extra) {
+    if (w == null) return powerTile(label, '–', 'kW', colourVar, extra);
     const word = w > 0 ? pos : w < 0 ? neg : 'idle';
-    return tile(`${label} · ${word}`, kw(Math.abs(w)), 'kW', w < 0 ? colourNeg : colourPos);
+    return powerTile(`${label} · ${word}`, kw(Math.abs(w)), 'kW', colourVar, extra);
+  }
+
+  function setStatus(text, stale) {
+    $('updated-text').textContent = text;
+    $('updated').classList.toggle('stale', !!stale);
   }
 
   function renderLiveTiles(sample) {
-    const power = (label, w, colour) => tile(label, w == null ? '–' : kw(w), 'kW', colour);
+    const kwTile = (label, w, colourVar) => powerTile(label, w == null ? '–' : kw(w), 'kW', colourVar);
     $('live-tiles').replaceChildren(
-      power('Solar (PV)', sample.pv_w, '--c-pv'),
-      power('Load', sample.load_w, '--c-load'),
-      flowTile('Grid', sample.grid_w, 'importing', 'exporting', '--c-import', '--c-export'),
-      flowTile('Battery', sample.battery_w, 'charging', 'discharging', '--c-charge', '--c-discharge'),
-      tile('State of charge', sample.soc_pct == null ? '–' : Math.round(sample.soc_pct), '%', '--c-soc'),
+      kwTile('Solar', sample.pv_w, '--c-pv'),
+      kwTile('Home', sample.load_w, '--c-load'),
+      flowTile('Battery', sample.battery_w, 'charging', 'discharging', '--c-battery',
+        sample.soc_pct == null ? null : socBar(sample.soc_pct)),
+      flowTile('Grid', sample.grid_w, 'importing', 'exporting', '--c-grid'),
     );
-    $('updated').textContent = `Live from inverter · updated ${ageText(Date.now() / 1000 - sample.ts)}`;
+    setStatus(`Live from inverter · updated ${ageText(Date.now() / 1000 - sample.ts)}`, false);
   }
 
   function renderCloudTiles(latest) {
@@ -211,43 +355,88 @@
     const pv = watt(P_PV), load = watt(P_LOAD);
     const soc = byId[P_SOC] && byId[P_SOC].value;
     $('live-tiles').replaceChildren(
-      tile('Solar (PV)', pv == null ? '–' : kw(pv), 'kW', '--c-pv'),
-      tile('Load', load == null ? '–' : kw(load), 'kW', '--c-load'),
-      tile('Battery', soc == null ? '–' : Math.round(soc), '%', '--c-soc'),
+      powerTile('Solar', pv == null ? '–' : kw(pv), 'kW', '--c-pv'),
+      powerTile('Home', load == null ? '–' : kw(load), 'kW', '--c-load'),
+      powerTile('Battery charge', soc == null ? '–' : String(Math.round(soc)), '%', '--c-battery',
+        soc == null ? null : socBar(soc)),
     );
     const ts = Math.max(0, ...[P_PV, P_LOAD, P_SOC].map((id) => (byId[id] ? byId[id].ts : 0)));
-    $('updated').textContent = ts
+    setStatus(ts
       ? `From iSolarCloud · updated ${ageText(Date.now() / 1000 - ts)} (${fmtLong.format(new Date(ts * 1000))})`
-      : 'No readings yet';
+      : 'No readings yet', true);
   }
+
+  function stat(label, valueText, unit, note) {
+    const s = el('div', 'stat');
+    const v = el('div', 'value', valueText);
+    if (unit) v.appendChild(el('span', 'unit', unit));
+    s.append(el('div', 'label', label), v);
+    if (note) s.appendChild(el('div', 'note', note));
+    return s;
+  }
+
+  function renderToday(t, costDay) {
+    const pct = (t.load_kwh > 0 && t.import_kwh != null)
+      ? Math.round(Math.max(0, Math.min(100, (1 - t.import_kwh / t.load_kwh) * 100))) : null;
+    const items = [
+      stat('Generated', kwh(t.pv_kwh), 'kWh'),
+      stat('Used', kwh(t.load_kwh), 'kWh'),
+      stat('Imported', kwh(t.import_kwh), 'kWh'),
+      stat('Exported', kwh(t.export_kwh), 'kWh'),
+      stat('Self-powered', pct == null ? '–' : String(pct), '%'),
+    ];
+    if (costDay) {
+      items.push(stat('Cost so far', money(costDay.actual), '',
+        costDay.credit > 0 ? `${money(costDay.credit)} evening credit earned` : ''));
+    }
+    $('today-tiles').replaceChildren(...items);
+  }
+
+  let lastNowChartAt = 0;
 
   /** Loads the Now view. Returns the delay before the next refresh. */
   async function loadNow() {
     const today = todayStr();
-    const [sample, daily] = await Promise.all([
+    const [sample, daily, savings] = await Promise.all([
       fetchLive(),
       api(`/api/daily?from=${today}&to=${today}`),
+      loadSavings().catch((err) => { if (err.message === 'Not logged in.') throw err; return null; }),
     ]);
+    if (state.view !== 'now') return LIVE_REFRESH_MS;
+    renderHero(savings);
     const todayTotals = daily.days[0] || {};
-    renderTotals($('today-tiles'), todayTotals);
+    renderToday(todayTotals,
+      savings && savings.configured ? savings.days.find((d) => d.date === today) : null);
     // Say where today's totals come from (see "source" in /api/daily).
     $('today-source').textContent =
       todayTotals.source === 'inverter' ? '(inverter)'
       : todayTotals.source === 'cloud' ? '(iSolarCloud)' : '';
+    let delay = REFRESH_MS;
     if (sample) {
       renderLiveTiles(sample);
-      return LIVE_REFRESH_MS;
+      delay = LIVE_REFRESH_MS;
+    } else {
+      renderCloudTiles(await api('/api/latest'));
     }
-    renderCloudTiles(await api('/api/latest'));
-    return REFRESH_MS;
+    // The chart needs two heavier requests, so it refreshes on the slower cadence.
+    if (Date.now() - lastNowChartAt >= REFRESH_MS - 1000) {
+      lastNowChartAt = Date.now();
+      try {
+        await loadDayChart('now-chart', 'now-source', today, () => state.view === 'now');
+      } catch (err) {
+        lastNowChartAt = 0;
+        throw err;
+      }
+    }
+    return delay;
   }
 
   // ---------- Day ----------
 
   const DAY_SERIES = [
     // key, label, colour var, sign, kind
-    ['pv_w', 'PV', '--c-pv', 1, 'area'],
-    ['load_w', 'Load', '--c-load', 1, 'line'],
+    ['pv_w', 'Solar', '--c-pv', 1, 'area'],
+    ['load_w', 'Home', '--c-load', 1, 'line'],
     ['grid_import_w', 'Grid import', '--c-import', 1, 'line'],
     ['grid_export_w', 'Grid export', '--c-export', -1, 'area'],
     ['battery_charge_w', 'Battery charge', '--c-charge', 1, 'line'],
@@ -317,19 +506,30 @@
 
   async function loadDay(date) {
     $('day-input').value = date;
+    const current = () => state.view === 'day' && state.day === date;
     const [day, daily] = await Promise.all([
       api(`/api/day?date=${date}`),
       api(`/api/daily?from=${date}&to=${date}`),
     ]);
-    if (state.view !== 'day' || state.day !== date) return;
+    if (!current()) return;
+    renderTotals($('day-totals'), daily.days[0] || {});
+    await loadDayChart('day-chart', 'day-source', date, current, day);
+  }
+
+  /**
+   * Draws the power chart for `date` (the Day view and the Now view share it).
+   * `current()` says whether the view is still showing this chart; `day` is an
+   * already-fetched /api/day response, if the caller has one.
+   */
+  async function loadDayChart(chartId, noteId, date, current, day) {
+    day = day || await api(`/api/day?date=${date}`);
     const start = day.start * 1000;
     const end = day.end * 1000;
     const live = await fetchLiveDay(day.start, day.end);
-    if (state.view !== 'day' || state.day !== date) return;
+    if (!current()) return;
     const { byKey, source } = mergeDay(day.series, live);
     const hasData = Object.values(byKey).some((d) => d.length > 0);
-    renderTotals($('day-totals'), daily.days[0] || {});
-    const note = $('day-source');
+    const note = $(noteId);
     note.textContent = source;
     note.hidden = !hasData;
 
@@ -368,8 +568,9 @@
 
     const option = {
       animation: false,
-      grid: { left: 8, right: 8, top: narrow ? 84 : 56, bottom: 8, containLabel: true },
+      grid: { left: 8, right: 8, top: narrow ? 108 : 56, bottom: 8, containLabel: true },
       legend: { top: 0, left: 8, right: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      textStyle: { fontFamily: css('--font') },
       tooltip: {
         trigger: 'axis', axisPointer: { type: 'line' }, ...tooltipStyle(),
         formatter(params) {
@@ -387,24 +588,24 @@
       },
       xAxis: {
         type: 'value', min: start, max: end, interval: step,
-        axisLabel: { color: th.muted, formatter: (v) => clock(v) },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => clock(v) },
         axisLine: { lineStyle: { color: th.line } }, splitLine: { show: false },
       },
       yAxis: [
         {
           type: 'value', name: 'kW', nameTextStyle: { color: th.muted },
-          axisLabel: { color: th.muted, formatter: (v) => v.toFixed(1) },
+          axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => v.toFixed(1) },
           splitLine: { lineStyle: { color: th.line } },
         },
         {
           type: 'value', name: 'SOC %', min: 0, max: 100, nameTextStyle: { color: th.muted },
-          axisLabel: { color: th.muted }, splitLine: { show: false },
+          axisLabel: { color: th.muted, fontFamily: css('--mono') }, splitLine: { show: false },
         },
       ],
       series,
     };
     const peak = Math.max(0, ...(byKey.pv_w || []).map((d) => d[1]));
-    showChart('day-chart', hasData, option,
+    showChart(chartId, hasData, option,
       hasData
         ? `Power chart for ${date}: peak solar ${kw(peak)} kW; PV, load, grid import and export, battery charge and discharge in kW, battery state of charge in percent.`
         : `Power chart for ${date}: no data`);
@@ -430,6 +631,7 @@
       animation: false,
       grid: { left: 8, right: 8, top: narrow ? 72 : 44, bottom: 8, containLabel: true },
       legend: { top: 0, left: 8, right: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      textStyle: { fontFamily: css('--font') },
       tooltip: {
         trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
         formatter(params) {
@@ -438,17 +640,17 @@
             return `<div style="display:flex;justify-content:space-between;gap:16px">`
               + `<span>${p.marker}${p.seriesName}</span><b>${val == null ? '–' : val.toFixed(1) + ' kWh'}</b></div>`;
           });
-          return `<div style="margin-bottom:4px">${tooltipTitle(params[0].dataIndex)}</div>${rows.join('')}`;
+          return `<div style="margin-bottom:4px">${esc(tooltipTitle(params[0].dataIndex))}</div>${rows.join('')}`;
         },
       },
       xAxis: {
         type: 'category', data: labels,
-        axisLabel: { color: th.muted, interval: narrow && thin ? 'auto' : 0 },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), interval: narrow && thin ? 'auto' : 0 },
         axisLine: { lineStyle: { color: th.line } },
       },
       yAxis: {
         type: 'value', name: 'kWh', nameTextStyle: { color: th.muted },
-        axisLabel: { color: th.muted }, splitLine: { lineStyle: { color: th.line } },
+        axisLabel: { color: th.muted, fontFamily: css('--mono') }, splitLine: { lineStyle: { color: th.line } },
       },
       series: [
         { name: 'PV generation', type: 'bar', stack: 'e', data: v('pv_kwh'), itemStyle: { color: css('--c-pv') } },
@@ -499,6 +701,9 @@
   /** Loads Now, then schedules the next refresh (15 s from the inverter, 60 s from the cloud). */
   async function pollNow() {
     clearTimeout(timer);
+    timer = null;
+    // A hidden tab does not poll; visibilitychange restarts it.
+    if (document.hidden) return;
     const token = ++pollToken;
     let delay = REFRESH_MS;
     await guarded(async () => { delay = await loadNow(); });
@@ -506,7 +711,8 @@
   }
 
   function parseHash() {
-    const raw = decodeURIComponent(window.location.hash.replace(/^#/, ''));
+    let raw = window.location.hash.replace(/^#/, '');
+    try { raw = decodeURIComponent(raw); } catch (e) { raw = ''; } // malformed escapes: fall back to Now
     const [view, value] = raw.split('=');
     const today = todayStr();
     state.view = ['now', 'day', 'month', 'year'].includes(view) ? view : 'now';
@@ -524,7 +730,7 @@
 
   function render() {
     parseHash();
-    for (const el of document.querySelectorAll('.view')) el.hidden = el.id !== `view-${state.view}`;
+    for (const v of document.querySelectorAll('.view')) v.hidden = v.id !== `view-${state.view}`;
     for (const tab of document.querySelectorAll('.tab')) {
       if (tab.dataset.view === state.view) tab.setAttribute('aria-current', 'page');
       else tab.removeAttribute('aria-current');
@@ -534,6 +740,7 @@
     clearTimeout(timer);
     timer = null;
     pollToken++;
+    lastNowChartAt = 0;
     if (state.view === 'now') pollNow();
     else if (state.view === 'day') guarded(() => loadDay(state.day));
     else if (state.view === 'month') guarded(() => loadMonth(state.month));
@@ -568,8 +775,9 @@
 
     window.addEventListener('hashchange', render);
     window.addEventListener('resize', () => { for (const c of Object.values(charts)) c.resize(); });
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden && state.view === 'now') pollNow(); });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && state.view === 'now') pollNow();
+    });
     render();
   }
 

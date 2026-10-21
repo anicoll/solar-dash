@@ -3,22 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="dark">
 <title>solar-dash</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header class="top">
-  <h1>solar-dash</h1>
-  <nav class="tabs" aria-label="Views">
-    <a class="tab" href="#now" data-view="now">Now</a>
-    <a class="tab" href="#day" data-view="day">Day</a>
-    <a class="tab" href="#month" data-view="month">Month</a>
-    <a class="tab" href="#year" data-view="year">Year</a>
-  </nav>
-  <form method="post" action="/logout" class="logout">
-    <button type="submit" class="btn">Log out</button>
-  </form>
+  <div class="top-inner">
+    <div class="brand">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"></circle><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"></path></svg>
+      <h1>solar-dash</h1>
+    </div>
+    <nav class="tabs" aria-label="Views">
+      <a class="tab" href="#now" data-view="now">Now</a>
+      <a class="tab" href="#day" data-view="day">Day</a>
+      <a class="tab" href="#month" data-view="month">Month</a>
+      <a class="tab" href="#year" data-view="year">Year</a>
+    </nav>
+    <form method="post" action="/logout" class="logout">
+      <button type="submit" class="btn">Log out</button>
+    </form>
+  </div>
 </header>
 
 <main>
@@ -26,10 +31,47 @@
 
   <section id="view-now" class="view" aria-labelledby="h-now" hidden>
     <h2 id="h-now" class="sr-only">Now</h2>
-    <p id="updated" class="muted" aria-live="polite">Loading...</p>
-    <div class="grid tiles" id="live-tiles"></div>
-    <h3 class="section">Today <span class="source-label" id="today-source"></span></h3>
-    <div class="grid tiles" id="today-tiles"></div>
+    <p id="updated" class="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="updated-text">Loading...</span></p>
+
+    <div class="now-top">
+      <section id="hero" class="hero" aria-labelledby="h-hero">
+        <h2 id="h-hero" class="panel-title">Saved by solar + battery</h2>
+        <p id="hero-empty" class="hero-empty" hidden></p>
+        <div id="hero-body" class="hero-body" hidden>
+          <div>
+            <div id="hero-since" class="hero-since"></div>
+            <div id="hero-total" class="num hero-total">&ndash;</div>
+          </div>
+          <div id="hero-spark" class="spark"></div>
+          <div class="hero-pair">
+            <div><span class="hero-label">This month</span><span id="hero-month" class="num hero-val">&ndash;</span></div>
+            <div><span class="hero-label">Today so far</span><span id="hero-today" class="num hero-val">&ndash;</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel power" aria-labelledby="h-power">
+        <div class="panel-head">
+          <h2 id="h-power" class="panel-title">Power right now</h2>
+          <span class="panel-note">Free power window &middot; 11:00&ndash;14:00</span>
+        </div>
+        <div class="power-tiles" id="live-tiles"></div>
+      </section>
+    </div>
+
+    <section class="stack" aria-labelledby="h-today">
+      <h2 id="h-today" class="panel-title">Today <span class="source-label" id="today-source"></span></h2>
+      <div class="today-list" id="today-tiles"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-nowchart">
+      <h2 id="h-nowchart" class="panel-title">Today's power</h2>
+      <div class="card flat">
+        <div id="now-chart" class="chart tall" role="img" aria-label="Today's power chart"></div>
+        <p id="now-source" class="source" hidden></p>
+        <p id="now-empty" class="empty" hidden>No data yet today</p>
+      </div>
+    </section>
   </section>
 
   <section id="view-day" class="view" aria-labelledby="h-day" hidden>
