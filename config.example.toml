@@ -22,6 +22,9 @@ password = "your-password"
 # plant_id = 1234567
 # The plant's time zone (IANA name). History timestamps are in this zone.
 # timezone = "Australia/Adelaide"
+# The day your inverter was connected. `serve` fills in the 5-minute history
+# from this day in the background, a few days at a time.
+# history_from = "2023-02-21"
 # Which measuring points `backfill` downloads. Default list and meanings:
 #   83033 plant power (W)              83067 PV total active power (W)
 #   83106 load power (W)               83328 grid active power (W)
