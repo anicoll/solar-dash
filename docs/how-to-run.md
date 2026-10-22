@@ -121,10 +121,11 @@ it on the server too.
 
 ### Dashboard views
 
-The page has tabs for Now, History, Money and Payback. History has a
-Day | Month | Year switch, and the address keeps the view (for example
+The home page (the solar-dash name at the top left) shows Now, with History
+below it; the tabs are Money and Payback. History has a
+Day | Month | Year switch, and the address keeps the period (for example
 `#day=2026-10-20`, `#month=2026-10`, `#year=2026`), so refresh and bookmarks
-work. Clicking a bar in the Month chart opens that day, and a bar in the Year
+work (the old `#now` and `#history` addresses open home). Clicking a bar in the Month chart opens that day, and a bar in the Year
 chart opens that month. Money has a Month | Year | All time switch
 (`#money=month:2026-09`, `#money=year:2025`, `#money=all`; `#money` is this month):
 what you saved, a bill-style breakdown, where the saving came from, a bar chart
@@ -135,13 +136,13 @@ GloBird's own figures for every day it has billed completely, and our estimate f
 the rest; a line under the saving says how many days are which. The old `#savings` and
 `#cost` addresses open it. All times are shown in Australia/Adelaide.
 
-- **Now**: solar and load power, battery, and today's energy totals. With
+- **Now** (top of the home page): solar and load power, battery, and today's energy totals. With
   [Modbus](#local-modbus-optional) running it shows the inverter's live values
   (solar, load, grid importing or exporting, battery charging or discharging,
   and battery %), refreshed every 15 seconds. Without a sample under 5 minutes
   old it falls back to the iSolarCloud readings, refreshed every minute. A line
   at the top says which source it is and how old the reading is.
-- **History > Day**: a power chart for one day (pick a date or step with the arrows).
+- **History > Day**: a power chart for one day, today's until you pick another (pick a date or step with the arrows).
   Solar, load, grid import, export (below the axis) and battery charge and
   discharge are in kW, and battery % is on the right axis. 11:00-14:00 is
   shaded as the "Free 11-2" window and 18:00-21:00 as "Peak". Energy totals
@@ -149,7 +150,8 @@ the rest; a line under the saving says how many days are which. The old `#saving
   there is at least 30 minutes of it for that day, and iSolarCloud's 5-minute
   data otherwise. If Modbus started part way through the day, iSolarCloud fills
   the time before it. A note under the chart names the source. The totals
-  always come from iSolarCloud.
+  always come from iSolarCloud. While it shows today it refreshes by itself, and a Smooth
+  button averages the lines over a few minutes.
 - **History > Month**: daily bars of PV generation and grid import (up) and export
   (down), with a line for load, plus the month's totals.
 - **History > Year**: the same, summed by month.

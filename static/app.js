@@ -728,9 +728,9 @@
     $('today-tiles').replaceChildren(...items);
   }
 
-  let lastNowChartAt = 0;
+  let lastDayChartAt = 0; // when the Day chart last drew today, for the auto refresh
 
-  /** Loads the Now view. Returns the delay before the next refresh. */
+  /** Loads the Now part of the home page. Returns the delay before the next refresh. */
   async function loadNow() {
     const today = todayStr();
     const [{ sample, car }, daily, savings] = await Promise.all([
@@ -738,7 +738,7 @@
       api(`/api/daily?from=${today}&to=${today}`),
       loadSavings().catch((err) => { if (err.message === 'Not logged in.') throw err; return null; }),
     ]);
-    if (state.view !== 'now') return LIVE_REFRESH_MS;
+    if (state.view !== 'home') return LIVE_REFRESH_MS;
     renderHero(savings);
     const todayTotals = daily.days[0] || {};
     renderToday(todayTotals,
@@ -755,15 +755,10 @@
       renderCloudTiles(await api('/api/latest'));
     }
     renderCarTile(car, car ? await fetchCarSession(car) : null);
-    // The chart needs two heavier requests, so it refreshes on the slower cadence.
-    if (Date.now() - lastNowChartAt >= REFRESH_MS - 1000) {
-      lastNowChartAt = Date.now();
-      try {
-        await loadDayChart('now-chart', 'now-source', today, () => state.view === 'now');
-      } catch (err) {
-        lastNowChartAt = 0;
-        throw err;
-      }
+    // While History shows today's Day chart, refresh it (and its totals) on the slower
+    // cadence: the chart needs heavier requests than the tiles.
+    if (state.period === 'day' && state.day === today && Date.now() - lastDayChartAt >= REFRESH_MS - 1000) {
+      await loadDay(today);
     }
     return delay;
   }
@@ -888,19 +883,28 @@
 
   async function loadDay(date) {
     $('day-input').value = date;
-    const current = () => state.view === 'day' && state.day === date;
-    const [day, daily] = await Promise.all([
-      api(`/api/day?date=${date}`),
-      api(`/api/daily?from=${date}&to=${date}`),
-    ]);
-    if (!current()) return;
-    renderTotals($('day-totals'), daily.days[0] || {});
-    await loadDayChart('day-chart', 'day-source', date, current, day);
+    const current = () => state.view === 'home' && state.period === 'day' && state.day === date;
+    const isToday = date === todayStr();
+    $('day-empty').textContent = isToday ? 'No data yet today' : 'No data for this day';
+    // Marked before the requests so the home poll does not load the same chart twice.
+    if (isToday) lastDayChartAt = Date.now();
+    try {
+      const [day, daily] = await Promise.all([
+        api(`/api/day?date=${date}`),
+        api(`/api/daily?from=${date}&to=${date}`),
+      ]);
+      if (!current()) return;
+      renderTotals($('day-totals'), daily.days[0] || {});
+      await loadDayChart('day-chart', 'day-source', date, current, day);
+    } catch (err) {
+      if (isToday) lastDayChartAt = 0;
+      throw err;
+    }
   }
 
   /**
-   * Draws the power chart for `date` (the Day view and the Now view share it).
-   * `current()` says whether the view is still showing this chart; `day` is an
+   * Draws the power chart for `date` (the History Day chart).
+   * `current()` says whether the page is still showing this chart; `day` is an
    * already-fetched /api/day response, if the caller has one.
    */
   async function loadDayChart(chartId, noteId, date, current, day) {
@@ -1091,14 +1095,14 @@
     const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
     const from = `${ym}-01`, to = `${ym}-${pad(last)}`;
     const { days } = await api(`/api/daily?from=${from}&to=${to}`);
-    if (state.view !== 'month' || state.month !== ym) return;
+    if (state.view !== 'home' || state.period !== 'month' || state.month !== ym) return;
     const hasData = days.some((d) => TOTALS.some(([, k]) => d[k] != null));
     renderTotals($('month-totals'), sumTotals(days));
     const labels = days.map((d) => String(+d.date.slice(8)));
     const option = energyOption(labels, days, (i) => days[i].date, window.innerWidth < 560);
     showChart('month-chart', hasData, option,
       `Daily energy for ${MONTHS[m - 1]} ${y}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
-    onBarClick('month-chart', (i) => go({ view: 'day', day: days[i].date }));
+    onBarClick('month-chart', (i) => go({ period: 'day', day: days[i].date }));
   }
 
   // ---------- Year ----------
@@ -1106,7 +1110,7 @@
   async function loadYear(year) {
     $('year-input').value = year;
     const { days } = await api(`/api/daily?from=${year}-01-01&to=${year}-12-31`);
-    if (state.view !== 'year' || state.year !== year) return;
+    if (state.view !== 'home' || state.period !== 'year' || state.year !== year) return;
     const months = MONTHS.map(() => []);
     for (const d of days) months[+d.date.slice(5, 7) - 1].push(d);
     const agg = months.map((ds) => sumTotals(ds));
@@ -1115,7 +1119,7 @@
     const option = energyOption(MONTHS, agg, (i) => `${MONTHS[i]} ${year}`, window.innerWidth < 560, false);
     showChart('year-chart', hasData, option,
       `Monthly energy for ${year}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
-    onBarClick('year-chart', (i) => go({ view: 'month', month: `${year}-${pad(i + 1)}` }));
+    onBarClick('year-chart', (i) => go({ period: 'month', month: `${year}-${pad(i + 1)}` }));
   }
 
   // ---------- shared bits for the money views ----------
@@ -1730,7 +1734,7 @@
     showChart('bill-chart', charted.length > 0, billOption(data.days),
       `Difference each day: bars of our estimate minus what GloBird billed, in dollars, for ${daysText(data.days.length)}. `
       + `${daysText(charted.length)} have an estimate and a complete bill. Select a bar to open that day.`);
-    onBarClick('bill-chart', (i) => go({ view: 'day', day: data.days[i].date }));
+    onBarClick('bill-chart', (i) => go({ view: 'home', period: 'day', day: data.days[i].date }));
   }
 
   // ---------- Money: Battery and evening credit ----------
@@ -1877,7 +1881,7 @@
       `${p.chartTitle}: stacked bars of what you paid and what you saved, in dollars. Select a bar to look closer.`);
     onBarClick('money-chart', (i) => {
       const key = rows[i].key;
-      if (mode === 'month') go({ view: 'day', day: key });
+      if (mode === 'month') go({ view: 'home', period: 'day', day: key });
       else go({ mode: mode === 'year' ? 'month' : 'year', when: key });
     });
     await loadMoneyCar(mode, when, p);
@@ -1887,17 +1891,17 @@
 
   // ---------- routing (hash) ----------
 
-  const VIEWS = ['now', 'day', 'month', 'year', 'money', 'payback'];
-  // Day, Month and Year are the periods of the History tab.
+  // Home is the Now content with History below it; Day, Month and Year are History's periods.
+  const VIEWS = ['home', 'money', 'payback'];
   const PERIODS = ['day', 'month', 'year'];
   let period = 'day'; // the period History opens on: the last one shown
   // Money's `mode` is month, year or all; `when` is its month (2026-09) or year (2025).
-  const state = { view: 'now', day: '', month: '', year: 0, mode: 'month', when: '', smooth: true };
+  const state = { view: 'home', period: 'day', day: '', month: '', year: 0, mode: 'month', when: '', smooth: true };
   const SMOOTH_KEY = 'solar-dash.smooth';
   let timer = null;
   let pollToken = 0;
 
-  /** Loads Now, then schedules the next refresh (15 s from the inverter, 60 s from the cloud). */
+  /** Loads the Now part of home, then schedules the next refresh (15 s from the inverter, 60 s from the cloud). */
   async function pollNow() {
     clearTimeout(timer);
     timer = null;
@@ -1906,20 +1910,23 @@
     const token = ++pollToken;
     let delay = REFRESH_MS;
     await guarded(async () => { delay = await loadNow(); });
-    if (token === pollToken && state.view === 'now') timer = setTimeout(pollNow, delay);
+    if (token === pollToken && state.view === 'home') timer = setTimeout(pollNow, delay);
   }
 
   function parseHash() {
     let raw = window.location.hash.replace(/^#/, '');
-    try { raw = decodeURIComponent(raw); } catch (e) { raw = ''; } // malformed escapes: fall back to Now
+    try { raw = decodeURIComponent(raw); } catch (e) { raw = ''; } // malformed escapes: fall back to home
     let [view, value] = raw.split('=');
-    if (view === 'history') view = period;
+    // Home is the empty hash, the old #now and #history, and the period hashes.
+    if (view === '' || view === 'now' || view === 'history') view = 'home';
     // The old Savings and Cost tabs are now Money. #savings=all etc. keep their range.
     const oldTab = view === 'savings' || view === 'cost';
     if (oldTab) view = 'money';
     if (PERIODS.includes(view)) period = view;
+    const periodView = PERIODS.includes(view);
     const today = todayStr();
-    state.view = VIEWS.includes(view) ? view : 'now';
+    state.view = periodView || !VIEWS.includes(view) ? 'home' : view;
+    state.period = period;
     state.day = /^\d{4}-\d{2}-\d{2}$/.test(value || '') && view === 'day' ? value : today;
     state.month = /^\d{4}-\d{2}$/.test(value || '') && view === 'month' ? value : today.slice(0, 7);
     state.year = /^\d{4}$/.test(value || '') && view === 'year' ? +value : +today.slice(0, 4);
@@ -1933,7 +1940,7 @@
 
   /** The hash for a view, carrying that view's current date or range. */
   function viewHash(v) {
-    if (v === 'history') v = period;
+    if (v === 'home') v = state.period;
     return v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}`
       : v === 'year' ? `year=${state.year}` : v === 'money' ? `money=${state.mode}${state.when && ':' + state.when}` : v;
   }
@@ -1945,11 +1952,20 @@
     else render();
   }
 
+  let homeShown = false; // whether the previous render showed home, so its live polling is already running
+
   function render() {
     parseHash();
-    for (const v of document.querySelectorAll('.view')) v.hidden = v.id !== `view-${state.view}`;
+    const home = state.view === 'home';
+    document.getElementById('view-home').hidden = !home;
+    document.getElementById('view-money').hidden = state.view !== 'money';
+    document.getElementById('view-payback').hidden = state.view !== 'payback';
+    for (const p of PERIODS) $(`view-${p}`).hidden = !home || p !== state.period;
+    const brand = document.querySelector('.brand');
+    if (home) brand.setAttribute('aria-current', 'page');
+    else brand.removeAttribute('aria-current');
     for (const tab of document.querySelectorAll('.tab')) {
-      const isCurrent = tab.dataset.view === 'history' ? PERIODS.includes(state.view) : tab.dataset.view === state.view;
+      const isCurrent = tab.dataset.view === state.view;
       if (isCurrent) {
         tab.setAttribute('aria-current', 'page');
         // On a phone the tab row scrolls; keep the current tab in view.
@@ -1960,17 +1976,23 @@
       const v = tab.dataset.view;
       tab.setAttribute('href', '#' + viewHash(v));
     }
-    for (const b of document.querySelectorAll('[data-period]')) b.setAttribute('aria-pressed', String(b.dataset.period === state.view));
-    clearTimeout(timer);
-    timer = null;
-    pollToken++;
-    lastNowChartAt = 0;
-    if (state.view === 'now') pollNow();
-    else if (state.view === 'day') guarded(() => loadDay(state.day));
-    else if (state.view === 'month') guarded(() => loadMonth(state.month));
-    else if (state.view === 'money') guarded(() => loadMoneyView(state.mode, state.when));
-    else if (state.view === 'payback') guarded(() => loadPaybackView());
-    else guarded(() => loadYear(state.year));
+    for (const b of document.querySelectorAll('[data-period]')) b.setAttribute('aria-pressed', String(b.dataset.period === state.period));
+    // Live polling runs while home shows. A change of History period or date on home leaves it alone.
+    if (!home) {
+      clearTimeout(timer);
+      timer = null;
+      pollToken++;
+    } else if (!homeShown) {
+      lastDayChartAt = 0;
+      pollNow();
+    }
+    homeShown = home;
+    if (home) {
+      if (state.period === 'day') guarded(() => loadDay(state.day));
+      else if (state.period === 'month') guarded(() => loadMonth(state.month));
+      else guarded(() => loadYear(state.year));
+    } else if (state.view === 'money') guarded(() => loadMoneyView(state.mode, state.when));
+    else guarded(() => loadPaybackView());
   }
 
   function shiftMonth(ym, n) {
@@ -1981,11 +2003,11 @@
 
   /** Switches the History period, keeping the date in view (today when the new period contains it). */
   function switchPeriod(to) {
-    const from = state.view;
+    const from = state.period;
     const day = from === 'day' ? state.day : from === 'month' ? `${state.month}-01` : `${state.year}-01-01`;
     const today = todayStr();
     const len = { day: 10, month: 7, year: 4 }[from];
-    go({ view: to, day: day.slice(0, len) === today.slice(0, len) ? today : day, month: day.slice(0, 7), year: +day.slice(0, 4) });
+    go({ period: to, day: day.slice(0, len) === today.slice(0, len) ? today : day, month: day.slice(0, 7), year: +day.slice(0, 4) });
   }
 
   /** Switches Money between month, year and all time, keeping the year in view. */
@@ -2038,7 +2060,7 @@
     window.addEventListener('hashchange', render);
     window.addEventListener('resize', () => { for (const c of Object.values(charts)) c.resize(); });
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && state.view === 'now') pollNow();
+      if (!document.hidden && state.view === 'home') pollNow();
     });
     render();
   }

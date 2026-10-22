@@ -75,7 +75,7 @@ a { color: var(--link); }
   max-width: 1280px; margin: 0 auto; padding: 14px 16px;
   display: flex; flex-wrap: wrap; align-items: center; gap: 12px 28px;
 }
-.brand { display: flex; align-items: center; gap: 10px; color: var(--c-pv); }
+.brand { display: flex; align-items: center; gap: 10px; min-height: 44px; color: var(--c-pv); text-decoration: none; border-radius: 8px; }
 .brand h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; color: var(--fg); }
 .logout { margin: 0 0 0 auto; }
 .tabs { position: relative; display: flex; gap: 4px; order: 3; width: 100%; overflow-x: auto; }
@@ -93,8 +93,8 @@ a { color: var(--link); }
 
 main { max-width: 1280px; margin: 0 auto; padding: 16px 16px 48px; }
 @media (min-width: 760px) { main { padding: 28px 24px 48px; } }
-.view { display: flex; flex-direction: column; gap: 16px; }
-@media (min-width: 760px) { .view { gap: 24px; } }
+.view, .hpane { display: flex; flex-direction: column; gap: 16px; }
+@media (min-width: 760px) { .view, .hpane { gap: 24px; } }
 
 /* ---------- controls ---------- */
 .btn, input[type="date"], input[type="month"], input[type="number"] {
