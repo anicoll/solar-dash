@@ -875,15 +875,17 @@
    */
   async function loadDayChart(chartId, noteId, date, current, day) {
     day = day || await api(`/api/day?date=${date}`);
-    const [live, charging] = await Promise.all([
+    const [live, charging, tariff] = await Promise.all([
       fetchLiveDay(day.start, day.end),
       fetchCharging(day.start, day.end),
+      tariffOrNull(date),
     ]);
+    const tf = dayTariff(tariff);
     if (!current()) return;
     const merged = mergeDay(day.series, live);
     // Kept so the Smooth toggle can redraw without refetching.
-    dayDraws[chartId] = () => drawDayChart(chartId, noteId, date, day, merged, charging);
-    drawDayChart(chartId, noteId, date, day, merged, charging);
+    dayDraws[chartId] = () => drawDayChart(chartId, noteId, date, day, merged, charging, tf);
+    drawDayChart(chartId, noteId, date, day, merged, charging, tf);
   }
 
   /**
@@ -901,27 +903,63 @@
     });
   }
 
-  // The tariff windows and rates the Day chart shades and labels. No API exposes
-  // the configured [tariff], so these mirror config.example.toml (GloBird ZEROHERO):
-  // update them together. Hours are local wall-clock; the first matching window wins.
-  const TARIFF = {
-    shoulderCents: 44,
-    importWindows: [
-      { name: 'Free', from: 11, to: 14, cents: 0 },
-      { name: 'Peak', from: 16, to: 23, cents: 58.3 },
-    ],
-    exportDefaultCents: 0,
-    exportWindows: [
-      { name: 'Super Export', from: 18, to: 21, cents: 10 },
-      { name: 'Feed-in', from: 16, to: 23, cents: 2 },
-    ],
-  };
+  // ---------- tariff (from /api/tariff) ----------
+
+  const tariffCache = new Map(); // YYYY-MM-DD -> Promise of the /api/tariff answer, or null when none is configured
+
+  /** The tariff in force on `date`, fetched once per day and kept. Resolves to null without a [tariff]. */
+  function loadTariff(date) {
+    let p = tariffCache.get(date);
+    if (!p) {
+      p = api(`/api/tariff?date=${date}`).then((r) => (r && r.configured ? r : null));
+      tariffCache.set(date, p);
+      p.catch(() => tariffCache.delete(date));
+    }
+    return p;
+  }
+
+  /** Like loadTariff, but a failed request gives null: the pages work without the tariff. */
+  async function tariffOrNull(date) {
+    try {
+      return await loadTariff(date);
+    } catch (err) {
+      if (err.message === 'Not logged in.') throw err;
+      return null;
+    }
+  }
+
+  const hours = (hhmm) => { const [h, m] = hhmm.split(':').map(Number); return h + m / 60; };
+
+  /**
+   * The Day chart's view of an /api/tariff answer: windows in local hours (0-24),
+   * named by band, in config order (the first matching window wins). A window that
+   * wraps past midnight becomes two. `null` when there is no tariff.
+   */
+  function dayTariff(t) {
+    if (!t) return null;
+    const windows = (list, nameOf) => {
+      const out = [];
+      for (const w of list) {
+        const a = hours(w.from), b = hours(w.to);
+        const add = (from, to) => { if (to > from) out.push({ name: nameOf(w), from, to, cents: w.cents, band: w.band }); };
+        if (a < b) add(a, b);
+        else { add(a, 24); add(0, b); }
+      }
+      return out;
+    };
+    return {
+      shoulderCents: t.default_import_cents,
+      importWindows: windows(t.import, (w) => ({ free: 'Free', peak: 'Peak', shoulder: 'Shoulder' })[w.band]),
+      exportDefaultCents: t.default_export_cents,
+      exportWindows: windows(t.export, (w) => (w.band === 'super' ? 'Super Export' : 'Feed-in')),
+    };
+  }
   const cents = (c) => `${+c.toFixed(1)}c`;
 
   /** The tariff rows for a day as `{ buy, sell }`: lists of `{ from, to, name, c, text }` in hours (0-24). */
-  function tariffSegments() {
+  function tariffSegments(tf) {
     const cuts = new Set([0, 24]);
-    for (const w of [...TARIFF.importWindows, ...TARIFF.exportWindows]) { cuts.add(w.from); cuts.add(w.to); }
+    for (const w of [...tf.importWindows, ...tf.exportWindows]) { cuts.add(w.from); cuts.add(w.to); }
     const edges = [...cuts].sort((a, b) => a - b);
     const row = (list, dflt, label) => {
       const out = [];
@@ -937,32 +975,32 @@
       return out;
     };
     return {
-      buy: row(TARIFF.importWindows, TARIFF.shoulderCents, (s, first) => (s.name
+      buy: row(tf.importWindows, tf.shoulderCents, (s, first) => (s.name
         ? (s.c === 0 ? s.name : `${s.name} ${cents(s.c)}`) : first ? `Shoulder ${cents(s.c)}` : cents(s.c))),
-      sell: row(TARIFF.exportWindows, TARIFF.exportDefaultCents, (s) => (s.name === 'Super Export'
+      sell: row(tf.exportWindows, tf.exportDefaultCents, (s) => (s.name === 'Super Export'
         ? `${s.name} ${cents(s.c)}` : cents(s.c))),
     };
   }
 
   /** What the tariff is at hour `h`, for the tooltip: "Peak 58.3c · Super Export 10c". */
-  function tariffAt(h) {
-    const imp = TARIFF.importWindows.find((w) => h >= w.from && h < w.to);
-    const exp = TARIFF.exportWindows.find((w) => h >= w.from && h < w.to);
-    const sell = exp ? `${exp.name === 'Feed-in' ? 'feed-in' : exp.name} ${cents(exp.cents)}` : `feed-in ${cents(TARIFF.exportDefaultCents)}`;
-    if (imp && imp.cents === 0) return { text: 'Free import', kind: 'free' };
-    if (imp) return { text: `${imp.name} ${cents(imp.cents)} · ${sell}`, kind: 'peak' };
-    return { text: `Shoulder ${cents(TARIFF.shoulderCents)} · ${sell}`, kind: 'shoulder' };
+  function tariffAt(h, tf) {
+    const imp = tf.importWindows.find((w) => h >= w.from && h < w.to);
+    const exp = tf.exportWindows.find((w) => h >= w.from && h < w.to);
+    const sell = exp ? `${exp.name === 'Feed-in' ? 'feed-in' : exp.name} ${cents(exp.cents)}` : `feed-in ${cents(tf.exportDefaultCents)}`;
+    if (imp && imp.band === 'free') return { text: 'Free import', kind: 'free' };
+    if (imp && imp.band === 'peak') return { text: `${imp.name} ${cents(imp.cents)} · ${sell}`, kind: 'peak' };
+    return { text: `Shoulder ${cents(imp ? imp.cents : tf.shoulderCents)} · ${sell}`, kind: 'shoulder' };
   }
 
   const STRIP_LEFT = 52;  // px between the chart's left edge and the plot: the kW labels, and "Buy"/"Sell" below
   const STRIP_RIGHT = 44; // and on the right, for the SOC labels
 
   /** Fills the two-row tariff strip under the chart, covering [start, max] ms of `date`. */
-  function drawTariffStrip(strip, date, start, max, gl, gr) {
+  function drawTariffStrip(strip, date, start, max, gl, gr, tf) {
     strip.style.setProperty('--gl', `${gl}px`);
     strip.style.setProperty('--gr', `${gr}px`);
     const plotW = $('day-chart').clientWidth - gl - gr;
-    const { buy, sell } = tariffSegments();
+    const { buy, sell } = tariffSegments(tf);
     const rows = [['Buy', buy], ['Sell', sell]].map(([name, segs]) => {
       const cells = segs.map((s) => {
         const a = Math.max(adelaideMs(date, s.from), start);
@@ -970,7 +1008,7 @@
         if (b <= a) return '';
         const frac = (b - a) / (max - start);
         const fits = frac * plotW >= s.text.length * 6.5 + 10;
-        const kind = s.name === 'Free' ? 'free' : s.name === 'Peak' ? 'peak' : s.name === 'Super Export' ? 'super' : s.name ? 'feed' : 'base';
+        const kind = s.name === 'Free' ? 'free' : s.name === 'Peak' ? 'peak' : s.name === 'Super Export' ? 'super' : s.name === 'Feed-in' ? 'feed' : 'base';
         return `<span class="ts-${kind}" style="width:${frac * 100}%" title="${esc(s.text)}">${fits ? esc(s.text) : ''}</span>`;
       });
       return `<div class="trow"><b>${name}</b><div class="ttrack">${cells.join('')}</div></div>`;
@@ -979,7 +1017,7 @@
   }
 
   /** Draws the power chart from fetched data, smoothed when the toggle is on. */
-  function drawDayChart(chartId, noteId, date, day, { byKey, source }, charging) {
+  function drawDayChart(chartId, noteId, date, day, { byKey, source }, charging, tf) {
     const start = day.start * 1000;
     const isToday = date === todayStr();
     // Today stops at now (at least 15 minutes in, so the first minutes still draw).
@@ -1027,11 +1065,11 @@
       emphasis: { disabled: true }, z: 2,
     });
     const shade = (w, colour) => [adelaideMs(date, w.from), Math.min(adelaideMs(date, w.to), end), colour];
-    const shading = [
-      ...TARIFF.importWindows.filter((w) => w.cents === 0).map((w) => shade(w, css('--free'))),
-      ...TARIFF.importWindows.filter((w) => w.cents > 0).map((w) => shade(w, css('--peak'))),
-      ...TARIFF.exportWindows.filter((w) => w.name === 'Super Export').map((w) => shade(w, css('--peak-strong'))),
-    ];
+    const shading = tf ? [
+      ...tf.importWindows.filter((w) => w.band === 'free').map((w) => shade(w, css('--free'))),
+      ...tf.importWindows.filter((w) => w.band === 'peak').map((w) => shade(w, css('--peak'))),
+      ...tf.exportWindows.filter((w) => w.name === 'Super Export').map((w) => shade(w, css('--peak-strong'))),
+    ] : [];
     series[0].markArea = {
       silent: true, z: 1,
       data: shading.filter(([a, b]) => a < b)
@@ -1082,7 +1120,7 @@
           params = params.filter((p) => p.value[1] != null);
           if (!params.length) return '';
           const t = params[0].value[0];
-          const tf = tariffAt((t - adelaideMs(date, 0)) / 3600000);
+          const at = tf ? tariffAt((t - adelaideMs(date, 0)) / 3600000, tf) : null;
           const rows = params.map((p) => {
             const v = p.value[1];
             let name = p.seriesName;
@@ -1097,7 +1135,8 @@
               + `width:10px;height:10px;background:${ev}"></span>${esc(chargingName)}</div>`);
           }
           return `<div>${clock(t)}</div>`
-            + `<div style="margin-bottom:4px;font-size:12px;color:${tipColour[tf.kind]}">${esc(tf.text)}</div>${rows.join('')}`;
+            + (at ? `<div style="margin-bottom:4px;font-size:12px;color:${tipColour[at.kind]}">${esc(at.text)}</div>` : '<div style="margin-bottom:4px"></div>')
+            + rows.join('');
         },
       },
       xAxis: {
@@ -1126,8 +1165,8 @@
         ? `Power chart for ${date}: peak solar ${kw(peakKw)} kW; solar, home, battery (supplying or charging) and grid (buying or selling) in kW, battery state of charge in percent.`
         : `Power chart for ${date}: no data`);
     const strip = $('day-strip');
-    strip.hidden = !hasData;
-    if (hasData) drawTariffStrip(strip, date, start, end, gl, gr);
+    strip.hidden = !hasData || !tf;
+    if (hasData && tf) drawTariffStrip(strip, date, start, end, gl, gr, tf);
   }
 
   // ---------- History: periods, date pill, cards ----------
