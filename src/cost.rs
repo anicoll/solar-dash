@@ -169,6 +169,63 @@ impl Tariff {
     }
 }
 
+/// Which import band a minute of the day falls in. The tariff does not name
+/// its bands, so they are told apart by price (see [`Tariff::import_band_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportBand {
+    Free,
+    Shoulder,
+    Peak,
+}
+
+/// Which export band a minute of the day falls in (see [`Tariff::export_band_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportBand {
+    Super,
+    Peak,
+    Other,
+}
+
+impl Tariff {
+    /// The role of the import price at this minute, judged by price against
+    /// this tariff's own rates: nothing to pay is `Free`, dearer than the
+    /// default import price is `Peak`, anything else is `Shoulder`.
+    pub fn import_band_at(&self, minute_of_day: u32) -> ImportBand {
+        let cents = self.import_cents_at(minute_of_day);
+        if cents <= 0.0 {
+            ImportBand::Free
+        } else if cents > self.default_import_cents {
+            ImportBand::Peak
+        } else {
+            ImportBand::Shoulder
+        }
+    }
+
+    /// The role of the feed-in price at this minute: a rate no better than
+    /// the default export price is `Other`; of the rates above the default the
+    /// highest is `Super`, but only when a lower one exists too (a lone
+    /// better-than-default rate is `Peak`).
+    pub fn export_band_at(&self, minute_of_day: u32) -> ExportBand {
+        let cents = self.export_cents_at(minute_of_day);
+        if cents <= self.default_export_cents {
+            return ExportBand::Other;
+        }
+        let better = |c: f64| c > self.default_export_cents;
+        let top = self
+            .export
+            .iter()
+            .map(|w| w.cents)
+            .filter(|&c| better(c))
+            .fold(f64::MIN, f64::max);
+        let has_lower = self.export.iter().any(|w| better(w.cents) && w.cents < top);
+        if has_lower && cents >= top {
+            ExportBand::Super
+        } else {
+            ExportBand::Peak
+        }
+    }
+}
+
 /// The plans over time: past ones, each with the last day it applied, then the
 /// current one. Build it with [`TariffSchedule::from_config`].
 #[derive(Debug, Clone)]
@@ -254,6 +311,45 @@ pub struct DayCost {
     pub savings_cents: f64,
 }
 
+/// Grid energy in kWh split by tariff band. See [`grid_split`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GridSplit {
+    pub import_free_kwh: f64,
+    pub import_shoulder_kwh: f64,
+    pub import_peak_kwh: f64,
+    pub export_super_kwh: f64,
+    pub export_peak_kwh: f64,
+    pub export_other_kwh: f64,
+}
+
+/// The local minute an interval is priced at: its midpoint.
+fn interval_minute(tz: Tz, iv: &Interval) -> u32 {
+    // Sum then halve, so we cannot overflow on huge timestamps.
+    let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
+    local_minute_of_day(tz, mid)
+}
+
+/// Splits a day's grid import and export by tariff band, classifying each
+/// interval at its midpoint exactly as [`day_cost`] prices it, so the parts add
+/// up to `day_cost`'s `import_kwh` and `export_kwh` for the same intervals.
+pub fn grid_split(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> GridSplit {
+    let mut split = GridSplit::default();
+    for iv in intervals {
+        let minute = interval_minute(tz, iv);
+        match tariff.import_band_at(minute) {
+            ImportBand::Free => split.import_free_kwh += iv.import_kwh,
+            ImportBand::Shoulder => split.import_shoulder_kwh += iv.import_kwh,
+            ImportBand::Peak => split.import_peak_kwh += iv.import_kwh,
+        }
+        match tariff.export_band_at(minute) {
+            ExportBand::Super => split.export_super_kwh += iv.export_kwh,
+            ExportBand::Peak => split.export_peak_kwh += iv.export_kwh,
+            ExportBand::Other => split.export_other_kwh += iv.export_kwh,
+        }
+    }
+    split
+}
+
 /// Local minutes since midnight for a unix time. We price an interval at its
 /// midpoint, so an interval straddling a price change is not split.
 pub(crate) fn local_minute_of_day(tz: Tz, ts: i64) -> u32 {
@@ -289,9 +385,7 @@ pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
     let mut baseline_import_cents = 0.0;
 
     for iv in intervals {
-        // Sum then halve, so we cannot overflow on huge timestamps.
-        let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
-        let minute = local_minute_of_day(tz, mid);
+        let minute = interval_minute(tz, iv);
         let import_price = tariff.import_cents_at(minute);
 
         cost.import_kwh += iv.import_kwh;
@@ -632,5 +726,105 @@ mod tests {
                 .import_cents_at(0),
             5.0
         );
+    }
+
+    /// The GloBird plan from config.example.toml.
+    fn globird() -> Tariff {
+        tariff(
+            r#"
+            [tariff]
+            supply_cents_per_day = 173.8
+            default_import_cents = 44.0
+            import = [
+              { from = "11:00", to = "14:00", cents = 0.0 },
+              { from = "16:00", to = "23:00", cents = 58.3 },
+            ]
+            default_export_cents = 0.0
+            export = [
+              { from = "18:00", to = "21:00", cents = 10.0 },
+              { from = "16:00", to = "23:00", cents = 2.0 },
+            ]
+            "#,
+        )
+    }
+
+    /// 1 kWh each way at an instant (the midpoint is the instant itself).
+    fn split_at(tariff: &Tariff, hour: u32, minute: u32) -> GridSplit {
+        let t = at(hour, minute);
+        let interval = Interval {
+            start_ts: t,
+            end_ts: t,
+            import_kwh: 1.0,
+            export_kwh: 1.0,
+            load_kwh: 0.0,
+        };
+        grid_split(tariff, ADELAIDE, &[interval])
+    }
+
+    /// The (import, export) bands, as the index of the one field holding the kWh.
+    fn bands(split: &GridSplit) -> (usize, usize) {
+        let imports = [
+            split.import_free_kwh,
+            split.import_shoulder_kwh,
+            split.import_peak_kwh,
+        ];
+        let exports = [
+            split.export_super_kwh,
+            split.export_peak_kwh,
+            split.export_other_kwh,
+        ];
+        let at = |v: [f64; 3]| v.iter().position(|&x| x == 1.0).unwrap();
+        (at(imports), at(exports))
+    }
+
+    #[test]
+    fn the_split_follows_the_window_boundaries() {
+        // (time, import band: 0 free 1 shoulder 2 peak, export band: 0 super 1 peak 2 other)
+        let cases = [
+            ((10, 59), (1, 2)),
+            ((11, 0), (0, 2)),
+            ((13, 59), (0, 2)),
+            ((14, 0), (1, 2)),
+            ((15, 59), (1, 2)),
+            ((16, 0), (2, 1)),
+            ((17, 59), (2, 1)),
+            ((18, 0), (2, 0)),
+            ((20, 59), (2, 0)),
+            ((21, 0), (2, 1)),
+            ((22, 59), (2, 1)),
+            ((23, 0), (1, 2)),
+        ];
+        for ((h, m), want) in cases {
+            let split = split_at(&globird(), h, m);
+            assert_eq!(bands(&split), want, "at {h}:{m:02}");
+        }
+    }
+
+    #[test]
+    fn the_split_adds_up_to_the_day_cost_energy() {
+        let tariff = globird();
+        let intervals = [
+            iv((9, 0), (11, 30), 1.5, 0.2, 2.0),
+            iv((12, 0), (13, 0), 2.0, 0.0, 2.0),
+            iv((17, 0), (18, 30), 0.7, 0.9, 1.0),
+            iv((19, 0), (20, 0), 0.0, 3.0, 0.5),
+            iv((21, 30), (22, 0), 0.4, 0.1, 0.4),
+        ];
+        let cost = day_cost(&tariff, ADELAIDE, &intervals);
+        let split = grid_split(&tariff, ADELAIDE, &intervals);
+        let imports = split.import_free_kwh + split.import_shoulder_kwh + split.import_peak_kwh;
+        let exports = split.export_super_kwh + split.export_peak_kwh + split.export_other_kwh;
+        assert!(close(imports, cost.import_kwh));
+        assert!(close(exports, cost.export_kwh));
+        assert!(close(split.import_free_kwh, 2.0));
+    }
+
+    #[test]
+    fn a_plan_without_windows_has_only_shoulder_and_other() {
+        let flat = tariff(
+            "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 30.0\ndefault_export_cents = 5.0\n",
+        );
+        assert_eq!(bands(&split_at(&flat, 12, 0)), (1, 2));
+        assert_eq!(bands(&split_at(&flat, 19, 0)), (1, 2));
     }
 }
