@@ -221,12 +221,14 @@ pub fn is_supply(category: &str) -> bool {
 ///
 /// - Cost rows with the same day and category are added together.
 /// - Usage rows with the same day, suffix and charge type are added together.
-/// - Each register's five-minute array is taken once per day, from its first
-///   row that has one, since the portal repeats it on every row. A suffix that
+/// - Each register's five-minute array is taken once per day: the one most of
+///   its rows carry, since the portal (nearly always) repeats it. A suffix that
 ///   is neither import nor export has no interval series (its per-period
 ///   usage is still kept).
 pub fn group_days(cost: &[CostRow], usage: &[UsageRow]) -> Vec<DayRecord> {
     let mut days: BTreeMap<NaiveDate, DayRecord> = BTreeMap::new();
+    // Every non-empty interval array seen for a register on a day.
+    let mut candidates: BTreeMap<(NaiveDate, &str), Vec<&Vec<f64>>> = BTreeMap::new();
 
     for row in cost {
         let day = days
@@ -263,16 +265,34 @@ pub fn group_days(cost: &[CostRow], usage: &[UsageRow]) -> Vec<DayRecord> {
             }),
         }
 
-        let has_series = day.intervals.iter().any(|s| s.suffix == row.suffix);
-        if let Some(direction) = Direction::from_suffix(&row.suffix)
-            && !has_series
-            && !row.intervals.is_empty()
-        {
+        if Direction::from_suffix(&row.suffix).is_some() && !row.intervals.is_empty() {
+            candidates
+                .entry((row.date, row.suffix.as_str()))
+                .or_default()
+                .push(&row.intervals);
+        }
+    }
+
+    // Each row normally repeats the register's full-day array, but not always:
+    // on 2026-10-09 the "Critical Peak - Export" row had its first six
+    // intervals zeroed. Keep the array most rows agree on (the first on a tie).
+    for ((date, suffix), arrays) in candidates {
+        let Some(direction) = Direction::from_suffix(suffix) else {
+            continue;
+        };
+        let count = |a: &Vec<f64>| arrays.iter().filter(|b| **b == a).count();
+        let mut best = arrays[0];
+        for &array in &arrays[1..] {
+            if count(array) > count(best) {
+                best = array;
+            }
+        }
+        if let Some(day) = days.get_mut(&date) {
             day.intervals.push(IntervalSeries {
-                suffix: row.suffix.clone(),
+                suffix: suffix.to_string(),
                 direction,
-                kwh_total: row.intervals.iter().sum(),
-                intervals: row.intervals.clone(),
+                kwh_total: best.iter().sum(),
+                intervals: best.clone(),
             });
         }
     }
@@ -441,7 +461,7 @@ mod tests {
         assert_eq!(import.direction, Direction::Import);
         assert_eq!(export.intervals.len(), 288);
         assert_eq!(import.intervals.len(), 288);
-        // The array comes from the register's first row, and the total is its sum.
+        // The array is the one most of the register's rows share, and the total is its sum.
         let first_export = usage_rows()
             .into_iter()
             .find(|r| r.date == day.date && r.suffix == "B7")

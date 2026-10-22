@@ -42,7 +42,8 @@ CREATE TABLE globird_usage (
 -- The meter's 5-minute readings: one row per register per day. `intervals` is
 -- a JSON array of the 288 kWh values exactly as GloBird sent them, and
 -- `kwh_total` is their sum. The portal repeats the same array on every
--- charge-period row of a register, so we keep the first one only.
+-- charge-period row of a register (nearly always), so we keep the array most
+-- of its rows share.
 --
 -- NOT VERIFIED YET: which local time each index matches. Index 0 is probably
 -- 00:00-00:05 of the local day, but that has not been checked against our own
