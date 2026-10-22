@@ -15,6 +15,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Local Modbus reader (`modbus-test`) for live power from the inverter
 - [x] `serve` polls Modbus when configured and stores live samples (`/api/live`, `/api/live/series`)
 - [x] `serve` follows the Tesla's charge state from TeslaMate over MQTT when configured (`/api/live`)
+- [x] GloBird portal probe (`globird-probe`) to learn the response shapes (unofficial API)
 - [x] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
 
 ## Architecture
@@ -37,6 +38,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
 - `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
 - `static/` - the dashboard (`index.html`, `app.js`, `style.css`), compiled into the binary
+- `src/globird/` - GloBird portal client (`client.rs`) and the `globird-probe` command (`probe.rs`)
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`
 - `deploy/` - systemd units, backup timer, cloudflared example and `install.sh`
