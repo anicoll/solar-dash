@@ -239,12 +239,12 @@
         <div id="bill-body" class="view-body" hidden>
           <div>
             <p id="bill-headline" class="bill-headline"></p>
-            <p class="panel-note">A positive difference means we estimated more than GloBird charged. Only days where we have both numbers are counted.</p>
+            <p class="panel-note">A positive difference means we estimated more than GloBird charged. Only days where GloBird has posted its full bill and we have an estimate are counted.</p>
           </div>
           <div class="table-wrap">
             <table class="data" id="bill-table">
               <caption class="sr-only">GloBird's bill and our estimate for the same days</caption>
-              <thead><tr><th scope="col">Charge</th><th scope="col">GloBird</th><th scope="col">Ours</th><th scope="col">Difference</th></tr></thead>
+              <thead><tr><th scope="col">Charge</th><th scope="col">GloBird</th><th scope="col">Ours</th><th scope="col"><span class="long">Difference</span><span class="short">Diff</span></th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
@@ -258,6 +258,7 @@
           <div>
             <h3 class="sub-title">Days that differ</h3>
             <ul id="bill-days" class="plain-list"></ul>
+            <button type="button" class="btn" id="bill-more" aria-expanded="false" aria-controls="bill-days" hidden></button>
           </div>
           <div id="bill-notes" class="panel-note" hidden></div>
         </div>

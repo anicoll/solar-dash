@@ -1556,15 +1556,18 @@
   // ...and by more than this many dollars (a day) or $1 (the whole period).
   const BILL_DAY_DOLLARS = 0.5;
   const BILL_PERIOD_DOLLARS = 1;
-  const BILL_NO_ESTIMATE = 'GloBird has bills for this period, but we have no estimate to compare them with yet.';
+  const BILL_NO_ESTIMATE = 'GloBird has bills for this period, but no complete day has an estimate of ours to compare with yet.';
+  // The "Days that differ" list shows this many days until "Show all" is pressed.
+  const BILL_DAYS_SHORT = 5;
+  const BILL_DAYS_MAX = 10;
 
   /** The money columns of the breakdown: label, key in `globird`/`ours`. Our estimate has no "other". */
   const BILL_ROWS = [
-    ['Import', 'import'],
-    ['Feed-in and export credits', 'export'],
-    ['Supply', 'supply'],
-    ['ZeroHero credit', 'credit'],
-    ['Other', 'other'],
+    ['Import', 'Import', 'import'],
+    ['Feed-in and export credits', 'Export credits', 'export'],
+    ['Supply', 'Supply', 'supply'],
+    ['ZeroHero credit', 'ZeroHero', 'credit'],
+    ['Other', 'Other', 'other'],
   ];
 
   /** "+$1.20" or "-$1.20". */
@@ -1590,19 +1593,27 @@
       ` for ${daysText(t.days_compared)}`);
   }
 
+  /** A table row: a label with a long and a short form (the short one shows on phones), then the numbers. */
+  function billRow(long, short, cells) {
+    const tr = document.createElement('tr');
+    const name = el('td');
+    name.append(el('span', 'long', long), el('span', 'short', short));
+    tr.append(name, ...cells.map((text) => el('td', '', text)));
+    return tr;
+  }
+
   /** The breakdown table: money rows, then kWh rows. `t` is the compare `totals`. */
   function renderBillTable(t) {
-    const rows = BILL_ROWS.map(([name, key]) => {
+    const rows = BILL_ROWS.map(([long, short, key]) => {
       const g = t.globird[key];
       const o = t.ours[key]; // undefined for "other"
-      const diff = (o || 0) - g;
-      return [[name], [money(g)], [o == null ? '–' : money(o)], [money(diff)]];
+      return billRow(long, short, [money(g), o == null ? '–' : money(o), money((o || 0) - g)]);
     });
     rows.push(
-      [['Grid import (kWh)'], [kwh(t.globird.import_kwh)], [kwh(t.ours.import_kwh)], [kwh(t.diff.import_kwh)]],
-      [['Export (kWh)'], [kwh(t.globird.export_kwh)], [kwh(t.ours.export_kwh)], [kwh(t.diff.export_kwh)]],
+      billRow('Grid import (kWh)', 'Import kWh', [kwh(t.globird.import_kwh), kwh(t.ours.import_kwh), kwh(t.diff.import_kwh)]),
+      billRow('Export (kWh)', 'Export kWh', [kwh(t.globird.export_kwh), kwh(t.ours.export_kwh), kwh(t.diff.export_kwh)]),
     );
-    fillTable('bill-table', rows);
+    $('bill-table').tBodies[0].replaceChildren(...rows);
   }
 
   /** Bars of ours minus GloBird per day. A day with no estimate gets no bar. */
@@ -1635,7 +1646,7 @@
       },
       series: [{
         name: 'Difference', type: 'bar', barMaxWidth: 28, itemStyle: { color: css('--c-load') },
-        data: days.map((d) => (d.diff ? d.diff.total : null)),
+        data: days.map((d) => (d.diff && d.complete ? d.diff.total : null)),
       }],
     };
   }
@@ -1643,7 +1654,7 @@
   /** The bucket where our estimate is furthest from GloBird's on a day, as "Import +$1.20". */
   function billBiggest(d) {
     let best = null;
-    for (const [name, key] of BILL_ROWS) {
+    for (const [name, , key] of BILL_ROWS) {
       if (key === 'other') continue;
       const diff = d.ours[key] - d.globird[key];
       if (best == null || Math.abs(diff) > Math.abs(best[1])) best = [name, diff];
@@ -1651,14 +1662,20 @@
     return `${best[0]} ${signedMoney(best[1])}`;
   }
 
+  let billExpanded = false;
+
   /**
-   * Up to 10 days, newest first, where the two totals are far apart. A day GloBird
-   * has only posted the supply charge for is skipped: it would always look wrong.
+   * The days where the two totals are far apart: the 5 furthest apart (up to 10
+   * after "Show all"), newest first. A day GloBird has only posted the supply
+   * charge for is skipped: it would always look wrong.
    */
   function renderBillDays(days) {
     const differ = days.filter((d) => d.diff && d.complete
       && Math.abs(d.diff.total) > Math.max(BILL_DAY_DOLLARS, BILL_SHARE * Math.abs(d.globird.total)));
-    const items = differ.slice(-10).reverse().map((d) => {
+    const top = differ.sort((a, b) => Math.abs(b.diff.total) - Math.abs(a.diff.total)).slice(0, BILL_DAYS_MAX);
+    const shown = top.slice(0, billExpanded ? BILL_DAYS_MAX : BILL_DAYS_SHORT)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+    const items = shown.map((d) => {
       const li = el('li');
       li.append(
         el('b', '', dayLabel(d.date)),
@@ -1669,6 +1686,11 @@
     });
     if (!items.length) items.push(el('li', '', 'None'));
     $('bill-days').replaceChildren(...items);
+    const more = $('bill-more');
+    more.hidden = top.length <= BILL_DAYS_SHORT;
+    more.textContent = billExpanded ? 'Show fewer' : `Show all ${top.length}`;
+    more.setAttribute('aria-expanded', String(billExpanded));
+    more.onclick = () => { billExpanded = !billExpanded; renderBillDays(days); };
   }
 
   /** Categories our tariff has no place for, with what GloBird charged under them. */
@@ -1698,10 +1720,10 @@
     renderBillTable(data.totals);
     renderBillDays(data.days);
     renderBillNotes(data.categories);
-    const charted = data.days.filter((d) => d.diff);
+    const charted = data.days.filter((d) => d.diff && d.complete);
     showChart('bill-chart', charted.length > 0, billOption(data.days),
       `Difference each day: bars of our estimate minus what GloBird billed, in dollars, for ${daysText(data.days.length)}. `
-      + `${daysText(charted.length)} have an estimate. Select a bar to open that day.`);
+      + `${daysText(charted.length)} have an estimate and a complete bill. Select a bar to open that day.`);
     onBarClick('bill-chart', (i) => go({ view: 'day', day: data.days[i].date }));
   }
 

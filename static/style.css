@@ -363,3 +363,13 @@ table.data td.save { color: var(--save); }
 .plain-list li:first-child { border-top: 0; }
 .plain-list .line-detail { display: block; }
 #bill-table { min-width: 440px; }
+#bill-table .short { display: none; }
+#bill-more { margin-top: 8px; }
+@media (max-width: 480px) {
+  #bill-table { min-width: 0; font-size: 13px; }
+  #bill-table th, #bill-table td { padding: 8px 4px; }
+  #bill-table td { font-size: 12px; }
+  #bill-table td:first-child { font-size: 13px; }
+  #bill-table .long { display: none; }
+  #bill-table .short { display: inline; }
+}
