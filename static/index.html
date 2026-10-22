@@ -16,9 +16,7 @@
     </div>
     <nav class="tabs" aria-label="Views">
       <a class="tab" href="#now" data-view="now">Now</a>
-      <a class="tab" href="#day" data-view="day">Day</a>
-      <a class="tab" href="#month" data-view="month">Month</a>
-      <a class="tab" href="#year" data-view="year">Year</a>
+      <a class="tab" href="#day" data-view="history">History</a>
       <a class="tab" href="#savings" data-view="savings">Savings</a>
       <a class="tab" href="#payback" data-view="payback">Payback</a>
       <a class="tab" href="#cost" data-view="cost">Cost</a>
@@ -82,7 +80,12 @@
   </section>
 
   <section id="view-day" class="view" aria-labelledby="h-day" hidden>
-    <h2 id="h-day" class="sr-only">Day</h2>
+    <h2 id="h-day" class="sr-only">History: day</h2>
+    <div class="picker seg" role="group" aria-label="Period">
+      <button type="button" class="btn" data-period="day" aria-pressed="true">Day</button>
+      <button type="button" class="btn" data-period="month" aria-pressed="false">Month</button>
+      <button type="button" class="btn" data-period="year" aria-pressed="false">Year</button>
+    </div>
     <div class="picker">
       <button type="button" class="btn" id="day-prev" aria-label="Previous day">&larr;</button>
       <input type="date" id="day-input" aria-label="Date">
@@ -100,7 +103,12 @@
   </section>
 
   <section id="view-month" class="view" aria-labelledby="h-month" hidden>
-    <h2 id="h-month" class="sr-only">Month</h2>
+    <h2 id="h-month" class="sr-only">History: month</h2>
+    <div class="picker seg" role="group" aria-label="Period">
+      <button type="button" class="btn" data-period="day" aria-pressed="false">Day</button>
+      <button type="button" class="btn" data-period="month" aria-pressed="true">Month</button>
+      <button type="button" class="btn" data-period="year" aria-pressed="false">Year</button>
+    </div>
     <div class="picker">
       <button type="button" class="btn" id="month-prev" aria-label="Previous month">&larr;</button>
       <input type="month" id="month-input" aria-label="Month">
@@ -116,7 +124,12 @@
   </section>
 
   <section id="view-year" class="view" aria-labelledby="h-year" hidden>
-    <h2 id="h-year" class="sr-only">Year</h2>
+    <h2 id="h-year" class="sr-only">History: year</h2>
+    <div class="picker seg" role="group" aria-label="Period">
+      <button type="button" class="btn" data-period="day" aria-pressed="false">Day</button>
+      <button type="button" class="btn" data-period="month" aria-pressed="false">Month</button>
+      <button type="button" class="btn" data-period="year" aria-pressed="true">Year</button>
+    </div>
     <div class="picker">
       <button type="button" class="btn" id="year-prev" aria-label="Previous year">&larr;</button>
       <input type="number" id="year-input" aria-label="Year" min="2000" max="2100" step="1">

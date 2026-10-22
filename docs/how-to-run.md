@@ -121,9 +121,11 @@ it on the server too.
 
 ### Dashboard views
 
-The page has four tabs, and the address keeps the view (for example
+The page has tabs for Now, History, Savings, Payback and Cost. History has a
+Day | Month | Year switch, and the address keeps the view (for example
 `#day=2026-10-20`, `#month=2026-10`, `#year=2026`), so refresh and bookmarks
-work. All times are shown in Australia/Adelaide.
+work. Clicking a bar in the Month chart opens that day, and a bar in the Year
+chart opens that month. All times are shown in Australia/Adelaide.
 
 - **Now**: solar and load power, battery, and today's energy totals. With
   [Modbus](#local-modbus-optional) running it shows the inverter's live values
@@ -131,7 +133,7 @@ work. All times are shown in Australia/Adelaide.
   and battery %), refreshed every 15 seconds. Without a sample under 5 minutes
   old it falls back to the iSolarCloud readings, refreshed every minute. A line
   at the top says which source it is and how old the reading is.
-- **Day**: a power chart for one day (pick a date or step with the arrows).
+- **History > Day**: a power chart for one day (pick a date or step with the arrows).
   Solar, load, grid import, export (below the axis) and battery charge and
   discharge are in kW, and battery % is on the right axis. 11:00-14:00 is
   shaded as the "Free 11-2" window and 18:00-21:00 as "Peak". Energy totals
@@ -140,9 +142,9 @@ work. All times are shown in Australia/Adelaide.
   data otherwise. If Modbus started part way through the day, iSolarCloud fills
   the time before it. A note under the chart names the source. The totals
   always come from iSolarCloud.
-- **Month**: daily bars of PV generation and grid import (up) and export
+- **History > Month**: daily bars of PV generation and grid import (up) and export
   (down), with a line for load, plus the month's totals.
-- **Year**: the same, summed by month.
+- **History > Year**: the same, summed by month.
 
 The charts use [ECharts](https://echarts.apache.org) 5.6.0 (Apache-2.0),
 loaded from cdnjs by a single pinned `<script>` tag in `static/index.html`. The
