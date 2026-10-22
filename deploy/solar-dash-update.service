@@ -1,0 +1,9 @@
+[Unit]
+Description=Update solar-dash to the latest release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# update.sh needs root: it installs the binary and units and restarts the service.
+ExecStart=/opt/solar-dash/update.sh
