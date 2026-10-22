@@ -1331,6 +1331,34 @@
         : `Used ${fmtKwh(load - pv)} kWh more than you made`;
     $('hc-grid').textContent = imp == null && exp == null ? '–'
       : `${fmtKwh(imp)} in · ${fmtKwh(exp)} out kWh`;
+    renderGridSplit(t);
+  }
+
+  /** Whole percentages of `parts` that add up to 100 (largest remainder), or null when they are all 0. */
+  function percentSplit(parts) {
+    const total = parts.reduce((a, b) => a + b, 0);
+    if (!(total > 0)) return null;
+    const exact = parts.map((v) => (v / total) * 100);
+    const out = exact.map(Math.floor);
+    let left = 100 - out.reduce((a, b) => a + b, 0);
+    exact.map((v, i) => [v - out[i], i]).sort((a, b) => b[0] - a[0]).forEach(([, i]) => { if (left > 0) { out[i] += 1; left -= 1; } });
+    return out;
+  }
+
+  /** The thin free/shoulder/peak bar and line on the Grid card; both are hidden when there is no split. */
+  function renderGridSplit(t) {
+    const bar = $('hc-split-bar');
+    const line = $('hc-split');
+    const sub = $('hc-grid-sub');
+    const known = BOUGHT_KEYS.some((k) => t[k] != null);
+    const pct = known ? percentSplit(BOUGHT_KEYS.map((k) => t[k] || 0)) : null;
+    bar.hidden = line.hidden = !pct;
+    sub.hidden = !!pct;
+    if (!pct) return;
+    const text = `${pct[0]}% bought free, ${pct[1]}% shoulder, ${pct[2]}% peak`;
+    line.textContent = text;
+    bar.setAttribute('aria-label', text);
+    [...bar.children].forEach((seg, i) => { seg.style.width = `${pct[i]}%`; });
   }
 
   function resetCostCard() {
