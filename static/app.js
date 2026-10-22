@@ -772,7 +772,7 @@
     ['battery_discharge_w', 'Battery discharge', '--c-discharge', 1, 'line'],
   ];
 
-  const SMOOTH_SECS = 5 * 60; // minimum width of the rolling mean behind the Smooth toggle
+  const SMOOTH_SECS = 10 * 60; // minimum width of the rolling mean behind the Smooth toggle
   const dayDraws = {};        // chart id -> redraw of its last fetched data
 
   /** Inverter minute rows for [start, end) (unix seconds), or [] if unavailable. */
