@@ -120,29 +120,6 @@
     }
   }
 
-  function tile(label, valueText, unit, colour) {
-    const t = el('div', 'tile');
-    if (colour) t.style.setProperty('--tile', `var(${colour})`);
-    const v = el('div', 'value', valueText);
-    if (unit) v.appendChild(el('span', 'unit', unit));
-    t.append(el('div', 'label', label), v);
-    return t;
-  }
-
-  const TOTALS = [
-    ['PV generation', 'pv_kwh', '--c-pv'],
-    ['Load', 'load_kwh', '--c-load'],
-    ['Grid import', 'import_kwh', '--c-import'],
-    ['Grid export', 'export_kwh', '--c-export'],
-    ['Battery charge', 'battery_charge_kwh', '--c-charge'],
-    ['Battery discharge', 'battery_discharge_kwh', '--c-discharge'],
-  ];
-
-  function renderTotals(container, totals) {
-    container.replaceChildren(...TOTALS.map(([label, key, colour]) =>
-      tile(label, kwh(totals[key]), 'kWh', colour)));
-  }
-
   // ---------- charts ----------
 
   const charts = {};
@@ -757,7 +734,7 @@
     renderCarTile(car, car ? await fetchCarSession(car) : null);
     // While History shows today's Day chart, refresh it (and its totals) on the slower
     // cadence: the chart needs heavier requests than the tiles.
-    if (state.period === 'day' && state.day === today && Date.now() - lastDayChartAt >= REFRESH_MS - 1000) {
+    if (curveDate() === today && Date.now() - lastDayChartAt >= REFRESH_MS - 1000) {
       await loadDay(today);
     }
     return delay;
@@ -882,8 +859,7 @@
   }
 
   async function loadDay(date) {
-    $('day-input').value = date;
-    const current = () => state.view === 'home' && state.period === 'day' && state.day === date;
+    const current = () => state.view === 'home' && curveDate() === date;
     const isToday = date === todayStr();
     $('day-empty').textContent = isToday ? 'No data yet today' : 'No data for this day';
     // Marked before the requests so the home poll does not load the same chart twice.
@@ -894,7 +870,7 @@
         api(`/api/daily?from=${date}&to=${date}`),
       ]);
       if (!current()) return;
-      renderTotals($('day-totals'), daily.days[0] || {});
+      renderCards(daily.days[0] || {});
       await loadDayChart('day-chart', 'day-source', date, current, day);
     } catch (err) {
       if (isToday) lastDayChartAt = 0;
@@ -1039,7 +1015,190 @@
         : `Power chart for ${date}: no data`);
   }
 
-  // ---------- Month ----------
+  // ---------- History: periods, date pill, cards ----------
+
+  const DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const LONG_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  /** Custom ranges up to this many days show daily bars; longer ones show monthly bars. */
+  const CUSTOM_DAILY_MAX = 92;
+  /** /api/daily?group= covers at most 20 years; Lifetime looks back 19 whole years and this one. */
+  const LIFETIME_YEARS = 19;
+  const ENERGY_KEYS = ['pv_kwh', 'load_kwh', 'import_kwh', 'export_kwh'];
+
+  const utcMs = (d) => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10));
+  const daysBetween = (a, b) => Math.round((utcMs(b) - utcMs(a)) / 86400000);
+  /** 0 for Monday to 6 for Sunday. */
+  const dowOf = (d) => (new Date(utcMs(d)).getUTCDay() + 6) % 7;
+  const mondayOf = (d) => addDays(d, -dowOf(d));
+  const monthEnd = (ym) => `${ym}-${pad(new Date(Date.UTC(+ym.slice(0, 4), +ym.slice(5, 7), 0)).getUTCDate())}`;
+  const validDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || '') && new Date(utcMs(v)).toISOString().slice(0, 10) === v;
+  const dmy = (d) => `${+d.slice(8)} ${MONTHS[+d.slice(5, 7) - 1]} ${d.slice(0, 4)}`;
+
+  /** The first month with data ("2023-02") once Lifetime has loaded; null until then. */
+  let lifetimeFirst = null;
+  const lifetimeCache = { at: 0, promise: null };
+
+  /** /api/daily by month for the whole history, cached for a minute. */
+  function loadLifetime() {
+    if (lifetimeCache.promise && Date.now() - lifetimeCache.at < COSTS_TTL_MS) return lifetimeCache.promise;
+    lifetimeCache.at = Date.now();
+    const from = `${+todayStr().slice(0, 4) - LIFETIME_YEARS}-01-01`;
+    const p = api(`/api/daily?from=${from}&to=${todayStr()}&group=month`).then((r) => {
+      lifetimeFirst = r.buckets.length ? r.buckets[0].period : null;
+      return r;
+    });
+    lifetimeCache.promise = p;
+    p.catch(() => { lifetimeCache.at = 0; });
+    return p;
+  }
+
+  /** The date History shows a power curve for (Day, or a one-day Custom range); null for bars. */
+  const curveDate = () => (state.period === 'day' ? state.day
+    : state.period === 'custom' && state.from === state.to ? state.from : null);
+
+  /** The first and last day History covers. */
+  function rangeOf() {
+    const today = todayStr();
+    switch (state.period) {
+      case 'day': return [state.day, state.day];
+      case 'week': return [state.week, addDays(state.week, 6)];
+      case 'month': return [`${state.month}-01`, monthEnd(state.month)];
+      case 'year': return [`${state.year}-01-01`, `${state.year}-12-31`];
+      case 'lifetime': return [lifetimeFirst ? `${lifetimeFirst}-01` : `${today.slice(0, 4)}-01-01`, today];
+      default: return [state.from, state.to];
+    }
+  }
+
+  function periodLabel() {
+    const [from, to] = rangeOf();
+    switch (state.period) {
+      case 'day': return `${DOW[dowOf(from)]} ${dmy(from)}`;
+      case 'month': return `${LONG_MONTHS[+state.month.slice(5) - 1]} ${state.month.slice(0, 4)}`;
+      case 'year': return String(state.year);
+      case 'lifetime': return lifetimeFirst ? `Since ${MONTHS[+lifetimeFirst.slice(5) - 1]} ${lifetimeFirst.slice(0, 4)}` : 'Lifetime';
+      default: {
+        if (from === to) return dmy(from);
+        const sameYear = from.slice(0, 4) === to.slice(0, 4);
+        const sameMonth = sameYear && from.slice(5, 7) === to.slice(5, 7);
+        if (state.period === 'week' && sameMonth) return `${+from.slice(8)}–${dmy(to)}`;
+        return `${sameYear ? dayLabel(from) : dmy(from)} – ${dmy(to)}`;
+      }
+    }
+  }
+
+  /** Does the period on show reach today? Then "next" is disabled. */
+  function atCurrent() {
+    const today = todayStr();
+    switch (state.period) {
+      case 'day': return state.day >= today;
+      case 'week': return addDays(state.week, 6) >= today;
+      case 'month': return state.month >= today.slice(0, 7);
+      case 'year': return state.year >= +today.slice(0, 4);
+      case 'lifetime': return true;
+      default: return state.to >= today;
+    }
+  }
+
+  function shiftPeriod(dir) {
+    const today = todayStr();
+    switch (state.period) {
+      case 'day': return go({ day: addDays(state.day, dir) });
+      case 'week': return go({ week: addDays(state.week, 7 * dir) });
+      case 'month': return go({ month: shiftMonth(state.month, dir) });
+      case 'year': return go({ year: state.year + dir });
+      case 'custom': {
+        const n = daysBetween(state.from, state.to) + 1;
+        if (dir < 0) return go({ from: addDays(state.from, -n), to: addDays(state.from, -1) });
+        const to = addDays(state.to, n);
+        return go({ from: addDays(state.to, 1), to: to > today ? today : to });
+      }
+      default: return undefined;
+    }
+  }
+
+  /** Updates the tabs, the date pill and which chart pane shows. */
+  function updateHistoryNav() {
+    for (const b of document.querySelectorAll('.ptab')) {
+      const on = b.dataset.period === state.period;
+      b.setAttribute('aria-selected', String(on));
+      b.tabIndex = on ? 0 : -1;
+      if (on) {
+        // On a phone the tab strip scrolls; keep the current tab in view.
+        const strip = b.parentElement;
+        if (b.offsetLeft < strip.scrollLeft) strip.scrollLeft = b.offsetLeft;
+        else if (b.offsetLeft + b.offsetWidth > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = b.offsetLeft + b.offsetWidth - strip.clientWidth;
+      }
+    }
+    const life = state.period === 'lifetime';
+    $('dp-text').textContent = periodLabel();
+    $('dp-prev').disabled = life;
+    $('dp-next').disabled = atCurrent();
+    $('dp-label').disabled = life;
+    const curve = curveDate() != null;
+    $('view-day').hidden = !curve;
+    $('view-bars').hidden = curve;
+    $('hist-panel').setAttribute('aria-labelledby', `ptab-${state.period}`);
+  }
+
+  // ---------- History: cards ----------
+
+  const fmtKwh = (v) => (v == null ? '–'
+    : v.toLocaleString('en-AU', { minimumFractionDigits: v >= 10000 ? 0 : 1, maximumFractionDigits: v >= 10000 ? 0 : 1 }));
+
+  /** The Money hash that matches the period on show. */
+  function moneyHashFor() {
+    const [from, to] = rangeOf();
+    switch (state.period) {
+      case 'day': case 'week': case 'month': return `#money=month:${from.slice(0, 7)}`;
+      case 'year': return `#money=year:${state.year}`;
+      case 'lifetime': return '#money=all';
+      default:
+        if (from.slice(0, 7) === to.slice(0, 7)) return `#money=month:${from.slice(0, 7)}`;
+        return from.slice(0, 4) === to.slice(0, 4) ? `#money=year:${from.slice(0, 4)}` : '#money=all';
+    }
+  }
+
+  /** Fills the energy cards from `t` (kWh totals; null for none). */
+  function renderCards(t) {
+    t = t || {};
+    const { pv_kwh: pv, load_kwh: load, import_kwh: imp, export_kwh: exp } = t;
+    $('hc-pv').textContent = fmtKwh(pv);
+    $('hc-load').textContent = fmtKwh(load);
+    const used = pv > 0 && exp != null ? Math.max(0, Math.min(100, Math.round(((pv - exp) / pv) * 100))) : null;
+    $('hc-pv-sub').textContent = used == null ? '' : `${used}% used at home or stored`;
+    $('hc-load-sub').textContent = pv == null || load == null ? ''
+      : pv >= load ? `Made ${fmtKwh(pv - load)} kWh more than you used`
+        : `Used ${fmtKwh(load - pv)} kWh more than you made`;
+    $('hc-grid').textContent = imp == null && exp == null ? '–'
+      : `${fmtKwh(imp)} in · ${fmtKwh(exp)} out kWh`;
+  }
+
+  function resetCostCard() {
+    $('hc-cost').textContent = '–';
+    $('hc-cost-sub').textContent = '';
+    $('hc-cost-link').setAttribute('href', moneyHashFor());
+  }
+
+  /** Fills the Cost card from /api/costs. `current()` says whether the page still shows this range. */
+  async function loadCostCard(current) {
+    resetCostCard();
+    const today = todayStr();
+    const [from, to0] = rangeOf();
+    const to = to0 > today ? today : to0;
+    if (from > to) return;
+    let costs;
+    try {
+      costs = await api(`/api/costs?from=${from}&to=${to}&group=month`);
+    } catch (err) {
+      if (err.message === 'Not logged in.') throw err;
+      return; // the energy cards still show; the cost stays a dash
+    }
+    if (!current() || !costs.configured || !(costs.totals.days > 0)) return;
+    $('hc-cost').textContent = money(costs.totals.actual);
+    $('hc-cost-sub').textContent = `Saved ${money(costs.totals.savings)} against no solar or battery`;
+  }
+
+  // ---------- History: charts ----------
 
   function sum(days, key) {
     const vals = days.map((d) => d[key]).filter((v) => v != null);
@@ -1048,7 +1207,7 @@
 
   function sumTotals(days) {
     const t = {};
-    for (const [, key] of TOTALS) t[key] = sum(days, key);
+    for (const key of ENERGY_KEYS) t[key] = sum(days, key);
     return t;
   }
 
@@ -1089,37 +1248,335 @@
     };
   }
 
-  async function loadMonth(ym) {
-    $('month-input').value = ym;
-    const [y, m] = ym.split('-').map(Number);
-    const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
-    const from = `${ym}-01`, to = `${ym}-${pad(last)}`;
-    const { days } = await api(`/api/daily?from=${from}&to=${to}`);
-    if (state.view !== 'home' || state.period !== 'month' || state.month !== ym) return;
-    const hasData = days.some((d) => TOTALS.some(([, k]) => d[k] != null));
-    renderTotals($('month-totals'), sumTotals(days));
-    const labels = days.map((d) => String(+d.date.slice(8)));
-    const option = energyOption(labels, days, (i) => days[i].date, window.innerWidth < 560);
-    showChart('month-chart', hasData, option,
-      `Daily energy for ${MONTHS[m - 1]} ${y}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
-    onBarClick('month-chart', (i) => go({ period: 'day', day: days[i].date }));
+  const hasEnergy = (rows) => rows.some((d) => ENERGY_KEYS.some((k) => d[k] != null));
+
+  /** Month buckets from /api/daily?group=month, summed into years. */
+  function bucketsToYears(buckets) {
+    const years = [];
+    for (const b of buckets) {
+      const y = b.period.slice(0, 4);
+      let row = years[years.length - 1];
+      if (!row || row.period !== y) { row = { period: y }; years.push(row); }
+      for (const k of ENERGY_KEYS) {
+        if (b[k] != null) row[k] = (row[k] || 0) + b[k];
+      }
+    }
+    return years;
   }
 
-  // ---------- Year ----------
+  function drawBars(rows, labels, title, thin, alt, hint, onClick) {
+    renderCards(sumTotals(rows));
+    const option = energyOption(labels, rows, title, window.innerWidth < 560, thin);
+    showChart('bars-chart', hasEnergy(rows), option,
+      `${alt}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
+    $('bars-hint').textContent = hint;
+    onBarClick('bars-chart', onClick);
+  }
 
-  async function loadYear(year) {
-    $('year-input').value = year;
-    const { days } = await api(`/api/daily?from=${year}-01-01&to=${year}-12-31`);
-    if (state.view !== 'home' || state.period !== 'year' || state.year !== year) return;
+  /** Daily bars for a week, a month or a Custom range of up to CUSTOM_DAILY_MAX days. */
+  async function loadDailyBars(from, to, current) {
+    const { days } = await api(`/api/daily?from=${from}&to=${to}`);
+    if (!current()) return;
+    let labels, alt;
+    if (state.period === 'week') {
+      labels = days.map((d) => `${DOW[dowOf(d.date)]} ${+d.date.slice(8)}`);
+      alt = `Daily energy for the week of ${dmy(from)}`;
+    } else if (state.period === 'month') {
+      labels = days.map((d) => String(+d.date.slice(8)));
+      alt = `Daily energy for ${LONG_MONTHS[+state.month.slice(5) - 1]} ${state.month.slice(0, 4)}`;
+    } else {
+      labels = days.map((d, i) => (i === 0 || d.date.endsWith('-01') ? dayLabel(d.date) : String(+d.date.slice(8))));
+      alt = `Daily energy from ${dmy(from)} to ${dmy(to)}`;
+    }
+    drawBars(days, labels, (i) => days[i].date, true, alt, 'Click a day to open its power curve.',
+      (i) => go({ period: 'day', day: days[i].date }));
+  }
+
+  /** Year: one bar per month. */
+  async function loadYearBars(from, to, current) {
+    const { days } = await api(`/api/daily?from=${from}&to=${to}`);
+    if (!current()) return;
     const months = MONTHS.map(() => []);
     for (const d of days) months[+d.date.slice(5, 7) - 1].push(d);
     const agg = months.map((ds) => sumTotals(ds));
-    const hasData = days.some((d) => TOTALS.some(([, k]) => d[k] != null));
-    renderTotals($('year-totals'), sumTotals(days));
-    const option = energyOption(MONTHS, agg, (i) => `${MONTHS[i]} ${year}`, window.innerWidth < 560, false);
-    showChart('year-chart', hasData, option,
-      `Monthly energy for ${year}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
-    onBarClick('year-chart', (i) => go({ period: 'month', month: `${year}-${pad(i + 1)}` }));
+    drawBars(agg, MONTHS, (i) => `${MONTHS[i]} ${state.year}`, false, `Monthly energy for ${state.year}`,
+      'Click a month to open it.', (i) => go({ period: 'month', month: `${state.year}-${pad(i + 1)}` }));
+  }
+
+  /** Lifetime (a bar per year) and long Custom ranges (a bar per month), from /api/daily?group=month. */
+  async function loadGroupedBars(from, to, yearly, current) {
+    const res = yearly ? await loadLifetime() : await api(`/api/daily?from=${from}&to=${to}&group=month`);
+    if (!current()) return;
+    const rows = yearly ? bucketsToYears(res.buckets) : res.buckets;
+    const monthName = (p) => `${MONTHS[+p.slice(5) - 1]} ${p.slice(0, 4)}`;
+    drawBars(rows, rows.map((r) => (yearly ? r.period : `${MONTHS[+r.period.slice(5) - 1]} ${r.period.slice(2, 4)}`)),
+      (i) => (yearly ? rows[i].period : monthName(rows[i].period)), false,
+      `${yearly ? 'Yearly' : 'Monthly'} energy from ${dmy(from)} to ${dmy(to)}`,
+      yearly ? 'Click a year to open it.' : 'Click a month to open it.',
+      (i) => go(yearly ? { period: 'year', year: +rows[i].period } : { period: 'month', month: rows[i].period }));
+    updateHistoryNav(); // Lifetime's label needs the first month
+  }
+
+  /** Loads whatever the History period needs: the cards and the curve or bars. */
+  async function loadHistory() {
+    updateHistoryNav();
+    // Lifetime's range moves once its first month is known, so it is keyed by period alone.
+    const key = () => (state.period === 'lifetime' ? 'lifetime' : `${state.period}|${rangeOf().join('|')}`);
+    const snapshot = key();
+    const current = () => state.view === 'home' && key() === snapshot;
+    // Lifetime starts at the first month with data, which the cost range needs.
+    if (state.period === 'lifetime') await loadLifetime();
+    if (!current()) return;
+    const [from, to] = rangeOf();
+    const date = curveDate();
+    const cost = loadCostCard(current);
+    if (date) await loadDay(date);
+    else if (state.period === 'lifetime') await loadGroupedBars(from, to, true, current);
+    else if (state.period === 'year') await loadYearBars(from, to, current);
+    else if (state.period === 'custom' && daysBetween(from, to) + 1 > CUSTOM_DAILY_MAX) await loadGroupedBars(from, to, false, current);
+    else await loadDailyBars(from, to, current);
+    await cost;
+  }
+
+  // ---------- History: date picker popover ----------
+
+  const pop = { open: false, month: '', year: 0 };
+  const calCache = new Map(); // "2026-10" -> { at, promise } of the month's /api/daily rows
+
+  function loadCalMonth(ym) {
+    const hit = calCache.get(ym);
+    if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.promise;
+    const today = todayStr();
+    const to = monthEnd(ym) > today ? today : monthEnd(ym);
+    const p = to < `${ym}-01` ? Promise.resolve({ days: [] }) : api(`/api/daily?from=${ym}-01&to=${to}`);
+    calCache.set(ym, { at: Date.now(), promise: p });
+    p.catch(() => calCache.delete(ym));
+    return p;
+  }
+
+  function popBtn(cls, text, onclick, label) {
+    const b = el('button', cls, text);
+    b.type = 'button';
+    b.onclick = onclick;
+    if (label) b.setAttribute('aria-label', label);
+    return b;
+  }
+
+  function closePop(refocus) {
+    if (!pop.open) return;
+    pop.open = false;
+    $('dp-pop').hidden = true;
+    $('dp-label').setAttribute('aria-expanded', 'false');
+    if (refocus) $('dp-label').focus();
+  }
+
+  function openPop() {
+    const today = todayStr();
+    pop.open = true;
+    pop.month = (state.period === 'week' ? state.week : state.period === 'day' ? state.day : today).slice(0, 7);
+    pop.year = state.period === 'month' ? +state.month.slice(0, 4) : +today.slice(0, 4);
+    $('dp-label').setAttribute('aria-expanded', 'true');
+    $('dp-pop').hidden = false;
+    drawPop(true);
+  }
+
+  /** Rebuilds the popover for the period; `focus` puts keyboard focus inside it. */
+  async function drawPop(focus) {
+    const host = $('dp-pop');
+    const kind = state.period;
+    const wasInside = host.contains(document.activeElement);
+    let body;
+    try {
+      if (kind === 'day' || kind === 'week') body = await calendarBody();
+      else if (kind === 'month') body = monthBody();
+      else if (kind === 'year') body = await yearBody();
+      else body = customBody();
+    } catch (err) {
+      if (err.message === 'Not logged in.') return;
+      throw err;
+    }
+    if (!pop.open || !body) return;
+    host.replaceChildren(...body.nodes);
+    if (focus || wasInside) {
+      const target = body.focus ? body.focus() : null;
+      (target || host.querySelector('button:not([disabled]), input')).focus();
+    }
+  }
+
+  /** Month calendar, Monday first, each day shaded by solar made. */
+  async function calendarBody() {
+    const today = todayStr();
+    const ym = pop.month;
+    let rows = [];
+    try { rows = (await loadCalMonth(ym)).days; } catch (err) { if (err.message === 'Not logged in.') throw err; }
+    if (!pop.open || pop.month !== ym) return null;
+    const pv = {};
+    let max = 0;
+    for (const d of rows) { if (d.pv_kwh != null) { pv[d.date] = d.pv_kwh; max = Math.max(max, d.pv_kwh); } }
+    const head = el('div', 'pop-head');
+    const next = popBtn('pop-step', '›', () => { pop.month = shiftMonth(ym, 1); drawPop(); }, 'Next month');
+    next.disabled = ym >= today.slice(0, 7);
+    head.append(
+      popBtn('pop-step', '‹', () => { pop.month = shiftMonth(ym, -1); drawPop(); }, 'Previous month'),
+      el('span', 'pop-title', `${LONG_MONTHS[+ym.slice(5) - 1]} ${ym.slice(0, 4)}`),
+      next,
+    );
+    const dows = el('div', 'cal');
+    dows.setAttribute('aria-hidden', 'true');
+    for (const d of ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su']) dows.appendChild(el('span', 'cal-dow', d));
+    const grid = el('div', 'cal');
+    grid.setAttribute('role', 'group');
+    grid.setAttribute('aria-label', `${LONG_MONTHS[+ym.slice(5) - 1]} ${ym.slice(0, 4)}, shaded by solar made`);
+    for (let i = dowOf(`${ym}-01`); i > 0; i--) grid.appendChild(el('span', 'cal-pad'));
+    const wk = state.period === 'week';
+    const last = +monthEnd(ym).slice(8);
+    const cells = [];
+    for (let n = 1; n <= last; n++) {
+      const date = `${ym}-${pad(n)}`;
+      const b = popBtn('cal-day', String(n), () => {
+        closePop(true);
+        go(wk ? { period: 'week', week: mondayOf(date) } : { period: 'day', day: date });
+      });
+      b.disabled = date > today;
+      b.setAttribute('aria-label', `${DOW[dowOf(date)]} ${dmy(date)}${pv[date] != null ? `, ${fmtKwh(pv[date])} kWh solar` : ''}`);
+      if (pv[date] != null && max > 0) b.style.setProperty('--shade', `${Math.round(8 + (pv[date] / max) * 40)}%`);
+      const inWeek = wk && mondayOf(date) === state.week;
+      if (inWeek) {
+        b.classList.add('in-week');
+        if (dowOf(date) === 0 || n === 1) b.classList.add('wk-start');
+        if (dowOf(date) === 6 || n === last) b.classList.add('wk-end');
+      }
+      if (wk ? inWeek : date === state.day) { b.classList.add('sel'); b.setAttribute('aria-current', 'date'); }
+      if (date === today) b.classList.add('today');
+      cells.push(b);
+      grid.appendChild(b);
+    }
+    const enabled = cells.filter((c) => !c.disabled);
+    const initial = enabled.find((c) => c.classList.contains('sel')) || enabled.find((c) => c.classList.contains('today')) || enabled[0] || null;
+    for (const c of cells) c.tabIndex = c === initial ? 0 : -1;
+    // Arrow keys move between days; only one day is a Tab stop.
+    grid.onkeydown = (e) => {
+      const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7 }[e.key];
+      if (step == null) return;
+      e.preventDefault();
+      const t = cells[cells.indexOf(document.activeElement) + step];
+      if (t && !t.disabled) { for (const c of cells) c.tabIndex = -1; t.tabIndex = 0; t.focus(); }
+    };
+    const foot = el('div', 'pop-foot');
+    foot.append(el('span', 'pop-note', 'Shaded by solar made'),
+      popBtn('pop-link', wk ? 'This week' : 'Today', () => {
+        closePop(true);
+        go(wk ? { period: 'week', week: mondayOf(today) } : { period: 'day', day: today });
+      }));
+    return { nodes: [head, dows, grid, foot], focus: () => initial };
+  }
+
+  function monthBody() {
+    const today = todayStr();
+    const head = el('div', 'pop-head');
+    const next = popBtn('pop-step', '›', () => { pop.year += 1; drawPop(); }, 'Next year');
+    next.disabled = pop.year >= +today.slice(0, 4);
+    head.append(popBtn('pop-step', '‹', () => { pop.year -= 1; drawPop(); }, 'Previous year'),
+      el('span', 'pop-title', String(pop.year)), next);
+    const grid = el('div', 'chips chips-4');
+    let focus = null;
+    MONTHS.forEach((m, i) => {
+      const ym = `${pop.year}-${pad(i + 1)}`;
+      const b = popBtn('chip', m, () => { closePop(true); go({ period: 'month', month: ym }); });
+      b.disabled = ym > today.slice(0, 7);
+      if (ym === state.month) { b.classList.add('sel'); b.setAttribute('aria-current', 'date'); focus = b; }
+      grid.appendChild(b);
+    });
+    const foot = el('div', 'pop-foot');
+    foot.appendChild(popBtn('pop-link', 'This month', () => { closePop(true); go({ period: 'month', month: today.slice(0, 7) }); }));
+    return { nodes: [head, grid, foot], focus: () => focus };
+  }
+
+  async function yearBody() {
+    const thisYear = +todayStr().slice(0, 4);
+    let years = [];
+    try { years = bucketsToYears((await loadLifetime()).buckets).map((r) => +r.period); } catch (err) { if (err.message === 'Not logged in.') throw err; }
+    if (!years.includes(thisYear)) years.push(thisYear);
+    if (!years.includes(state.year)) years.push(state.year);
+    years.sort((a, b) => b - a);
+    const grid = el('div', 'chips chips-4');
+    let focus = null;
+    for (const y of years) {
+      const b = popBtn('chip', String(y), () => { closePop(true); go({ period: 'year', year: y }); });
+      if (y === state.year) { b.classList.add('sel'); b.setAttribute('aria-current', 'date'); focus = b; }
+      grid.appendChild(b);
+    }
+    const foot = el('div', 'pop-foot');
+    foot.appendChild(popBtn('pop-link', 'This year', () => { closePop(true); go({ period: 'year', year: thisYear }); }));
+    return { nodes: [el('div', 'pop-note', 'Years with data'), grid, foot], focus: () => focus };
+  }
+
+  function customBody() {
+    const today = todayStr();
+    const quarterStart = `${today.slice(0, 4)}-${pad(Math.floor((+today.slice(5, 7) - 1) / 3) * 3 + 1)}-01`;
+    const presets = [
+      ['Last 7 days', addDays(today, -6)],
+      ['Last 30 days', addDays(today, -29)],
+      ['This quarter', quarterStart],
+      ['Last 12 months', `${shiftMonth(today.slice(0, 7), -11)}-01`],
+    ];
+    const chips = el('div', 'chips');
+    for (const [label, from] of presets) {
+      const b = popBtn('chip', label, () => { closePop(true); go({ period: 'custom', from, to: today }); });
+      if (from === state.from && today === state.to) { b.classList.add('sel'); b.setAttribute('aria-current', 'true'); }
+      chips.appendChild(b);
+    }
+    const field = (label, value) => {
+      const l = el('label', 'pop-field', label);
+      const i = document.createElement('input');
+      i.type = 'date';
+      i.value = value;
+      i.max = today;
+      l.appendChild(i);
+      return [l, i];
+    };
+    const [fromL, fromI] = field('From', state.from);
+    const [toL, toI] = field('To', state.to);
+    const fields = el('div', 'pop-fields');
+    fields.append(fromL, toL);
+    const err = el('div', 'pop-error');
+    err.setAttribute('role', 'alert');
+    const apply = popBtn('btn pop-apply', 'Apply', () => {
+      const f = fromI.value, t = toI.value;
+      let msg = '';
+      if (!validDate(f) || !validDate(t)) msg = 'Pick both dates.';
+      else if (t < f) msg = 'The end date is before the start.';
+      else if (daysBetween(f, t) + 1 > 366 * 20) msg = 'Pick at most 20 years.';
+      err.textContent = msg;
+      if (msg) return;
+      closePop(true);
+      go({ period: 'custom', from: f, to: t > today ? today : t });
+    });
+    const hint = el('div', 'pop-note', 'One day shows its power curve, up to 92 days shows days, longer shows months.');
+    return { nodes: [chips, fields, err, apply, hint], focus: () => chips.firstChild };
+  }
+
+  function initHistory() {
+    const tabs = [...document.querySelectorAll('.ptab')];
+    for (const b of tabs) {
+      b.onclick = () => switchPeriod(b.dataset.period);
+      b.onkeydown = (e) => {
+        const i = tabs.indexOf(b);
+        const t = e.key === 'ArrowRight' ? tabs[(i + 1) % tabs.length] : e.key === 'ArrowLeft' ? tabs[(i + tabs.length - 1) % tabs.length]
+          : e.key === 'Home' ? tabs[0] : e.key === 'End' ? tabs[tabs.length - 1] : null;
+        if (!t) return;
+        e.preventDefault();
+        t.focus();
+        switchPeriod(t.dataset.period);
+      };
+    }
+    $('dp-prev').onclick = () => shiftPeriod(-1);
+    $('dp-next').onclick = () => shiftPeriod(1);
+    $('dp-label').onclick = () => (pop.open ? closePop(false) : openPop());
+    const wrap = document.querySelector('.dp');
+    document.addEventListener('pointerdown', (e) => { if (pop.open && !wrap.contains(e.target)) closePop(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && pop.open) { e.preventDefault(); closePop(true); } });
+    wrap.addEventListener('focusout', (e) => { if (pop.open && e.relatedTarget && !wrap.contains(e.relatedTarget)) closePop(false); });
   }
 
   // ---------- shared bits for the money views ----------
@@ -1893,13 +2350,29 @@
 
   // Home is the Now content with History below it; Day, Month and Year are History's periods.
   const VIEWS = ['home', 'money', 'payback'];
-  const PERIODS = ['day', 'month', 'year'];
+  const PERIODS = ['day', 'week', 'month', 'year', 'lifetime', 'custom'];
   let period = 'day'; // the period History opens on: the last one shown
   // Money's `mode` is month, year or all; `when` is its month (2026-09) or year (2025).
-  const state = { view: 'home', period: 'day', day: '', month: '', year: 0, mode: 'month', when: '', smooth: true };
+  const state = { view: 'home', period: 'day', day: '', week: '', month: '', year: 0, from: '', to: '', mode: 'month', when: '', smooth: true };
   const SMOOTH_KEY = 'solar-dash.smooth';
   let timer = null;
   let pollToken = 0;
+
+  let seenToday = todayStr();
+
+  /**
+   * After midnight, moves a Day view that was on the old today to the new one.
+   * A view on any other date stays where it is.
+   */
+  function checkMidnight() {
+    const today = todayStr();
+    if (today === seenToday) return;
+    const wasToday = seenToday;
+    seenToday = today;
+    if (state.view !== 'home') return;
+    if (state.period === 'day' && state.day === wasToday) go({ day: today });
+    else updateHistoryNav();
+  }
 
   /** Loads the Now part of home, then schedules the next refresh (15 s from the inverter, 60 s from the cloud). */
   async function pollNow() {
@@ -1907,6 +2380,7 @@
     timer = null;
     // A hidden tab does not poll; visibilitychange restarts it.
     if (document.hidden) return;
+    checkMidnight();
     const token = ++pollToken;
     let delay = REFRESH_MS;
     await guarded(async () => { delay = await loadNow(); });
@@ -1927,9 +2401,15 @@
     const today = todayStr();
     state.view = periodView || !VIEWS.includes(view) ? 'home' : view;
     state.period = period;
-    state.day = /^\d{4}-\d{2}-\d{2}$/.test(value || '') && view === 'day' ? value : today;
+    state.day = validDate(value) && view === 'day' ? value : today;
     state.month = /^\d{4}-\d{2}$/.test(value || '') && view === 'month' ? value : today.slice(0, 7);
     state.year = /^\d{4}$/.test(value || '') && view === 'year' ? +value : +today.slice(0, 4);
+    state.week = validDate(value) && view === 'week' ? mondayOf(value) : mondayOf(today);
+    // Custom: "custom=2026-09-01..2026-10-22"; anything else is the last 30 days.
+    const [cFrom, cTo] = view === 'custom' ? (value || '').split('..') : [];
+    const okRange = validDate(cFrom) && validDate(cTo) && cFrom <= cTo;
+    state.from = okRange ? cFrom : addDays(today, -29);
+    state.to = okRange ? cTo : today;
     // Money: "money=month:2026-09", "money=year:2025" or "money=all"; "money" is this month.
     const [mode, when = ''] = (view === 'money' ? value || '' : '').split(':');
     state.mode = MONEY_MODES.includes(mode) ? mode : 'month';
@@ -1942,6 +2422,7 @@
   function viewHash(v) {
     if (v === 'home') v = state.period;
     return v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}`
+      : v === 'week' ? `week=${state.week}` : v === 'custom' ? `custom=${state.from}..${state.to}`
       : v === 'year' ? `year=${state.year}` : v === 'money' ? `money=${state.mode}${state.when && ':' + state.when}` : v;
   }
 
@@ -1960,7 +2441,7 @@
     document.getElementById('view-home').hidden = !home;
     document.getElementById('view-money').hidden = state.view !== 'money';
     document.getElementById('view-payback').hidden = state.view !== 'payback';
-    for (const p of PERIODS) $(`view-${p}`).hidden = !home || p !== state.period;
+    closePop(false);
     const brand = document.querySelector('.brand');
     if (home) brand.setAttribute('aria-current', 'page');
     else brand.removeAttribute('aria-current');
@@ -1976,7 +2457,6 @@
       const v = tab.dataset.view;
       tab.setAttribute('href', '#' + viewHash(v));
     }
-    for (const b of document.querySelectorAll('[data-period]')) b.setAttribute('aria-pressed', String(b.dataset.period === state.period));
     // Live polling runs while home shows. A change of History period or date on home leaves it alone.
     if (!home) {
       clearTimeout(timer);
@@ -1988,9 +2468,7 @@
     }
     homeShown = home;
     if (home) {
-      if (state.period === 'day') guarded(() => loadDay(state.day));
-      else if (state.period === 'month') guarded(() => loadMonth(state.month));
-      else guarded(() => loadYear(state.year));
+      guarded(() => loadHistory());
     } else if (state.view === 'money') guarded(() => loadMoneyView(state.mode, state.when));
     else guarded(() => loadPaybackView());
   }
@@ -2001,13 +2479,18 @@
     return `${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}`;
   }
 
-  /** Switches the History period, keeping the date in view (today when the new period contains it). */
+  /**
+   * Switches the History period, keeping the date in view: today when the old
+   * period holds it, otherwise the old period's last day. Custom takes the old range.
+   */
   function switchPeriod(to) {
-    const from = state.period;
-    const day = from === 'day' ? state.day : from === 'month' ? `${state.month}-01` : `${state.year}-01-01`;
+    if (to === state.period) return;
     const today = todayStr();
-    const len = { day: 10, month: 7, year: 4 }[from];
-    go({ period: to, day: day.slice(0, len) === today.slice(0, len) ? today : day, month: day.slice(0, 7), year: +day.slice(0, 4) });
+    const [from, end] = rangeOf();
+    const anchor = from <= today && today <= end ? today : state.period === 'lifetime' ? today : end > today ? today : end;
+    const patch = { period: to, day: anchor, week: mondayOf(anchor), month: anchor.slice(0, 7), year: +anchor.slice(0, 4) };
+    if (to === 'custom') Object.assign(patch, state.period === 'lifetime' ? { from: addDays(today, -29), to: today } : { from, to: end > today ? today : end });
+    go(patch);
   }
 
   /** Switches Money between month, year and all time, keeping the year in view. */
@@ -2039,19 +2522,7 @@
       chartsError = "Charts couldn't load (no internet to cdnjs?)";
       updateBanner();
     }
-    for (const b of document.querySelectorAll('[data-period]')) b.onclick = () => switchPeriod(b.dataset.period);
-    $('day-prev').onclick = () => go({ day: addDays(state.day, -1) });
-    $('day-next').onclick = () => go({ day: addDays(state.day, 1) });
-    $('day-today').onclick = () => go({ day: todayStr() });
-    $('day-input').onchange = (e) => { if (e.target.value) go({ day: e.target.value }); };
-    $('month-prev').onclick = () => go({ month: shiftMonth(state.month, -1) });
-    $('month-next').onclick = () => go({ month: shiftMonth(state.month, 1) });
-    $('month-today').onclick = () => go({ month: todayStr().slice(0, 7) });
-    $('month-input').onchange = (e) => { if (e.target.value) go({ month: e.target.value }); };
-    $('year-prev').onclick = () => go({ year: state.year - 1 });
-    $('year-next').onclick = () => go({ year: state.year + 1 });
-    $('year-today').onclick = () => go({ year: +todayStr().slice(0, 4) });
-    $('year-input').onchange = (e) => { const y = +e.target.value; if (y >= 2000 && y <= 2100) go({ year: y }); };
+    initHistory();
 
     for (const b of document.querySelectorAll('[data-money]')) b.onclick = () => switchMoney(b.dataset.money);
     $('money-prev').onclick = () => go({ when: state.mode === 'month' ? shiftMonth(state.when, -1) : String(+state.when - 1) });

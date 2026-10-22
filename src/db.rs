@@ -396,6 +396,30 @@ pub async fn live_ts_range(pool: &SqlitePool) -> Result<Option<(i64, i64)>> {
     Ok(min.zip(max))
 }
 
+/// The oldest reading of any of `point_ids`, or `None` if there is none.
+pub async fn first_reading_ts(
+    pool: &SqlitePool,
+    plant_id: i64,
+    point_ids: &[i64],
+) -> Result<Option<i64>> {
+    let mut first: Option<i64> = None;
+    // One lookup per point, each answered from the (plant, point, ts) key.
+    for &point_id in point_ids {
+        let ts: Option<i64> =
+            sqlx::query_scalar("SELECT MIN(ts) FROM reading WHERE plant_id = ? AND point_id = ?")
+                .bind(plant_id)
+                .bind(point_id)
+                .fetch_one(pool)
+                .await
+                .context("could not read the first reading")?;
+        first = match (first, ts) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    Ok(first)
+}
+
 /// Every live sample with `from <= ts < to`, oldest first, not averaged.
 pub async fn live_samples_raw(pool: &SqlitePool, from: i64, to: i64) -> Result<Vec<Sample>> {
     sqlx::query_as(
