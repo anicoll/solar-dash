@@ -65,66 +65,71 @@
 
     <section class="stack" aria-labelledby="h-history">
       <h2 id="h-history" class="panel-title">History</h2>
-    <div id="view-day" class="hpane" hidden>
-      <div class="picker seg" role="group" aria-label="Period">
-        <button type="button" class="btn" data-period="day" aria-pressed="true">Day</button>
-        <button type="button" class="btn" data-period="month" aria-pressed="false">Month</button>
-        <button type="button" class="btn" data-period="year" aria-pressed="false">Year</button>
+    <div class="hist-bar">
+      <div class="ptabs" role="tablist" aria-label="Period" id="ptabs">
+        <button type="button" role="tab" class="ptab" id="ptab-day" data-period="day" aria-selected="true" aria-controls="hist-panel">Day</button>
+        <button type="button" role="tab" class="ptab" id="ptab-week" data-period="week" aria-selected="false" aria-controls="hist-panel" tabindex="-1">Week</button>
+        <button type="button" role="tab" class="ptab" id="ptab-month" data-period="month" aria-selected="false" aria-controls="hist-panel" tabindex="-1">Month</button>
+        <button type="button" role="tab" class="ptab" id="ptab-year" data-period="year" aria-selected="false" aria-controls="hist-panel" tabindex="-1">Year</button>
+        <button type="button" role="tab" class="ptab" id="ptab-lifetime" data-period="lifetime" aria-selected="false" aria-controls="hist-panel" tabindex="-1">Lifetime</button>
+        <button type="button" role="tab" class="ptab" id="ptab-custom" data-period="custom" aria-selected="false" aria-controls="hist-panel" tabindex="-1">Custom</button>
       </div>
-      <div class="picker">
-        <button type="button" class="btn" id="day-prev" aria-label="Previous day">&larr;</button>
-        <input type="date" id="day-input" aria-label="Date">
-        <button type="button" class="btn" id="day-next" aria-label="Next day">&rarr;</button>
-        <button type="button" class="btn" id="day-today">Today</button>
-        <button type="button" class="btn smooth-toggle" aria-pressed="true">Smooth</button>
+      <div class="dp">
+        <div class="dpill">
+          <button type="button" class="dp-step" id="dp-prev" aria-label="Previous period">&lsaquo;</button>
+          <button type="button" class="dp-label" id="dp-label" aria-haspopup="dialog" aria-expanded="false" aria-controls="dp-pop">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 3v4M16 3v4"></path></svg>
+            <span id="dp-text"></span>
+          </button>
+          <button type="button" class="dp-step" id="dp-next" aria-label="Next period">&rsaquo;</button>
+        </div>
+        <div class="pop" id="dp-pop" role="dialog" aria-label="Choose a date" hidden></div>
       </div>
-      <div class="card">
-        <div id="day-chart" class="chart tall" role="img" aria-label="Day chart"></div>
-        <p id="day-source" class="source" hidden></p>
-        <p id="day-empty" class="empty" hidden>No data for this day</p>
-      </div>
-      <h3 class="section">Totals</h3>
-      <div class="grid tiles" id="day-totals"></div>
     </div>
 
-    <div id="view-month" class="hpane" hidden>
-      <div class="picker seg" role="group" aria-label="Period">
-        <button type="button" class="btn" data-period="day" aria-pressed="false">Day</button>
-        <button type="button" class="btn" data-period="month" aria-pressed="true">Month</button>
-        <button type="button" class="btn" data-period="year" aria-pressed="false">Year</button>
-      </div>
-      <div class="picker">
-        <button type="button" class="btn" id="month-prev" aria-label="Previous month">&larr;</button>
-        <input type="month" id="month-input" aria-label="Month">
-        <button type="button" class="btn" id="month-next" aria-label="Next month">&rarr;</button>
-        <button type="button" class="btn" id="month-today">This month</button>
-      </div>
-      <div class="card">
-        <div id="month-chart" class="chart" role="img" aria-label="Month chart"></div>
-        <p id="month-empty" class="empty" hidden>No data for this month</p>
-      </div>
-      <h3 class="section">Totals</h3>
-      <div class="grid tiles" id="month-totals"></div>
-    </div>
+    <div id="hist-panel" role="tabpanel" class="hpane">
+      <section class="hcards" aria-label="Totals for the period">
+        <div class="hcard" style="--tile: var(--c-pv)">
+          <div class="hc-label">Solar made</div>
+          <div class="hc-val num"><span id="hc-pv">&ndash;</span><span class="unit">kWh</span></div>
+          <div class="hc-sub" id="hc-pv-sub"></div>
+        </div>
+        <div class="hcard" style="--tile: var(--c-load)">
+          <div class="hc-label">Home used</div>
+          <div class="hc-val num"><span id="hc-load">&ndash;</span><span class="unit">kWh</span></div>
+          <div class="hc-sub" id="hc-load-sub"></div>
+        </div>
+        <div class="hcard" style="--tile: var(--c-grid)">
+          <div class="hc-label">Grid</div>
+          <div class="hc-val num hc-grid" id="hc-grid">&ndash;</div>
+          <div class="hc-sub">Bought and sold</div>
+        </div>
+        <div class="hcard hc-cost" style="--tile: var(--save)">
+          <div class="hc-label">Cost</div>
+          <div class="hc-val num" id="hc-cost">&ndash;</div>
+          <div class="hc-sub" id="hc-cost-sub"></div>
+          <a class="hc-link" id="hc-cost-link" href="#money">Open in Money &rsaquo;</a>
+        </div>
+      </section>
 
-    <div id="view-year" class="hpane" hidden>
-      <div class="picker seg" role="group" aria-label="Period">
-        <button type="button" class="btn" data-period="day" aria-pressed="false">Day</button>
-        <button type="button" class="btn" data-period="month" aria-pressed="false">Month</button>
-        <button type="button" class="btn" data-period="year" aria-pressed="true">Year</button>
+      <div id="view-day" class="hpane" hidden>
+        <div class="picker">
+          <button type="button" class="btn smooth-toggle" aria-pressed="true">Smooth</button>
+        </div>
+        <div class="card">
+          <div id="day-chart" class="chart tall" role="img" aria-label="Day chart"></div>
+          <p id="day-source" class="source" hidden></p>
+          <p id="day-empty" class="empty" hidden>No data for this day</p>
+        </div>
       </div>
-      <div class="picker">
-        <button type="button" class="btn" id="year-prev" aria-label="Previous year">&larr;</button>
-        <input type="number" id="year-input" aria-label="Year" min="2000" max="2100" step="1">
-        <button type="button" class="btn" id="year-next" aria-label="Next year">&rarr;</button>
-        <button type="button" class="btn" id="year-today">This year</button>
+
+      <div id="view-bars" class="hpane" hidden>
+        <div class="card">
+          <div id="bars-chart" class="chart" role="img" aria-label="Energy chart"></div>
+          <p id="bars-empty" class="empty" hidden>No data for this period</p>
+        </div>
+        <p id="bars-hint" class="panel-note"></p>
       </div>
-      <div class="card">
-        <div id="year-chart" class="chart" role="img" aria-label="Year chart"></div>
-        <p id="year-empty" class="empty" hidden>No data for this year</p>
-      </div>
-      <h3 class="section">Totals</h3>
-      <div class="grid tiles" id="year-totals"></div>
     </div>
     </section>
   </section>
