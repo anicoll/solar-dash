@@ -355,9 +355,9 @@ and `TeslaMate MQTT back` is logged when it reconnects.
 ## GloBird (optional)
 
 solar-dash can log in to your GloBird Energy customer portal
-(myaccount.globirdenergy.com.au) and save what its endpoints return, so we can
-see the real response shapes before storing any GloBird data. The portal has
-no official API: this uses the same calls its web pages make, learned from the
+(myaccount.globirdenergy.com.au) and keep its daily cost and usage in the
+database. The portal has no official API: this uses the same calls its web
+pages make, learned from the
 [bolagnaise/globird-ha](https://github.com/bolagnaise/globird-ha) Home
 Assistant integration. It is read-only, but it may break whenever GloBird
 changes the portal. Without a `[globird]` section nothing changes.
@@ -369,36 +369,93 @@ changes the portal. Without a `[globird]` section nothing changes.
    [globird]
    email = "you@example.com"
    password = "your-portal-password"
+   # Optional: local time of the daily sync. Default "09:00".
+   sync_time = "09:00"
    ```
 
-2. Run the probe:
+2. Start `serve` as usual. With a `[globird]` section it also runs the GloBird
+   sync, next to the other background tasks. Nothing else needs doing.
 
-   ```sh
-   cargo run -- globird-probe
-   ```
+### What the sync does
 
-   On the deployed server (see [deploy.md](deploy.md)):
+About 30 seconds after `serve` starts, and then every day at `sync_time`
+(local time, in the `[isolarcloud]` time zone), it logs in, lists your
+services and syncs each electricity service that has a smart meter. Gas
+services and services with only a Basic meter are skipped.
 
-   ```sh
-   sudo -u solar-dash /opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml globird-probe --out /tmp/globird-probe.json
-   ```
+- **Backfill.** The first time, it walks back from today in 31-day windows
+  until the portal has nothing older (or three years), pausing a second
+  between calls (a few months of history takes about a minute). Progress is saved after each window, so a restart carries on, and
+  once it has finished it never runs again.
+- **Recent days.** Every run then fetches from a week before the newest
+  complete day up to today and saves the days over the stored ones, because
+  GloBird can revise a day after posting it.
 
-   `--out` sets the file (default `globird-probe.json`) and `--days` how many
-   days of usage and cost to ask for (default 31). It calls each endpoint once
-   with a short pause between calls, so it takes a minute or so. A failing
-   endpoint is recorded as an error in the file and the rest carry on.
+A day is *complete* once GloBird has posted any charge other than the daily
+supply charge (which it posts first). The data lags by a day or more, so if
+yesterday is still incomplete after a run, the sync tries again every 2 hours
+until 23:00 and then waits for the next `sync_time`. A network or portal
+error is logged as a warning and retried the same way. Each run logs in once
+(it keeps no session between runs) and logs one line, for example:
+
+```
+GloBird sync: 9 days written, newest complete day 2026-10-21, incomplete days: 2026-10-22
+```
+
+**Captcha.** If GloBird asks for a captcha, login fails and the sync logs an
+error. Log in once in a browser at the portal, and the sync works again at the
+next `sync_time`. It does not retry before then, so it cannot make GloBird
+more suspicious.
+
+### The tables
+
+Each day is saved as a whole: the day's old rows are deleted and the new ones
+inserted in one transaction, so a line GloBird revised or removed does not
+linger. Dates are local days (`YYYY-MM-DD`) and `fetched_at` is unix seconds.
+
+| Table | One row per | Holds |
+| --- | --- | --- |
+| `globird_cost` | day and charge category | `amount_cents` (GST included, negative is a credit), `quantity` (kWh), `meter_read_missing` |
+| `globird_usage` | day, meter register and charge period | `kwh`, `charge_type` such as "Peak Usage", `category_code`, `quality` |
+| `globird_interval` | day and meter register | `direction` (`import` for registers starting with E, `export` for B), `kwh_total` and `intervals`, a JSON array of the 288 five-minute kWh values |
+
+The charge categories are GloBird's own text ("USAGE", "SOLAR", "SUPPLY",
+"ZEROHERO Credit", ...) and are stored as they come. The tables have no
+service column, so they assume one electricity service. It is not yet checked
+how the 288 intervals line up with local clock time (compare them with our own
+inverter samples before relying on that). Nothing reads the tables yet: the
+web API and the dashboard come later.
+
+### Looking at what the portal returns
+
+`globird-probe` logs in, calls each endpoint once and saves what came back, so
+you can see the real response shapes:
+
+```sh
+cargo run -- globird-probe
+```
+
+On the deployed server (see [deploy.md](deploy.md)):
+
+```sh
+sudo -u solar-dash /opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml globird-probe --out /tmp/globird-probe.json
+```
+
+`--out` sets the file (default `globird-probe.json`) and `--days` how many
+days of usage and cost to ask for (default 31). It calls each endpoint once
+with a short pause between calls, so it takes a minute or so. A failing
+endpoint is recorded as an error in the file and the rest carry on.
 
 It prints the file's path and, per service, the number of usage and cost
 rows, the `chargeCategory` values seen, the length of the first `usageArray`
 (48 or 288 intervals?) and how many cost rows come back for windows one and
-two years ago (how far back history goes).
-
-If GloBird asks for a captcha, login fails with a message saying so. Log in
-once in a browser at the portal and try again later.
+two years ago (how far back history goes). If GloBird asks for a captcha,
+login fails with a message saying so; see the captcha note above.
 
 The file is written with mode 600 and names, addresses, account numbers, NMIs,
-meter serial numbers and tokens are replaced with `REDACTED`. The redaction
-goes by field name, so open the file and check it before sharing it.
+meter serial numbers, tokens and payment descriptions are replaced with
+`REDACTED`. The redaction goes by field name, so open the file and check it
+before sharing it.
 
 ## Backfill history
 

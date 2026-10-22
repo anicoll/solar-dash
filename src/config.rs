@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -21,8 +21,9 @@ pub struct Config {
     /// TeslaMate's MQTT broker, for the car's charge state. `None` (no
     /// `[teslamate]` section) means it is off.
     pub teslamate: Option<Teslamate>,
-    /// Login for the GloBird customer portal, used by `globird-probe`. `None`
-    /// (no `[globird]` section) means it is off.
+    /// Login for the GloBird customer portal, used by `globird-probe` and by
+    /// `serve`'s daily GloBird sync. `None` (no `[globird]` section) means it
+    /// is off.
     pub globird: Option<Globird>,
     /// Electricity prices, used to work out costs and savings. `None` (no
     /// `[tariff]` section) means cost features are off.
@@ -224,6 +225,9 @@ impl Teslamate {
 pub struct Globird {
     pub email: String,
     pub password: String,
+    /// Local time of day ("HH:MM") for the daily sync of GloBird's data.
+    #[serde(default = "default_globird_sync_time")]
+    pub sync_time: String,
 }
 
 impl Globird {
@@ -236,7 +240,16 @@ impl Globird {
             !self.password.is_empty(),
             "password in [globird] must not be empty"
         );
+        self.sync_time_of_day()?;
         Ok(())
+    }
+
+    /// `sync_time` as a time of day.
+    pub fn sync_time_of_day(&self) -> Result<NaiveTime> {
+        let minutes = parse_hhmm(&self.sync_time).context("sync_time in [globird]")?;
+        // `parse_hhmm` guarantees less than 24 hours, so this always succeeds.
+        NaiveTime::from_hms_opt(minutes / 60, minutes % 60, 0)
+            .context("sync_time in [globird] is not a valid time of day")
     }
 }
 
@@ -246,6 +259,7 @@ impl fmt::Debug for Globird {
         f.debug_struct("Globird")
             .field("email", &self.email)
             .field("password", &"<redacted>")
+            .field("sync_time", &self.sync_time)
             .finish()
     }
 }
@@ -485,6 +499,10 @@ fn default_points() -> Vec<i64> {
     ]
 }
 
+fn default_globird_sync_time() -> String {
+    "09:00".to_string()
+}
+
 fn default_timezone() -> String {
     "Australia/Adelaide".to_string()
 }
@@ -625,10 +643,34 @@ mod tests {
     }
 
     #[test]
+    fn globird_sync_time_defaults_and_is_checked() {
+        let parse = |extra: &str| -> Globird {
+            let text =
+                format!("{MINIMAL}\n[globird]\nemail = \"a@b.c\"\npassword = \"pw\"\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().globird.unwrap()
+        };
+        let default = parse("");
+        assert_eq!(default.sync_time, "09:00");
+        assert!(default.check().is_ok());
+        let evening = parse("sync_time = \"18:30\"");
+        assert!(evening.check().is_ok());
+        assert_eq!(
+            evening.sync_time_of_day().unwrap(),
+            NaiveTime::from_hms_opt(18, 30, 0).unwrap()
+        );
+        for bad in ["9:00", "25:00", "09:60", "noon", ""] {
+            let globird = parse(&format!("sync_time = \"{bad}\""));
+            let err = globird.check().unwrap_err();
+            assert!(format!("{err:#}").contains("sync_time"), "{bad}: {err:#}");
+        }
+    }
+
+    #[test]
     fn globird_password_is_not_in_debug_output() {
         let globird = Globird {
             email: "a@b.c".into(),
             password: "hunter2".into(),
+            sync_time: "09:00".into(),
         };
         let text = format!("{globird:?}");
         assert!(!text.contains("hunter2"));
