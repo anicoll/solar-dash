@@ -19,7 +19,7 @@ use super::api::{
     ApiError, ApiResult, DEFAULT_DAILY_DAYS, MAX_HOLD_SECS, Spread, date_range,
     day_bounds_or_error, live_totals, spread_steps, today,
 };
-use crate::cost::{self, DayCost, Interval, Tariff, TariffSchedule};
+use crate::cost::{self, DayCost, GridSplit, Interval, Tariff, TariffSchedule};
 use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
 use crate::globird::data::{self as globird_data, bucket_of, is_supply};
 use crate::modbus::Sample;
@@ -165,6 +165,61 @@ pub(super) fn day_intervals(
     }
     let intervals = cloud_intervals(day.start, day.import, day.export, day.load);
     Some(("cloud", intervals, true))
+}
+
+/// One day's grid energy split by tariff band, priced on the plan in effect
+/// that day, or `None` when the day has no interval data (or no tariff).
+///
+/// This uses [`day_intervals`], the same intervals `/api/costs` prices, so the
+/// parts add up to its `import_kwh` and `export_kwh`. `live` is the day's live
+/// samples as `/api/daily` already loaded them; the cloud counters are read
+/// here, and only when the live samples do not cover the day well (a solid
+/// live day never looks at them). The split can differ slightly from
+/// `/api/daily`'s own `import_kwh`: that reads the cloud's daily counter total
+/// (or the live integral), while the split sums the intervals built from the
+/// 5-minute counter steps, which can lose the first reading or cap long gaps.
+pub(super) async fn day_grid_split(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    date: NaiveDate,
+    live: &[Sample],
+    now: i64,
+) -> Result<Option<GridSplit>, ApiError> {
+    let (start, end) = day_bounds_or_error(date, state.tz)?;
+    let solid = live_totals(live, start, end, now).is_some_and(|l| l.solid);
+    let rows = if solid {
+        Vec::new()
+    } else {
+        db::readings_for_points(
+            &state.pool,
+            state.plant_id,
+            &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER],
+            start,
+            end,
+        )
+        .await?
+    };
+    let counter = |point_id: i64| -> Vec<(i64, f64)> {
+        rows.iter()
+            .filter(|row| row.0 == point_id)
+            .map(|row| (row.1, row.2))
+            .collect()
+    };
+    let (import, export, load) = (
+        counter(IMPORT_COUNTER),
+        counter(EXPORT_COUNTER),
+        counter(LOAD_COUNTER),
+    );
+    let day = DayData {
+        start,
+        end,
+        live,
+        import: &import,
+        export: &export,
+        load: &load,
+    };
+    Ok(day_intervals(&day, now)
+        .map(|(_, intervals, _)| cost::grid_split(schedule.for_date(date), state.tz, &intervals)))
 }
 
 /// The rows of a list sorted by time that fall in `[start, end)`.
