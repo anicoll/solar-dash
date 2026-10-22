@@ -113,7 +113,6 @@ input[type="number"] { width: 6.5em; }
 .seg .btn:last-child { border-radius: 0 8px 8px 0; }
 .seg .btn[aria-pressed="true"] { z-index: 1; }
 @media (min-width: 560px) { .seg { align-self: flex-start; } .seg .btn { flex: none; min-width: 88px; } }
-.picker-label { font-size: 13px; color: var(--muted); margin-right: 6px; }
 
 .banner {
   margin: 0 0 16px; padding: 10px 14px; border-radius: 8px;
@@ -283,7 +282,7 @@ input[type="number"] { width: 6.5em; }
 }
 .panel .card.flat .empty { background: var(--panel); }
 
-/* ---------- Savings, Payback, Cost ---------- */
+/* ---------- Money, Payback ---------- */
 .view-body { display: flex; flex-direction: column; gap: 16px; }
 @media (min-width: 760px) { .view-body { gap: 24px; } }
 .notice { color: var(--fg-soft); margin: 0; }
@@ -310,7 +309,6 @@ table.data td { padding: 8px; text-align: right; border-top: 1px solid var(--bor
 table.data th:first-child, table.data td:first-child { text-align: left; }
 table.data td:first-child { font-family: var(--font); }
 table.data td.save { color: var(--save); }
-table.data.compact { min-width: 0; }
 .kpi.positive .value { color: var(--save); }
 .page-title { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
 @media (min-width: 760px) { .page-title { font-size: 34px; } }
@@ -330,3 +328,26 @@ table.data.compact { min-width: 0; }
 .how { display: block; padding: 16px 20px; }
 .how summary { cursor: pointer; font-weight: 600; min-height: 24px; }
 .how p { margin: 12px 0 0; color: var(--fg-soft); }
+
+/* ---------- Money ---------- */
+.money-label { min-width: 9em; text-align: center; font-weight: 600; font-size: 16px; }
+.hero h2.hero-label { margin: 0; font-weight: 400; }
+.split { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--track); gap: 2px; }
+.split span { display: block; height: 100%; }
+.money-pair { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+@media (min-width: 760px) { .money-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; } }
+.money-pair .panel { justify-content: flex-start; }
+.money-pair .panel-note { margin: 0; }
+.lines { display: flex; flex-direction: column; }
+.lines .split { margin-bottom: 8px; }
+.line {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  padding: 10px 0; border-top: 1px solid var(--border);
+}
+.line:first-child { border-top: 0; }
+.line-name { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.line-detail { font-size: 13px; color: var(--muted); }
+.line .num { white-space: nowrap; }
+.line .num.save { color: var(--save); }
+.line.total { border-top: 2px solid var(--border-strong); font-weight: 600; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }

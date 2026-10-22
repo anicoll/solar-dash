@@ -1138,27 +1138,8 @@
     $(`${prefix}-body`).hidden = !ok;
   }
 
-  /** Groups costed days by month ("YYYY-MM"), or by day, oldest first. */
-  function bucketDays(days, byDay) {
-    const map = new Map();
-    for (const d of days) {
-      const key = byDay ? d.date : d.date.slice(0, 7);
-      let b = map.get(key);
-      if (!b) map.set(key, (b = { key, actual: 0, baseline: 0, savings: 0, credit: 0, creditDays: 0, days: 0 }));
-      b.actual += d.actual;
-      b.baseline += d.baseline;
-      b.savings += d.savings;
-      b.credit += d.credit;
-      if (d.credit > 0) b.creditDays++;
-      b.days++;
-    }
-    return [...map.values()];
-  }
-
-  /** Label for a bucket key: "Feb 2023" for months, "21 Oct" for days. */
-  function bucketLabel(key) {
-    return key.length === 7 ? monthYear(`${key}-01`) : `${+key.slice(8)} ${MONTHS[+key.slice(5, 7) - 1]}`;
-  }
+  /** "21 Oct" for a YYYY-MM-DD string. */
+  const dayLabel = (d) => `${+d.slice(8)} ${MONTHS[+d.slice(5, 7) - 1]}`;
 
   /** Tooltip HTML from `[marker, name, text]` rows; every API-derived string is escaped. */
   function moneyTooltip(rows, title) {
@@ -1174,143 +1155,6 @@
       for (const [text, cls] of cells) tr.appendChild(el('td', cls || '', text));
       return tr;
     }));
-  }
-
-  // ---------- Savings ----------
-
-  const RANGES = ['month', 'year', 'all'];
-
-  function inRange(days, range) {
-    const today = todayStr();
-    if (range === 'month') return days.filter((d) => d.date.startsWith(today.slice(0, 7)));
-    if (range === 'year') return days.filter((d) => d.date.startsWith(today.slice(0, 4)));
-    return days;
-  }
-
-  function savingsOption(buckets, byDay, purchases) {
-    const th = baseTheme();
-    let run = 0;
-    const cumulative = buckets.map((b) => +(run += b.savings).toFixed(2));
-    const unit = byDay ? 'day' : 'month';
-    const marks = purchases
-      .map((p) => ({ name: p.name, key: byDay ? p.date : p.date.slice(0, 7) }))
-      .filter((p) => buckets.some((b) => b.key === p.key))
-      .slice(1) // the first purchase is where the line starts
-      .map((p) => ({ name: p.name, xAxis: bucketLabel(p.key) }));
-    return {
-      animation: false,
-      textStyle: { fontFamily: css('--font') },
-      grid: { left: 8, right: 16, top: 64, bottom: 8, containLabel: true },
-      legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
-      tooltip: {
-        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
-        formatter: (params) => moneyTooltip(
-          params.map((p) => [p.marker, p.seriesName, money(p.value)]), params[0].axisValueLabel),
-      },
-      xAxis: {
-        type: 'category', data: buckets.map((b) => bucketLabel(b.key)),
-        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
-        axisLine: { lineStyle: { color: th.line } },
-      },
-      yAxis: {
-        type: 'value', name: 'Dollars ($)', nameTextStyle: { color: th.muted, align: 'left' },
-        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
-        splitLine: { lineStyle: { color: th.line } },
-      },
-      series: [
-        { name: `Saved per ${unit}`, type: 'bar', data: buckets.map((b) => +b.savings.toFixed(2)), itemStyle: { color: css('--save-bar') }, barMaxWidth: 28 },
-        {
-          name: 'Saved (cumulative)', type: 'line', data: cumulative, showSymbol: false, smooth: 0.3,
-          lineStyle: { width: 3, color: css('--save') }, itemStyle: { color: css('--save') }, z: 5,
-          markLine: marks.length ? {
-            silent: true, symbol: 'none', lineStyle: { color: css('--save-label'), type: 'dashed' },
-            label: { color: css('--save-label'), formatter: '{b}' }, data: marks,
-          } : undefined,
-        },
-      ],
-    };
-  }
-
-  const NOT_CONFIGURED_PETROL =
-    'Set petrol_cents_per_litre in the [teslamate] section of the config file to compare the car with petrol.';
-
-  /** "1,234 km", or a dash when there is no figure. */
-  const kmText = (km) => (km == null ? '–' : `${Math.round(km).toLocaleString('en-AU')} km`);
-
-  /** A cost per km in cents, or a dash. */
-  const centsText = (c) => (c == null ? '–' : `${c.toFixed(1)} c`);
-
-  /**
-   * The "Car vs petrol" panel: this month and the last 12 months from
-   * /api/ev/summary. It stays hidden when there is no car data at all (for
-   * example TeslaMate is off), and says what to set when petrol has no price.
-   */
-  async function loadEvCompare() {
-    const today = todayStr();
-    // The first day of the month 11 months ago, so the months shown are whole.
-    const from = new Date(Date.UTC(+today.slice(0, 4), +today.slice(5, 7) - 12, 1)).toISOString().slice(0, 10);
-    const data = await api(`/api/ev/summary?from=${from}&to=${today}`);
-    if (state.view !== 'savings') return;
-    const t = data.total;
-    const hasData = t.km > 0 || t.home_kwh > 0 || t.away_kwh > 0;
-    $('ev-compare').hidden = !hasData;
-    if (!hasData) return;
-    setConfigured('ev-compare', data.configured, NOT_CONFIGURED_PETROL);
-    if (!data.configured) return;
-    const month = data.months.find((m) => m.month === today.slice(0, 7));
-    const rows = [
-      ['Driven', (p) => kmText(p && p.km)],
-      ['Charging cost', (p) => money(p && p.charging_cost)],
-      ['Petrol would cost', (p) => money(p && p.petrol_cost)],
-      ['Saved', (p) => money(p && p.saved), 'save'],
-      ['EV cost per km', (p) => centsText(p && p.ev_cents_per_km)],
-      ['Petrol cost per km', (p) => centsText(p && p.petrol_cents_per_km)],
-    ];
-    fillTable('ev-compare-table', rows.map(([label, text, cls]) => [
-      [label], [text(month), cls], [text(t), cls],
-    ]));
-    let note = `Compared with a petrol car using ${data.petrol_litres_per_100km} L/100km at ${data.petrol_cents_per_litre} c/L.`;
-    if (t.away_kwh > 0 && t.away_cost == null) {
-      note += ` ${Math.round(t.away_kwh)} kWh charged away from home is not counted: set away_cents_per_kwh to include it.`;
-    }
-    $('ev-compare-note').textContent = note;
-  }
-
-  async function loadSavingsView(range) {
-    for (const b of document.querySelectorAll('[data-range]')) {
-      b.setAttribute('aria-pressed', String(b.dataset.range === range));
-    }
-    // The panel does not depend on the tariff or the range, and a failure
-    // here only hides it.
-    loadEvCompare().catch(() => { $('ev-compare').hidden = true; });
-    const data = await loadSavings();
-    if (state.view !== 'savings' || state.range !== range) return;
-    setConfigured('savings', data.configured, NOT_CONFIGURED_TARIFF);
-    if (!data.configured) return;
-    const days = inRange(data.days, range);
-    const sumOf = (key) => days.reduce((a, d) => a + d[key], 0);
-    const saved = range === 'all' ? data.saved : sumOf('savings');
-    const creditDays = days.filter((d) => d.credit > 0).length;
-    $('savings-cards').replaceChildren(
-      kpi('save', 'Saved', money(saved, 0), '', days.length ? `about ${money(saved / days.length)} a day` : ''),
-      kpi('', 'What you paid', money(sumOf('actual'), 0), '', 'supply charge, imports, minus credits'),
-      kpi('', 'Without solar or battery', money(sumOf('baseline'), 0), '', 'same usage at your tariff'),
-      kpi('', 'Evening credit earned', creditDays.toLocaleString('en-AU'), 'days', `of ${days.length.toLocaleString('en-AU')} · ${money(sumOf('credit'), 0)} in credits`),
-    );
-    const byDay = range === 'month';
-    const buckets = bucketDays(days, byDay);
-    showChart('savings-chart', buckets.length > 0, savingsOption(buckets, byDay, data.purchases || []),
-      buckets.length
-        ? `Running total of savings, rising to ${money(saved, 0)}, with savings per ${byDay ? 'day' : 'month'} as bars, in dollars.`
-        : 'Running total of savings: no data');
-    $('savings-table-title').textContent = byDay ? 'By day' : 'By month';
-    $('savings-table').tHead.rows[0].cells[0].textContent = byDay ? 'Day' : 'Month';
-    const nowKey = byDay ? todayStr() : todayStr().slice(0, 7);
-    fillTable('savings-table', buckets.slice().reverse().map((b) => [
-      [bucketLabel(b.key) + (b.key === nowKey && !byDay ? ' (so far)' : '')],
-      [money(b.actual)], [money(b.baseline)], [money(b.savings), 'save'],
-      [byDay ? (b.creditDays ? 'yes' : 'no') : `${b.creditDays} / ${b.days}`],
-    ]));
   }
 
   // ---------- Payback ----------
@@ -1475,12 +1319,126 @@
     ]));
   }
 
-  // ---------- Cost ----------
+  // ---------- Money ----------
 
+  const MONEY_MODES = ['month', 'year', 'all'];
   const NOT_CONFIGURED_COST = 'Add a [tariff] section to the config file to see what your power costs.';
+  const NOT_CONFIGURED_PETROL =
+    'Set petrol_cents_per_litre in the [teslamate] section of the config file to compare the car with petrol.';
 
-  /** Clustered bars of paid against without-solar cost. `labels`: x labels. */
-  function costOption(labels, actual, baseline, perUnit) {
+  /** "September 2026" for "2026-09". */
+  const longMonth = (ym) => new Date(Date.UTC(+ym.slice(0, 4), +ym.slice(5, 7) - 1, 1))
+    .toLocaleString('en-AU', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+
+  /** "1,234.5". */
+  const kwhText = (v) => (v == null ? '–' : v.toLocaleString('en-AU', { maximumFractionDigits: 1 }));
+
+  /** "1,234 km", or a dash when there is no figure. */
+  const kmText = (km) => (km == null ? '–' : `${Math.round(km).toLocaleString('en-AU')} km`);
+
+  /**
+   * What the Money tab shows for a mode ("month", "year" or "all") and a month
+   * ("2026-09") or year ("2025"): the date range, how /api/costs groups it, the
+   * label above the chart and the words used in sentences ("this month").
+   */
+  function moneyPeriod(mode, when) {
+    const today = todayStr();
+    if (mode === 'month') {
+      const last = new Date(Date.UTC(+when.slice(0, 4), +when.slice(5, 7), 0)).getUTCDate();
+      return {
+        from: `${when}-01`, to: `${when}-${pad(last)}`, group: 'day',
+        label: longMonth(when), words: when === today.slice(0, 7) ? 'this month' : longMonth(when),
+        chartTitle: 'Day by day', isNow: when >= today.slice(0, 7),
+      };
+    }
+    if (mode === 'year') {
+      return {
+        from: `${when}-01-01`, to: `${when}-12-31`, group: 'month',
+        label: when, words: when === today.slice(0, 4) ? 'this year' : when,
+        chartTitle: 'Month by month', isNow: when >= today.slice(0, 4),
+      };
+    }
+    // /api/costs takes at most 20 years of months or years.
+    return {
+      from: `${+today.slice(0, 4) - 19}-01-01`, to: today, group: 'year',
+      label: 'All time', words: 'all time', chartTitle: 'Year by year', isNow: true,
+    };
+  }
+
+  /** A row of a bill: name and detail on the left, an amount on the right. `cls` colours the amount. */
+  function moneyLine(name, detail, amount, cls, swatch) {
+    const row = el('div', 'line');
+    const left = el('div', 'line-name');
+    if (swatch) {
+      const s = el('span', 'swatch');
+      s.style.background = `var(${swatch})`;
+      left.appendChild(s);
+    }
+    const text = el('div');
+    text.append(el('div', '', name), el('div', 'line-detail', detail));
+    left.appendChild(text);
+    row.append(left, el('div', `num ${cls || ''}`.trim(), amount));
+    return row;
+  }
+
+  /** A thin bar cut into parts: `[share, colourVar]` pairs, widths in proportion to the shares. */
+  function splitBar(parts) {
+    const bar = el('div', 'split');
+    bar.setAttribute('aria-hidden', 'true');
+    const sum = parts.reduce((a, [v]) => a + v, 0);
+    for (const [v, colour] of parts) {
+      if (!(v > 0)) continue;
+      const s = el('span');
+      s.style.width = `${(v / sum) * 100}%`;
+      s.style.background = `var(${colour})`;
+      bar.appendChild(s);
+    }
+    return bar;
+  }
+
+  /** The big "Saved" panel at the top. `t` is /api/costs' `totals`. */
+  function renderMoneyHero(t, words) {
+    const pct = t.baseline > 0 ? Math.round((t.savings / t.baseline) * 100) : null;
+    $('money-saved').textContent = money(t.savings, 0);
+    $('money-pct').textContent = pct == null ? '' : `${pct}% of what ${words === 'all time' ? 'your power' : words} would have cost`;
+    $('money-paid').textContent = money(t.actual);
+    $('money-without').textContent = money(t.baseline);
+    // Paid is coral, the rest of the without-solar cost is the saving.
+    const paid = Math.max(0, Math.min(t.actual, t.baseline));
+    $('money-split').replaceChildren(...(t.baseline > 0 ? [splitBar([[paid, '--cost'], [t.baseline - paid, '--save']])] : []));
+  }
+
+  /** "Your bill": laid out like the power bill, so the total can be checked against it. */
+  function renderMoneyBill(t) {
+    const rows = [
+      moneyLine('Supply charge', `${t.days} ${t.days === 1 ? 'day' : 'days'} at ${money(t.supply / t.days, 3)} a day`, money(t.supply)),
+      moneyLine('Power from the grid', `${kwhText(t.import_kwh)} kWh`, money(t.import)),
+      moneyLine('Feed-in', `${kwhText(t.export_kwh)} kWh sent`, money(-t.feed_in), 'save'),
+    ];
+    // Plans without credits would only ever show an empty row.
+    if (t.credit_days > 0) {
+      rows.push(moneyLine('ZeroHero credits', `${t.credit_days} of ${t.days} days`, money(-t.credit), 'save'));
+    }
+    const total = moneyLine('Total', '', money(t.actual));
+    total.classList.add('total');
+    $('money-bill').replaceChildren(...rows, total);
+  }
+
+  /** "Where the saving came from": the three parts of `savings`, as a bar and rows. */
+  function renderMoneySources(t) {
+    const parts = [
+      ['Power you didn\'t have to buy', t.not_bought, '--save'],
+      ['ZeroHero credits', t.credit, '--c-grid'],
+      ['Feed-in', t.feed_in, '--c-pv'],
+    ];
+    const sum = parts.reduce((a, p) => a + Math.max(0, p[1]), 0);
+    const rows = parts.map(([name, v, colour]) =>
+      moneyLine(name, sum > 0 && v > 0 ? `${Math.round((v / sum) * 100)}% of the saving` : '', money(v), '', colour));
+    $('money-sources').replaceChildren(...(sum > 0 ? [splitBar(parts.map(([, v, c]) => [Math.max(0, v), c]))] : []), ...rows);
+  }
+
+  /** Stacked bars: what you paid at the bottom, the rest of the without-solar cost (the saving) on top. */
+  function moneyOption(rows) {
     const th = baseTheme();
     return {
       animation: false,
@@ -1489,75 +1447,96 @@
       legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 12, itemHeight: 10 },
       tooltip: {
         trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
-        formatter: (params) => moneyTooltip(
-          params.map((p) => [p.marker, p.seriesName, money(p.value)]), params[0].axisValueLabel),
+        formatter: (params) => {
+          const r = rows[params[0].dataIndex];
+          const lines = [
+            [params[0].marker, 'You paid', money(r.actual)],
+            ['', 'Without solar or battery', money(r.baseline)],
+            [params[1].marker, 'Saved', money(r.savings)],
+          ];
+          const note = r.actual < 0 ? '<div style="margin-top:4px;color:var(--muted)">Credits were more than the bill, so the paid bar shows $0.</div>' : '';
+          return moneyTooltip(lines, r.title) + note;
+        },
       },
       xAxis: {
-        type: 'category', data: labels,
+        type: 'category', data: rows.map((r) => r.label),
         axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
         axisLine: { lineStyle: { color: th.line } },
       },
       yAxis: {
-        type: 'value', name: `$ per ${perUnit}`, nameTextStyle: { color: th.muted, align: 'left' },
+        type: 'value', name: 'Dollars ($)', nameTextStyle: { color: th.muted, align: 'left' },
         axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
         splitLine: { lineStyle: { color: th.line } },
       },
       series: [
-        { name: 'Without solar or battery', type: 'bar', data: baseline, itemStyle: { color: css('--baseline') }, barMaxWidth: 26 },
-        { name: 'What you paid', type: 'bar', data: actual, itemStyle: { color: css('--save') }, barMaxWidth: 26 },
+        { name: 'You paid', type: 'bar', stack: 'cost', data: rows.map((r) => +Math.max(0, r.actual).toFixed(2)), itemStyle: { color: css('--cost') }, barMaxWidth: 28 },
+        { name: 'Saved', type: 'bar', stack: 'cost', data: rows.map((r) => +Math.max(0, r.savings).toFixed(2)), itemStyle: { color: css('--save-bar') }, barMaxWidth: 28 },
       ],
     };
   }
 
-  async function loadCostView() {
-    const data = await loadSavings();
-    if (state.view !== 'cost') return;
-    setConfigured('cost', data.configured, NOT_CONFIGURED_COST);
-    if (!data.configured) return;
+  /** Runs a request whose failure should only hide its panel (a login problem still stops everything). */
+  const quiet = (promise) => promise.catch((err) => {
+    if (err.message === 'Not logged in.') throw err;
+    return null;
+  });
+
+  /**
+   * The car panel and, for a month, the charging sessions. /api/ev/summary takes
+   * at most 400 days, so All time shows the last 12 months of the car.
+   */
+  async function loadMoneyCar(mode, when, p) {
     const today = todayStr();
-    const t = data.days.find((d) => d.date === today);
-    const avg = (rows, key) => (rows.length ? rows.reduce((a, d) => a + d[key], 0) / rows.length : null);
-    const last30 = data.days.filter((d) => d.date > addDays(today, -30));
-    const per = (v) => (v == null ? '–' : money(v));
-    $('cost-cards').replaceChildren(
-      kpi('', 'Today without solar or battery', per(t && t.baseline), '', 'same usage at your tariff'),
-      kpi('save', 'Today it actually cost', per(t && t.actual), '',
-        t ? `${t.import_kwh.toFixed(1)} kWh imported, ${t.export_kwh.toFixed(1)} kWh exported` : 'no data yet today'),
-      kpi('', 'Average a day without solar', per(avg(last30, 'baseline')), '', `last ${last30.length} days`),
-      kpi('save', 'Average a day paid', per(avg(last30, 'actual')), '', `last ${last30.length} days`),
-    );
-
-    const recent = data.days.filter((d) => d.date > addDays(today, -14));
-    showChart('cost-days-chart', recent.length > 0,
-      costOption(recent.map((d) => bucketLabel(d.date)), recent.map((d) => d.actual), recent.map((d) => d.baseline), 'day'),
-      'Daily cost for the last 14 days: what you paid, against what the same usage would have cost without solar or battery, in dollars.');
-
-    const monthStart = shiftMonth(today.slice(0, 7), -11);
-    const buckets = bucketDays(data.days.filter((d) => d.date.slice(0, 7) >= monthStart), false);
-    showChart('cost-months-chart', buckets.length > 0,
-      costOption(buckets.map((b) => bucketLabel(b.key)), buckets.map((b) => +b.actual.toFixed(2)),
-        buckets.map((b) => +b.baseline.toFixed(2)), 'month'),
-      'Monthly cost for the last 12 months: what you paid, against what the same usage would have cost without solar or battery, in dollars.');
-    fillTable('cost-table', buckets.slice().reverse().map((b) => [
-      [bucketLabel(b.key) + (b.key === today.slice(0, 7) ? ' (so far)' : '')],
-      [money(b.actual)], [money(b.baseline)], [money(b.actual / b.days)], [money(b.baseline / b.days)],
-    ]));
-    await loadCostSessions();
+    const from = mode === 'all' ? addDays(today, -364) : p.from;
+    const to = mode === 'all' ? today : p.to;
+    const [summary, sessionData, live] = await Promise.all([
+      quiet(api(`/api/ev/summary?from=${from}&to=${to}`)),
+      quiet(api(`/api/ev/sessions?from=${Math.floor(adelaideMs(from, 0) / 1000)}&to=${Math.floor(adelaideMs(to, 24) / 1000)}`)),
+      quiet(api('/api/live')),
+    ]);
+    if (state.view !== 'money' || state.mode !== mode || state.when !== when) return;
+    const sessions = (sessionData && sessionData.sessions) || [];
+    renderMoneyCar(summary, sessions, (live && live.car && live.car.display_name) || 'Car',
+      mode === 'all' ? 'in the last 12 months' : p.words);
+    renderMoneySessions(mode === 'month' ? sessions : []);
   }
 
-  /** Fills the "Charging sessions" table with the last 10 sessions of the last 60 days; the panel is hidden when there are none. */
-  async function loadCostSessions() {
-    const now = Math.floor(Date.now() / 1000);
-    let sessions = [];
-    try {
-      sessions = (await api(`/api/ev/sessions?from=${now - 60 * 86400}&to=${now}`)).sessions || [];
-    } catch (err) {
-      if (err.message === 'Not logged in.') throw err;
+  function renderMoneyCar(summary, sessions, name, words) {
+    const t = summary && summary.total;
+    const hasData = t && (t.km > 0 || t.home_kwh > 0 || t.away_kwh > 0);
+    $('money-car').hidden = !hasData;
+    if (!hasData) return;
+    $('money-car-title').textContent = `${name} ${words}`;
+    // Solar share of the home sessions that were costed, from the session list.
+    const costed = sessions.filter((c) => c.solar_kwh != null);
+    const total = costed.reduce((a, c) => a + c.solar_kwh + c.battery_kwh + c.grid_kwh, 0);
+    const solar = total > 0 ? `${Math.round((costed.reduce((a, c) => a + c.solar_kwh, 0) / total) * 100)}%` : '–';
+    const cards = [
+      kpi('', 'Charged at home', kwhText(t.home_kwh), 'kWh'),
+      kpi('', 'From solar', solar, '', 'of the home charging'),
+    ];
+    let note = '';
+    if (summary.configured) {
+      cards.splice(1, 0, kpi('', 'Cost to charge', money(t.charging_cost)));
+      cards.push(
+        kpi('', 'Same km in petrol', money(t.petrol_cost), '', kmText(t.km)),
+        kpi('save', 'Saved vs petrol', money(t.saved)),
+      );
+      note = `Compared with a petrol car using ${summary.petrol_litres_per_100km} L/100km at ${summary.petrol_cents_per_litre} c/L.`;
+      if (t.away_kwh > 0 && t.away_cost == null) {
+        note += ` ${Math.round(t.away_kwh)} kWh charged away from home is not counted: set away_cents_per_kwh to include it.`;
+      }
+    } else {
+      note = NOT_CONFIGURED_PETROL;
     }
-    if (state.view !== 'cost') return;
-    $('cost-sessions').hidden = sessions.length === 0;
-    const shown = sessions.slice(-10).reverse();
-    fillTable('cost-sessions-table', shown.map((c) => {
+    $('money-car-cards').replaceChildren(...cards);
+    $('money-car-note').textContent = note;
+  }
+
+  /** Fills the "Charging sessions" table with the month's last 10 sessions; the panel is hidden when there are none. */
+  function renderMoneySessions(sessions) {
+    $('money-sessions').hidden = sessions.length === 0;
+    fillTable('money-sessions-table', sessions.slice(-10).reverse().map((c) => {
       const used = c.energy_used_kwh == null ? c.energy_added_kwh : c.energy_used_kwh;
       const solar = solarPct(c);
       const [, month, day] = fmtDate.format(new Date(c.started_at * 1000)).split('-');
@@ -1568,13 +1547,61 @@
     }));
   }
 
+  async function loadMoneyView(mode, when) {
+    for (const b of document.querySelectorAll('[data-money]')) {
+      b.setAttribute('aria-pressed', String(b.dataset.money === mode));
+    }
+    const p = moneyPeriod(mode, when);
+    $('money-label').textContent = p.label;
+    $('money-nav').hidden = mode === 'all';
+    const unit = mode === 'month' ? 'month' : 'year';
+    $('money-prev').setAttribute('aria-label', `Previous ${unit}`);
+    $('money-next').setAttribute('aria-label', `Next ${unit}`);
+    $('money-next').disabled = p.isNow;
+    $('money-today').textContent = `This ${unit}`;
+    $('money-today').disabled = p.isNow;
+
+    const url = (group) => `/api/costs?from=${p.from}&to=${p.to}&group=${group}`;
+    const [data, months] = await Promise.all([api(url(p.group)), mode === 'all' ? api(url('month')) : null]);
+    if (state.view !== 'money' || state.mode !== mode || state.when !== when) return;
+    setConfigured('money', data.configured, NOT_CONFIGURED_COST);
+    if (!data.configured) return;
+    if (mode === 'all' && months.buckets.length) $('money-label').textContent = `Since ${longMonth(months.buckets[0].period)}`;
+
+    const t = data.totals;
+    const hasData = t.days > 0;
+    $('money-numbers').hidden = !hasData;
+    if (hasData) {
+      renderMoneyHero(t, p.words);
+      renderMoneyBill(t);
+      renderMoneySources(t);
+    }
+    // One row per bar: a day, a month or a year.
+    const rows = (data.days || data.buckets).map((r) => {
+      const key = r.date || r.period;
+      const title = mode === 'month' ? dayLabel(key) : mode === 'year' ? longMonth(key) : key;
+      const label = mode === 'month' ? String(+key.slice(8)) : mode === 'year' ? MONTHS[+key.slice(5) - 1] : key;
+      return { ...r, key, title, label };
+    });
+    $('money-chart-title').textContent = p.chartTitle;
+    showChart('money-chart', rows.length > 0, moneyOption(rows),
+      `${p.chartTitle}: stacked bars of what you paid and what you saved, in dollars. Select a bar to look closer.`);
+    onBarClick('money-chart', (i) => {
+      const key = rows[i].key;
+      if (mode === 'month') go({ view: 'day', day: key });
+      else go({ mode: mode === 'year' ? 'month' : 'year', when: key });
+    });
+    await loadMoneyCar(mode, when, p);
+  }
+
   // ---------- routing (hash) ----------
 
-  const VIEWS = ['now', 'day', 'month', 'year', 'savings', 'payback', 'cost'];
+  const VIEWS = ['now', 'day', 'month', 'year', 'money', 'payback'];
   // Day, Month and Year are the periods of the History tab.
   const PERIODS = ['day', 'month', 'year'];
   let period = 'day'; // the period History opens on: the last one shown
-  const state = { view: 'now', day: '', month: '', year: 0, range: 'all', smooth: true };
+  // Money's `mode` is month, year or all; `when` is its month (2026-09) or year (2025).
+  const state = { view: 'now', day: '', month: '', year: 0, mode: 'month', when: '', smooth: true };
   const SMOOTH_KEY = 'solar-dash.smooth';
   let timer = null;
   let pollToken = 0;
@@ -1596,20 +1623,28 @@
     try { raw = decodeURIComponent(raw); } catch (e) { raw = ''; } // malformed escapes: fall back to Now
     let [view, value] = raw.split('=');
     if (view === 'history') view = period;
+    // The old Savings and Cost tabs are now Money. #savings=all etc. keep their range.
+    const oldTab = view === 'savings' || view === 'cost';
+    if (oldTab) view = 'money';
     if (PERIODS.includes(view)) period = view;
     const today = todayStr();
     state.view = VIEWS.includes(view) ? view : 'now';
-    state.range = view === 'savings' && RANGES.includes(value) ? value : 'all';
     state.day = /^\d{4}-\d{2}-\d{2}$/.test(value || '') && view === 'day' ? value : today;
     state.month = /^\d{4}-\d{2}$/.test(value || '') && view === 'month' ? value : today.slice(0, 7);
     state.year = /^\d{4}$/.test(value || '') && view === 'year' ? +value : +today.slice(0, 4);
+    // Money: "money=month:2026-09", "money=year:2025" or "money=all"; "money" is this month.
+    const [mode, when = ''] = (view === 'money' ? value || '' : '').split(':');
+    state.mode = MONEY_MODES.includes(mode) ? mode : 'month';
+    const wanted = state.mode === 'month' ? /^\d{4}-\d{2}$/ : /^\d{4}$/;
+    state.when = state.mode === 'all' ? '' : wanted.test(when) ? when : today.slice(0, state.mode === 'month' ? 7 : 4);
+    if (oldTab) window.history.replaceState(null, '', '#' + viewHash('money'));
   }
 
   /** The hash for a view, carrying that view's current date or range. */
   function viewHash(v) {
     if (v === 'history') v = period;
     return v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}`
-      : v === 'year' ? `year=${state.year}` : v === 'savings' ? `savings=${state.range}` : v;
+      : v === 'year' ? `year=${state.year}` : v === 'money' ? `money=${state.mode}${state.when && ':' + state.when}` : v;
   }
 
   function setHash() {
@@ -1642,9 +1677,8 @@
     if (state.view === 'now') pollNow();
     else if (state.view === 'day') guarded(() => loadDay(state.day));
     else if (state.view === 'month') guarded(() => loadMonth(state.month));
-    else if (state.view === 'savings') guarded(() => loadSavingsView(state.range));
+    else if (state.view === 'money') guarded(() => loadMoneyView(state.mode, state.when));
     else if (state.view === 'payback') guarded(() => loadPaybackView());
-    else if (state.view === 'cost') guarded(() => loadCostView());
     else guarded(() => loadYear(state.year));
   }
 
@@ -1661,6 +1695,14 @@
     const today = todayStr();
     const len = { day: 10, month: 7, year: 4 }[from];
     go({ view: to, day: day.slice(0, len) === today.slice(0, len) ? today : day, month: day.slice(0, 7), year: +day.slice(0, 4) });
+  }
+
+  /** Switches Money between month, year and all time, keeping the year in view. */
+  function switchMoney(mode) {
+    const today = todayStr();
+    const year = state.mode === 'all' ? today.slice(0, 4) : state.when.slice(0, 4);
+    const month = year === today.slice(0, 4) ? today.slice(0, 7) : `${year}-01`;
+    go({ mode, when: mode === 'month' ? month : mode === 'year' ? year : '' });
   }
 
   function go(patch) { Object.assign(state, patch); setHash(); }
@@ -1698,7 +1740,10 @@
     $('year-today').onclick = () => go({ year: +todayStr().slice(0, 4) });
     $('year-input').onchange = (e) => { const y = +e.target.value; if (y >= 2000 && y <= 2100) go({ year: y }); };
 
-    for (const b of document.querySelectorAll('[data-range]')) b.onclick = () => go({ range: b.dataset.range });
+    for (const b of document.querySelectorAll('[data-money]')) b.onclick = () => switchMoney(b.dataset.money);
+    $('money-prev').onclick = () => go({ when: state.mode === 'month' ? shiftMonth(state.when, -1) : String(+state.when - 1) });
+    $('money-next').onclick = () => go({ when: state.mode === 'month' ? shiftMonth(state.when, 1) : String(+state.when + 1) });
+    $('money-today').onclick = () => go({ when: todayStr().slice(0, state.mode === 'month' ? 7 : 4) });
     window.addEventListener('hashchange', render);
     window.addEventListener('resize', () => { for (const c of Object.values(charts)) c.resize(); });
     document.addEventListener('visibilitychange', () => {
