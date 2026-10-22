@@ -825,6 +825,78 @@ pub async fn globird_day_is_complete(pool: &SqlitePool, date: NaiveDate) -> Resu
     Ok(found.is_some())
 }
 
+/// One stored GloBird cost line (`globird_cost`), as the compare API reads it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct GlobirdCostRow {
+    /// Local day, `YYYY-MM-DD`.
+    pub date: String,
+    /// GloBird's own text, e.g. "USAGE".
+    pub category: String,
+    /// Cents including GST; negative is a credit.
+    pub amount_cents: i64,
+    pub quantity: f64,
+}
+
+/// Every GloBird cost line for the local days `from` to `to` (`YYYY-MM-DD`,
+/// both included), oldest day first.
+pub async fn globird_cost_in_range(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+) -> Result<Vec<GlobirdCostRow>> {
+    sqlx::query_as(
+        "SELECT date, category, amount_cents, quantity FROM globird_cost
+         WHERE date >= ? AND date <= ? ORDER BY date, category",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read GloBird costs")
+}
+
+/// The kWh GloBird metered on one day in one direction (`import` or `export`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct GlobirdDayKwh {
+    pub date: String,
+    pub direction: String,
+    pub kwh: f64,
+}
+
+/// The metered kWh per day and direction for the local days `from` to `to`.
+/// The total of the 5-minute `globird_interval` readings is used when the day
+/// has it for that direction. Otherwise the kWh of the `globird_usage` charge
+/// periods are added up (a register starting with E is import, B is export).
+pub async fn globird_kwh_in_range(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+) -> Result<Vec<GlobirdDayKwh>> {
+    sqlx::query_as(
+        "SELECT date, direction, SUM(kwh_total) AS kwh FROM globird_interval
+         WHERE date >= ?1 AND date <= ?2 GROUP BY date, direction
+         UNION ALL
+         SELECT u.date,
+                CASE UPPER(SUBSTR(TRIM(u.suffix), 1, 1)) WHEN 'E' THEN 'import' ELSE 'export' END,
+                SUM(u.kwh)
+         FROM globird_usage u
+         WHERE u.date >= ?1 AND u.date <= ?2
+           AND UPPER(SUBSTR(TRIM(u.suffix), 1, 1)) IN ('E', 'B')
+           AND NOT EXISTS (
+             SELECT 1 FROM globird_interval i
+             WHERE i.date = u.date
+               AND i.direction = CASE UPPER(SUBSTR(TRIM(u.suffix), 1, 1))
+                                   WHEN 'E' THEN 'import' ELSE 'export' END)
+         GROUP BY u.date, 2
+         ORDER BY 1, 2",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read GloBird kWh")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,6 +1399,57 @@ mod tests {
             counts.push(n);
         }
         (counts[0], counts[1], counts[2])
+    }
+
+    #[tokio::test]
+    async fn globird_kwh_prefers_intervals_and_falls_back_to_usage() {
+        use crate::globird::data::{group_days, parse_cost_rows, parse_usage_rows};
+        let (_dir, pool) = test_db().await;
+        let data_of = |text: &str| -> serde_json::Value {
+            let mut reply: serde_json::Value = serde_json::from_str(text).unwrap();
+            reply["data"].take()
+        };
+        let cost =
+            parse_cost_rows(data_of(include_str!("globird/testdata/cost_detail.json"))).unwrap();
+        let usage = parse_usage_rows(data_of(include_str!(
+            "globird/testdata/smart_meter_read.json"
+        )))
+        .unwrap();
+        let days = group_days(&cost, &usage);
+        for day in &days {
+            save_globird_day(&pool, day, 1000).await.unwrap();
+        }
+        let kwh = globird_kwh_in_range(&pool, "2026-10-09", "2026-10-09")
+            .await
+            .unwrap();
+        let totals: Vec<(&str, f64)> = days[0]
+            .intervals
+            .iter()
+            .map(|s| (s.direction.as_str(), s.kwh_total))
+            .collect();
+        assert_eq!(kwh.len(), 2);
+        for row in &kwh {
+            let expected = totals.iter().find(|(d, _)| *d == row.direction).unwrap().1;
+            assert!((row.kwh - expected).abs() < 1e-9, "{row:?}");
+        }
+
+        // Without the interval rows the charge-period kWh are added up.
+        sqlx::query("DELETE FROM globird_interval WHERE date = '2026-10-09'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fallback = globird_kwh_in_range(&pool, "2026-10-09", "2026-10-09")
+            .await
+            .unwrap();
+        assert_eq!(fallback.len(), 2);
+        let import: f64 = days[0]
+            .usage
+            .iter()
+            .filter(|u| u.suffix.starts_with('E'))
+            .map(|u| u.kwh)
+            .sum();
+        let got = fallback.iter().find(|r| r.direction == "import").unwrap();
+        assert!((got.kwh - import).abs() < 1e-9);
     }
 
     #[tokio::test]
