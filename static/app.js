@@ -742,16 +742,6 @@
 
   // ---------- Day ----------
 
-  const DAY_SERIES = [
-    // key, label, colour var, sign, kind
-    ['pv_w', 'Solar', '--c-pv', 1, 'area'],
-    ['load_w', 'Home', '--c-load', 1, 'line'],
-    ['grid_import_w', 'Grid import', '--c-import', 1, 'line'],
-    ['grid_export_w', 'Grid export', '--c-export', -1, 'area'],
-    ['battery_charge_w', 'Battery charge', '--c-charge', 1, 'line'],
-    ['battery_discharge_w', 'Battery discharge', '--c-discharge', 1, 'line'],
-  ];
-
   const SMOOTH_SECS = 10 * 60; // minimum width of the rolling mean behind the Smooth toggle
   const dayDraws = {};        // chart id -> redraw of its last fetched data
 
@@ -896,10 +886,104 @@
     drawDayChart(chartId, noteId, date, day, merged, charging);
   }
 
+  /**
+   * Joins a pair of one-direction series (`plusKey` minus `minusKey`, W) into one
+   * signed series, `[t, W]` in unix seconds. A time with neither side is a gap (null).
+   */
+  function signedSeries(byKey, plusKey, minusKey) {
+    const plus = new Map(byKey[plusKey] || []);
+    const minus = new Map(byKey[minusKey] || []);
+    const times = [...new Set([...plus.keys(), ...minus.keys()])].sort((a, b) => a - b);
+    return times.map((t) => {
+      const a = plus.get(t);
+      const b = minus.get(t);
+      return [t, a == null && b == null ? null : (a || 0) - (b || 0)];
+    });
+  }
+
+  // The tariff windows and rates the Day chart shades and labels. No API exposes
+  // the configured [tariff], so these mirror config.example.toml (GloBird ZEROHERO):
+  // update them together. Hours are local wall-clock; the first matching window wins.
+  const TARIFF = {
+    shoulderCents: 44,
+    importWindows: [
+      { name: 'Free', from: 11, to: 14, cents: 0 },
+      { name: 'Peak', from: 16, to: 23, cents: 58.3 },
+    ],
+    exportDefaultCents: 0,
+    exportWindows: [
+      { name: 'Super Export', from: 18, to: 21, cents: 10 },
+      { name: 'Feed-in', from: 16, to: 23, cents: 2 },
+    ],
+  };
+  const cents = (c) => `${+c.toFixed(1)}c`;
+
+  /** The tariff rows for a day as `{ buy, sell }`: lists of `{ from, to, name, c, text }` in hours (0-24). */
+  function tariffSegments() {
+    const cuts = new Set([0, 24]);
+    for (const w of [...TARIFF.importWindows, ...TARIFF.exportWindows]) { cuts.add(w.from); cuts.add(w.to); }
+    const edges = [...cuts].sort((a, b) => a - b);
+    const row = (list, dflt, label) => {
+      const out = [];
+      for (let i = 0; i + 1 < edges.length; i++) {
+        const w = list.find((x) => edges[i] >= x.from && edges[i] < x.to);
+        const seg = w ? { name: w.name, c: w.cents } : { name: '', c: dflt };
+        const last = out[out.length - 1];
+        if (last && last.name === seg.name && last.c === seg.c) last.to = edges[i + 1];
+        else out.push({ from: edges[i], to: edges[i + 1], ...seg });
+      }
+      let first = true;
+      for (const s of out) { s.text = label(s, first); if (!s.name) first = false; }
+      return out;
+    };
+    return {
+      buy: row(TARIFF.importWindows, TARIFF.shoulderCents, (s, first) => (s.name
+        ? (s.c === 0 ? s.name : `${s.name} ${cents(s.c)}`) : first ? `Shoulder ${cents(s.c)}` : cents(s.c))),
+      sell: row(TARIFF.exportWindows, TARIFF.exportDefaultCents, (s) => (s.name === 'Super Export'
+        ? `${s.name} ${cents(s.c)}` : cents(s.c))),
+    };
+  }
+
+  /** What the tariff is at hour `h`, for the tooltip: "Peak 58.3c · Super Export 10c". */
+  function tariffAt(h) {
+    const imp = TARIFF.importWindows.find((w) => h >= w.from && h < w.to);
+    const exp = TARIFF.exportWindows.find((w) => h >= w.from && h < w.to);
+    const sell = exp ? `${exp.name === 'Feed-in' ? 'feed-in' : exp.name} ${cents(exp.cents)}` : `feed-in ${cents(TARIFF.exportDefaultCents)}`;
+    if (imp && imp.cents === 0) return { text: 'Free import', kind: 'free' };
+    if (imp) return { text: `${imp.name} ${cents(imp.cents)} · ${sell}`, kind: 'peak' };
+    return { text: `Shoulder ${cents(TARIFF.shoulderCents)} · ${sell}`, kind: 'shoulder' };
+  }
+
+  const STRIP_LEFT = 52;  // px between the chart's left edge and the plot: the kW labels, and "Buy"/"Sell" below
+  const STRIP_RIGHT = 44; // and on the right, for the SOC labels
+
+  /** Fills the two-row tariff strip under the chart, covering [start, max] ms of `date`. */
+  function drawTariffStrip(strip, date, start, max, gl, gr) {
+    strip.style.setProperty('--gl', `${gl}px`);
+    strip.style.setProperty('--gr', `${gr}px`);
+    const plotW = $('day-chart').clientWidth - gl - gr;
+    const { buy, sell } = tariffSegments();
+    const rows = [['Buy', buy], ['Sell', sell]].map(([name, segs]) => {
+      const cells = segs.map((s) => {
+        const a = Math.max(adelaideMs(date, s.from), start);
+        const b = Math.min(adelaideMs(date, s.to), max);
+        if (b <= a) return '';
+        const frac = (b - a) / (max - start);
+        const fits = frac * plotW >= s.text.length * 6.5 + 10;
+        const kind = s.name === 'Free' ? 'free' : s.name === 'Peak' ? 'peak' : s.name === 'Super Export' ? 'super' : s.name ? 'feed' : 'base';
+        return `<span class="ts-${kind}" style="width:${frac * 100}%" title="${esc(s.text)}">${fits ? esc(s.text) : ''}</span>`;
+      });
+      return `<div class="trow"><b>${name}</b><div class="ttrack">${cells.join('')}</div></div>`;
+    });
+    strip.innerHTML = rows.join('');
+  }
+
   /** Draws the power chart from fetched data, smoothed when the toggle is on. */
   function drawDayChart(chartId, noteId, date, day, { byKey, source }, charging) {
     const start = day.start * 1000;
-    const end = day.end * 1000;
+    const isToday = date === todayStr();
+    // Today stops at now (at least 15 minutes in, so the first minutes still draw).
+    const end = isToday ? Math.min(Math.max(Date.now(), start + 15 * 60000), day.end * 1000) : day.end * 1000;
     const hasData = Object.values(byKey).some((d) => d.length > 0);
     const note = $(noteId);
     note.textContent = source;
@@ -907,49 +991,71 @@
 
     const th = baseTheme();
     const narrow = window.innerWidth < 560;
-    const step = (narrow ? 6 : 3) * 3600 * 1000;
+    const gl = narrow ? 44 : STRIP_LEFT;
+    const gr = narrow ? 36 : STRIP_RIGHT;
+    const span = end - start;
+    const maxTicks = narrow ? 5 : 8;
+    const step = [5, 10, 15, 30, 60, 120, 180, 360, 720].map((m) => m * 60000).find((s) => span / s <= maxTicks) || 12 * 3600000;
 
     const smooth = state.smooth;
-    const series = DAY_SERIES.map(([key, label, colourVar, sign, kind]) => {
+    const kwData = (data, f) => (smooth ? smoothSeries(data, SMOOTH_SECS) : data)
+      .map(([t, v]) => [t * 1000, v == null ? null : f(v / 1000)]);
+    const defs = [
+      // name, colour var, data (kW), filled?
+      ['Solar', '--c-pv', kwData(byKey.pv_w || [], (v) => Math.max(v, 0)), true],
+      ['Home', '--c-load', kwData(byKey.load_w || [], (v) => v), false],
+      // Battery: + supplying, - charging. Grid: + buying, - selling.
+      ['Battery', '--c-battery', kwData(signedSeries(byKey, 'battery_discharge_w', 'battery_charge_w'), (v) => v), true],
+      ['Grid', '--c-grid', kwData(signedSeries(byKey, 'grid_import_w', 'grid_export_w'), (v) => v), true],
+    ];
+    const series = defs.map(([name, colourVar, data, area]) => {
       const colour = css(colourVar);
       const s = {
-        name: label, type: 'line', showSymbol: false, sync: true,
-        smooth: smooth ? 0.3 : false,
-        data: (smooth ? smoothSeries(byKey[key] || [], SMOOTH_SECS) : byKey[key] || []).map(([t, v]) => [t * 1000, v == null ? null : sign * v / 1000]),
+        name, type: 'line', showSymbol: false, sync: true,
+        smooth: smooth ? 0.3 : false, data,
         lineStyle: { width: 2, color: colour }, itemStyle: { color: colour },
         emphasis: { disabled: true }, z: 3,
       };
-      if (kind === 'area') s.areaStyle = { color: colour, opacity: 0.22 };
+      if (area) s.areaStyle = { color: colour, opacity: 0.22 };
       return s;
     });
-    // SOC on the right axis, with the free and peak windows shaded on the first series.
+    // SOC on the right axis. The tariff shading and the "now" line sit on the first series.
     series.push({
       name: 'Battery SOC', type: 'line', yAxisIndex: 1, showSymbol: false,
       data: (byKey.soc || []).map(([t, v]) => [t * 1000, v]),
       lineStyle: { width: 2, type: 'dashed', color: css('--c-soc') }, itemStyle: { color: css('--c-soc') },
       emphasis: { disabled: true }, z: 2,
     });
+    const shade = (w, colour) => [adelaideMs(date, w.from), Math.min(adelaideMs(date, w.to), end), colour];
+    const shading = [
+      ...TARIFF.importWindows.filter((w) => w.cents === 0).map((w) => shade(w, css('--free'))),
+      ...TARIFF.importWindows.filter((w) => w.cents > 0).map((w) => shade(w, css('--peak'))),
+      ...TARIFF.exportWindows.filter((w) => w.name === 'Super Export').map((w) => shade(w, css('--peak-strong'))),
+    ];
     series[0].markArea = {
       silent: true, z: 1,
-      label: { color: th.muted, fontSize: 12, position: 'insideTop' },
-      data: [
-        [{ name: 'Free 11–2', xAxis: adelaideMs(date, 11), itemStyle: { color: css('--free') } },
-          { xAxis: adelaideMs(date, 14) }],
-        [{ name: 'Peak', xAxis: adelaideMs(date, 18), itemStyle: { color: css('--peak') } },
-          { xAxis: adelaideMs(date, 21) }],
-      ],
+      data: shading.filter(([a, b]) => a < b)
+        .map(([a, b, colour]) => [{ xAxis: a, itemStyle: { color: colour } }, { xAxis: b }]),
     };
+    if (isToday) {
+      series[0].markLine = {
+        silent: true, symbol: 'none', animation: false,
+        lineStyle: { color: css('--warn'), width: 1, type: 'solid' },
+        label: { show: true, position: 'end', offset: [0, -12], formatter: `now ${clock(end)}`, color: css('--warn'), fontWeight: 600, fontSize: 11 },
+        data: [{ xAxis: end }],
+      };
+    }
 
     // Charging sessions are bands along the bottom of the plot, on a hidden
-    // 0-1 axis, so they stay clear of the Free and Peak shading. A session that
-    // is still running ends now.
+    // 0-1 axis, so they stay clear of the shading. A session that is still
+    // running ends now.
     const ev = css('--c-ev');
     const chargingName = `${charging.name} charging`;
     const nowMs = Date.now();
     const bands = charging.sessions.map((c) => ({
       from: Math.max(c.started_at * 1000, start),
       to: Math.min(c.ended_at == null ? nowMs : c.ended_at * 1000, end),
-    }));
+    })).filter((b) => b.from < b.to);
     if (bands.length) {
       series.push({
         name: chargingName, type: 'line', yAxisIndex: 2, data: [],
@@ -963,56 +1069,65 @@
       });
     }
 
+    const tipColour = { free: css('--save'), peak: css('--cost'), shoulder: css('--fg-soft') };
     const option = {
       animation: false,
-      grid: { left: 8, right: 8, top: narrow ? 108 : 56, bottom: 8, containLabel: true },
+      // Fixed margins (not containLabel) so the tariff strip lines up with the plot.
+      grid: { left: gl, right: gr, top: narrow ? 108 : 56, bottom: 28 },
       legend: { top: 0, left: 8, right: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
       textStyle: { fontFamily: css('--font') },
       tooltip: {
-        trigger: 'axis', axisPointer: { type: 'line' }, ...tooltipStyle(),
+        trigger: 'axis', axisPointer: { type: 'line' }, ...tooltipStyle(), confine: true,
         formatter(params) {
           params = params.filter((p) => p.value[1] != null);
           if (!params.length) return '';
+          const t = params[0].value[0];
+          const tf = tariffAt((t - adelaideMs(date, 0)) / 3600000);
           const rows = params.map((p) => {
             const v = p.value[1];
-            const isSoc = p.seriesName === 'Battery SOC';
-            const txt = isSoc ? `${v.toFixed(0)} %` : `${Math.abs(v).toFixed(2)} kW`;
+            let name = p.seriesName;
+            if (name === 'Battery') name = v < 0 ? 'Battery charging' : 'Battery supplying';
+            if (name === 'Grid') name = v < 0 ? 'Selling to grid' : 'Buying from grid';
+            const txt = p.seriesName === 'Battery SOC' ? `${v.toFixed(0)} %` : `${Math.abs(v).toFixed(2)} kW`;
             return `<div style="display:flex;justify-content:space-between;gap:16px">`
-              + `<span>${p.marker}${p.seriesName}</span><b>${txt}</b></div>`;
+              + `<span>${p.marker}${esc(name)}</span><b>${txt}</b></div>`;
           });
-          const t = params[0].value[0];
           if (bands.some((b) => t >= b.from && t <= b.to)) {
             rows.push(`<div><span style="display:inline-block;margin-right:4px;border-radius:10px;`
               + `width:10px;height:10px;background:${ev}"></span>${esc(chargingName)}</div>`);
           }
-          return `<div style="margin-bottom:4px">${clock(t)}</div>${rows.join('')}`;
+          return `<div>${clock(t)}</div>`
+            + `<div style="margin-bottom:4px;font-size:12px;color:${tipColour[tf.kind]}">${esc(tf.text)}</div>${rows.join('')}`;
         },
       },
       xAxis: {
         type: 'value', min: start, max: end, interval: step,
-        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => clock(v) },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => clock(v), showMaxLabel: !isToday },
         axisLine: { lineStyle: { color: th.line } }, splitLine: { show: false },
       },
       yAxis: [
         {
-          type: 'value', name: 'kW', nameTextStyle: { color: th.muted },
+          type: 'value', name: 'kW', nameTextStyle: { color: th.muted, align: 'right' },
           axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => v.toFixed(1) },
           splitLine: { lineStyle: { color: th.line } },
         },
         {
-          type: 'value', name: 'SOC %', min: 0, max: 100, nameTextStyle: { color: th.muted },
-          axisLabel: { color: th.muted, fontFamily: css('--mono') }, splitLine: { show: false },
+          type: 'value', min: 0, max: 100,
+          axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `${v}%` }, splitLine: { show: false },
         },
         // Holds the charging bands only.
         { type: 'value', min: 0, max: 1, show: false },
       ],
       series,
     };
-    const peak = Math.max(0, ...(byKey.pv_w || []).map((d) => d[1]));
+    const peakKw = Math.max(0, ...(byKey.pv_w || []).map((d) => d[1]));
     showChart(chartId, hasData, option,
       hasData
-        ? `Power chart for ${date}: peak solar ${kw(peak)} kW; PV, load, grid import and export, battery charge and discharge in kW, battery state of charge in percent.`
+        ? `Power chart for ${date}: peak solar ${kw(peakKw)} kW; solar, home, battery (supplying or charging) and grid (buying or selling) in kW, battery state of charge in percent.`
         : `Power chart for ${date}: no data`);
+    const strip = $('day-strip');
+    strip.hidden = !hasData;
+    if (hasData) drawTariffStrip(strip, date, start, end, gl, gr);
   }
 
   // ---------- History: periods, date pill, cards ----------
@@ -2529,7 +2644,10 @@
     $('money-next').onclick = () => go({ when: state.mode === 'month' ? shiftMonth(state.when, 1) : String(+state.when + 1) });
     $('money-today').onclick = () => go({ when: todayStr().slice(0, state.mode === 'month' ? 7 : 4) });
     window.addEventListener('hashchange', render);
-    window.addEventListener('resize', () => { for (const c of Object.values(charts)) c.resize(); });
+    window.addEventListener('resize', () => {
+      for (const c of Object.values(charts)) c.resize();
+      for (const draw of Object.values(dayDraws)) draw(); // margins and strip text depend on width
+    });
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden && state.view === 'home') pollNow();
     });

@@ -145,9 +145,15 @@ the rest; a line under the saving says how many days are which. The old `#saving
   old it falls back to the iSolarCloud readings, refreshed every minute. A line
   at the top says which source it is and how old the reading is.
 - **History > Day**: a power chart for one day, today's until you pick another (pick a date or step with the arrows).
-  Solar, load, grid import, export (below the axis) and battery charge and
-  discharge are in kW, and battery % is on the right axis. 11:00-14:00 is
-  shaded as the "Free 11-2" window and 18:00-21:00 as "Peak". Energy totals
+  Solar is an area, home a line, and battery and grid are signed areas: battery
+  above zero is supplying and below is charging, grid above zero is buying and
+  below is selling. All are in kW, and battery % (dashed) is on the right axis.
+  11:00-14:00 is shaded as free, 16:00-23:00 as peak, and 18:00-21:00 (Super
+  Export) a little stronger. A two-row Buy/Sell strip under the chart shows the
+  tariff, and the hover tooltip names it for that moment. For today the chart
+  ends at the current time. The windows and rates are constants (`TARIFF` in
+  `static/app.js`), because no API exposes the `[tariff]`; keep them in step with
+  it. Energy totals
   for the day are underneath. The chart uses the inverter's 1-minute data when
   there is at least 30 minutes of it for that day, and iSolarCloud's 5-minute
   data otherwise. If Modbus started part way through the day, iSolarCloud fills
