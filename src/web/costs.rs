@@ -146,17 +146,22 @@ struct DayData<'a> {
 }
 
 /// The intervals of one day and where they came from, or `None` if there is
-/// no data. Live samples win when they cover the day, the same test as
-/// `/api/daily` uses; otherwise the cloud counters are used.
-fn day_intervals(day: &DayData, now: i64) -> Option<(&'static str, Vec<Interval>)> {
-    if live_totals(day.live, day.start, day.end, now).is_some() {
-        return Some(("inverter", live_intervals(day.live)));
+/// no data. Live samples win when they cover the day well, the same test as
+/// `/api/daily` uses; a day they cover only partly falls back to the cloud
+/// counters, unless the cloud has nothing for the day. The last flag is
+/// whether the live samples covered the day well.
+fn day_intervals(day: &DayData, now: i64) -> Option<(&'static str, Vec<Interval>, bool)> {
+    let cloud_has_data = !(day.import.is_empty() && day.export.is_empty() && day.load.is_empty());
+    if let Some(live) = live_totals(day.live, day.start, day.end, now)
+        && live.usable(cloud_has_data)
+    {
+        return Some(("inverter", live_intervals(day.live), live.solid));
     }
-    if day.import.is_empty() && day.export.is_empty() && day.load.is_empty() {
+    if !cloud_has_data {
         return None;
     }
     let intervals = cloud_intervals(day.start, day.import, day.export, day.load);
-    Some(("cloud", intervals))
+    Some(("cloud", intervals, true))
 }
 
 /// The rows of a list sorted by time that fall in `[start, end)`.
@@ -377,15 +382,22 @@ fn known_source(text: &str) -> Option<&'static str> {
     }
 }
 
+/// Bump this when the way a day is costed changes, so days stored by the old
+/// rules are worked out again. Version 2: finished days need 98% live coverage
+/// (not 90%) to use the inverter, and the zero-import credit waits for the
+/// window to finish. Old rows are replaced by date as days are recomputed.
+const COST_CACHE_VERSION: u32 = 2;
+
 /// What stored costs are tagged with. The time zone is in it too, because
 /// moving it moves where every local day starts.
 fn cache_key(tz: Tz, tariff: &Tariff) -> String {
-    format!("{tz}|{}", tariff.key())
+    format!("{COST_CACHE_VERSION}|{tz}|{}", tariff.key())
 }
 
 /// May this day's cost be stored for good? Only a finished day with all its
-/// data: it is before `today`, and either it used the inverter (which already
-/// needs good coverage) or the cloud counters were read in the day's last 10
+/// data: it is before `today`, and either it used the inverter with good
+/// coverage (`live_solid`; a partial live day is kept out so a cloud backfill
+/// can replace it later) or the cloud counters were read in the day's last 10
 /// minutes (23:50 local or later). `newest_counter_ts` is the latest cloud
 /// reading in the day. A day that fails this is worked out again next time, so
 /// a backfill that fills it in later is picked up.
@@ -393,6 +405,7 @@ fn is_cacheable(
     date: NaiveDate,
     today: NaiveDate,
     source: &str,
+    live_solid: bool,
     newest_counter_ts: Option<i64>,
     day_end: i64,
 ) -> bool {
@@ -400,7 +413,10 @@ fn is_cacheable(
         return false;
     }
     // Ten minutes before the end is 23:50 local, even on a daylight saving change.
-    source == "inverter" || newest_counter_ts.is_some_and(|ts| ts >= day_end - 10 * 60)
+    if source == "inverter" {
+        return live_solid;
+    }
+    newest_counter_ts.is_some_and(|ts| ts >= day_end - 10 * 60)
 }
 
 /// Splits sorted dates into runs of consecutive days, so each run is loaded
@@ -474,14 +490,14 @@ async fn compute_days(
                 export: slice_between(&export, |r| r.0, start, end),
                 load: slice_between(&load, |r| r.0, start, end),
             };
-            let Some((source, intervals)) = day_intervals(&day, now) else {
+            let Some((source, intervals, live_solid)) = day_intervals(&day, now) else {
                 continue;
             };
             let newest_counter_ts = [day.import, day.export, day.load]
                 .iter()
                 .filter_map(|c| c.last().map(|r| r.0))
                 .max();
-            let cacheable = is_cacheable(date, today, source, newest_counter_ts, end);
+            let cacheable = is_cacheable(date, today, source, live_solid, newest_counter_ts, end);
             let cost = cost::day_cost(tariff, state.tz, &intervals);
             days.push((CostedDay { date, source, cost }, cacheable));
         }
@@ -869,9 +885,46 @@ mod tests {
             load: &[(300, 10.0)],
             ..empty
         };
-        let (source, intervals) = day_intervals(&some, 100_000).unwrap();
+        let (source, intervals, _) = day_intervals(&some, 100_000).unwrap();
         assert_eq!(source, "cloud");
         assert_eq!(intervals.len(), 1);
+    }
+
+    /// A finished day of live samples every 60 s, from midnight to `last_ts`.
+    fn live_until(last_ts: i64) -> Vec<Sample> {
+        (0..=last_ts / 60)
+            .map(|i| Sample {
+                ts: i * 60,
+                pv_w: Some(1000.0),
+                load_w: Some(500.0),
+                grid_w: Some(0.0),
+                battery_w: Some(0.0),
+                soc_pct: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_partly_covered_day_prefers_the_cloud_but_never_goes_blank() {
+        let cloud = [(300, 10.0), (600, 20.0)];
+        let day = |live: &'_ [Sample], cloud: &'_ [(i64, f64)]| {
+            let day = DayData {
+                start: 0,
+                end: 86_400,
+                live,
+                import: cloud,
+                export: &[],
+                load: &[],
+            };
+            day_intervals(&day, 1_000_000).map(|(source, _, solid)| (source, solid))
+        };
+        let (at_95, at_99) = (live_until(82_080), live_until(85_500));
+        // 95% live with cloud present: the cloud wins.
+        assert_eq!(day(&at_95, &cloud), Some(("cloud", true)));
+        // 95% live and no cloud: the live numbers stand, but are not cacheable.
+        assert_eq!(day(&at_95, &[]), Some(("inverter", false)));
+        // 99% live wins over the cloud.
+        assert_eq!(day(&at_99, &cloud), Some(("inverter", true)));
     }
 
     #[test]
@@ -894,6 +947,7 @@ mod tests {
             yesterday,
             today,
             "cloud",
+            true,
             Some(end - 600),
             end
         ));
@@ -901,18 +955,31 @@ mod tests {
             yesterday,
             today,
             "cloud",
+            true,
             Some(end - 601),
             end
         ));
-        assert!(!is_cacheable(yesterday, today, "cloud", None, end));
+        assert!(!is_cacheable(yesterday, today, "cloud", true, None, end));
         // Inverter days already passed the coverage test.
-        assert!(is_cacheable(yesterday, today, "inverter", None, end));
+        assert!(is_cacheable(yesterday, today, "inverter", true, None, end));
+        // A partly covered live day is not kept, so a cloud backfill can replace it.
+        assert!(!is_cacheable(
+            yesterday, today, "inverter", false, None, end
+        ));
         // Today is never cached, nor is the future.
-        assert!(!is_cacheable(today, today, "inverter", Some(end), end));
+        assert!(!is_cacheable(
+            today,
+            today,
+            "inverter",
+            true,
+            Some(end),
+            end
+        ));
         assert!(!is_cacheable(
             date("2026-09-17"),
             today,
             "cloud",
+            true,
             Some(end),
             end
         ));
