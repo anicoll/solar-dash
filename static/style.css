@@ -373,3 +373,45 @@ table.data td.save { color: var(--save); }
   #bill-table .long { display: none; }
   #bill-table .short { display: inline; }
 }
+
+/* ---------- Battery and evening credit ---------- */
+.battery-missed { margin: 0; font-size: 15px; color: var(--cost); }
+.battery-missed.none { color: var(--save); }
+.battery-stats { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; }
+.battery-stats .kpi { border-radius: 0; border-width: 0 0 1px; background: none; padding: 10px 0; flex-direction: row; flex-wrap: wrap; justify-content: space-between; align-items: baseline; }
+.battery-stats .kpi:last-child { border-bottom: 0; }
+.battery-stats .kpi .label { font-size: 15px; color: var(--fg-soft); }
+.battery-stats .kpi .value { font-size: 18px; }
+.battery-stats .kpi .note { flex-basis: 100%; text-align: right; }
+@media (min-width: 560px) {
+  .battery-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .battery-stats .kpi { border-width: 1px; border-radius: 12px; background: var(--panel-2); flex-direction: column; flex-wrap: nowrap; align-items: stretch; padding: 14px 16px; }
+  .battery-stats .kpi:last-child { border-bottom-width: 1px; }
+  .battery-stats .kpi .label { font-size: 13px; color: var(--muted); }
+  .battery-stats .kpi .value { font-size: 26px; }
+  .battery-stats .kpi .note { text-align: left; }
+}
+.dot-strip { display: flex; flex-wrap: wrap; gap: 6px; }
+.dot-strip button { all: unset; box-sizing: border-box; cursor: pointer; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; }
+.dot-strip button:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.cdot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; flex: none; }
+.cdot.earned { background: var(--save); }
+.cdot.missed { background: var(--cost); }
+.cdot.unknown { box-shadow: inset 0 0 0 2px var(--baseline); }
+.dot-strip button.selected .cdot { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--fg-soft); }
+.dot-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+.dot-legend span { display: inline-flex; align-items: center; gap: 6px; }
+#battery-card .line-detail { min-height: 1.45em; margin: 6px 0 0; }
+#battery-table { min-width: 440px; }
+#battery-table th:nth-child(2), #battery-table td:nth-child(2) { text-align: left; font-family: var(--font); }
+#battery-table .short { display: none; }
+#battery-more { margin-top: 8px; }
+@media (max-width: 480px) {
+  #battery-table { min-width: 0; font-size: 13px; }
+  #battery-table th, #battery-table td { padding: 8px 4px; }
+  #battery-table td { font-size: 12px; }
+  #battery-table td:first-child, #battery-table td:nth-child(2) { font-size: 13px; }
+  #battery-table .long { display: none; }
+  #battery-table .short { display: inline; }
+}
+.battery-stats .kpi .unit { font-family: var(--font); }

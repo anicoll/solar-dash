@@ -264,6 +264,39 @@
           <div id="bill-notes" class="panel-note" hidden></div>
         </div>
       </section>
+      <section class="panel" id="battery-card" aria-labelledby="h-battery" hidden>
+        <h2 id="h-battery" class="panel-title">Battery and evening credit</h2>
+        <p id="battery-nodata" class="panel-note" hidden>No days with data yet.</p>
+        <div id="battery-body" class="view-body" hidden>
+          <div>
+            <p id="battery-headline" class="bill-headline"></p>
+            <p id="battery-missed" class="battery-missed"></p>
+          </div>
+          <div class="battery-stats" id="battery-stats"></div>
+          <div>
+            <h3 class="sub-title">Last <span id="battery-count">30</span> days</h3>
+            <div class="dot-strip" id="battery-strip" role="group" aria-label="Evening credit, one dot per day, oldest first"></div>
+            <p class="dot-legend">
+              <span><i class="cdot earned"></i>Earned</span>
+              <span><i class="cdot missed"></i>Missed</span>
+              <span><i class="cdot unknown"></i>Not known</span>
+            </p>
+            <p id="battery-dot-detail" class="line-detail" aria-live="polite"></p>
+          </div>
+          <div id="battery-missed-days">
+            <h3 class="sub-title">Missed days</h3>
+            <div class="table-wrap">
+              <table class="data" id="battery-table">
+                <caption class="sr-only">Days the evening credit was missed, and why</caption>
+                <thead><tr><th scope="col">Date</th><th scope="col">Why</th><th scope="col"><span class="long">Imported</span><span class="short">Import</span></th><th scope="col"><span class="long">Battery at 21:00</span><span class="short">At 21:00</span></th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <button type="button" class="btn" id="battery-more" aria-expanded="false" aria-controls="battery-table" hidden></button>
+          </div>
+          <p class="panel-note">Credits are from GloBird's bill where it has posted the day, otherwise our estimate. The reason is our best guess.</p>
+        </div>
+      </section>
       <details class="panel how">
         <summary>How this is calculated</summary>
         <p>Each day is priced twice on your tariff: what you actually paid, and what the same usage would have cost with no solar or battery. The difference is the saving. The supply charge is in both, so the saving is the power you did not buy, plus feed-in and any credits. Where GloBird has billed a whole day, its own figures are used instead (the day's bill, feed-in, credits and grid kWh), and the saving is that day's no-solar cost less the bill. The rest are our estimate. Days with no data are left out.</p>

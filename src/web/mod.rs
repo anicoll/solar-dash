@@ -3,6 +3,7 @@
 
 mod api;
 mod auth;
+mod battery;
 mod costs;
 mod globird;
 mod payback;
@@ -244,6 +245,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
+        .route("/api/battery", get(battery::battery))
         .route("/api/costs", get(costs::costs))
         .route("/api/globird/compare", get(globird::compare))
         .route("/api/payback", get(payback::payback))
@@ -1954,5 +1956,160 @@ mod tests {
         let json = payback_json(&cheap).await;
         assert_eq!(json["net"], 0.35);
         assert_eq!(json["projected_payback"], Value::Null);
+    }
+
+    /// The ZeroHero plan: free import 11:00-14:00, 10 c export and a $1
+    /// credit for (almost) no import 18:00-21:00.
+    fn zerohero_tariff() -> TariffSchedule {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+        }
+        let text = r#"
+            [tariff]
+            supply_cents_per_day = 100.0
+            default_import_cents = 40.0
+            import = [{ from = "11:00", to = "14:00", cents = 0.0 }]
+            default_export_cents = 0.0
+            export = [{ from = "18:00", to = "21:00", cents = 10.0 }]
+            [tariff.zero_import_credit]
+            from = "18:00"
+            to = "21:00"
+            max_kwh = 0.1
+            credit_cents = 100.0
+        "#;
+        let w: Wrapper = toml::from_str(text).unwrap();
+        TariffSchedule::from_config(&w.tariff, &[]).unwrap()
+    }
+
+    /// A live sample every minute for the local day `days_ago` days back. The
+    /// grid power in the 18:00-21:00 window is `window_grid_w` and the
+    /// battery sits at 60%, dropping to 30% in the evening.
+    async fn seed_battery_day(pool: &SqlitePool, days_ago: u64, window_grid_w: f64) {
+        let tz = chrono_tz::Australia::Adelaide;
+        let date = api::today(tz) - chrono::Days::new(days_ago);
+        let (start, end) = api::day_bounds_or_error(date, tz).unwrap();
+        for ts in (start..end).step_by(60) {
+            let hour = (ts - start) / 3600;
+            let in_window = (18..21).contains(&hour);
+            let sample = Sample {
+                grid_w: Some(if in_window { window_grid_w } else { 0.0 }),
+                load_w: Some(500.0),
+                soc_pct: Some(if hour >= 17 { 30.0 } else { 60.0 }),
+                ..live_sample(ts)
+            };
+            db::insert_live_sample(pool, &sample).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn battery_needs_a_session_and_a_credit_in_the_tariff() {
+        let (_dir, app, pool) = costs_app().await;
+        let response = send(&app, get_request("/api/battery", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The flat tariff has no zero-import credit.
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/battery", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["configured"], false);
+
+        // A bad `days` is refused once there is a credit to report on.
+        let app = costs_router(&pool, zerohero_tariff());
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/battery?days=lots", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn battery_reports_earned_and_missed_days_with_reasons() {
+        let (_dir, _app, pool) = costs_app().await;
+        // Yesterday: no import in the window, so the credit is earned.
+        seed_battery_day(&pool, 1, 0.0).await;
+        // Two days ago: 1 kW import in the window, so it is missed.
+        seed_battery_day(&pool, 2, 1000.0).await;
+        // Three days ago: the same, but the car was charging then.
+        seed_battery_day(&pool, 3, 1000.0).await;
+        let tz = chrono_tz::Australia::Adelaide;
+        let three_ago = api::today(tz) - chrono::Days::new(3);
+        let evening = api::day_bounds_or_error(three_ago, tz).unwrap().0 + 19 * 3600;
+        let id = db::start_charge_session(&pool, 1, evening, None, Some("Home"))
+            .await
+            .unwrap();
+        let done = db::ChargeProgress {
+            energy_added_kwh: None,
+            energy_used_kwh: None,
+            soc_pct: None,
+            max_power_kw: None,
+        };
+        db::end_charge_session(&pool, id, evening + 600, &done)
+            .await
+            .unwrap();
+
+        let app = costs_router(&pool, zerohero_tariff());
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/battery?days=4", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+
+        // Newest first: today (window not over or no data), then the three days.
+        let days = json["days"].as_array().unwrap();
+        assert_eq!(days.len(), 4);
+        let credits: Vec<&Value> = days.iter().map(|d| &d["credit"]).collect();
+        assert_eq!(credits[1..], ["earned", "missed", "missed"]);
+        assert_eq!(days[0]["credit"], "unknown");
+
+        let earned = &days[1];
+        assert_eq!(earned["credit_source"], "estimate");
+        assert_eq!(earned["window_import_kwh"], 0.0);
+        assert_eq!(earned["soc_at_11"], 60.0);
+        assert_eq!(earned["soc_at_16"], 60.0);
+        assert_eq!(earned["soc_at_21"], 30.0);
+        assert_eq!(earned["min_soc_in_window"], 30.0);
+        assert_eq!(earned["reason"], Value::Null);
+
+        let missed = &days[2];
+        // 3 hours at 1 kW, less the last minute (a sample covers the minute after it).
+        assert_eq!(missed["window_import_kwh"], 3.0);
+        assert_eq!(missed["reason"], "battery_low");
+        assert_eq!(days[3]["reason"], "car_charging");
+
+        let summary = &json["summary"];
+        assert_eq!(summary["days"], 4);
+        assert_eq!(summary["earned"], 1);
+        assert_eq!(summary["missed"], 2);
+        assert_eq!(summary["missed_dollars"], 2.0);
+        assert_eq!(summary["battery_floor_pct"], 30.0);
+        assert_eq!(summary["avg_soc_at_11"], 60.0);
+    }
+
+    #[tokio::test]
+    async fn battery_takes_the_credit_from_globirds_bill_when_it_has_the_day() {
+        let (_dir, _app, pool) = costs_app().await;
+        // Our data says two days ago missed the credit (1 kW import in the window)...
+        seed_battery_day(&pool, 2, 1000.0).await;
+        // ...but GloBird's bill for that day has the credit line.
+        let tz = chrono_tz::Australia::Adelaide;
+        let date = (api::today(tz) - chrono::Days::new(2)).to_string();
+        for (category, cents) in [("SUPPLY", 100), ("USAGE", 75), ("ZEROHERO Credit", -100)] {
+            sqlx::query("INSERT INTO globird_cost VALUES (?, ?, ?, 1.0, 0, 1000)")
+                .bind(&date)
+                .bind(category)
+                .bind(cents)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let app = costs_router(&pool, zerohero_tariff());
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/battery?days=3", Some(&cookie))).await;
+        let json = body_json(response).await;
+        let day = &json["days"][2];
+        assert_eq!(day["date"], date.as_str());
+        assert_eq!(day["credit"], "earned");
+        assert_eq!(day["credit_source"], "globird");
+        assert_eq!(day["reason"], Value::Null);
+        assert_eq!(json["summary"]["earned"], 1);
+        assert_eq!(json["summary"]["missed"], 0);
     }
 }

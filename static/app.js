@@ -1733,6 +1733,109 @@
     onBarClick('bill-chart', (i) => go({ view: 'day', day: data.days[i].date }));
   }
 
+  // ---------- Money: Battery and evening credit ----------
+
+  const BATTERY_DAYS = 30;
+  // The "Missed days" table shows this many days until "Show all" is pressed.
+  const BATTERY_ROWS_SHORT = 5;
+  const BATTERY_REASONS = {
+    car_charging: 'Car charging',
+    battery_low: 'Battery ran low',
+    high_load: 'High load',
+    small_import: 'Small import',
+    no_data: 'No data',
+  };
+  const batteryReason = (d) => BATTERY_REASONS[d.reason] || '–';
+  const percent = (v) => (v == null ? '–' : `${Math.round(v)}%`);
+
+  /** "Tue 21 Oct" for a YYYY-MM-DD date. */
+  function longDayLabel(d) {
+    const wd = new Date(`${d}T12:00:00Z`).toLocaleDateString('en-AU', { weekday: 'short', timeZone: 'UTC' });
+    return `${wd} ${dayLabel(d)}`;
+  }
+
+  /** What one day says, for a dot's tooltip and the line under the strip. */
+  function batteryDayText(d) {
+    const source = d.credit_source === 'globird' ? "from GloBird's bill" : 'our estimate';
+    const head = `${longDayLabel(d.date)}: ${d.credit === 'unknown' ? 'credit not known yet' : `credit ${d.credit} (${source})`}`;
+    if (d.credit !== 'missed') return head;
+    return `${head}. ${batteryReason(d)}, imported ${kwh(d.window_import_kwh)} kWh.`;
+  }
+
+  /** Three small averages: exported in the evening, battery at 11:00, bought before 11:00. */
+  function renderBatteryStats(s) {
+    const stat = (label, value, unit, note) => kpi('', label, value, unit, note);
+    $('battery-stats').replaceChildren(
+      stat('Exported 18:00 to 21:00', kwh(s.avg_window_export_kwh), 'kWh a day',
+        s.avg_window_export_cents == null ? '' : `worth ${money(s.avg_window_export_cents / 100)} a day`),
+      stat('Battery at 11:00', percent(s.avg_soc_at_11), 'average',
+        s.battery_floor_pct == null ? '' : `lowest seen ${percent(s.battery_floor_pct)}`),
+      stat('Bought before 11:00', money((s.avg_morning_import_cents || 0) / 100), 'a day',
+        s.avg_morning_import_kwh == null ? '' : `${kwh(s.avg_morning_import_kwh)} kWh a day`));
+  }
+
+  /** One dot per day, oldest first. Pressing one shows its details underneath. */
+  function renderBatteryStrip(days) {
+    const detail = $('battery-dot-detail');
+    detail.textContent = '';
+    const buttons = [...days].reverse().map((d) => {
+      const b = el('button');
+      b.type = 'button';
+      b.title = batteryDayText(d);
+      b.setAttribute('aria-label', batteryDayText(d));
+      b.append(el('i', `cdot ${d.credit}`));
+      b.onclick = () => {
+        for (const other of $('battery-strip').children) other.classList.toggle('selected', other === b);
+        detail.textContent = batteryDayText(d);
+      };
+      return b;
+    });
+    $('battery-strip').replaceChildren(...buttons);
+  }
+
+  let batteryExpanded = false;
+
+  /** The missed days, newest first: 5 until "Show all" is pressed. */
+  function renderBatteryMissed(days) {
+    const missed = days.filter((d) => d.credit === 'missed');
+    $('battery-missed-days').hidden = missed.length === 0;
+    const shown = batteryExpanded ? missed : missed.slice(0, BATTERY_ROWS_SHORT);
+    $('battery-table').tBodies[0].replaceChildren(...shown.map((d) => {
+      const tr = document.createElement('tr');
+      tr.append(el('td', '', dayLabel(d.date)), el('td', '', batteryReason(d)),
+        el('td', '', d.window_import_kwh == null ? '–' : `${d.window_import_kwh.toFixed(2)} kWh`),
+        el('td', '', percent(d.soc_at_21)));
+      return tr;
+    }));
+    const more = $('battery-more');
+    more.hidden = missed.length <= BATTERY_ROWS_SHORT;
+    more.textContent = batteryExpanded ? 'Show fewer' : `Show all ${missed.length}`;
+    more.setAttribute('aria-expanded', String(batteryExpanded));
+    more.onclick = () => { batteryExpanded = !batteryExpanded; renderBatteryMissed(days); };
+  }
+
+  /** The Battery and evening credit card: the last 30 days, whatever period Money shows. */
+  async function loadBatteryCard(mode, when) {
+    const data = await quiet(api(`/api/battery?days=${BATTERY_DAYS}`));
+    if (state.view !== 'money' || state.mode !== mode || state.when !== when) return;
+    $('battery-card').hidden = !data || !data.configured;
+    if ($('battery-card').hidden) return;
+    const s = data.summary;
+    const known = s.earned + s.missed;
+    $('battery-nodata').hidden = known > 0;
+    $('battery-body').hidden = known === 0;
+    if (known === 0) return;
+
+    $('battery-headline').textContent = `Credit earned ${s.earned} of ${known} days`;
+    const missed = $('battery-missed');
+    missed.className = s.missed ? 'battery-missed' : 'battery-missed none';
+    missed.textContent = s.missed ? `${money(s.missed_dollars, s.missed_dollars % 1 ? 2 : 0)} missed` : 'None missed';
+    $('battery-count').textContent = String(data.days.length);
+    renderBatteryStats(s);
+    renderBatteryStrip(data.days);
+    renderBatteryMissed(data.days);
+  }
+
   async function loadMoneyView(mode, when) {
     for (const b of document.querySelectorAll('[data-money]')) {
       b.setAttribute('aria-pressed', String(b.dataset.money === mode));
@@ -1779,6 +1882,7 @@
     });
     await loadMoneyCar(mode, when, p);
     await loadBillCheck(mode, when, p);
+    await loadBatteryCard(mode, when);
   }
 
   // ---------- routing (hash) ----------

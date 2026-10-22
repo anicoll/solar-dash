@@ -34,9 +34,9 @@ const MAX_GROUPED_COSTS_DAYS: u64 = 366 * 20;
 const LIVE_CHUNK_DAYS: usize = 31;
 
 /// The cloud counters (Wh, reset at local midnight) the cloud cost comes from.
-const IMPORT_COUNTER: i64 = 83102;
-const EXPORT_COUNTER: i64 = 83072;
-const LOAD_COUNTER: i64 = 83118;
+pub(super) const IMPORT_COUNTER: i64 = 83102;
+pub(super) const EXPORT_COUNTER: i64 = 83072;
+pub(super) const LOAD_COUNTER: i64 = 83118;
 
 /// W·s in one kWh.
 const WS_PER_KWH: f64 = 3.6e6;
@@ -136,13 +136,13 @@ fn cloud_intervals(
 }
 
 /// Everything stored for one local day `[start, end)`.
-struct DayData<'a> {
-    start: i64,
-    end: i64,
-    live: &'a [Sample],
-    import: &'a [(i64, f64)],
-    export: &'a [(i64, f64)],
-    load: &'a [(i64, f64)],
+pub(super) struct DayData<'a> {
+    pub start: i64,
+    pub end: i64,
+    pub live: &'a [Sample],
+    pub import: &'a [(i64, f64)],
+    pub export: &'a [(i64, f64)],
+    pub load: &'a [(i64, f64)],
 }
 
 /// The intervals of one day and where they came from, or `None` if there is
@@ -150,7 +150,10 @@ struct DayData<'a> {
 /// `/api/daily` uses; a day they cover only partly falls back to the cloud
 /// counters, unless the cloud has nothing for the day. The last flag is
 /// whether the live samples covered the day well.
-fn day_intervals(day: &DayData, now: i64) -> Option<(&'static str, Vec<Interval>, bool)> {
+pub(super) fn day_intervals(
+    day: &DayData,
+    now: i64,
+) -> Option<(&'static str, Vec<Interval>, bool)> {
     let cloud_has_data = !(day.import.is_empty() && day.export.is_empty() && day.load.is_empty());
     if let Some(live) = live_totals(day.live, day.start, day.end, now)
         && live.usable(cloud_has_data)
@@ -165,7 +168,12 @@ fn day_intervals(day: &DayData, now: i64) -> Option<(&'static str, Vec<Interval>
 }
 
 /// The rows of a list sorted by time that fall in `[start, end)`.
-fn slice_between<T>(rows: &[T], ts_of: impl Fn(&T) -> i64, start: i64, end: i64) -> &[T] {
+pub(super) fn slice_between<T>(
+    rows: &[T],
+    ts_of: impl Fn(&T) -> i64,
+    start: i64,
+    end: i64,
+) -> &[T] {
     let first = rows.partition_point(|row| ts_of(row) < start);
     let last = rows.partition_point(|row| ts_of(row) < end);
     &rows[first..last]
