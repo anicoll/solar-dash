@@ -148,21 +148,38 @@ the rest; a line under the saving says how many days are which. The old `#saving
   Solar is an area, home a line, and battery and grid are signed areas: battery
   above zero is supplying and below is charging, grid above zero is buying and
   below is selling. All are in kW, and battery % (dashed) is on the right axis.
-  11:00-14:00 is shaded as free, 16:00-23:00 as peak, and 18:00-21:00 (Super
-  Export) a little stronger. A two-row Buy/Sell strip under the chart shows the
-  tariff, and the hover tooltip names it for that moment. For today the chart
-  ends at the current time. The windows and rates are constants (`TARIFF` in
-  `static/app.js`), because no API exposes the `[tariff]`; keep them in step with
-  it. Energy totals
+  Free import windows are shaded green, peak ones red, and the best export
+  window (Super Export) a little stronger. A two-row Buy/Sell strip under the
+  chart shows the tariff, and the hover tooltip names it for that moment. For
+  today the chart ends at the current time. The windows and rates come from
+  `GET /api/tariff` for the day shown, so they follow the `[tariff]` (and any
+  `[[previous_tariff]]`); without a `[tariff]` the shading and strip are left
+  out. Energy totals
   for the day are underneath. The chart uses the inverter's 1-minute data when
   there is at least 30 minutes of it for that day, and iSolarCloud's 5-minute
   data otherwise. If Modbus started part way through the day, iSolarCloud fills
   the time before it. A note under the chart names the source. The totals
   always come from iSolarCloud. While it shows today it refreshes by itself, and a Smooth
   button averages the lines over a few minutes.
-- **History > Month**: daily bars of PV generation and grid import (up) and export
-  (down), with a line for load, plus the month's totals.
-- **History > Year**: the same, summed by month.
+- **History > Week, Month, Year, Lifetime, Custom**: grouped columns per bucket
+  (a day, month or year): Solar; Grid, with energy bought above zero stacked by
+  tariff band (free, shoulder, peak) and energy sold below it (Super Export, then
+  the lower rates); Battery, out above and in below; and Home. A bucket with no
+  tariff split (an older day without interval data) draws plain bought and sold in
+  the grid colours. The tooltip lists each part in kWh, and a click opens the
+  bucket. On a phone a chart with many buckets scrolls sideways. The Grid card
+  has a thin free/shoulder/peak bar and a line such as "72% bought free, 21%
+  shoulder, 7% peak" (hidden without a split).
+- **History > Chart / By tariff** (all periods): By tariff is a table of the
+  period's grid energy by band: time of day, rate, kWh bought, kWh sold and cost
+  (kWh times the band's rate, less what the same band earned from export), then
+  the supply charge, the zero-import credit when one was earned, and a total.
+  Times and rates come from `/api/tariff`. Each day is costed at its own plan
+  when the period spans a `[[previous_tariff]]` change (the times and rates shown
+  are the current plan's, and a note says so). The total normally equals the
+  Cost card (`/api/costs` `actual`); it differs on days GloBird has billed (the
+  card uses its bill) and where a band has more than one rate (costed at the
+  average), and a note under the table says by how much.
 
 The charts use [ECharts](https://echarts.apache.org) 5.6.0 (Apache-2.0),
 loaded from cdnjs by a single pinned `<script>` tag in `static/index.html`. The

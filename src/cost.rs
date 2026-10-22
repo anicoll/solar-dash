@@ -867,6 +867,49 @@ mod tests {
         assert!(close(split.import_free_kwh, 2.0));
     }
 
+    /// The one price of a band: the windows in it, else the default if it falls in the band.
+    fn band_price(windows: &[(u32, u32, f64)], default: f64, in_band: impl Fn(f64) -> bool) -> f64 {
+        windows
+            .iter()
+            .map(|w| w.2)
+            .find(|&c| in_band(c))
+            .unwrap_or(default)
+    }
+
+    #[test]
+    fn the_by_tariff_table_arithmetic_reproduces_the_day_cost() {
+        // What the History "By tariff" table does: band kWh times the band's rate,
+        // plus supply, less credit, equals `actual_cents` while each band has one price.
+        let tariff = globird();
+        let intervals = [
+            iv((9, 0), (11, 30), 1.5, 0.2, 2.0),
+            iv((12, 0), (13, 0), 2.0, 0.0, 2.0),
+            iv((17, 0), (18, 30), 0.7, 0.9, 1.0),
+            iv((19, 0), (20, 0), 0.0, 3.0, 0.5),
+            iv((21, 30), (22, 0), 0.4, 0.1, 0.4),
+        ];
+        let cost = day_cost(&tariff, ADELAIDE, &intervals);
+        let split = grid_split(&tariff, ADELAIDE, &intervals);
+        let imp = tariff.import_windows();
+        let exp = tariff.export_windows();
+        let (di, de) = (tariff.default_import_cents(), tariff.default_export_cents());
+        let buy = |band| band_price(&imp, di, |c| tariff.import_band_for(c) == band);
+        let sell = |band| band_price(&exp, de, |c| tariff.export_band_for(c) == band);
+        let cents = split.import_free_kwh * buy(ImportBand::Free)
+            + split.import_shoulder_kwh * di
+            + split.import_peak_kwh * buy(ImportBand::Peak)
+            - split.export_super_kwh * sell(ExportBand::Super)
+            - split.export_peak_kwh * sell(ExportBand::Peak)
+            - split.export_other_kwh * de
+            + tariff.supply_cents_per_day()
+            - cost.zero_import_credit_cents;
+        assert!(
+            close(cents, cost.actual_cents),
+            "{cents} vs {}",
+            cost.actual_cents
+        );
+    }
+
     #[test]
     fn a_plan_without_windows_has_only_shoulder_and_other() {
         let flat = tariff(

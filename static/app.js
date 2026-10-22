@@ -734,7 +734,7 @@
     renderCarTile(car, car ? await fetchCarSession(car) : null);
     // While History shows today's Day chart, refresh it (and its totals) on the slower
     // cadence: the chart needs heavier requests than the tiles.
-    if (curveDate() === today && Date.now() - lastDayChartAt >= REFRESH_MS - 1000) {
+    if (state.hview === 'chart' && curveDate() === today && Date.now() - lastDayChartAt >= REFRESH_MS - 1000) {
       await loadDay(today);
     }
     return delay;
@@ -1181,8 +1181,6 @@
   /** /api/daily's grid energy by tariff band (null without a tariff or interval data). */
   const BOUGHT_KEYS = ['import_free_kwh', 'import_shoulder_kwh', 'import_peak_kwh'];
   const SOLD_KEYS = ['export_super_kwh', 'export_peak_kwh', 'export_other_kwh'];
-  /** The tariff the bars label rates with: the plan in force on the period's last day. */
-  let histTariff = null;
   const ENERGY_KEYS = [...CORE_KEYS, 'battery_charge_kwh', 'battery_discharge_kwh', ...BOUGHT_KEYS, ...SOLD_KEYS];
 
   const utcMs = (d) => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10));
@@ -1295,8 +1293,15 @@
     $('dp-next').disabled = atCurrent();
     $('dp-label').disabled = life;
     const curve = curveDate() != null;
-    $('view-day').hidden = !curve;
-    $('view-bars').hidden = curve;
+    const table = state.hview === 'table';
+    $('view-day').hidden = !curve || table;
+    $('view-bars').hidden = curve || table;
+    $('view-table').hidden = !table;
+    for (const b of document.querySelectorAll('.vtab')) {
+      const on = b.dataset.hview === state.hview;
+      b.setAttribute('aria-selected', String(on));
+      b.tabIndex = on ? 0 : -1;
+    }
     $('hist-panel').setAttribute('aria-labelledby', `ptab-${state.period}`);
   }
 
@@ -1588,6 +1593,215 @@
     updateHistoryNav(); // Lifetime's label needs the first month
   }
 
+  // ---------- History: By tariff table ----------
+
+  /** The tariff the bars and the table label rates with: the plan in force on the period's last day. */
+  let histTariff = null;
+
+  const sigOf = (t) => (t ? JSON.stringify({ ...t, date: undefined }) : 'none');
+
+  /**
+   * Splits `from`..`to` into runs of days on one plan, finding the changes by
+   * bisecting (a few /api/tariff calls, all cached). Each run is `{ from, to, t }`;
+   * `t` is null when no tariff is configured.
+   */
+  async function rateSegments(from, to) {
+    const walk = async (a, b, ta, tb, depth) => {
+      if (sigOf(ta) === sigOf(tb)) return [{ from: a, to: b, t: ta }];
+      if (a === b || depth > 12) return [{ from: a, to: b, t: tb }];
+      const m = addDays(a, Math.floor(daysBetween(a, b) / 2));
+      const [tm, tm1] = await Promise.all([tariffOrNull(m), tariffOrNull(addDays(m, 1))]);
+      const [left, right] = await Promise.all([walk(a, m, ta, tm, depth + 1), walk(addDays(m, 1), b, tm1, tb, depth + 1)]);
+      return [...left, ...right];
+    };
+    const [ta, tb] = await Promise.all([tariffOrNull(from), tariffOrNull(to)]);
+    const runs = await walk(from, to, ta, tb, 0);
+    const out = [];
+    for (const r of runs) {
+      const last = out[out.length - 1];
+      if (last && sigOf(last.t) === sigOf(r.t)) last.to = r.to;
+      else out.push({ ...r });
+    }
+    return out;
+  }
+
+  /** "11am", "2:30pm": the hour as `{ t, suf }` so a range can share its am/pm. */
+  function clock12(h) {
+    const m = Math.round(h * 60) % 1440;
+    const hh = Math.floor(m / 60);
+    const mm = m % 60;
+    return { t: `${hh % 12 || 12}${mm ? ':' + pad(mm) : ''}`, suf: hh < 12 ? 'am' : 'pm' };
+  }
+
+  /** "11am–2pm and 4–6pm" for windows of an /api/tariff answer. */
+  function windowsText(list) {
+    return list.map((w) => {
+      const a = clock12(hours(w.from));
+      const b = clock12(hours(w.to));
+      return `${a.t}${a.suf === b.suf ? '' : a.suf}–${b.t}${b.suf}`;
+    }).join(' and ');
+  }
+
+  const mean = (list) => list.reduce((a, b) => a + b, 0) / list.length;
+
+  /**
+   * The table rows for one run of days on one plan `t`, from the /api/daily
+   * totals for those days. Money is in dollars; each row is costed as
+   * bought kWh x buy rate less sold kWh x sell rate.
+   */
+  function tariffRows(t, tot) {
+    const kwh = (k) => tot[k] || 0;
+    const rate = (side, band, fallback) => {
+      const list = bandRates(t, side, band);
+      return list.length ? mean(list) : fallback;
+    };
+    const buy = {
+      free: rate('import', 'free', 0),
+      shoulder: rate('import', 'shoulder', t.default_import_cents),
+      peak: rate('import', 'peak', t.default_import_cents),
+    };
+    const sell = {
+      super: rate('export', 'super', t.default_export_cents),
+      peak: rate('export', 'peak', t.default_export_cents),
+      other: t.default_export_cents,
+    };
+    return {
+      free: { bought: kwh('import_free_kwh'), sold: 0, cost: (kwh('import_free_kwh') * buy.free) / 100 },
+      shoulder: {
+        bought: kwh('import_shoulder_kwh'), sold: kwh('export_other_kwh'),
+        cost: (kwh('import_shoulder_kwh') * buy.shoulder - kwh('export_other_kwh') * sell.other) / 100,
+      },
+      peak: {
+        bought: kwh('import_peak_kwh'), sold: kwh('export_peak_kwh'),
+        cost: (kwh('import_peak_kwh') * buy.peak - kwh('export_peak_kwh') * sell.peak) / 100,
+      },
+      super: { bought: 0, sold: kwh('export_super_kwh'), cost: (-kwh('export_super_kwh') * sell.super) / 100 },
+      supply: { days: tot.days || 0, cost: ((tot.days || 0) * t.supply_cents_per_day) / 100 },
+    };
+  }
+
+  const tcell = (text, cls) => el('td', cls || '', text);
+  const tkwh = (v) => (v > 0.04 ? `${fmtKwh(v)} kWh` : '–');
+
+  /** Fills the By tariff table. `segs` are the runs on one plan, `parts` their /api/daily totals, `costs` the /api/costs totals. */
+  function drawTariffTable(segs, parts, costs) {
+    const cur = segs[segs.length - 1].t; // labels come from the latest plan
+    const sum = { free: { bought: 0, sold: 0, cost: 0 }, shoulder: { bought: 0, sold: 0, cost: 0 }, peak: { bought: 0, sold: 0, cost: 0 }, super: { bought: 0, sold: 0, cost: 0 } };
+    let supplyDays = 0;
+    let supplyCost = 0;
+    segs.forEach((sg, i) => {
+      const r = tariffRows(sg.t, parts[i]);
+      for (const k of Object.keys(sum)) for (const f of ['bought', 'sold', 'cost']) sum[k][f] += r[k][f];
+      supplyDays += r.supply.days;
+      supplyCost += r.supply.cost;
+    });
+    const windows = (list, band) => list.filter((w) => w.band === band);
+    const rates = (side, band) => ratesText(bandRates(cur, side, band));
+    const rows = [];
+    const add = (cls, name, detail, rate, v) => rows.push({ cls, name, detail, rate, ...v });
+    const freeW = windows(cur.import, 'free');
+    if (freeW.length || sum.free.bought > 0.04) {
+      add('free', 'Free', windowsText(freeW), `buy ${rates('import', 'free') || '0c'}`, sum.free);
+    }
+    add('shoulder', 'Shoulder', '', `buy ${rates('import', 'shoulder')}${sum.shoulder.sold > 0.04 ? ` · sell ${cents(cur.default_export_cents)}` : ''}`, sum.shoulder);
+    const peakW = windows(cur.import, 'peak');
+    if (peakW.length || sum.peak.bought > 0.04 || sum.peak.sold > 0.04) {
+      const sellPeak = rates('export', 'peak');
+      add('peak', 'Peak', windowsText(peakW), `buy ${rates('import', 'peak')}${sellPeak ? ` · sell ${sellPeak}` : ''}`, sum.peak);
+    }
+    const superW = windows(cur.export, 'super');
+    if (superW.length || sum.super.sold > 0.04) {
+      add('super', 'Super Export', windowsText(superW), `sell ${rates('export', 'super')}`, sum.super);
+    }
+    const credit = costs.totals.credit > 0 ? costs.totals.credit : 0;
+    const body = rows.map((r) => {
+      const tr = el('tr');
+      const name = el('td');
+      const nm = el('span', 'nm');
+      nm.append(el('span', `dot dot-${r.cls}`), r.name + (r.detail ? `, ${r.detail}` : ''));
+      name.append(nm);
+      tr.append(name, tcell(r.rate, 'rate'), tcell(tkwh(r.bought)), tcell(tkwh(r.sold)), tcell(money(r.cost)));
+      return tr;
+    });
+    const plain = (cls, name, rate, cost) => {
+      const tr = el('tr');
+      const n = el('td');
+      const nm = el('span', 'nm');
+      nm.append(el('span', `dot dot-${cls}`), name);
+      n.append(nm);
+      tr.append(n, tcell(rate, 'rate'), tcell(''), tcell(''), tcell(money(cost)));
+      return tr;
+    };
+    // One plan: days x its daily charge. After a plan change the charges differ, so show the average.
+    const perDay = segs.length > 1 && supplyDays > 0 ? `${money(supplyCost / supplyDays, 3)} avg` : money(cur.supply_cents_per_day / 100, 3);
+    body.push(plain('supply', 'Supply charge', `${supplyDays} ${supplyDays === 1 ? 'day' : 'days'} × ${perDay}`, supplyCost));
+    const cr = cur.zero_import_credit;
+    if (credit > 0) {
+      const n = costs.totals.credit_days;
+      body.push(plain('credit', 'Zero-import credit',
+        `${n} ${n === 1 ? 'day' : 'days'}${cr ? ` × ${money(cr.credit_cents / 100)}` : ''}`, -credit));
+    }
+    $('tt-body').replaceChildren(...body);
+
+    const bought = rows.reduce((a, r) => a + r.bought, 0);
+    const sold = rows.reduce((a, r) => a + r.sold, 0);
+    const total = rows.reduce((a, r) => a + r.cost, 0) + supplyCost - credit;
+    const foot = el('tr');
+    foot.append(tcell('Total'), tcell(''), tcell(tkwh(bought)), tcell(tkwh(sold)), tcell(money(total)));
+    $('tt-foot').replaceChildren(foot);
+
+    // Notes: what the numbers rest on, and how the total compares with the Cost card.
+    const notes = [];
+    if (segs.length > 1) {
+      notes.push(`The tariff changed during this period. Each day is costed at its own rates; the times and rates above are from the current plan (since ${dmy(segs[segs.length - 1].from)}).`);
+    }
+    const mixed = ['free', 'shoulder', 'peak'].filter((b) => bandRates(cur, 'import', b).length > 1)
+      .concat(['super', 'peak'].filter((b) => bandRates(cur, 'export', b).length > 1));
+    if (mixed.length) notes.push('Some bands have more than one rate; they are costed at the average rate.');
+    const unsplit = (key, parts2) => parts2.reduce((a, x) => a + (x[key] || 0), 0);
+    const totalIn = unsplit('import_kwh', parts);
+    const totalOut = unsplit('export_kwh', parts);
+    const lostIn = totalIn - BOUGHT_KEYS.reduce((a, k) => a + unsplit(k, parts), 0);
+    const lostOut = totalOut - SOLD_KEYS.reduce((a, k) => a + unsplit(k, parts), 0);
+    if (lostIn > Math.max(0.1, 0.03 * totalIn) || lostOut > Math.max(0.1, 0.03 * totalOut)) {
+      notes.push(`${fmtKwh(Math.max(0, lostIn))} kWh bought and ${fmtKwh(Math.max(0, lostOut))} kWh sold are not in the table: those days have no interval data to split by tariff.`);
+    }
+    const diff = Math.round((total - costs.totals.actual) * 100) / 100;
+    if (Math.abs(diff) < 0.015) {
+      notes.push(`The total matches the Cost card (${money(costs.totals.actual)}).`);
+    } else {
+      const billed = costs.totals.billed_days;
+      notes.push(`The Cost card shows ${money(costs.totals.actual)}, ${money(Math.abs(diff))} ${diff > 0 ? 'less' : 'more'} than this total`
+        + `${billed ? `: ${billed} ${billed === 1 ? 'day uses' : 'days use'} GloBird's own bill` : ' (rounding of the energy figures, or days costed from different meter data)'}.`);
+    }
+    $('tt-notes').replaceChildren(...notes.map((n) => el('li', '', n)));
+    $('tt-scroll').hidden = false;
+  }
+
+  /** Loads the By tariff view for the period on show, and the cards above it. */
+  async function loadTable(current) {
+    const today = todayStr();
+    const [from, to0] = rangeOf();
+    const to = to0 > today ? today : to0;
+    const msg = $('tt-msg');
+    const show = (text) => { msg.textContent = text; msg.hidden = !text; $('tt-scroll').hidden = !!text; $('tt-notes').replaceChildren(); };
+    if (from > to) { renderCards({}); show('No data for this period'); return; }
+    const segs = await rateSegments(from, to);
+    if (!current()) return;
+    const cur = segs[segs.length - 1].t;
+    if (!cur) { renderCards({}); show('Add a [tariff] section to the config file to see energy by tariff.'); return; }
+    const [costs, ...parts] = await Promise.all([
+      api(`/api/costs?from=${from}&to=${to}&group=month`),
+      ...segs.map((sg) => api(`/api/daily?from=${sg.from}&to=${sg.to}&group=month`)),
+    ]);
+    if (!current()) return;
+    const totals = parts.map((p) => p.totals);
+    renderCards(sumTotals(totals));
+    if (!costs.configured || !hasEnergy(totals)) { show('No data for this period'); return; }
+    show('');
+    drawTariffTable(segs, totals, costs);
+  }
+
   /** Loads whatever the History period needs: the cards and the curve or bars. */
   async function loadHistory() {
     updateHistoryNav();
@@ -1601,11 +1815,13 @@
     const [from, to] = rangeOf();
     const date = curveDate();
     const cost = loadCostCard(current);
-    if (!date) {
+    const table = state.hview === 'table';
+    if (!date || table) {
       histTariff = await tariffOrNull(to > todayStr() ? todayStr() : to);
       if (!current()) return;
     }
-    if (date) await loadDay(date);
+    if (table) await loadTable(current);
+    else if (date) await loadDay(date);
     else if (state.period === 'lifetime') await loadGroupedBars(from, to, true, current);
     else if (state.period === 'year') await loadYearBars(from, to, current);
     else if (state.period === 'custom' && daysBetween(from, to) + 1 > CUSTOM_DAILY_MAX) await loadGroupedBars(from, to, false, current);
@@ -1843,6 +2059,17 @@
         e.preventDefault();
         t.focus();
         switchPeriod(t.dataset.period);
+      };
+    }
+    const vtabs = [...document.querySelectorAll('.vtab')];
+    for (const b of vtabs) {
+      b.onclick = () => go({ hview: b.dataset.hview });
+      b.onkeydown = (e) => {
+        if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+        e.preventDefault();
+        const t = vtabs[(vtabs.indexOf(b) + 1) % vtabs.length];
+        t.focus();
+        go({ hview: t.dataset.hview });
       };
     }
     $('dp-prev').onclick = () => shiftPeriod(-1);
@@ -2628,7 +2855,7 @@
   const PERIODS = ['day', 'week', 'month', 'year', 'lifetime', 'custom'];
   let period = 'day'; // the period History opens on: the last one shown
   // Money's `mode` is month, year or all; `when` is its month (2026-09) or year (2025).
-  const state = { view: 'home', period: 'day', day: '', week: '', month: '', year: 0, from: '', to: '', mode: 'month', when: '', smooth: true };
+  const state = { view: 'home', period: 'day', day: '', week: '', month: '', year: 0, from: '', to: '', mode: 'month', when: '', smooth: true, hview: 'chart' };
   const SMOOTH_KEY = 'solar-dash.smooth';
   let timer = null;
   let pollToken = 0;

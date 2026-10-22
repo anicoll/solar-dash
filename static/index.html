@@ -114,6 +114,11 @@
         </div>
       </section>
 
+      <div class="vtabs" role="tablist" aria-label="Chart or table">
+        <button type="button" role="tab" class="vtab" id="vtab-chart" data-hview="chart" aria-selected="true">Chart</button>
+        <button type="button" role="tab" class="vtab" id="vtab-table" data-hview="table" aria-selected="false" tabindex="-1">By tariff</button>
+      </div>
+
       <div id="view-day" class="hpane" hidden>
         <div class="picker">
           <button type="button" class="btn smooth-toggle" aria-pressed="true">Smooth</button>
@@ -135,6 +140,20 @@
           </div>
         </div>
         <p id="bars-hint" class="panel-note"></p>
+      </div>
+
+      <div id="view-table" class="hpane" hidden>
+        <div class="card">
+          <p id="tt-msg" class="panel-note" hidden></p>
+          <div id="tt-scroll" class="tscroll" tabindex="0" role="region" aria-label="Energy by tariff">
+            <table class="data tariff-table">
+              <thead><tr><th scope="col">Time of day</th><th scope="col">Rate</th><th scope="col">Bought</th><th scope="col">Sold</th><th scope="col">Cost</th></tr></thead>
+              <tbody id="tt-body"></tbody>
+              <tfoot id="tt-foot"></tfoot>
+            </table>
+          </div>
+          <ul id="tt-notes" class="panel-note tnotes"></ul>
+        </div>
       </div>
     </div>
     </section>
