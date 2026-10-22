@@ -16,6 +16,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] `serve` polls Modbus when configured and stores live samples (`/api/live`, `/api/live/series`)
 - [x] `serve` follows the Tesla's charge state from TeslaMate over MQTT when configured (`/api/live`)
 - [x] GloBird portal probe (`globird-probe`) to learn the response shapes (unofficial API)
+- [x] `serve` keeps GloBird's daily cost and usage in SQLite when configured (no API or UI yet)
 - [x] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
 
 ## Architecture
@@ -38,7 +39,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
 - `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
 - `static/` - the dashboard (`index.html`, `app.js`, `style.css`), compiled into the binary
-- `src/globird/` - GloBird portal client (`client.rs`) and the `globird-probe` command (`probe.rs`)
+- `src/globird/` - GloBird portal client (`client.rs`), the `globird-probe` command (`probe.rs`), the daily sync (`sync.rs`) and the row types it saves (`data.rs`)
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`
 - `deploy/` - systemd units, backup timer, cloudflared example and `install.sh`

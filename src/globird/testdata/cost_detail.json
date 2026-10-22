@@ -1,0 +1,86 @@
+{
+ "data": [
+  {
+   "amount": 0.75,
+   "chargeCategory": "USAGE",
+   "chargeType": null,
+   "date": "2026/10/09",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 20.5
+  },
+  {
+   "amount": -0.32,
+   "chargeCategory": "SOLAR",
+   "chargeType": null,
+   "date": "2026/10/09",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 19.08
+  },
+  {
+   "amount": -1.18,
+   "chargeCategory": "Super Export top up",
+   "chargeType": null,
+   "date": "2026/10/09",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 14.75
+  },
+  {
+   "amount": -1.0,
+   "chargeCategory": "ZEROHERO Credit",
+   "chargeType": null,
+   "date": "2026/10/09",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 1.0
+  },
+  {
+   "amount": -0.35,
+   "chargeCategory": "Critical Peak - Export",
+   "chargeType": null,
+   "date": "2026/10/09",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 0.35
+  },
+  {
+   "amount": 1.74,
+   "chargeCategory": "SUPPLY",
+   "chargeType": null,
+   "date": "2026/10/09",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 0.0
+  },
+  {
+   "amount": 1.77,
+   "chargeCategory": "USAGE",
+   "chargeType": null,
+   "date": "2026/10/17",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 17.96
+  },
+  {
+   "amount": -0.24,
+   "chargeCategory": "SOLAR",
+   "chargeType": null,
+   "date": "2026/10/17",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 15.25
+  },
+  {
+   "amount": -0.77,
+   "chargeCategory": "Super Export top up",
+   "chargeType": null,
+   "date": "2026/10/17",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 9.59
+  },
+  {
+   "amount": 1.74,
+   "chargeCategory": "SUPPLY",
+   "chargeType": null,
+   "date": "2026/10/17",
+   "isMeterReadMissingOnDate": false,
+   "quantity": 0.0
+  }
+ ],
+ "message": null,
+ "success": true
+}

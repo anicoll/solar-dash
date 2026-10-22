@@ -99,6 +99,7 @@ path = "data/solar.db"
 # away_cents_per_kwh = 65.0
 
 # Optional: your GloBird Energy customer portal login, used by `globird-probe`
+# and by `serve`, which keeps GloBird's daily cost and usage in the database
 # (read-only access to your account at myaccount.globirdenergy.com.au). The
 # password is stored in plain text, so keep this file's mode at 600
 # (chmod 600 config.toml). This is an unofficial portal API and may break
@@ -106,6 +107,10 @@ path = "data/solar.db"
 # [globird]
 # email = "you@example.com"
 # password = "your-portal-password"
+# # Local time ("HH:MM", in the [isolarcloud] timezone) of the daily sync.
+# # GloBird's data lags a day or more, so mid-morning is a good time.
+# # Default: "09:00".
+# sync_time = "09:00"
 
 # Optional: electricity prices, used to work out what each day cost and what
 # the solar and battery saved. Without this section cost features are off.

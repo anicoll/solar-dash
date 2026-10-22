@@ -7,6 +7,14 @@
 //! - [`client`]: the HTTP client: login and generic JSON calls.
 //! - [`probe`]: the `globird-probe` command, which dumps what each endpoint
 //!   returns so we can see the real response shapes.
+//! - [`service`]: picking the power service and its meter, shared by the probe
+//!   and the sync.
+//! - [`data`]: cost and usage rows, and grouping them into one record per day.
+//! - [`sync`]: the background task in `serve` that keeps the database up to
+//!   date with the portal.
 
 pub mod client;
+pub mod data;
 pub mod probe;
+pub mod service;
+pub mod sync;

@@ -197,6 +197,16 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    // The GloBird sync also only runs with a [globird] section and only logs
+    // its errors. It needs the same time zone as everything else for "today".
+    let sync_globird = async {
+        if let Some(globird) = config.globird.clone()
+            && let Err(err) = globird::sync::run(globird, pool.clone(), tz, shutdown_signal()).await
+        {
+            error!("GloBird sync stopped: {err:#}; the dashboard keeps running");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     // The live sync must never take the others down: if it fails for a
     // fatal reason (say a database error) we log it and keep serving.
     let live_sync = async {
@@ -207,15 +217,16 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
-    // Run all four until Ctrl+C. `try_join!` polls them together on this
+    // Run all five until Ctrl+C. `try_join!` polls them together on this
     // task and returns early if one fails (neither the live sync, the
-    // Modbus poller nor the TeslaMate reader does: their errors are only
-    // logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
+    // Modbus poller, the TeslaMate reader nor the GloBird sync does: their
+    // errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
     tokio::try_join!(
         live_sync,
         web::serve(listener, state, shutdown_signal()),
         poll_modbus,
         follow_car,
+        sync_globird,
     )?;
     Ok(())
 }

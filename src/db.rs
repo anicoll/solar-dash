@@ -10,10 +10,12 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::cost::DayCost;
+use crate::globird::data::DayRecord;
 use crate::modbus::Sample;
 
 /// A measuring point (a kind of value, such as "battery power").
@@ -722,6 +724,107 @@ pub async fn odometer_in_range(
     .context("could not read odometer")
 }
 
+/// Replaces everything stored for one GloBird day with `day`, in one
+/// transaction: the day's old rows are deleted first, so a line GloBird has
+/// since revised or removed does not linger. Either all of it is saved or none.
+pub async fn save_globird_day(pool: &SqlitePool, day: &DayRecord, fetched_at: i64) -> Result<()> {
+    let date = day.date.to_string(); // "2026-10-09"
+    let mut tx = pool.begin().await?;
+    for delete in [
+        "DELETE FROM globird_cost WHERE date = ?",
+        "DELETE FROM globird_usage WHERE date = ?",
+        "DELETE FROM globird_interval WHERE date = ?",
+    ] {
+        sqlx::query(delete)
+            .bind(&date)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("could not clear old GloBird rows for {date}"))?;
+    }
+    for line in &day.cost {
+        sqlx::query(
+            "INSERT INTO globird_cost
+               (date, category, amount_cents, quantity, meter_read_missing, fetched_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&date)
+        .bind(&line.category)
+        .bind(line.amount_cents)
+        .bind(line.quantity)
+        .bind(line.meter_read_missing)
+        .bind(fetched_at)
+        .execute(&mut *tx)
+        .await
+        .context("could not save GloBird cost")?;
+    }
+    for line in &day.usage {
+        sqlx::query(
+            "INSERT INTO globird_usage
+               (date, suffix, charge_type, category_code, kwh, quality, fetched_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&date)
+        .bind(&line.suffix)
+        .bind(&line.charge_type)
+        .bind(&line.category_code)
+        .bind(line.kwh)
+        .bind(&line.quality)
+        .bind(fetched_at)
+        .execute(&mut *tx)
+        .await
+        .context("could not save GloBird usage")?;
+    }
+    for series in &day.intervals {
+        let intervals = serde_json::to_string(&series.intervals)
+            .context("could not write GloBird intervals as JSON")?;
+        sqlx::query(
+            "INSERT INTO globird_interval
+               (date, suffix, direction, kwh_total, intervals, fetched_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&date)
+        .bind(&series.suffix)
+        .bind(series.direction.as_str())
+        .bind(series.kwh_total)
+        .bind(intervals)
+        .bind(fetched_at)
+        .execute(&mut *tx)
+        .await
+        .context("could not save GloBird intervals")?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The newest stored GloBird day that is complete, i.e. has a cost row other
+/// than SUPPLY. (`globird::data::is_supply` is the same rule in Rust.)
+pub async fn latest_complete_globird_date(pool: &SqlitePool) -> Result<Option<NaiveDate>> {
+    let date: Option<String> = sqlx::query_scalar(
+        "SELECT MAX(date) FROM globird_cost WHERE UPPER(TRIM(category)) <> 'SUPPLY'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("could not read the newest complete GloBird day")?;
+    date.map(|text| {
+        NaiveDate::parse_from_str(&text, "%Y-%m-%d")
+            .with_context(|| format!("bad date {text:?} in globird_cost"))
+    })
+    .transpose()
+}
+
+/// Whether a stored GloBird day is complete (see [`latest_complete_globird_date`]).
+pub async fn globird_day_is_complete(pool: &SqlitePool, date: NaiveDate) -> Result<bool> {
+    let found: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM globird_cost
+         WHERE date = ? AND UPPER(TRIM(category)) <> 'SUPPLY' LIMIT 1",
+    )
+    .bind(date.to_string())
+    .fetch_optional(pool)
+    .await
+    .context("could not check a GloBird day")?;
+    Ok(found.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,12 +862,12 @@ mod tests {
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
              ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session',
-              'ev_odometer_daily')",
+              'ev_odometer_daily', 'globird_cost', 'globird_usage', 'globird_interval')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 7);
+        assert_eq!(tables.len(), 10);
     }
 
     #[tokio::test]
@@ -1206,5 +1309,116 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dates(got), vec!["2026-10-01"]);
+    }
+
+    /// Row counts of the three GloBird tables for one day.
+    async fn globird_counts(pool: &SqlitePool, date: &str) -> (i64, i64, i64) {
+        let mut counts = Vec::new();
+        for sql in [
+            "SELECT COUNT(*) FROM globird_cost WHERE date = ?",
+            "SELECT COUNT(*) FROM globird_usage WHERE date = ?",
+            "SELECT COUNT(*) FROM globird_interval WHERE date = ?",
+        ] {
+            let n = sqlx::query_scalar(sql)
+                .bind(date)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            counts.push(n);
+        }
+        (counts[0], counts[1], counts[2])
+    }
+
+    #[tokio::test]
+    async fn globird_day_is_replaced_not_merged() {
+        use crate::globird::data::{group_days, parse_cost_rows, parse_usage_rows};
+        let (_dir, pool) = test_db().await;
+
+        // Two real days, as the sync would write them.
+        let data_of = |text: &str| -> serde_json::Value {
+            let mut reply: serde_json::Value = serde_json::from_str(text).unwrap();
+            reply["data"].take()
+        };
+        let cost =
+            parse_cost_rows(data_of(include_str!("globird/testdata/cost_detail.json"))).unwrap();
+        let usage = parse_usage_rows(data_of(include_str!(
+            "globird/testdata/smart_meter_read.json"
+        )))
+        .unwrap();
+        let days = group_days(&cost, &usage);
+        for day in &days {
+            save_globird_day(&pool, day, 1000).await.unwrap();
+        }
+        assert_eq!(globird_counts(&pool, "2026-10-09").await, (6, 8, 2));
+        assert_eq!(globird_counts(&pool, "2026-10-17").await, (4, 7, 2));
+
+        // Spot-check the values: cents, an unchanged array and the direction.
+        let (cents, missing): (i64, bool) = sqlx::query_as(
+            "SELECT amount_cents, meter_read_missing FROM globird_cost
+             WHERE date = '2026-10-09' AND category = 'ZEROHERO Credit'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((cents, missing), (-100, false));
+        let (direction, json): (String, String) = sqlx::query_as(
+            "SELECT direction, intervals FROM globird_interval
+             WHERE date = '2026-10-09' AND suffix = 'B7'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(direction, "export");
+        let stored: Vec<f64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored, days[0].intervals[0].intervals);
+        assert_eq!(
+            latest_complete_globird_date(&pool).await.unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 17)
+        );
+
+        // GloBird revises the 9th: fewer lines. The old ones must be gone.
+        let mut revised = days[0].clone();
+        revised.cost.truncate(2);
+        revised.usage.truncate(1);
+        revised.intervals.clear();
+        save_globird_day(&pool, &revised, 2000).await.unwrap();
+        assert_eq!(globird_counts(&pool, "2026-10-09").await, (2, 1, 0));
+        // The other day is untouched.
+        assert_eq!(globird_counts(&pool, "2026-10-17").await, (4, 7, 2));
+        let fetched: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT fetched_at FROM globird_cost WHERE date = '2026-10-09'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fetched, [2000]);
+    }
+
+    #[tokio::test]
+    async fn globird_completeness_ignores_supply() {
+        use crate::globird::data::{CostRow, group_days};
+        let (_dir, pool) = test_db().await;
+        let date = |d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        assert_eq!(latest_complete_globird_date(&pool).await.unwrap(), None);
+
+        let row = |d: u32, category: &str| CostRow {
+            date: date(d),
+            category: category.to_string(),
+            amount_cents: 100,
+            quantity: 0.0,
+            meter_read_missing: false,
+        };
+        // The 20th is complete; the 21st has only SUPPLY so far.
+        let rows = [row(20, "SUPPLY"), row(20, "USAGE"), row(21, "SUPPLY")];
+        for day in group_days(&rows, &[]) {
+            save_globird_day(&pool, &day, 1).await.unwrap();
+        }
+        assert_eq!(
+            latest_complete_globird_date(&pool).await.unwrap(),
+            Some(date(20))
+        );
+        assert!(globird_day_is_complete(&pool, date(20)).await.unwrap());
+        assert!(!globird_day_is_complete(&pool, date(21)).await.unwrap());
+        assert!(!globird_day_is_complete(&pool, date(22)).await.unwrap());
     }
 }

@@ -5,6 +5,7 @@
 //! [`Client::get_json`] and [`Client::post_json`] check that and hand back just
 //! the `data` part.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,25 @@ const LENIENT_URL_SAFE: GeneralPurpose = GeneralPurpose::new(
     &base64::alphabet::URL_SAFE,
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
+
+/// The portal wants a captcha before it will log in. A separate error type
+/// (instead of a plain message) so the sync can tell it apart from a network
+/// error: retrying does not help, only logging in once in a browser does. Find
+/// it in an `anyhow::Error` with `err.downcast_ref::<CaptchaRequired>()`.
+#[derive(Debug)]
+pub struct CaptchaRequired;
+
+impl fmt::Display for CaptchaRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GloBird wants a captcha before it will log in. Log in once in a browser at \
+             {BASE_URL} and try again later"
+        )
+    }
+}
+
+impl std::error::Error for CaptchaRequired {}
 
 /// A client for the portal. Call [`Client::login`] before anything else.
 pub struct Client {
@@ -263,10 +283,7 @@ fn check_login_reply(status: StatusCode, body: &str) -> Result<()> {
     let data = &reply["data"];
     let flag = |name: &str| data.get(name).and_then(Value::as_bool) == Some(true);
     if flag("requireHCaptcha") || flag("requireRetryCaptCha") {
-        bail!(
-            "GloBird wants a captcha before it will log in. Log in once in a browser at \
-             {BASE_URL} and try again later"
-        );
+        return Err(CaptchaRequired.into());
     }
     let succeeded = reply.get("success").and_then(Value::as_bool) != Some(false)
         && data.get("isLoginSucceeded").and_then(Value::as_bool) != Some(false)
@@ -411,6 +428,8 @@ mod tests {
             r#"{"data": {"requireHCaptcha": true, "isLoginSucceeded": false}, "success": false}"#;
         let err = check_login_reply(StatusCode::OK, captcha).unwrap_err();
         assert!(err.to_string().contains("captcha"));
+        // The sync finds this type to tell a captcha from a network error.
+        assert!(err.downcast_ref::<CaptchaRequired>().is_some());
         let retry = r#"{"data": {"requireRetryCaptCha": true}, "success": true}"#;
         assert!(check_login_reply(StatusCode::OK, retry).is_err());
 
