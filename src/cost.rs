@@ -76,6 +76,12 @@ pub struct Tariff {
     key: String,
 }
 
+fn windows_of(list: &[PricedWindow]) -> Vec<(u32, u32, f64)> {
+    list.iter()
+        .map(|w| (w.window.start, w.window.end, w.cents))
+        .collect()
+}
+
 /// Parse "HH:MM" start and end strings into a [`Window`].
 fn parse_window(from: &str, to: &str) -> Result<Window> {
     Ok(Window {
@@ -158,6 +164,38 @@ impl Tariff {
             .map(|w| w.window.start)
     }
 
+    /// The plan's import windows as `(start, end, cents)`, minutes since local
+    /// midnight, in config order (the first match wins). `end` is smaller than
+    /// `start` when the window wraps past midnight.
+    pub fn import_windows(&self) -> Vec<(u32, u32, f64)> {
+        windows_of(&self.import)
+    }
+
+    /// The plan's feed-in windows, like [`Tariff::import_windows`].
+    pub fn export_windows(&self) -> Vec<(u32, u32, f64)> {
+        windows_of(&self.export)
+    }
+
+    /// Daily supply charge in cents.
+    pub fn supply_cents_per_day(&self) -> f64 {
+        self.supply_cents_per_day
+    }
+
+    /// Import price outside every import window, in cents.
+    pub fn default_import_cents(&self) -> f64 {
+        self.default_import_cents
+    }
+
+    /// Feed-in price outside every export window, in cents.
+    pub fn default_export_cents(&self) -> f64 {
+        self.default_export_cents
+    }
+
+    /// The most grid import (kWh) in the credit window that still earns the credit.
+    pub fn credit_max_kwh(&self) -> Option<f64> {
+        self.zero_import_credit.as_ref().map(|c| c.max_kwh)
+    }
+
     /// Cents per kWh paid to import at this local time (minutes since midnight).
     pub fn import_cents_at(&self, minute_of_day: u32) -> f64 {
         price_at(&self.import, self.default_import_cents, minute_of_day)
@@ -171,7 +209,8 @@ impl Tariff {
 
 /// Which import band a minute of the day falls in. The tariff does not name
 /// its bands, so they are told apart by price (see [`Tariff::import_band_at`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ImportBand {
     Free,
     Shoulder,
@@ -179,7 +218,8 @@ pub enum ImportBand {
 }
 
 /// Which export band a minute of the day falls in (see [`Tariff::export_band_at`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ExportBand {
     Super,
     Peak,
@@ -191,7 +231,11 @@ impl Tariff {
     /// this tariff's own rates: nothing to pay is `Free`, dearer than the
     /// default import price is `Peak`, anything else is `Shoulder`.
     pub fn import_band_at(&self, minute_of_day: u32) -> ImportBand {
-        let cents = self.import_cents_at(minute_of_day);
+        self.import_band_for(self.import_cents_at(minute_of_day))
+    }
+
+    /// The role of an import price `cents` against this tariff (see [`Tariff::import_band_at`]).
+    pub fn import_band_for(&self, cents: f64) -> ImportBand {
         if cents <= 0.0 {
             ImportBand::Free
         } else if cents > self.default_import_cents {
@@ -206,7 +250,11 @@ impl Tariff {
     /// highest is `Super`, but only when a lower one exists too (a lone
     /// better-than-default rate is `Peak`).
     pub fn export_band_at(&self, minute_of_day: u32) -> ExportBand {
-        let cents = self.export_cents_at(minute_of_day);
+        self.export_band_for(self.export_cents_at(minute_of_day))
+    }
+
+    /// The role of a feed-in price `cents` against this tariff (see [`Tariff::export_band_at`]).
+    pub fn export_band_for(&self, cents: f64) -> ExportBand {
         if cents <= self.default_export_cents {
             return ExportBand::Other;
         }

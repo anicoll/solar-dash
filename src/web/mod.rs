@@ -247,6 +247,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily", get(api::daily))
         .route("/api/battery", get(battery::battery))
         .route("/api/costs", get(costs::costs))
+        .route("/api/tariff", get(costs::tariff))
         .route("/api/globird/compare", get(globird::compare))
         .route("/api/payback", get(payback::payback))
         .route_layer(middleware::from_fn_with_state(
@@ -1320,6 +1321,29 @@ mod tests {
             body_json(response).await,
             serde_json::json!({ "configured": false })
         );
+    }
+
+    #[tokio::test]
+    async fn tariff_needs_a_session_and_a_tariff() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/tariff", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/tariff", Some(&cookie))).await;
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "configured": false })
+        );
+
+        let (_dir, app, _pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/tariff?date=bad", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let uri = "/api/tariff?date=2026-10-20";
+        let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["default_import_cents"], 25.0);
+        assert_eq!(json["supply_cents_per_day"], 100.0);
     }
 
     #[tokio::test]

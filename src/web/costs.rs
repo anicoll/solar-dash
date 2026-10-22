@@ -838,6 +838,71 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
     })))
 }
 
+#[derive(Deserialize)]
+pub struct TariffParams {
+    date: Option<String>,
+}
+
+/// "HH:MM" for minutes since local midnight.
+fn hhmm(minute: u32) -> String {
+    format!("{:02}:{:02}", minute / 60, minute % 60)
+}
+
+fn window_json(
+    (start, end, cents): (u32, u32, f64),
+    band: impl serde::Serialize,
+) -> serde_json::Value {
+    json!({ "from": hhmm(start), "to": hhmm(end), "cents": cents, "band": band })
+}
+
+/// `/api/tariff?date=`: the plan in force on a local day (default today), so
+/// the page can label rates and shade windows without a copy of the config.
+/// Each window carries its band role, classified as `/api/daily` does.
+pub async fn tariff(
+    State(state): State<AppState>,
+    Query(params): Query<TariffParams>,
+) -> ApiResult {
+    let date = match params.date.as_deref() {
+        Some(text) => NaiveDate::from_str(text)
+            .map_err(|_| ApiError::bad_request("date must look like 2026-10-20"))?,
+        None => today(state.tz),
+    };
+    let Some(schedule) = &state.tariff else {
+        return Ok(Json(json!({ "configured": false })));
+    };
+    let t = schedule.for_date(date);
+    let import: Vec<_> = t
+        .import_windows()
+        .into_iter()
+        .map(|w| window_json(w, t.import_band_for(w.2)))
+        .collect();
+    let export: Vec<_> = t
+        .export_windows()
+        .into_iter()
+        .map(|w| window_json(w, t.export_band_for(w.2)))
+        .collect();
+    let credit = t.credit_window_minutes().map(|(from, to)| {
+        json!({
+            "from": hhmm(from),
+            "to": hhmm(to),
+            "max_kwh": t.credit_max_kwh(),
+            "credit_cents": t.credit_cents(),
+        })
+    });
+    Ok(Json(json!({
+        "configured": true,
+        "date": date.to_string(),
+        "supply_cents_per_day": t.supply_cents_per_day(),
+        "default_import_cents": t.default_import_cents(),
+        "default_import_band": t.import_band_for(t.default_import_cents()),
+        "default_export_cents": t.default_export_cents(),
+        "default_export_band": t.export_band_for(t.default_export_cents()),
+        "import": import,
+        "export": export,
+        "zero_import_credit": credit,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,5 +1287,95 @@ mod tests {
             .collect();
         assert_eq!(summary, [("2025", 1, 0), ("2026", 3, 2)]);
         assert!(bucket_days(Group::Year, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tariff_shows_the_plan_in_force_on_the_day() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+            #[serde(default)]
+            previous_tariff: Vec<crate::config::PreviousTariff>,
+        }
+        let w: Wrapper = toml::from_str(
+            r#"
+            [tariff]
+            supply_cents_per_day = 173.8
+            default_import_cents = 44.0
+            import = [
+              { from = "11:00", to = "14:00", cents = 0.0 },
+              { from = "16:00", to = "23:00", cents = 58.3 },
+            ]
+            default_export_cents = 0.0
+            export = [
+              { from = "18:00", to = "21:00", cents = 10.0 },
+              { from = "16:00", to = "23:00", cents = 2.0 },
+            ]
+            zero_import_credit = { from = "18:00", to = "20:00", max_kwh = 0.03, credit_cents = 100.0 }
+
+            [[previous_tariff]]
+            until = "2026-06-30"
+            supply_cents_per_day = 100.0
+            default_import_cents = 30.0
+            "#,
+        )
+        .unwrap();
+        let schedule = TariffSchedule::from_config(&w.tariff, &w.previous_tariff).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(
+            pool,
+            7,
+            chrono_tz::Australia::Adelaide,
+            &hash,
+            axum_extra::extract::cookie::Key::generate(),
+        )
+        .unwrap();
+        let ask = |date: Option<&str>| TariffParams {
+            date: date.map(str::to_string),
+        };
+
+        let with = state.clone().with_tariff(Some(schedule));
+        let Json(now) = tariff(State(with.clone()), Query(ask(Some("2026-10-20"))))
+            .await
+            .unwrap();
+        assert_eq!(now["configured"], true);
+        assert_eq!(now["supply_cents_per_day"], 173.8);
+        assert_eq!(now["default_import_cents"], 44.0);
+        assert_eq!(now["default_export_cents"], 0.0);
+        assert_eq!(now["import"][0]["from"], "11:00");
+        assert_eq!(now["import"][0]["to"], "14:00");
+        assert_eq!(now["import"][0]["band"], "free");
+        assert_eq!(now["import"][1]["cents"], 58.3);
+        assert_eq!(now["import"][1]["band"], "peak");
+        assert_eq!(now["export"][0]["band"], "super");
+        assert_eq!(now["export"][1]["band"], "peak");
+        assert_eq!(now["default_import_band"], "shoulder");
+        assert_eq!(now["default_export_band"], "other");
+        assert_eq!(now["zero_import_credit"]["credit_cents"], 100.0);
+        assert_eq!(now["zero_import_credit"]["to"], "20:00");
+
+        // A day before the change gets the earlier plan, with no windows or credit.
+        let Json(old) = tariff(State(with.clone()), Query(ask(Some("2026-06-30"))))
+            .await
+            .unwrap();
+        assert_eq!(old["supply_cents_per_day"], 100.0);
+        assert_eq!(old["default_import_cents"], 30.0);
+        assert_eq!(old["import"].as_array().unwrap().len(), 0);
+        assert!(old["zero_import_credit"].is_null());
+
+        // No date means today; a bad one is a 400; no tariff is "not configured".
+        let Json(today_plan) = tariff(State(with.clone()), Query(ask(None))).await.unwrap();
+        assert_eq!(today_plan["configured"], true);
+        assert!(
+            tariff(State(with), Query(ask(Some("yesterday"))))
+                .await
+                .is_err()
+        );
+        let Json(none) = tariff(State(state), Query(ask(None))).await.unwrap();
+        assert_eq!(none["configured"], false);
     }
 }
