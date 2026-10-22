@@ -1371,18 +1371,32 @@ mod tests {
                 "export_kwh": 2.0,
                 "load_kwh": 4.0,
                 "credit": 0.0,
+                "supply": 1.0,
+                "import": 0.25,
+                "feed_in": 0.1,
             })
         );
+        // Not bought: baseline 200 - supply 100 - import 25 = 75 c, and
+        // 75 + 10 feed-in + 0 credit = the 85 c saved.
         assert_eq!(
             json["totals"],
             serde_json::json!({
+                "days": 1,
+                "credit_days": 0,
+                "supply": 1.0,
+                "import": 0.25,
+                "import_kwh": 1.0,
+                "feed_in": 0.1,
+                "export_kwh": 2.0,
+                "load_kwh": 4.0,
+                "credit": 0.0,
                 "actual": 1.15,
                 "baseline": 2.0,
                 "savings": 0.85,
-                "credit_days": 0,
-                "days": 1,
+                "not_bought": 0.75,
             })
         );
+        assert_eq!(json["group"], "day");
     }
 
     #[tokio::test]
@@ -1513,6 +1527,73 @@ mod tests {
             .unwrap();
         let gone = costs_json(&app, range).await;
         assert_eq!(gone["days"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn costs_can_be_grouped_by_month_and_year() {
+        let (_dir, app, pool) = costs_app().await;
+        // The same usage on 31 Dec 2025, then 15 Sep, 16 Sep and 1 Oct 2026.
+        let tz = chrono_tz::Australia::Adelaide;
+        for date in ["2025-12-31", "2026-09-15", "2026-09-16", "2026-10-01"] {
+            let (day_start, _) = api::day_bounds_or_error(date.parse().unwrap(), tz).unwrap();
+            seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
+        }
+        let months = costs_json(&app, "from=2025-01-01&to=2026-12-31&group=month").await;
+        assert_eq!(months["group"], "month");
+        assert!(months.get("days").is_none());
+        let periods: Vec<&str> = months["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["period"].as_str().unwrap())
+            .collect();
+        assert_eq!(periods, ["2025-12", "2026-09", "2026-10"]);
+        let sep = &months["buckets"][1];
+        assert_eq!(sep["days"], 2);
+        assert_eq!(sep["credit_days"], 0);
+        // Two days of the cloud day above: actual 2 * 1.15, saved 2 * 0.85.
+        assert_eq!(sep["actual"], 2.3);
+        assert_eq!(sep["savings"], 1.7);
+        assert_eq!(sep["supply"], 2.0);
+        assert_eq!(sep["feed_in"], 0.2);
+        assert_eq!(sep["not_bought"], 1.5);
+        assert_eq!(months["totals"]["days"], 4);
+
+        let years = costs_json(&app, "from=2025-01-01&to=2026-12-31&group=year").await;
+        let summary: Vec<(String, i64)> = years["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["period"].as_str().unwrap().to_string(),
+                    b["days"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(summary, [("2025".to_string(), 1), ("2026".to_string(), 3)]);
+        // Finished days were stored by the first request and reused.
+        assert_eq!(stored_days(&pool).await, 4);
+    }
+
+    #[tokio::test]
+    async fn grouped_costs_allow_a_longer_range_but_check_the_group() {
+        let (_dir, app, _pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        let get = |uri: &'static str| send(&app, get_request(uri, Some(&cookie)));
+        // 20 years is fine when grouped (and an empty database has no buckets).
+        let response = get("/api/costs?from=2007-01-01&to=2026-12-31&group=year").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["buckets"], serde_json::json!([]));
+        // Longer is refused, as are an unknown group and a long day range.
+        for uri in [
+            "/api/costs?from=2006-01-01&to=2026-12-31&group=month",
+            "/api/costs?group=week",
+            "/api/costs?from=2022-01-01&to=2026-02-09&group=day",
+        ] {
+            let response = get(uri).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     /// The flat tariff at 35 c import from 2026-09-16, after an earlier plan
