@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use tracing::error;
 
 use super::AppState;
-use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, round2};
+use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, round2};
+use crate::cost::GridSplit;
 use crate::db::{self, LatestReading};
 use crate::ev_cost;
 use crate::modbus::Sample;
@@ -714,6 +715,49 @@ struct DayTotals {
     battery_charge_kwh: Option<f64>,
     battery_discharge_kwh: Option<f64>,
     self_consumed_kwh: Option<f64>,
+    /// Grid energy by tariff band; all `null` without a tariff or interval data.
+    #[serde(flatten)]
+    split: SplitSums,
+}
+
+/// Grid energy by tariff band in kWh (see `cost::grid_split`), summed over
+/// any number of days. A figure is `None` when no day had interval data.
+#[derive(Debug, Default, Serialize, PartialEq)]
+struct SplitSums {
+    import_free_kwh: Option<f64>,
+    import_shoulder_kwh: Option<f64>,
+    import_peak_kwh: Option<f64>,
+    export_super_kwh: Option<f64>,
+    export_peak_kwh: Option<f64>,
+    export_other_kwh: Option<f64>,
+}
+
+impl SplitSums {
+    fn add(&mut self, split: &GridSplit) {
+        fn add(sum: &mut Option<f64>, v: f64) {
+            *sum = Some(sum.unwrap_or(0.0) + v);
+        }
+        add(&mut self.import_free_kwh, split.import_free_kwh);
+        add(&mut self.import_shoulder_kwh, split.import_shoulder_kwh);
+        add(&mut self.import_peak_kwh, split.import_peak_kwh);
+        add(&mut self.export_super_kwh, split.export_super_kwh);
+        add(&mut self.export_peak_kwh, split.export_peak_kwh);
+        add(&mut self.export_other_kwh, split.export_other_kwh);
+    }
+
+    fn merge(&mut self, other: &SplitSums) {
+        fn add(sum: &mut Option<f64>, v: Option<f64>) {
+            if let Some(v) = v {
+                *sum = Some(sum.unwrap_or(0.0) + v);
+            }
+        }
+        add(&mut self.import_free_kwh, other.import_free_kwh);
+        add(&mut self.import_shoulder_kwh, other.import_shoulder_kwh);
+        add(&mut self.import_peak_kwh, other.import_peak_kwh);
+        add(&mut self.export_super_kwh, other.export_super_kwh);
+        add(&mut self.export_peak_kwh, other.export_peak_kwh);
+        add(&mut self.export_other_kwh, other.export_other_kwh);
+    }
 }
 
 /// The day's total for one counter: its largest value within the local day,
@@ -730,29 +774,41 @@ async fn day_max_kwh(
 
 /// `live_range` is the oldest and newest live sample time (see
 /// `db::live_ts_range`), so days without any live data skip the extra query.
+#[cfg(test)]
 async fn day_totals(
     state: &AppState,
     date: NaiveDate,
     live_range: Option<(i64, i64)>,
     now: i64,
 ) -> Result<DayTotals, ApiError> {
+    Ok(day_totals_with_live(state, date, live_range, now).await?.0)
+}
+
+/// [`day_totals`], plus the live samples it loaded (empty when none), so the
+/// tariff split can reuse them instead of querying again.
+async fn day_totals_with_live(
+    state: &AppState,
+    date: NaiveDate,
+    live_range: Option<(i64, i64)>,
+    now: i64,
+) -> Result<(DayTotals, Vec<Sample>), ApiError> {
     // Each day gets its own [start, end), so a 23 or 25 hour day is handled correctly.
     let (start, end) = day_bounds_or_error(date, state.tz)?;
-    let live = match live_range {
+    let samples = match live_range {
         Some((first, last)) if first < end && last >= start => {
-            let samples = db::live_samples_raw(&state.pool, start, end).await?;
-            live_totals(&samples, start, end, now)
+            db::live_samples_raw(&state.pool, start, end).await?
         }
-        _ => None,
+        _ => Vec::new(),
     };
+    let live = live_totals(&samples, start, end, now);
     // A solid live day never needs the cloud; skip its queries.
     if let Some(live) = live.as_ref().filter(|live| live.solid) {
-        return Ok(live_day(date, live));
+        return Ok((live_day(date, live), samples));
     }
     let cloud = cloud_day(state, date, start, end).await?;
     match live {
-        Some(live) if live.usable(cloud.has_data()) => Ok(live_day(date, &live)),
-        _ => Ok(cloud),
+        Some(live) if live.usable(cloud.has_data()) => Ok((live_day(date, &live), samples)),
+        _ => Ok((cloud, samples)),
     }
 }
 
@@ -770,6 +826,7 @@ fn live_day(date: NaiveDate, live: &LiveTotals) -> DayTotals {
         // Needs a pv-to-battery split we do not have; the cloud's value
         // would not match the live numbers, so leave it out.
         self_consumed_kwh: None,
+        split: SplitSums::default(),
     }
 }
 
@@ -790,6 +847,7 @@ async fn cloud_day(
         battery_charge_kwh: day_max_kwh(state, 83322, start, end).await?,
         battery_discharge_kwh: day_max_kwh(state, 83323, start, end).await?,
         self_consumed_kwh: day_max_kwh(state, 83097, start, end).await?,
+        split: SplitSums::default(),
     })
 }
 
@@ -852,6 +910,8 @@ struct EnergySums {
     export_kwh: Option<f64>,
     battery_charge_kwh: Option<f64>,
     battery_discharge_kwh: Option<f64>,
+    #[serde(flatten)]
+    split: SplitSums,
 }
 
 impl EnergySums {
@@ -870,6 +930,7 @@ impl EnergySums {
         add(&mut self.export_kwh, day.export_kwh);
         add(&mut self.battery_charge_kwh, day.battery_charge_kwh);
         add(&mut self.battery_discharge_kwh, day.battery_discharge_kwh);
+        self.split.merge(&day.split);
     }
 }
 
@@ -947,7 +1008,13 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
     }
     let mut days = Vec::new();
     for date in from.iter_days().take(count as usize) {
-        days.push((date, day_totals(&state, date, live_range, now).await?));
+        let (mut totals, live) = day_totals_with_live(&state, date, live_range, now).await?;
+        if let Some(schedule) = &state.tariff
+            && let Some(split) = day_grid_split(&state, schedule, date, &live, now).await?
+        {
+            totals.split.add(&split);
+        }
+        days.push((date, totals));
     }
     if group == Group::Day {
         let days: Vec<_> = days.into_iter().map(|(_, d)| d).collect();
@@ -1308,8 +1375,33 @@ mod tests {
             battery_charge_kwh: None,
             battery_discharge_kwh: None,
             self_consumed_kwh: None,
+            split: SplitSums::default(),
         };
         (date, day)
+    }
+
+    #[test]
+    fn tariff_bands_are_summed_into_buckets() {
+        let split = |free: f64, peak: f64| GridSplit {
+            import_free_kwh: free,
+            import_peak_kwh: peak,
+            export_super_kwh: 1.0,
+            ..GridSplit::default()
+        };
+        let mut a = totals_of("2026-01-01", Some(1.0), Some(1.0));
+        a.1.split.add(&split(1.0, 0.5));
+        let mut b = totals_of("2026-01-02", Some(1.0), Some(1.0));
+        b.1.split.add(&split(2.0, 0.0));
+        // A day with data but no intervals leaves the sums alone.
+        let c = totals_of("2026-01-03", Some(1.0), None);
+        let d = totals_of("2026-02-01", Some(1.0), None);
+        let months = bucket_energy(Group::Month, &[a, b, c, d]);
+        assert_eq!(months[0].sums.split.import_free_kwh, Some(3.0));
+        assert_eq!(months[0].sums.split.import_peak_kwh, Some(0.5));
+        assert_eq!(months[0].sums.split.export_super_kwh, Some(2.0));
+        assert_eq!(months[0].sums.split.import_shoulder_kwh, Some(0.0));
+        // February had no interval data at all.
+        assert_eq!(months[1].sums.split, SplitSums::default());
     }
 
     #[test]
@@ -1349,6 +1441,116 @@ mod tests {
             .collect();
         assert_eq!(summary, [("2025", 1, Some(10.0)), ("2026", 3, Some(26.5))]);
         assert!(bucket_energy(Group::Year, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn daily_splits_grid_energy_by_tariff_band() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+        }
+        let globird: Wrapper = toml::from_str(
+            r#"
+            [tariff]
+            supply_cents_per_day = 173.8
+            default_import_cents = 44.0
+            import = [
+              { from = "11:00", to = "14:00", cents = 0.0 },
+              { from = "16:00", to = "23:00", cents = 58.3 },
+            ]
+            default_export_cents = 0.0
+            export = [
+              { from = "18:00", to = "21:00", cents = 10.0 },
+              { from = "16:00", to = "23:00", cents = 2.0 },
+            ]
+            "#,
+        )
+        .unwrap();
+        let schedule = crate::cost::TariffSchedule::from_config(&globird.tariff, &[]).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        for point_id in [83102, 83072, 83118] {
+            let point = Point {
+                point_id,
+                code: None,
+                name: None,
+                unit: Some("Wh".to_string()),
+            };
+            db::upsert_point(&pool, &point).await.unwrap();
+        }
+        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let start = day_bounds(date("2026-10-20"), ADELAIDE).unwrap().0;
+        let at = |hour: i64, minute: i64| start + hour * 3600 + minute * 60;
+        // Import: 1 kWh in the free window, 0.5 kWh in the peak.
+        // Export: 2 kWh in the super window, 1 kWh in the rest of the peak.
+        let counter = |point_id: i64, rows: &[(i64, i64, f64)]| -> Vec<Reading> {
+            rows.iter()
+                .map(|&(h, m, wh)| Reading {
+                    point_id,
+                    ts: at(h, m),
+                    value: Some(wh),
+                })
+                .collect()
+        };
+        let mut rows = counter(
+            83102,
+            &[
+                (12, 0, 0.0),
+                (12, 5, 1000.0),
+                (17, 0, 1000.0),
+                (17, 5, 1500.0),
+            ],
+        );
+        rows.extend(counter(
+            83072,
+            &[
+                (19, 0, 0.0),
+                (19, 5, 2000.0),
+                (22, 0, 2000.0),
+                (22, 5, 3000.0),
+            ],
+        ));
+        db::upsert_readings(&pool, 7, &rows).await.unwrap();
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let with_tariff = state.clone().with_tariff(Some(schedule));
+        let ask = |group: Option<&str>| DailyParams {
+            from: Some("2026-10-20".to_string()),
+            to: Some("2026-10-21".to_string()),
+            group: group.map(str::to_string),
+        };
+
+        let Json(json) = daily(State(with_tariff.clone()), Query(ask(None)))
+            .await
+            .unwrap();
+        let day = &json["days"][0];
+        let near = |v: &serde_json::Value, want: f64| (v.as_f64().unwrap() - want).abs() < 1e-9;
+        assert!(near(&day["import_free_kwh"], 1.0));
+        assert!(near(&day["import_shoulder_kwh"], 0.0));
+        assert!(near(&day["import_peak_kwh"], 0.5));
+        assert!(near(&day["export_super_kwh"], 2.0));
+        assert!(near(&day["export_peak_kwh"], 1.0));
+        assert!(near(&day["export_other_kwh"], 0.0));
+        // The existing fields are unchanged, and the parts add up to them.
+        assert_eq!(day["import_kwh"], 1.5);
+        assert_eq!(day["export_kwh"], 3.0);
+        // The next day has no data: null, not zero.
+        assert!(json["days"][1]["import_free_kwh"].is_null());
+        assert!(json["days"][1]["export_other_kwh"].is_null());
+
+        let Json(json) = daily(State(with_tariff), Query(ask(Some("month"))))
+            .await
+            .unwrap();
+        assert!(near(&json["totals"]["import_free_kwh"], 1.0));
+        assert!(near(&json["buckets"][0]["export_super_kwh"], 2.0));
+
+        // Without a tariff the fields are there but null.
+        let Json(json) = daily(State(state), Query(ask(None))).await.unwrap();
+        assert!(json["days"][0]["import_free_kwh"].is_null());
+        assert_eq!(json["days"][0]["import_kwh"], 1.5);
     }
 
     #[tokio::test]
