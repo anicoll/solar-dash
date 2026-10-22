@@ -14,6 +14,7 @@ The files used here are in [`deploy/`](../deploy):
 | --- | --- |
 | `solar-dash.service` | systemd unit that runs `solar-dash serve` as its own user |
 | `solar-dash-backup.service` / `.timer` | nightly SQLite backup at 03:30, keeps 14 days |
+| `solar-dash-update.service` / `.timer` | optional nightly `update.sh` run at about 04:30, off until you enable it |
 | `cloudflared-config.yml` | example Cloudflare Tunnel config |
 | `install.sh` | sets up the user, folders, binary and units |
 | `update.sh` | updates to the latest build from GitHub, with rollback |
@@ -295,8 +296,9 @@ cat /opt/solar-dash/VERSION           # the commit that is installed
 ```
 
 Before installing, the update takes an online backup of the database to
-`/var/backups/solar-dash/pre-update-<timestamp>.db` (these are not deleted
-automatically; remove old ones by hand). If your database is not at the `path`
+`/var/backups/solar-dash/pre-update-<timestamp>.db`. Once the new version is up,
+it deletes the older `pre-update-*.db` files, so only the backup from the last
+update is kept (matching the one version `--rollback` can go back to). If your database is not at the `path`
 in `/etc/solar-dash/config.toml`, set `SOLAR_DASH_DB=/path/to/solar.db`.
 
 Rollback swaps the program back. A database change made by the newer version
@@ -312,6 +314,28 @@ sudo systemctl stop solar-dash && sudo -u solar-dash sqlite3 /var/lib/solar-dash
 ```
 
 Old API call records (kept 40 days) are now pruned automatically.
+
+### Updating automatically
+
+To update every night, turn on the update timer once, as root:
+
+```sh
+systemctl enable --now solar-dash-update.timer
+```
+
+It runs `update.sh` at about 04:30 (within half an hour, so it does not hit
+GitHub at the same second every day), after the 03:30 database backup, and at
+the next boot if the LXC was off. When there is nothing new it does nothing.
+Check on it with:
+
+```sh
+systemctl list-timers solar-dash-update.timer   # when it next runs
+journalctl -u solar-dash-update.service -n 30   # what the last run did
+systemctl disable --now solar-dash-update.timer # turn it off again
+```
+
+If an update fails its health check, solar-dash is left on the new version and
+the journal says so; roll back by hand with `update.sh --rollback`.
 
 If you built inside the LXC (option B), update with `git pull`,
 `cargo build --release`, `./deploy/install.sh` and `systemctl restart solar-dash`

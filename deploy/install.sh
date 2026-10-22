@@ -59,6 +59,8 @@ fi
 install -m 644 "$repo_dir/deploy/solar-dash.service" /etc/systemd/system/
 install -m 644 "$repo_dir/deploy/solar-dash-backup.service" /etc/systemd/system/
 install -m 644 "$repo_dir/deploy/solar-dash-backup.timer" /etc/systemd/system/
+install -m 644 "$repo_dir/deploy/solar-dash-update.service" /etc/systemd/system/
+install -m 644 "$repo_dir/deploy/solar-dash-update.timer" /etc/systemd/system/
 
 if [ -e /etc/solar-dash/config.toml ]; then
     echo "Config already exists, leaving it alone: /etc/solar-dash/config.toml"

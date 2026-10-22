@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly solar-dash update
+
+[Timer]
+# After the 03:30 database backup. The delay spreads runs over half an hour.
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=30min
+# Run at next boot if the LXC was off at the time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -6,8 +6,10 @@
 #   /opt/solar-dash/update.sh --check     # only say whether an update is waiting
 #   /opt/solar-dash/update.sh --rollback  # go back to the previous version
 #
-# It keeps your config and database, keeps the old binary as solar-dash.prev,
-# and restarts the service. See docs/deploy.md.
+# It keeps your config and database, keeps the old binary as solar-dash.prev
+# (one version back), and restarts the service. After a good update it deletes
+# older pre-update database backups, keeping only the newest. To run it every
+# night: systemctl enable --now solar-dash-update.timer. See docs/deploy.md.
 set -euo pipefail
 
 repo="anicoll/solar-dash"
@@ -103,3 +105,8 @@ fi
 "$new/deploy/install.sh" "$new/solar-dash" >/dev/null
 systemctl restart solar-dash
 check_health
+
+# Only one rollback is possible, so only the newest pre-update backup is useful.
+if [ -n "${backup:-}" ]; then
+    find /var/backups/solar-dash -maxdepth 1 -name 'pre-update-*.db' ! -path "$backup" -delete
+fi
