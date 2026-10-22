@@ -1396,6 +1396,7 @@ mod tests {
             serde_json::json!({
                 "days": 1,
                 "credit_days": 0,
+                "billed_days": 0,
                 "supply": 1.0,
                 "import": 0.25,
                 "import_kwh": 1.0,
@@ -1810,6 +1811,70 @@ mod tests {
         // A range with neither day is empty.
         let json = compare_json(&app, "from=2026-10-10&to=2026-10-16").await;
         assert_eq!(json["days"], serde_json::json!([]));
+    }
+
+    /// A pool with the 9 October cloud day (our estimate: 115 c actual, 200 c
+    /// baseline) and GloBird's bill for it (-36 c) seeded.
+    async fn billed_pool() -> (tempfile::TempDir, SqlitePool) {
+        let (dir, _app, pool) = costs_app().await;
+        seed_globird(&pool).await;
+        let tz = chrono_tz::Australia::Adelaide;
+        let oct_9 = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let start = api::day_bounds_or_error(oct_9, tz).unwrap().0;
+        seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
+        (dir, pool)
+    }
+
+    #[tokio::test]
+    async fn costs_use_globird_where_it_has_billed_but_the_cache_keeps_our_estimate() {
+        let (_dir, pool) = billed_pool().await;
+        let app = costs_router(&pool, flat_tariff());
+        let json = costs_json(&app, "from=2026-10-08&to=2026-10-10").await;
+
+        // Only the 9th has data of ours. GloBird's figures replace the money.
+        let days = json["days"].as_array().unwrap();
+        assert_eq!(days.len(), 1);
+        let day = &days[0];
+        assert_eq!(day["source"], "globird");
+        assert_eq!(day["import"], 0.75);
+        assert_eq!(day["feed_in"], 1.85);
+        assert_eq!(day["supply"], 1.74);
+        assert_eq!(day["credit"], 1.0);
+        assert_eq!(day["actual"], -0.36);
+        // Our baseline (100 + 4 kWh * 25 c) and load stay; savings are baseline - bill.
+        assert_eq!(day["baseline"], 2.0);
+        assert_eq!(day["load_kwh"], 4.0);
+        assert_eq!(day["savings"], 2.36);
+        assert!(day["import_kwh"].as_f64().unwrap() > 20.0);
+        assert_eq!(json["totals"]["billed_days"], 1);
+        assert_eq!(json["totals"]["credit_days"], 1);
+
+        let month = costs_json(&app, "from=2026-10-01&to=2026-10-31&group=month").await;
+        assert_eq!(month["buckets"][0]["billed_days"], 1);
+
+        // The stored estimate is still ours.
+        let stored: (String, f64) = sqlx::query_as("SELECT source, actual_cents FROM daily_cost")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, ("cloud".to_string(), 115.0));
+
+        // The Bill check still compares GloBird with our raw estimate.
+        let compare = compare_json(&app, "from=2026-10-09&to=2026-10-09").await;
+        let day = &compare["days"][0];
+        assert_eq!(day["ours"]["source"], "cloud");
+        assert_eq!(day["ours"]["total"], 1.15);
+        assert_eq!(day["diff"]["total"], 1.51);
+    }
+
+    #[tokio::test]
+    async fn payback_counts_the_billed_savings() {
+        let (_dir, pool) = billed_pool().await;
+        let app = payback_router(&pool, vec![solar_purchase("2026-10-01", 10.0)]);
+        let json = payback_json(&app).await;
+        // Baseline 2.00 less GloBird's -0.36, not our 0.85.
+        assert_eq!(json["saved"], 2.36);
+        assert_eq!(json["net"], -7.64);
     }
 
     #[tokio::test]

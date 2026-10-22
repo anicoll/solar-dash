@@ -217,6 +217,45 @@ pub fn is_supply(category: &str) -> bool {
     category.trim().eq_ignore_ascii_case("SUPPLY")
 }
 
+/// Where a GloBird charge category lands in the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bucket {
+    Import,
+    Export,
+    Supply,
+    Credit,
+    Other,
+}
+
+impl Bucket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Import => "import",
+            Self::Export => "export",
+            Self::Supply => "supply",
+            Self::Credit => "credit",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Maps GloBird's category text to a bucket, ignoring case:
+/// USAGE is import, SUPPLY is supply, "ZEROHERO Credit" is credit, and SOLAR,
+/// "Super Export top up" and anything containing "export" (such as
+/// "Critical Peak - Export") are export. New categories fall into `Other`,
+/// so they still count in the total.
+pub fn bucket_of(category: &str) -> Bucket {
+    let name = category.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "usage" => Bucket::Import,
+        "supply" => Bucket::Supply,
+        "zerohero credit" => Bucket::Credit,
+        "solar" | "super export top up" => Bucket::Export,
+        _ if name.contains("export") => Bucket::Export,
+        _ => Bucket::Other,
+    }
+}
+
 /// Groups rows into one record per day, oldest first.
 ///
 /// - Cost rows with the same day and category are added together.
@@ -599,6 +638,26 @@ mod tests {
         }
         for pair in windows.windows(2) {
             assert_eq!(pair[1].from, pair[0].to + Days::new(1), "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn categories_map_to_buckets_ignoring_case() {
+        for (category, bucket) in [
+            ("USAGE", Bucket::Import),
+            ("usage", Bucket::Import),
+            ("SUPPLY", Bucket::Supply),
+            (" Supply ", Bucket::Supply),
+            ("ZEROHERO Credit", Bucket::Credit),
+            ("zerohero credit", Bucket::Credit),
+            ("SOLAR", Bucket::Export),
+            ("Super Export top up", Bucket::Export),
+            ("Critical Peak - Export", Bucket::Export),
+            ("CRITICAL PEAK - EXPORT", Bucket::Export),
+            ("Something new", Bucket::Other),
+            ("", Bucket::Other),
+        ] {
+            assert_eq!(bucket_of(category), bucket, "{category:?}");
         }
     }
 }
