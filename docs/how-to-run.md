@@ -122,11 +122,13 @@ it on the server too.
 ### Dashboard views
 
 The home page (the solar-dash name at the top left) shows Now, with History
-below it; the tabs are Money and Payback. History has a
-Day | Month | Year switch, and the address keeps the period (for example
-`#day=2026-10-20`, `#month=2026-10`, `#year=2026`), so refresh and bookmarks
-work (the old `#now` and `#history` addresses open home). Clicking a bar in the Month chart opens that day, and a bar in the Year
-chart opens that month. Money has a Month | Year | All time switch
+below it; the tabs are Money and Payback. History has Day, Week
+(Monday to Sunday), Month, Year, Lifetime and Custom tabs, a date pill with a
+picker, and four total cards above the chart. The address keeps the period
+(`#day=2026-10-20`, `#week=2026-10-19`, `#month=2026-10`, `#year=2026`,
+`#lifetime`, `#custom=2026-09-01..2026-10-22`), so refresh and bookmarks
+work (the old `#now` and `#history` addresses open home). Clicking a bar opens
+that day, month or year. Money has a Month | Year | All time switch
 (`#money=month:2026-09`, `#money=year:2025`, `#money=all`; `#money` is this month):
 what you saved, a bill-style breakdown, where the saving came from, a bar chart
 that opens the day, month or year you click, the car, and, with a `[globird]` section,
