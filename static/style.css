@@ -38,6 +38,16 @@
   --cost: #ffa3ab;
   --baseline: #4a5766;
 
+  /* Grid bars and the Grid card. Bought bands step down in lightness (green, grey, red) so they
+     read without hue; the two sold purples and battery out/in differ in lightness too. */
+  --band-free: var(--save);
+  --band-shoulder: #9aa4af;
+  --band-peak: #e5484d;
+  --sold-super: var(--c-grid);
+  --sold-rest: var(--c-export);
+  --batt-out: var(--c-discharge);
+  --batt-in: #1f9d82;
+
   --free: rgba(61, 214, 176, 0.09);
   --peak: rgba(255, 122, 133, 0.08);
   --peak-strong: rgba(255, 122, 133, 0.15);
@@ -366,6 +376,11 @@ input[type="number"] { width: 6.5em; }
 .hc-cost .hc-label { color: var(--save-label); }
 .hc-link { margin-top: auto; padding-top: 4px; font-size: 13px; color: var(--link); text-decoration: none; min-height: 24px; }
 .hc-link:hover { text-decoration: underline; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--fg-soft); padding: 0 2px 8px; }
+.lg { display: inline-flex; align-items: center; gap: 5px; }
+.lg-sw { width: 12px; height: 12px; border-radius: 2px; flex: none; }
+.barbox { position: relative; overflow-x: auto; }
 
 .chart { width: 100%; height: 320px; }
 .chart.tall { height: 380px; }

@@ -1177,7 +1177,13 @@
   const CUSTOM_DAILY_MAX = 92;
   /** /api/daily?group= covers at most 20 years; Lifetime looks back 19 whole years and this one. */
   const LIFETIME_YEARS = 19;
-  const ENERGY_KEYS = ['pv_kwh', 'load_kwh', 'import_kwh', 'export_kwh'];
+  const CORE_KEYS = ['pv_kwh', 'load_kwh', 'import_kwh', 'export_kwh'];
+  /** /api/daily's grid energy by tariff band (null without a tariff or interval data). */
+  const BOUGHT_KEYS = ['import_free_kwh', 'import_shoulder_kwh', 'import_peak_kwh'];
+  const SOLD_KEYS = ['export_super_kwh', 'export_peak_kwh', 'export_other_kwh'];
+  /** The tariff the bars label rates with: the plan in force on the period's last day. */
+  let histTariff = null;
+  const ENERGY_KEYS = [...CORE_KEYS, 'battery_charge_kwh', 'battery_discharge_kwh', ...BOUGHT_KEYS, ...SOLD_KEYS];
 
   const utcMs = (d) => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10));
   const daysBetween = (a, b) => Math.round((utcMs(b) - utcMs(a)) / 86400000);
@@ -1365,23 +1371,87 @@
     return t;
   }
 
-  function energyOption(labels, days, tooltipTitle, narrow, thin = true) {
+  /** The distinct prices (cents) of an /api/tariff band, lowest first. `side` is 'import' or 'export'. */
+  function bandRates(t, side, band) {
+    const out = new Set(t[side].filter((w) => w.band === band).map((w) => w.cents));
+    if (t[`default_${side}_band`] === band) out.add(t[`default_${side}_cents`]);
+    return [...out].sort((x, y) => x - y);
+  }
+  const ratesText = (list) => list.map(cents).join('/');
+
+  /** The bar chart's seven grid parts and their labels, from the tariff (or generic words without one). */
+  function gridParts(t) {
+    const r = (side, band) => (t ? ratesText(bandRates(t, side, band)) : '');
+    const withRate = (name, rate) => (rate ? `${name} ${rate}` : name);
+    return {
+      bought: [
+        { key: 'import_free_kwh', name: withRate('Bought free', r('import', 'free')), colour: '--band-free' },
+        { key: 'import_shoulder_kwh', name: withRate('Bought shoulder', r('import', 'shoulder')), colour: '--band-shoulder' },
+        { key: 'import_peak_kwh', name: withRate('Bought peak', r('import', 'peak')), colour: '--band-peak' },
+      ],
+      sold: [
+        { key: 'export_super_kwh', name: withRate('Sold', r('export', 'super') || 'super'), colour: '--sold-super' },
+        { key: 'export_peak_kwh', name: withRate('Sold', r('export', 'peak') || 'peak'), colour: '--sold-rest' },
+        { key: 'export_other_kwh', name: withRate('Sold', r('export', 'other') || 'other'), colour: '--sold-rest' },
+      ],
+    };
+  }
+
+  /**
+   * One bucket's grid column: kWh per part, and the bought / sold kWh the split
+   * does not cover (all of it for a bucket with no split; a little can also be
+   * left when the cloud's daily counter and its 5-minute steps differ).
+   */
+  function gridColumn(d, parts) {
+    const n = (k) => d[k] || 0;
+    const rest = (total, keys) => {
+      const left = (total || 0) - keys.reduce((a, k) => a + n(k), 0);
+      return left > Math.max(0.05, 0.03 * (total || 0)) ? left : 0;
+    };
+    return {
+      boughtRest: rest(d.import_kwh, parts.bought.map((x) => x.key)),
+      soldRest: rest(d.export_kwh, parts.sold.map((x) => x.key)),
+    };
+  }
+
+  /**
+   * Grouped columns per bucket, like iSolarCloud: Solar; Grid (bought above zero
+   * by tariff band, sold below by export rate); Battery (out above, in below); Home.
+   */
+  function energyOption(labels, days, tooltipTitle, narrow, thin = true, t = null) {
     const th = baseTheme();
-    const v = (key) => days.map((d) => (d[key] == null ? null : d[key]));
+    const parts = gridParts(t);
+    const cols = days.map((d) => gridColumn(d, parts));
+    const panel = css('--panel');
+    const val = (f) => days.map((d, i) => {
+      const v = f(d, i);
+      return v == null || Math.abs(v) < 0.005 ? null : v;
+    });
+    const bar = (name, stack, colour, data) => ({
+      name, type: 'bar', stack, data, barMaxWidth: 18,
+      itemStyle: { color: css(colour), borderColor: panel, borderWidth: 1 },
+    });
+    const series = [
+      bar('Solar', 'solar', '--c-pv', val((d) => d.pv_kwh)),
+      ...parts.bought.map((x) => bar(x.name, 'grid', x.colour, val((d) => d[x.key]))),
+      bar('Bought (no tariff split)', 'grid', '--c-grid', val((d, i) => cols[i].boughtRest)),
+      ...parts.sold.map((x) => bar(x.name, 'grid', x.colour, val((d) => (d[x.key] == null ? null : -d[x.key])))),
+      bar('Sold (no tariff split)', 'grid', '--c-export', val((d, i) => -cols[i].soldRest)),
+      bar('Battery out', 'battery', '--batt-out', val((d) => d.battery_discharge_kwh)),
+      bar('Battery in', 'battery', '--batt-in', val((d) => (d.battery_charge_kwh == null ? null : -d.battery_charge_kwh))),
+      bar('Home', 'home', '--c-load', val((d) => d.load_kwh)),
+    ];
     return {
       animation: false,
-      grid: { left: 8, right: 8, top: narrow ? 72 : 44, bottom: 8, containLabel: true },
-      legend: { top: 0, left: 8, right: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      grid: { left: 8, right: 8, top: 24, bottom: 8, containLabel: true },
       textStyle: { fontFamily: css('--font') },
       tooltip: {
-        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(), confine: true,
         formatter(params) {
-          const rows = params.map((p) => {
-            const val = p.value == null ? null : Math.abs(p.value);
-            return `<div style="display:flex;justify-content:space-between;gap:16px">`
-              + `<span>${p.marker}${p.seriesName}</span><b>${val == null ? '–' : val.toFixed(1) + ' kWh'}</b></div>`;
-          });
-          return `<div style="margin-bottom:4px">${esc(tooltipTitle(params[0].dataIndex))}</div>${rows.join('')}`;
+          const rows = params.filter((p) => p.value != null).map((p) => (
+            `<div style="display:flex;justify-content:space-between;gap:16px">`
+            + `<span>${p.marker}${esc(p.seriesName)}</span><b>${Math.abs(p.value).toFixed(1)} kWh</b></div>`));
+          return `<div style="margin-bottom:4px">${esc(tooltipTitle(params[0].dataIndex))}</div>${rows.join('') || '<div>No data</div>'}`;
         },
       },
       xAxis: {
@@ -1393,16 +1463,28 @@
         type: 'value', name: 'kWh', nameTextStyle: { color: th.muted },
         axisLabel: { color: th.muted, fontFamily: css('--mono') }, splitLine: { lineStyle: { color: th.line } },
       },
-      series: [
-        { name: 'PV generation', type: 'bar', stack: 'e', data: v('pv_kwh'), itemStyle: { color: css('--c-pv') } },
-        { name: 'Grid import', type: 'bar', stack: 'e', data: v('import_kwh'), itemStyle: { color: css('--c-import') } },
-        { name: 'Grid export', type: 'bar', stack: 'e', data: days.map((d) => (d.export_kwh == null ? null : -d.export_kwh)), itemStyle: { color: css('--c-export') } },
-        { name: 'Load', type: 'line', data: v('load_kwh'), showSymbol: false, lineStyle: { width: 2, color: css('--c-load') }, itemStyle: { color: css('--c-load') }, z: 5 },
-      ],
+      series,
     };
   }
 
-  const hasEnergy = (rows) => rows.some((d) => ENERGY_KEYS.some((k) => d[k] != null));
+  /** The key above the bars: Solar, Bought free/shoulder/peak, Sold by rate, Battery out/in, Home. */
+  function renderBarsLegend(t, unsplit) {
+    const parts = gridParts(t);
+    const sw = (colour) => { const e = el('span', 'lg-sw'); e.style.background = `var(${colour})`; e.setAttribute('aria-hidden', 'true'); return e; };
+    const item = (...nodes) => { const e = el('span', 'lg'); e.append(...nodes); return e; };
+    const rate = (x) => x.name.replace(/^(Bought|Sold) ?/, '') || x.name;
+    const soldRest = t ? `${ratesText(bandRates(t, 'export', 'peak')) || 'peak'}-${ratesText(bandRates(t, 'export', 'other')) || 'other'}` : 'other';
+    $('bars-legend').replaceChildren(
+      item(sw('--c-pv'), 'Solar'),
+      item('Bought ', sw('--band-free'), 'free ', sw('--band-shoulder'), 'shoulder ', sw('--band-peak'), 'peak'),
+      item('Sold ', sw('--sold-super'), `${t ? rate(parts.sold[0]) : 'super'} `, sw('--sold-rest'), soldRest),
+      item(sw('--batt-out'), 'Battery out ', sw('--batt-in'), 'in'),
+      item(sw('--c-load'), 'Home'),
+      ...(unsplit ? [item(sw('--c-grid'), 'Grid, not split by tariff')] : []),
+    );
+  }
+
+  const hasEnergy = (rows) => rows.some((d) => CORE_KEYS.some((k) => d[k] != null));
 
   /** Month buckets from /api/daily?group=month, summed into years. */
   function bucketsToYears(buckets) {
@@ -1420,10 +1502,17 @@
 
   function drawBars(rows, labels, title, thin, alt, hint, onClick) {
     renderCards(sumTotals(rows));
-    const option = energyOption(labels, rows, title, window.innerWidth < 560, thin);
+    const narrow = window.innerWidth < 560;
+    // On a phone four columns per bucket get too thin, so many buckets scroll sideways.
+    const parts = gridParts(histTariff);
+    const unsplit = rows.some((d) => { const c = gridColumn(d, parts); return c.boughtRest > 0 || c.soldRest > 0; });
+    const wide = narrow && rows.length > 8;
+    $('bars-chart').style.width = wide ? `${rows.length * 30 + 40}px` : '';
+    const option = energyOption(labels, rows, title, narrow && !wide, thin, histTariff);
+    renderBarsLegend(histTariff, unsplit);
     showChart('bars-chart', hasEnergy(rows), option,
-      `${alt}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
-    $('bars-hint').textContent = hint;
+      `${alt}: columns per period for solar, grid (bought above the axis, sold below), battery (out above, in below) and home, in kWh.`);
+    $('bars-hint').textContent = wide ? `${hint} Scroll the chart sideways to see every bar.` : hint;
     onBarClick('bars-chart', onClick);
   }
 
@@ -1484,6 +1573,10 @@
     const [from, to] = rangeOf();
     const date = curveDate();
     const cost = loadCostCard(current);
+    if (!date) {
+      histTariff = await tariffOrNull(to > todayStr() ? todayStr() : to);
+      if (!current()) return;
+    }
     if (date) await loadDay(date);
     else if (state.period === 'lifetime') await loadGroupedBars(from, to, true, current);
     else if (state.period === 'year') await loadYearBars(from, to, current);
