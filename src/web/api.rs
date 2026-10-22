@@ -47,13 +47,13 @@ const MIN_FINISHED_LIVE_COVERAGE: f64 = 0.98;
 
 /// Battery state of charge. iSolarCloud stores it as a fraction (0.674),
 /// but its unit is "%", so the API scales it to a percentage (67.4).
-const SOC_POINT: i64 = 83252;
+pub(super) const SOC_POINT: i64 = 83252;
 
 /// Power points shown by `/api/day`: (key, point id).
 const POWER_POINTS: [(&str, i64); 3] = [("pv_w", 83033), ("load_w", 83106), ("soc", SOC_POINT)];
 
 /// A stored value as the API shows it (see [`SOC_POINT`]).
-fn display_value(point_id: i64, value: f64) -> f64 {
+pub(super) fn display_value(point_id: i64, value: f64) -> f64 {
     if point_id == SOC_POINT {
         value * 100.0
     } else {

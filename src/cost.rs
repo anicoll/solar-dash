@@ -130,6 +130,34 @@ impl Tariff {
         &self.key
     }
 
+    /// The zero-import credit window as (start, end) minutes since local
+    /// midnight, or `None` when the plan has no such credit.
+    pub fn credit_window_minutes(&self) -> Option<(u32, u32)> {
+        let credit = self.zero_import_credit.as_ref()?;
+        Some((credit.window.start, credit.window.end))
+    }
+
+    /// Whether this local time (minutes since midnight) is inside the credit window.
+    pub fn in_credit_window(&self, minute_of_day: u32) -> bool {
+        self.zero_import_credit
+            .as_ref()
+            .is_some_and(|credit| credit.window.contains(minute_of_day))
+    }
+
+    /// The credit's value in cents, or `None` when the plan has no such credit.
+    pub fn credit_cents(&self) -> Option<f64> {
+        self.zero_import_credit.as_ref().map(|c| c.credit_cents)
+    }
+
+    /// When free import starts (minutes since local midnight): the start of
+    /// the first import window priced at 0 c. `None` if no import is free.
+    pub fn free_import_start(&self) -> Option<u32> {
+        self.import
+            .iter()
+            .find(|w| w.cents <= 0.0)
+            .map(|w| w.window.start)
+    }
+
     /// Cents per kWh paid to import at this local time (minutes since midnight).
     pub fn import_cents_at(&self, minute_of_day: u32) -> f64 {
         price_at(&self.import, self.default_import_cents, minute_of_day)
@@ -228,7 +256,7 @@ pub struct DayCost {
 
 /// Local minutes since midnight for a unix time. We price an interval at its
 /// midpoint, so an interval straddling a price change is not split.
-fn local_minute_of_day(tz: Tz, ts: i64) -> u32 {
+pub(crate) fn local_minute_of_day(tz: Tz, ts: i64) -> u32 {
     // `from_timestamp` only fails for absurd times far outside real data;
     // minute 0 is a harmless fallback there.
     DateTime::from_timestamp(ts, 0).map_or(0, |utc| {
