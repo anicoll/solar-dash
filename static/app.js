@@ -165,6 +165,14 @@
     };
   }
 
+  /** Calls `fn(dataIndex)` when a bar of chart `id` is clicked (replaces any earlier handler). */
+  function onBarClick(id, fn) {
+    const c = getChart(id);
+    if (!c) return;
+    c.off('click');
+    c.on('click', (p) => { if (p.seriesType === 'bar') fn(p.dataIndex); });
+  }
+
   function showChart(id, hasData, option, label) {
     const empty = $(id.replace('-chart', '-empty'));
     empty.hidden = hasData;
@@ -1053,6 +1061,7 @@
     const option = energyOption(labels, days, (i) => days[i].date, window.innerWidth < 560);
     showChart('month-chart', hasData, option,
       `Daily energy for ${MONTHS[m - 1]} ${y}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
+    onBarClick('month-chart', (i) => go({ view: 'day', day: days[i].date }));
   }
 
   // ---------- Year ----------
@@ -1069,6 +1078,7 @@
     const option = energyOption(MONTHS, agg, (i) => `${MONTHS[i]} ${year}`, window.innerWidth < 560, false);
     showChart('year-chart', hasData, option,
       `Monthly energy for ${year}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
+    onBarClick('year-chart', (i) => go({ view: 'month', month: `${year}-${pad(i + 1)}` }));
   }
 
   // ---------- shared bits for the money views ----------
@@ -1524,6 +1534,9 @@
   // ---------- routing (hash) ----------
 
   const VIEWS = ['now', 'day', 'month', 'year', 'savings', 'payback', 'cost'];
+  // Day, Month and Year are the periods of the History tab.
+  const PERIODS = ['day', 'month', 'year'];
+  let period = 'day'; // the period History opens on: the last one shown
   const state = { view: 'now', day: '', month: '', year: 0, range: 'all' };
   let timer = null;
   let pollToken = 0;
@@ -1543,7 +1556,9 @@
   function parseHash() {
     let raw = window.location.hash.replace(/^#/, '');
     try { raw = decodeURIComponent(raw); } catch (e) { raw = ''; } // malformed escapes: fall back to Now
-    const [view, value] = raw.split('=');
+    let [view, value] = raw.split('=');
+    if (view === 'history') view = period;
+    if (PERIODS.includes(view)) period = view;
     const today = todayStr();
     state.view = VIEWS.includes(view) ? view : 'now';
     state.range = view === 'savings' && RANGES.includes(value) ? value : 'all';
@@ -1554,6 +1569,7 @@
 
   /** The hash for a view, carrying that view's current date or range. */
   function viewHash(v) {
+    if (v === 'history') v = period;
     return v === 'day' ? `day=${state.day}` : v === 'month' ? `month=${state.month}`
       : v === 'year' ? `year=${state.year}` : v === 'savings' ? `savings=${state.range}` : v;
   }
@@ -1569,7 +1585,8 @@
     parseHash();
     for (const v of document.querySelectorAll('.view')) v.hidden = v.id !== `view-${state.view}`;
     for (const tab of document.querySelectorAll('.tab')) {
-      if (tab.dataset.view === state.view) {
+      const isCurrent = tab.dataset.view === 'history' ? PERIODS.includes(state.view) : tab.dataset.view === state.view;
+      if (isCurrent) {
         tab.setAttribute('aria-current', 'page');
         // On a phone the tab row scrolls; keep the current tab in view.
         const nav = tab.parentElement;
@@ -1579,6 +1596,7 @@
       const v = tab.dataset.view;
       tab.setAttribute('href', '#' + viewHash(v));
     }
+    for (const b of document.querySelectorAll('[data-period]')) b.setAttribute('aria-pressed', String(b.dataset.period === state.view));
     clearTimeout(timer);
     timer = null;
     pollToken++;
@@ -1598,6 +1616,15 @@
     return `${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}`;
   }
 
+  /** Switches the History period, keeping the date in view (today when the new period contains it). */
+  function switchPeriod(to) {
+    const from = state.view;
+    const day = from === 'day' ? state.day : from === 'month' ? `${state.month}-01` : `${state.year}-01-01`;
+    const today = todayStr();
+    const len = { day: 10, month: 7, year: 4 }[from];
+    go({ view: to, day: day.slice(0, len) === today.slice(0, len) ? today : day, month: day.slice(0, 7), year: +day.slice(0, 4) });
+  }
+
   function go(patch) { Object.assign(state, patch); setHash(); }
 
   function init() {
@@ -1605,6 +1632,7 @@
       chartsError = "Charts couldn't load (no internet to cdnjs?)";
       updateBanner();
     }
+    for (const b of document.querySelectorAll('[data-period]')) b.onclick = () => switchPeriod(b.dataset.period);
     $('day-prev').onclick = () => go({ day: addDays(state.day, -1) });
     $('day-next').onclick = () => go({ day: addDays(state.day, 1) });
     $('day-today').onclick = () => go({ day: todayStr() });
