@@ -734,7 +734,7 @@
     renderCarTile(car, car ? await fetchCarSession(car) : null);
     // While History shows today's Day chart, refresh it (and its totals) on the slower
     // cadence: the chart needs heavier requests than the tiles.
-    if (curveDate() === today && Date.now() - lastDayChartAt >= REFRESH_MS - 1000) {
+    if (state.hview === 'chart' && curveDate() === today && Date.now() - lastDayChartAt >= REFRESH_MS - 1000) {
       await loadDay(today);
     }
     return delay;
@@ -875,15 +875,17 @@
    */
   async function loadDayChart(chartId, noteId, date, current, day) {
     day = day || await api(`/api/day?date=${date}`);
-    const [live, charging] = await Promise.all([
+    const [live, charging, tariff] = await Promise.all([
       fetchLiveDay(day.start, day.end),
       fetchCharging(day.start, day.end),
+      tariffOrNull(date),
     ]);
+    const tf = dayTariff(tariff);
     if (!current()) return;
     const merged = mergeDay(day.series, live);
     // Kept so the Smooth toggle can redraw without refetching.
-    dayDraws[chartId] = () => drawDayChart(chartId, noteId, date, day, merged, charging);
-    drawDayChart(chartId, noteId, date, day, merged, charging);
+    dayDraws[chartId] = () => drawDayChart(chartId, noteId, date, day, merged, charging, tf);
+    drawDayChart(chartId, noteId, date, day, merged, charging, tf);
   }
 
   /**
@@ -901,27 +903,63 @@
     });
   }
 
-  // The tariff windows and rates the Day chart shades and labels. No API exposes
-  // the configured [tariff], so these mirror config.example.toml (GloBird ZEROHERO):
-  // update them together. Hours are local wall-clock; the first matching window wins.
-  const TARIFF = {
-    shoulderCents: 44,
-    importWindows: [
-      { name: 'Free', from: 11, to: 14, cents: 0 },
-      { name: 'Peak', from: 16, to: 23, cents: 58.3 },
-    ],
-    exportDefaultCents: 0,
-    exportWindows: [
-      { name: 'Super Export', from: 18, to: 21, cents: 10 },
-      { name: 'Feed-in', from: 16, to: 23, cents: 2 },
-    ],
-  };
+  // ---------- tariff (from /api/tariff) ----------
+
+  const tariffCache = new Map(); // YYYY-MM-DD -> Promise of the /api/tariff answer, or null when none is configured
+
+  /** The tariff in force on `date`, fetched once per day and kept. Resolves to null without a [tariff]. */
+  function loadTariff(date) {
+    let p = tariffCache.get(date);
+    if (!p) {
+      p = api(`/api/tariff?date=${date}`).then((r) => (r && r.configured ? r : null));
+      tariffCache.set(date, p);
+      p.catch(() => tariffCache.delete(date));
+    }
+    return p;
+  }
+
+  /** Like loadTariff, but a failed request gives null: the pages work without the tariff. */
+  async function tariffOrNull(date) {
+    try {
+      return await loadTariff(date);
+    } catch (err) {
+      if (err.message === 'Not logged in.') throw err;
+      return null;
+    }
+  }
+
+  const hours = (hhmm) => { const [h, m] = hhmm.split(':').map(Number); return h + m / 60; };
+
+  /**
+   * The Day chart's view of an /api/tariff answer: windows in local hours (0-24),
+   * named by band, in config order (the first matching window wins). A window that
+   * wraps past midnight becomes two. `null` when there is no tariff.
+   */
+  function dayTariff(t) {
+    if (!t) return null;
+    const windows = (list, nameOf) => {
+      const out = [];
+      for (const w of list) {
+        const a = hours(w.from), b = hours(w.to);
+        const add = (from, to) => { if (to > from) out.push({ name: nameOf(w), from, to, cents: w.cents, band: w.band }); };
+        if (a < b) add(a, b);
+        else { add(a, 24); add(0, b); }
+      }
+      return out;
+    };
+    return {
+      shoulderCents: t.default_import_cents,
+      importWindows: windows(t.import, (w) => ({ free: 'Free', peak: 'Peak', shoulder: 'Shoulder' })[w.band]),
+      exportDefaultCents: t.default_export_cents,
+      exportWindows: windows(t.export, (w) => (w.band === 'super' ? 'Super Export' : 'Feed-in')),
+    };
+  }
   const cents = (c) => `${+c.toFixed(1)}c`;
 
   /** The tariff rows for a day as `{ buy, sell }`: lists of `{ from, to, name, c, text }` in hours (0-24). */
-  function tariffSegments() {
+  function tariffSegments(tf) {
     const cuts = new Set([0, 24]);
-    for (const w of [...TARIFF.importWindows, ...TARIFF.exportWindows]) { cuts.add(w.from); cuts.add(w.to); }
+    for (const w of [...tf.importWindows, ...tf.exportWindows]) { cuts.add(w.from); cuts.add(w.to); }
     const edges = [...cuts].sort((a, b) => a - b);
     const row = (list, dflt, label) => {
       const out = [];
@@ -937,32 +975,32 @@
       return out;
     };
     return {
-      buy: row(TARIFF.importWindows, TARIFF.shoulderCents, (s, first) => (s.name
+      buy: row(tf.importWindows, tf.shoulderCents, (s, first) => (s.name
         ? (s.c === 0 ? s.name : `${s.name} ${cents(s.c)}`) : first ? `Shoulder ${cents(s.c)}` : cents(s.c))),
-      sell: row(TARIFF.exportWindows, TARIFF.exportDefaultCents, (s) => (s.name === 'Super Export'
+      sell: row(tf.exportWindows, tf.exportDefaultCents, (s) => (s.name === 'Super Export'
         ? `${s.name} ${cents(s.c)}` : cents(s.c))),
     };
   }
 
   /** What the tariff is at hour `h`, for the tooltip: "Peak 58.3c · Super Export 10c". */
-  function tariffAt(h) {
-    const imp = TARIFF.importWindows.find((w) => h >= w.from && h < w.to);
-    const exp = TARIFF.exportWindows.find((w) => h >= w.from && h < w.to);
-    const sell = exp ? `${exp.name === 'Feed-in' ? 'feed-in' : exp.name} ${cents(exp.cents)}` : `feed-in ${cents(TARIFF.exportDefaultCents)}`;
-    if (imp && imp.cents === 0) return { text: 'Free import', kind: 'free' };
-    if (imp) return { text: `${imp.name} ${cents(imp.cents)} · ${sell}`, kind: 'peak' };
-    return { text: `Shoulder ${cents(TARIFF.shoulderCents)} · ${sell}`, kind: 'shoulder' };
+  function tariffAt(h, tf) {
+    const imp = tf.importWindows.find((w) => h >= w.from && h < w.to);
+    const exp = tf.exportWindows.find((w) => h >= w.from && h < w.to);
+    const sell = exp ? `${exp.name === 'Feed-in' ? 'feed-in' : exp.name} ${cents(exp.cents)}` : `feed-in ${cents(tf.exportDefaultCents)}`;
+    if (imp && imp.band === 'free') return { text: 'Free import', kind: 'free' };
+    if (imp && imp.band === 'peak') return { text: `${imp.name} ${cents(imp.cents)} · ${sell}`, kind: 'peak' };
+    return { text: `Shoulder ${cents(imp ? imp.cents : tf.shoulderCents)} · ${sell}`, kind: 'shoulder' };
   }
 
   const STRIP_LEFT = 52;  // px between the chart's left edge and the plot: the kW labels, and "Buy"/"Sell" below
   const STRIP_RIGHT = 44; // and on the right, for the SOC labels
 
   /** Fills the two-row tariff strip under the chart, covering [start, max] ms of `date`. */
-  function drawTariffStrip(strip, date, start, max, gl, gr) {
+  function drawTariffStrip(strip, date, start, max, gl, gr, tf) {
     strip.style.setProperty('--gl', `${gl}px`);
     strip.style.setProperty('--gr', `${gr}px`);
     const plotW = $('day-chart').clientWidth - gl - gr;
-    const { buy, sell } = tariffSegments();
+    const { buy, sell } = tariffSegments(tf);
     const rows = [['Buy', buy], ['Sell', sell]].map(([name, segs]) => {
       const cells = segs.map((s) => {
         const a = Math.max(adelaideMs(date, s.from), start);
@@ -970,7 +1008,7 @@
         if (b <= a) return '';
         const frac = (b - a) / (max - start);
         const fits = frac * plotW >= s.text.length * 6.5 + 10;
-        const kind = s.name === 'Free' ? 'free' : s.name === 'Peak' ? 'peak' : s.name === 'Super Export' ? 'super' : s.name ? 'feed' : 'base';
+        const kind = s.name === 'Free' ? 'free' : s.name === 'Peak' ? 'peak' : s.name === 'Super Export' ? 'super' : s.name === 'Feed-in' ? 'feed' : 'base';
         return `<span class="ts-${kind}" style="width:${frac * 100}%" title="${esc(s.text)}">${fits ? esc(s.text) : ''}</span>`;
       });
       return `<div class="trow"><b>${name}</b><div class="ttrack">${cells.join('')}</div></div>`;
@@ -979,7 +1017,7 @@
   }
 
   /** Draws the power chart from fetched data, smoothed when the toggle is on. */
-  function drawDayChart(chartId, noteId, date, day, { byKey, source }, charging) {
+  function drawDayChart(chartId, noteId, date, day, { byKey, source }, charging, tf) {
     const start = day.start * 1000;
     const isToday = date === todayStr();
     // Today stops at now (at least 15 minutes in, so the first minutes still draw).
@@ -1027,11 +1065,11 @@
       emphasis: { disabled: true }, z: 2,
     });
     const shade = (w, colour) => [adelaideMs(date, w.from), Math.min(adelaideMs(date, w.to), end), colour];
-    const shading = [
-      ...TARIFF.importWindows.filter((w) => w.cents === 0).map((w) => shade(w, css('--free'))),
-      ...TARIFF.importWindows.filter((w) => w.cents > 0).map((w) => shade(w, css('--peak'))),
-      ...TARIFF.exportWindows.filter((w) => w.name === 'Super Export').map((w) => shade(w, css('--peak-strong'))),
-    ];
+    const shading = tf ? [
+      ...tf.importWindows.filter((w) => w.band === 'free').map((w) => shade(w, css('--free'))),
+      ...tf.importWindows.filter((w) => w.band === 'peak').map((w) => shade(w, css('--peak'))),
+      ...tf.exportWindows.filter((w) => w.name === 'Super Export').map((w) => shade(w, css('--peak-strong'))),
+    ] : [];
     series[0].markArea = {
       silent: true, z: 1,
       data: shading.filter(([a, b]) => a < b)
@@ -1082,7 +1120,7 @@
           params = params.filter((p) => p.value[1] != null);
           if (!params.length) return '';
           const t = params[0].value[0];
-          const tf = tariffAt((t - adelaideMs(date, 0)) / 3600000);
+          const at = tf ? tariffAt((t - adelaideMs(date, 0)) / 3600000, tf) : null;
           const rows = params.map((p) => {
             const v = p.value[1];
             let name = p.seriesName;
@@ -1097,7 +1135,8 @@
               + `width:10px;height:10px;background:${ev}"></span>${esc(chargingName)}</div>`);
           }
           return `<div>${clock(t)}</div>`
-            + `<div style="margin-bottom:4px;font-size:12px;color:${tipColour[tf.kind]}">${esc(tf.text)}</div>${rows.join('')}`;
+            + (at ? `<div style="margin-bottom:4px;font-size:12px;color:${tipColour[at.kind]}">${esc(at.text)}</div>` : '<div style="margin-bottom:4px"></div>')
+            + rows.join('');
         },
       },
       xAxis: {
@@ -1126,8 +1165,8 @@
         ? `Power chart for ${date}: peak solar ${kw(peakKw)} kW; solar, home, battery (supplying or charging) and grid (buying or selling) in kW, battery state of charge in percent.`
         : `Power chart for ${date}: no data`);
     const strip = $('day-strip');
-    strip.hidden = !hasData;
-    if (hasData) drawTariffStrip(strip, date, start, end, gl, gr);
+    strip.hidden = !hasData || !tf;
+    if (hasData && tf) drawTariffStrip(strip, date, start, end, gl, gr, tf);
   }
 
   // ---------- History: periods, date pill, cards ----------
@@ -1138,7 +1177,11 @@
   const CUSTOM_DAILY_MAX = 92;
   /** /api/daily?group= covers at most 20 years; Lifetime looks back 19 whole years and this one. */
   const LIFETIME_YEARS = 19;
-  const ENERGY_KEYS = ['pv_kwh', 'load_kwh', 'import_kwh', 'export_kwh'];
+  const CORE_KEYS = ['pv_kwh', 'load_kwh', 'import_kwh', 'export_kwh'];
+  /** /api/daily's grid energy by tariff band (null without a tariff or interval data). */
+  const BOUGHT_KEYS = ['import_free_kwh', 'import_shoulder_kwh', 'import_peak_kwh'];
+  const SOLD_KEYS = ['export_super_kwh', 'export_peak_kwh', 'export_other_kwh'];
+  const ENERGY_KEYS = [...CORE_KEYS, 'battery_charge_kwh', 'battery_discharge_kwh', ...BOUGHT_KEYS, ...SOLD_KEYS];
 
   const utcMs = (d) => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10));
   const daysBetween = (a, b) => Math.round((utcMs(b) - utcMs(a)) / 86400000);
@@ -1250,8 +1293,15 @@
     $('dp-next').disabled = atCurrent();
     $('dp-label').disabled = life;
     const curve = curveDate() != null;
-    $('view-day').hidden = !curve;
-    $('view-bars').hidden = curve;
+    const table = state.hview === 'table';
+    $('view-day').hidden = !curve || table;
+    $('view-bars').hidden = curve || table;
+    $('view-table').hidden = !table;
+    for (const b of document.querySelectorAll('.vtab')) {
+      const on = b.dataset.hview === state.hview;
+      b.setAttribute('aria-selected', String(on));
+      b.tabIndex = on ? 0 : -1;
+    }
     $('hist-panel').setAttribute('aria-labelledby', `ptab-${state.period}`);
   }
 
@@ -1286,6 +1336,34 @@
         : `Used ${fmtKwh(load - pv)} kWh more than you made`;
     $('hc-grid').textContent = imp == null && exp == null ? '–'
       : `${fmtKwh(imp)} in · ${fmtKwh(exp)} out kWh`;
+    renderGridSplit(t);
+  }
+
+  /** Whole percentages of `parts` that add up to 100 (largest remainder), or null when they are all 0. */
+  function percentSplit(parts) {
+    const total = parts.reduce((a, b) => a + b, 0);
+    if (!(total > 0)) return null;
+    const exact = parts.map((v) => (v / total) * 100);
+    const out = exact.map(Math.floor);
+    let left = 100 - out.reduce((a, b) => a + b, 0);
+    exact.map((v, i) => [v - out[i], i]).sort((a, b) => b[0] - a[0]).forEach(([, i]) => { if (left > 0) { out[i] += 1; left -= 1; } });
+    return out;
+  }
+
+  /** The thin free/shoulder/peak bar and line on the Grid card; both are hidden when there is no split. */
+  function renderGridSplit(t) {
+    const bar = $('hc-split-bar');
+    const line = $('hc-split');
+    const sub = $('hc-grid-sub');
+    const known = BOUGHT_KEYS.some((k) => t[k] != null);
+    const pct = known ? percentSplit(BOUGHT_KEYS.map((k) => t[k] || 0)) : null;
+    bar.hidden = line.hidden = !pct;
+    sub.hidden = !!pct;
+    if (!pct) return;
+    const text = `${pct[0]}% bought free, ${pct[1]}% shoulder, ${pct[2]}% peak`;
+    line.textContent = text;
+    bar.setAttribute('aria-label', text);
+    [...bar.children].forEach((seg, i) => { seg.style.width = `${pct[i]}%`; });
   }
 
   function resetCostCard() {
@@ -1326,23 +1404,87 @@
     return t;
   }
 
-  function energyOption(labels, days, tooltipTitle, narrow, thin = true) {
+  /** The distinct prices (cents) of an /api/tariff band, lowest first. `side` is 'import' or 'export'. */
+  function bandRates(t, side, band) {
+    const out = new Set(t[side].filter((w) => w.band === band).map((w) => w.cents));
+    if (t[`default_${side}_band`] === band) out.add(t[`default_${side}_cents`]);
+    return [...out].sort((x, y) => x - y);
+  }
+  const ratesText = (list) => list.map(cents).join('/');
+
+  /** The bar chart's seven grid parts and their labels, from the tariff (or generic words without one). */
+  function gridParts(t) {
+    const r = (side, band) => (t ? ratesText(bandRates(t, side, band)) : '');
+    const withRate = (name, rate) => (rate ? `${name} ${rate}` : name);
+    return {
+      bought: [
+        { key: 'import_free_kwh', name: withRate('Bought free', r('import', 'free')), colour: '--band-free' },
+        { key: 'import_shoulder_kwh', name: withRate('Bought shoulder', r('import', 'shoulder')), colour: '--band-shoulder' },
+        { key: 'import_peak_kwh', name: withRate('Bought peak', r('import', 'peak')), colour: '--band-peak' },
+      ],
+      sold: [
+        { key: 'export_super_kwh', name: withRate('Sold', r('export', 'super') || 'super'), colour: '--sold-super' },
+        { key: 'export_peak_kwh', name: withRate('Sold', r('export', 'peak') || 'peak'), colour: '--sold-rest' },
+        { key: 'export_other_kwh', name: withRate('Sold', r('export', 'other') || 'other'), colour: '--sold-rest' },
+      ],
+    };
+  }
+
+  /**
+   * One bucket's grid column: kWh per part, and the bought / sold kWh the split
+   * does not cover (all of it for a bucket with no split; a little can also be
+   * left when the cloud's daily counter and its 5-minute steps differ).
+   */
+  function gridColumn(d, parts) {
+    const n = (k) => d[k] || 0;
+    const rest = (total, keys) => {
+      const left = (total || 0) - keys.reduce((a, k) => a + n(k), 0);
+      return left > Math.max(0.05, 0.03 * (total || 0)) ? left : 0;
+    };
+    return {
+      boughtRest: rest(d.import_kwh, parts.bought.map((x) => x.key)),
+      soldRest: rest(d.export_kwh, parts.sold.map((x) => x.key)),
+    };
+  }
+
+  /**
+   * Grouped columns per bucket, like iSolarCloud: Solar; Grid (bought above zero
+   * by tariff band, sold below by export rate); Battery (out above, in below); Home.
+   */
+  function energyOption(labels, days, tooltipTitle, narrow, thin = true, t = null) {
     const th = baseTheme();
-    const v = (key) => days.map((d) => (d[key] == null ? null : d[key]));
+    const parts = gridParts(t);
+    const cols = days.map((d) => gridColumn(d, parts));
+    const panel = css('--panel');
+    const val = (f) => days.map((d, i) => {
+      const v = f(d, i);
+      return v == null || Math.abs(v) < 0.005 ? null : v;
+    });
+    const bar = (name, stack, colour, data) => ({
+      name, type: 'bar', stack, data, barMaxWidth: 18,
+      itemStyle: { color: css(colour), borderColor: panel, borderWidth: 1 },
+    });
+    const series = [
+      bar('Solar', 'solar', '--c-pv', val((d) => d.pv_kwh)),
+      ...parts.bought.map((x) => bar(x.name, 'grid', x.colour, val((d) => d[x.key]))),
+      bar('Bought (no tariff split)', 'grid', '--c-grid', val((d, i) => cols[i].boughtRest)),
+      ...parts.sold.map((x) => bar(x.name, 'grid', x.colour, val((d) => (d[x.key] == null ? null : -d[x.key])))),
+      bar('Sold (no tariff split)', 'grid', '--c-export', val((d, i) => -cols[i].soldRest)),
+      bar('Battery out', 'battery', '--batt-out', val((d) => d.battery_discharge_kwh)),
+      bar('Battery in', 'battery', '--batt-in', val((d) => (d.battery_charge_kwh == null ? null : -d.battery_charge_kwh))),
+      bar('Home', 'home', '--c-load', val((d) => d.load_kwh)),
+    ];
     return {
       animation: false,
-      grid: { left: 8, right: 8, top: narrow ? 72 : 44, bottom: 8, containLabel: true },
-      legend: { top: 0, left: 8, right: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
+      grid: { left: 8, right: 8, top: 24, bottom: 8, containLabel: true },
       textStyle: { fontFamily: css('--font') },
       tooltip: {
-        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(), confine: true,
         formatter(params) {
-          const rows = params.map((p) => {
-            const val = p.value == null ? null : Math.abs(p.value);
-            return `<div style="display:flex;justify-content:space-between;gap:16px">`
-              + `<span>${p.marker}${p.seriesName}</span><b>${val == null ? '–' : val.toFixed(1) + ' kWh'}</b></div>`;
-          });
-          return `<div style="margin-bottom:4px">${esc(tooltipTitle(params[0].dataIndex))}</div>${rows.join('')}`;
+          const rows = params.filter((p) => p.value != null).map((p) => (
+            `<div style="display:flex;justify-content:space-between;gap:16px">`
+            + `<span>${p.marker}${esc(p.seriesName)}</span><b>${Math.abs(p.value).toFixed(1)} kWh</b></div>`));
+          return `<div style="margin-bottom:4px">${esc(tooltipTitle(params[0].dataIndex))}</div>${rows.join('') || '<div>No data</div>'}`;
         },
       },
       xAxis: {
@@ -1354,16 +1496,28 @@
         type: 'value', name: 'kWh', nameTextStyle: { color: th.muted },
         axisLabel: { color: th.muted, fontFamily: css('--mono') }, splitLine: { lineStyle: { color: th.line } },
       },
-      series: [
-        { name: 'PV generation', type: 'bar', stack: 'e', data: v('pv_kwh'), itemStyle: { color: css('--c-pv') } },
-        { name: 'Grid import', type: 'bar', stack: 'e', data: v('import_kwh'), itemStyle: { color: css('--c-import') } },
-        { name: 'Grid export', type: 'bar', stack: 'e', data: days.map((d) => (d.export_kwh == null ? null : -d.export_kwh)), itemStyle: { color: css('--c-export') } },
-        { name: 'Load', type: 'line', data: v('load_kwh'), showSymbol: false, lineStyle: { width: 2, color: css('--c-load') }, itemStyle: { color: css('--c-load') }, z: 5 },
-      ],
+      series,
     };
   }
 
-  const hasEnergy = (rows) => rows.some((d) => ENERGY_KEYS.some((k) => d[k] != null));
+  /** The key above the bars: Solar, Bought free/shoulder/peak, Sold by rate, Battery out/in, Home. */
+  function renderBarsLegend(t, unsplit) {
+    const parts = gridParts(t);
+    const sw = (colour) => { const e = el('span', 'lg-sw'); e.style.background = `var(${colour})`; e.setAttribute('aria-hidden', 'true'); return e; };
+    const item = (...nodes) => { const e = el('span', 'lg'); e.append(...nodes); return e; };
+    const rate = (x) => x.name.replace(/^(Bought|Sold) ?/, '') || x.name;
+    const soldRest = t ? `${ratesText(bandRates(t, 'export', 'peak')) || 'peak'}-${ratesText(bandRates(t, 'export', 'other')) || 'other'}` : 'other';
+    $('bars-legend').replaceChildren(
+      item(sw('--c-pv'), 'Solar'),
+      item('Bought ', sw('--band-free'), 'free ', sw('--band-shoulder'), 'shoulder ', sw('--band-peak'), 'peak'),
+      item('Sold ', sw('--sold-super'), `${t ? rate(parts.sold[0]) : 'super'} `, sw('--sold-rest'), soldRest),
+      item(sw('--batt-out'), 'Battery out ', sw('--batt-in'), 'in'),
+      item(sw('--c-load'), 'Home'),
+      ...(unsplit ? [item(sw('--c-grid'), 'Grid, not split by tariff')] : []),
+    );
+  }
+
+  const hasEnergy = (rows) => rows.some((d) => CORE_KEYS.some((k) => d[k] != null));
 
   /** Month buckets from /api/daily?group=month, summed into years. */
   function bucketsToYears(buckets) {
@@ -1381,10 +1535,17 @@
 
   function drawBars(rows, labels, title, thin, alt, hint, onClick) {
     renderCards(sumTotals(rows));
-    const option = energyOption(labels, rows, title, window.innerWidth < 560, thin);
+    const narrow = window.innerWidth < 560;
+    // On a phone four columns per bucket get too thin, so many buckets scroll sideways.
+    const parts = gridParts(histTariff);
+    const unsplit = rows.some((d) => { const c = gridColumn(d, parts); return c.boughtRest > 0 || c.soldRest > 0; });
+    const wide = narrow && rows.length > 8;
+    $('bars-chart').style.width = wide ? `${rows.length * 30 + 40}px` : '';
+    const option = energyOption(labels, rows, title, narrow && !wide, thin, histTariff);
+    renderBarsLegend(histTariff, unsplit);
     showChart('bars-chart', hasEnergy(rows), option,
-      `${alt}: stacked bars of PV generation and grid import above the axis, grid export below, with a line for load, in kWh.`);
-    $('bars-hint').textContent = hint;
+      `${alt}: columns per period for solar, grid (bought above the axis, sold below), battery (out above, in below) and home, in kWh.`);
+    $('bars-hint').textContent = wide ? `${hint} Scroll the chart sideways to see every bar.` : hint;
     onBarClick('bars-chart', onClick);
   }
 
@@ -1432,6 +1593,215 @@
     updateHistoryNav(); // Lifetime's label needs the first month
   }
 
+  // ---------- History: By tariff table ----------
+
+  /** The tariff the bars and the table label rates with: the plan in force on the period's last day. */
+  let histTariff = null;
+
+  const sigOf = (t) => (t ? JSON.stringify({ ...t, date: undefined }) : 'none');
+
+  /**
+   * Splits `from`..`to` into runs of days on one plan, finding the changes by
+   * bisecting (a few /api/tariff calls, all cached). Each run is `{ from, to, t }`;
+   * `t` is null when no tariff is configured.
+   */
+  async function rateSegments(from, to) {
+    const walk = async (a, b, ta, tb, depth) => {
+      if (sigOf(ta) === sigOf(tb)) return [{ from: a, to: b, t: ta }];
+      if (a === b || depth > 12) return [{ from: a, to: b, t: tb }];
+      const m = addDays(a, Math.floor(daysBetween(a, b) / 2));
+      const [tm, tm1] = await Promise.all([tariffOrNull(m), tariffOrNull(addDays(m, 1))]);
+      const [left, right] = await Promise.all([walk(a, m, ta, tm, depth + 1), walk(addDays(m, 1), b, tm1, tb, depth + 1)]);
+      return [...left, ...right];
+    };
+    const [ta, tb] = await Promise.all([tariffOrNull(from), tariffOrNull(to)]);
+    const runs = await walk(from, to, ta, tb, 0);
+    const out = [];
+    for (const r of runs) {
+      const last = out[out.length - 1];
+      if (last && sigOf(last.t) === sigOf(r.t)) last.to = r.to;
+      else out.push({ ...r });
+    }
+    return out;
+  }
+
+  /** "11am", "2:30pm": the hour as `{ t, suf }` so a range can share its am/pm. */
+  function clock12(h) {
+    const m = Math.round(h * 60) % 1440;
+    const hh = Math.floor(m / 60);
+    const mm = m % 60;
+    return { t: `${hh % 12 || 12}${mm ? ':' + pad(mm) : ''}`, suf: hh < 12 ? 'am' : 'pm' };
+  }
+
+  /** "11am–2pm and 4–6pm" for windows of an /api/tariff answer. */
+  function windowsText(list) {
+    return list.map((w) => {
+      const a = clock12(hours(w.from));
+      const b = clock12(hours(w.to));
+      return `${a.t}${a.suf === b.suf ? '' : a.suf}–${b.t}${b.suf}`;
+    }).join(' and ');
+  }
+
+  const mean = (list) => list.reduce((a, b) => a + b, 0) / list.length;
+
+  /**
+   * The table rows for one run of days on one plan `t`, from the /api/daily
+   * totals for those days. Money is in dollars; each row is costed as
+   * bought kWh x buy rate less sold kWh x sell rate.
+   */
+  function tariffRows(t, tot) {
+    const kwh = (k) => tot[k] || 0;
+    const rate = (side, band, fallback) => {
+      const list = bandRates(t, side, band);
+      return list.length ? mean(list) : fallback;
+    };
+    const buy = {
+      free: rate('import', 'free', 0),
+      shoulder: rate('import', 'shoulder', t.default_import_cents),
+      peak: rate('import', 'peak', t.default_import_cents),
+    };
+    const sell = {
+      super: rate('export', 'super', t.default_export_cents),
+      peak: rate('export', 'peak', t.default_export_cents),
+      other: t.default_export_cents,
+    };
+    return {
+      free: { bought: kwh('import_free_kwh'), sold: 0, cost: (kwh('import_free_kwh') * buy.free) / 100 },
+      shoulder: {
+        bought: kwh('import_shoulder_kwh'), sold: kwh('export_other_kwh'),
+        cost: (kwh('import_shoulder_kwh') * buy.shoulder - kwh('export_other_kwh') * sell.other) / 100,
+      },
+      peak: {
+        bought: kwh('import_peak_kwh'), sold: kwh('export_peak_kwh'),
+        cost: (kwh('import_peak_kwh') * buy.peak - kwh('export_peak_kwh') * sell.peak) / 100,
+      },
+      super: { bought: 0, sold: kwh('export_super_kwh'), cost: (-kwh('export_super_kwh') * sell.super) / 100 },
+      supply: { days: tot.days || 0, cost: ((tot.days || 0) * t.supply_cents_per_day) / 100 },
+    };
+  }
+
+  const tcell = (text, cls) => el('td', cls || '', text);
+  const tkwh = (v) => (v > 0.04 ? `${fmtKwh(v)} kWh` : '–');
+
+  /** Fills the By tariff table. `segs` are the runs on one plan, `parts` their /api/daily totals, `costs` the /api/costs totals. */
+  function drawTariffTable(segs, parts, costs) {
+    const cur = segs[segs.length - 1].t; // labels come from the latest plan
+    const sum = { free: { bought: 0, sold: 0, cost: 0 }, shoulder: { bought: 0, sold: 0, cost: 0 }, peak: { bought: 0, sold: 0, cost: 0 }, super: { bought: 0, sold: 0, cost: 0 } };
+    let supplyDays = 0;
+    let supplyCost = 0;
+    segs.forEach((sg, i) => {
+      const r = tariffRows(sg.t, parts[i]);
+      for (const k of Object.keys(sum)) for (const f of ['bought', 'sold', 'cost']) sum[k][f] += r[k][f];
+      supplyDays += r.supply.days;
+      supplyCost += r.supply.cost;
+    });
+    const windows = (list, band) => list.filter((w) => w.band === band);
+    const rates = (side, band) => ratesText(bandRates(cur, side, band));
+    const rows = [];
+    const add = (cls, name, detail, rate, v) => rows.push({ cls, name, detail, rate, ...v });
+    const freeW = windows(cur.import, 'free');
+    if (freeW.length || sum.free.bought > 0.04) {
+      add('free', 'Free', windowsText(freeW), `buy ${rates('import', 'free') || '0c'}`, sum.free);
+    }
+    add('shoulder', 'Shoulder', '', `buy ${rates('import', 'shoulder')}${sum.shoulder.sold > 0.04 ? ` · sell ${cents(cur.default_export_cents)}` : ''}`, sum.shoulder);
+    const peakW = windows(cur.import, 'peak');
+    if (peakW.length || sum.peak.bought > 0.04 || sum.peak.sold > 0.04) {
+      const sellPeak = rates('export', 'peak');
+      add('peak', 'Peak', windowsText(peakW), `buy ${rates('import', 'peak')}${sellPeak ? ` · sell ${sellPeak}` : ''}`, sum.peak);
+    }
+    const superW = windows(cur.export, 'super');
+    if (superW.length || sum.super.sold > 0.04) {
+      add('super', 'Super Export', windowsText(superW), `sell ${rates('export', 'super')}`, sum.super);
+    }
+    const credit = costs.totals.credit > 0 ? costs.totals.credit : 0;
+    const body = rows.map((r) => {
+      const tr = el('tr');
+      const name = el('td');
+      const nm = el('span', 'nm');
+      nm.append(el('span', `dot dot-${r.cls}`), r.name + (r.detail ? `, ${r.detail}` : ''));
+      name.append(nm);
+      tr.append(name, tcell(r.rate, 'rate'), tcell(tkwh(r.bought)), tcell(tkwh(r.sold)), tcell(money(r.cost)));
+      return tr;
+    });
+    const plain = (cls, name, rate, cost) => {
+      const tr = el('tr');
+      const n = el('td');
+      const nm = el('span', 'nm');
+      nm.append(el('span', `dot dot-${cls}`), name);
+      n.append(nm);
+      tr.append(n, tcell(rate, 'rate'), tcell(''), tcell(''), tcell(money(cost)));
+      return tr;
+    };
+    // One plan: days x its daily charge. After a plan change the charges differ, so show the average.
+    const perDay = segs.length > 1 && supplyDays > 0 ? `${money(supplyCost / supplyDays, 3)} avg` : money(cur.supply_cents_per_day / 100, 3);
+    body.push(plain('supply', 'Supply charge', `${supplyDays} ${supplyDays === 1 ? 'day' : 'days'} × ${perDay}`, supplyCost));
+    const cr = cur.zero_import_credit;
+    if (credit > 0) {
+      const n = costs.totals.credit_days;
+      body.push(plain('credit', 'Zero-import credit',
+        `${n} ${n === 1 ? 'day' : 'days'}${cr ? ` × ${money(cr.credit_cents / 100)}` : ''}`, -credit));
+    }
+    $('tt-body').replaceChildren(...body);
+
+    const bought = rows.reduce((a, r) => a + r.bought, 0);
+    const sold = rows.reduce((a, r) => a + r.sold, 0);
+    const total = rows.reduce((a, r) => a + r.cost, 0) + supplyCost - credit;
+    const foot = el('tr');
+    foot.append(tcell('Total'), tcell(''), tcell(tkwh(bought)), tcell(tkwh(sold)), tcell(money(total)));
+    $('tt-foot').replaceChildren(foot);
+
+    // Notes: what the numbers rest on, and how the total compares with the Cost card.
+    const notes = [];
+    if (segs.length > 1) {
+      notes.push(`The tariff changed during this period. Each day is costed at its own rates; the times and rates above are from the current plan (since ${dmy(segs[segs.length - 1].from)}).`);
+    }
+    const mixed = ['free', 'shoulder', 'peak'].filter((b) => bandRates(cur, 'import', b).length > 1)
+      .concat(['super', 'peak'].filter((b) => bandRates(cur, 'export', b).length > 1));
+    if (mixed.length) notes.push('Some bands have more than one rate; they are costed at the average rate.');
+    const unsplit = (key, parts2) => parts2.reduce((a, x) => a + (x[key] || 0), 0);
+    const totalIn = unsplit('import_kwh', parts);
+    const totalOut = unsplit('export_kwh', parts);
+    const lostIn = totalIn - BOUGHT_KEYS.reduce((a, k) => a + unsplit(k, parts), 0);
+    const lostOut = totalOut - SOLD_KEYS.reduce((a, k) => a + unsplit(k, parts), 0);
+    if (lostIn > Math.max(0.1, 0.03 * totalIn) || lostOut > Math.max(0.1, 0.03 * totalOut)) {
+      notes.push(`${fmtKwh(Math.max(0, lostIn))} kWh bought and ${fmtKwh(Math.max(0, lostOut))} kWh sold are not in the table: those days have no interval data to split by tariff.`);
+    }
+    const diff = Math.round((total - costs.totals.actual) * 100) / 100;
+    if (Math.abs(diff) < 0.015) {
+      notes.push(`The total matches the Cost card (${money(costs.totals.actual)}).`);
+    } else {
+      const billed = costs.totals.billed_days;
+      notes.push(`The Cost card shows ${money(costs.totals.actual)}, ${money(Math.abs(diff))} ${diff > 0 ? 'less' : 'more'} than this total`
+        + `${billed ? `: ${billed} ${billed === 1 ? 'day uses' : 'days use'} GloBird's own bill` : ' (rounding of the energy figures, or days costed from different meter data)'}.`);
+    }
+    $('tt-notes').replaceChildren(...notes.map((n) => el('li', '', n)));
+    $('tt-scroll').hidden = false;
+  }
+
+  /** Loads the By tariff view for the period on show, and the cards above it. */
+  async function loadTable(current) {
+    const today = todayStr();
+    const [from, to0] = rangeOf();
+    const to = to0 > today ? today : to0;
+    const msg = $('tt-msg');
+    const show = (text) => { msg.textContent = text; msg.hidden = !text; $('tt-scroll').hidden = !!text; $('tt-notes').replaceChildren(); };
+    if (from > to) { renderCards({}); show('No data for this period'); return; }
+    const segs = await rateSegments(from, to);
+    if (!current()) return;
+    const cur = segs[segs.length - 1].t;
+    if (!cur) { renderCards({}); show('Add a [tariff] section to the config file to see energy by tariff.'); return; }
+    const [costs, ...parts] = await Promise.all([
+      api(`/api/costs?from=${from}&to=${to}&group=month`),
+      ...segs.map((sg) => api(`/api/daily?from=${sg.from}&to=${sg.to}&group=month`)),
+    ]);
+    if (!current()) return;
+    const totals = parts.map((p) => p.totals);
+    renderCards(sumTotals(totals));
+    if (!costs.configured || !hasEnergy(totals)) { show('No data for this period'); return; }
+    show('');
+    drawTariffTable(segs, totals, costs);
+  }
+
   /** Loads whatever the History period needs: the cards and the curve or bars. */
   async function loadHistory() {
     updateHistoryNav();
@@ -1445,7 +1815,13 @@
     const [from, to] = rangeOf();
     const date = curveDate();
     const cost = loadCostCard(current);
-    if (date) await loadDay(date);
+    const table = state.hview === 'table';
+    if (!date || table) {
+      histTariff = await tariffOrNull(to > todayStr() ? todayStr() : to);
+      if (!current()) return;
+    }
+    if (table) await loadTable(current);
+    else if (date) await loadDay(date);
     else if (state.period === 'lifetime') await loadGroupedBars(from, to, true, current);
     else if (state.period === 'year') await loadYearBars(from, to, current);
     else if (state.period === 'custom' && daysBetween(from, to) + 1 > CUSTOM_DAILY_MAX) await loadGroupedBars(from, to, false, current);
@@ -1683,6 +2059,17 @@
         e.preventDefault();
         t.focus();
         switchPeriod(t.dataset.period);
+      };
+    }
+    const vtabs = [...document.querySelectorAll('.vtab')];
+    for (const b of vtabs) {
+      b.onclick = () => go({ hview: b.dataset.hview });
+      b.onkeydown = (e) => {
+        if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+        e.preventDefault();
+        const t = vtabs[(vtabs.indexOf(b) + 1) % vtabs.length];
+        t.focus();
+        go({ hview: t.dataset.hview });
       };
     }
     $('dp-prev').onclick = () => shiftPeriod(-1);
@@ -2468,7 +2855,7 @@
   const PERIODS = ['day', 'week', 'month', 'year', 'lifetime', 'custom'];
   let period = 'day'; // the period History opens on: the last one shown
   // Money's `mode` is month, year or all; `when` is its month (2026-09) or year (2025).
-  const state = { view: 'home', period: 'day', day: '', week: '', month: '', year: 0, from: '', to: '', mode: 'month', when: '', smooth: true };
+  const state = { view: 'home', period: 'day', day: '', week: '', month: '', year: 0, from: '', to: '', mode: 'month', when: '', smooth: true, hview: 'chart' };
   const SMOOTH_KEY = 'solar-dash.smooth';
   let timer = null;
   let pollToken = 0;

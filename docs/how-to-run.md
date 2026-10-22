@@ -148,21 +148,38 @@ the rest; a line under the saving says how many days are which. The old `#saving
   Solar is an area, home a line, and battery and grid are signed areas: battery
   above zero is supplying and below is charging, grid above zero is buying and
   below is selling. All are in kW, and battery % (dashed) is on the right axis.
-  11:00-14:00 is shaded as free, 16:00-23:00 as peak, and 18:00-21:00 (Super
-  Export) a little stronger. A two-row Buy/Sell strip under the chart shows the
-  tariff, and the hover tooltip names it for that moment. For today the chart
-  ends at the current time. The windows and rates are constants (`TARIFF` in
-  `static/app.js`), because no API exposes the `[tariff]`; keep them in step with
-  it. Energy totals
+  Free import windows are shaded green, peak ones red, and the best export
+  window (Super Export) a little stronger. A two-row Buy/Sell strip under the
+  chart shows the tariff, and the hover tooltip names it for that moment. For
+  today the chart ends at the current time. The windows and rates come from
+  `GET /api/tariff` for the day shown, so they follow the `[tariff]` (and any
+  `[[previous_tariff]]`); without a `[tariff]` the shading and strip are left
+  out. Energy totals
   for the day are underneath. The chart uses the inverter's 1-minute data when
   there is at least 30 minutes of it for that day, and iSolarCloud's 5-minute
   data otherwise. If Modbus started part way through the day, iSolarCloud fills
   the time before it. A note under the chart names the source. The totals
   always come from iSolarCloud. While it shows today it refreshes by itself, and a Smooth
   button averages the lines over a few minutes.
-- **History > Month**: daily bars of PV generation and grid import (up) and export
-  (down), with a line for load, plus the month's totals.
-- **History > Year**: the same, summed by month.
+- **History > Week, Month, Year, Lifetime, Custom**: grouped columns per bucket
+  (a day, month or year): Solar; Grid, with energy bought above zero stacked by
+  tariff band (free, shoulder, peak) and energy sold below it (Super Export, then
+  the lower rates); Battery, out above and in below; and Home. A bucket with no
+  tariff split (an older day without interval data) draws plain bought and sold in
+  the grid colours. The tooltip lists each part in kWh, and a click opens the
+  bucket. On a phone a chart with many buckets scrolls sideways. The Grid card
+  has a thin free/shoulder/peak bar and a line such as "72% bought free, 21%
+  shoulder, 7% peak" (hidden without a split).
+- **History > Chart / By tariff** (all periods): By tariff is a table of the
+  period's grid energy by band: time of day, rate, kWh bought, kWh sold and cost
+  (kWh times the band's rate, less what the same band earned from export), then
+  the supply charge, the zero-import credit when one was earned, and a total.
+  Times and rates come from `/api/tariff`. Each day is costed at its own plan
+  when the period spans a `[[previous_tariff]]` change (the times and rates shown
+  are the current plan's, and a note says so). The total normally equals the
+  Cost card (`/api/costs` `actual`); it differs on days GloBird has billed (the
+  card uses its bill) and where a band has more than one rate (costed at the
+  average), and a note under the table says by how much.
 
 The charts use [ECharts](https://echarts.apache.org) 5.6.0 (Apache-2.0),
 loaded from cdnjs by a single pinned `<script>` tag in `static/index.html`. The
@@ -187,6 +204,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/ev/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` | The car against petrol, by month and in total: `{"configured":true,"months":[{month,km,home_kwh,home_cost,away_kwh,away_cost,charging_cost,petrol_litres,petrol_cost,saved,ev_cents_per_km,petrol_cents_per_km},...],"total":{...},"petrol_cents_per_litre":...,"petrol_litres_per_100km":...}`. Local dates, both included, at most 400 days; without `from` it covers the last 365 days. Money is in dollars. `away_cost` is `null` when there were away sessions and no `away_cents_per_kwh`, and the `*_cents_per_km` fields are `null` for 0 km. `configured` is `false`, and the money fields `null`, without a `petrol_cents_per_litre`. See [TeslaMate](#teslamate-optional) |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days. Each day has a `source` (see [Modbus in `serve`](#modbus-in-serve))Every day (and every bucket and the `totals`) also has the grid energy split by tariff band: `import_free_kwh`, `import_shoulder_kwh`, `import_peak_kwh`, `export_super_kwh`, `export_peak_kwh` and `export_other_kwh`. The bands come from the `[tariff]` (the `[[previous_tariff]]` in effect that day), told apart by price: import at 0 c is free, dearer than `default_import_cents` is peak, the rest shoulder; export at or below `default_export_cents` is other, and of the better rates the highest is super (when a lower one exists, which is peak). They are summed from the same intervals `/api/costs` prices (live samples when they cover the day, else the 5-minute cloud counters), so they add up to its `import_kwh` and `export_kwh`, and to `/api/daily`'s own totals within rounding (the cloud's daily counter can differ a little from its 5-minute steps). They are `null` without a `[tariff]` or for a day with no interval data |
 | `GET /api/costs?from=YYYY-MM-DD&to=YYYY-MM-DD&group=day\|month\|year` | Dollars from the `[tariff]` section. `totals` is a bill-style breakdown: `supply`, `import` (and `import_kwh`), `feed_in` (and `export_kwh`), `credit` (zero-import credit) and `credit_days`, `actual` (paid), `baseline` (no solar or battery), `savings`, and `not_bought` (baseline less supply and import; `savings` = `not_bought` + `feed_in` + `credit`), plus `load_kwh` and `days` with data. `billed_days` is how many of those days use GloBird's own bill instead of our estimate (see below). With `group=day` (the default) `days` has one row per local day with `source` (`inverter` or `cloud` for our estimate, `globird` for a day billed by GloBird), `actual`, `baseline`, `savings`, `credit`, `supply`, `import`, `feed_in` and the import, export and load kWh. With `group=month` or `year`, `buckets` has one row per period (`period` is `2026-09` or `2026`) with the same fields as `totals`, so a year is 12 small rows. Default: the last 30 days. At most 1,500 days per day-grouped request, 20 years for month or year. Days with no data are left out. Finished days are stored in the database, so repeat requests are fast; editing the `[tariff]` rates makes them be worked out again (editing a `[[previous_tariff]]` only redoes the days on that plan). Days before the current plan are priced on the `[[previous_tariff]]` entry in effect on that day (its `until` is the last day it applies), if any are configured. A day GloBird has billed completely (see [GloBird](#globird-optional)) shows GloBird's figures: `import`, `feed_in`, `supply`, `credit` and `actual` are its lines added up, the import and export kWh are its meter's (when it has them), and `savings` is our `baseline` less that bill; `load_kwh` and `baseline` stay ours, and `source` is `globird`. Other days, and days GloBird has not finished posting, keep our estimate. The stored days are always our estimate; GloBird's figures are applied each time. A day with no data of ours is still left out. Without a `[tariff]` section it answers `{"configured":false}` |
+| `GET /api/tariff?date=YYYY-MM-DD` | The plan in force on that local day (default today; the `[[previous_tariff]]` in effect that day, else `[tariff]`), so the page needs no copy of the config: `supply_cents_per_day`, `default_import_cents`, `default_export_cents`, the `import` and `export` windows (`from`, `to` as `HH:MM`, `cents`, and `band`) and `zero_import_credit` (`from`, `to`, `max_kwh`, `credit_cents`, or `null`). `band` uses the same price rule as the `/api/daily` split: `free`, `shoulder` or `peak` for import; `super`, `peak` or `other` for export. `default_import_band` and `default_export_band` say the same for the default rates. Without a `[tariff]` section it answers `{"configured":false}` |
 | `GET /api/globird/compare?from=YYYY-MM-DD&to=YYYY-MM-DD` | GloBird's own daily bill next to our estimate, from the synced `globird_*` tables and the `[tariff]`. `days` has one row per local day GloBird has cost lines for: `complete`, `globird` (dollars `import`, `export`, `supply`, `credit`, `other` and `total`, signed as GloBird signs them, so feed-in and credits are negative; `import_kwh` and `export_kwh`; and its `lines`, each with `category`, `amount` and `quantity`), `ours` (the same fields from `/api/costs`, with `source`, always our own estimate even where `/api/costs` shows GloBird's bill) and `diff` (ours minus GloBird's `total` and kWh). `ours` and `diff` are `null` when there is no `[tariff]` or no data of ours for that day. `totals` adds up the days that are `complete` and have both sides (`days_compared`), and `categories` totals each GloBird category over the range (`amount`, `quantity`, `days` and the `bucket` it counts in), which shows new categories such as "Critical Peak - Export". Default: the last 31 days, at most 400. With no GloBird data it answers `{"configured":...,"days":[],...}`, where `configured` is whether there is a `[globird]` section |
 | `GET /api/payback` | How much of the system's cost the savings have covered, from the `[[system.purchase]]` entries and the `[tariff]`: `total_cost`, `saved`, `net`, `recovered_pct`, `rate_per_day` (mean savings over the last 365 days with data), `price_rise_percent` (the `[system]` setting, default 3, that grows that rate each year in the projection), `projected_payback` (`"YYYY-MM"`, `null` once paid back, or `"never"`), the `purchases`, a monthly `series` of cumulative `saved` and `net`, and `by_year` (`partial` when a year has fewer days of data than days). Counts from the first purchase date to today, using GloBird's bill for the days it has billed (as `/api/costs` does). Without purchases or a `[tariff]` section it answers `{"configured":false}` |
 

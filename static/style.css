@@ -38,6 +38,16 @@
   --cost: #ffa3ab;
   --baseline: #4a5766;
 
+  /* Grid bars and the Grid card. Bought bands step down in lightness (green, grey, red) so they
+     read without hue; the two sold purples and battery out/in differ in lightness too. */
+  --band-free: var(--save);
+  --band-shoulder: #9aa4af;
+  --band-peak: #e5484d;
+  --sold-super: var(--c-grid);
+  --sold-rest: var(--c-export);
+  --batt-out: var(--c-discharge);
+  --batt-in: #1f9d82;
+
   --free: rgba(61, 214, 176, 0.09);
   --peak: rgba(255, 122, 133, 0.08);
   --peak-strong: rgba(255, 122, 133, 0.15);
@@ -366,6 +376,43 @@ input[type="number"] { width: 6.5em; }
 .hc-cost .hc-label { color: var(--save-label); }
 .hc-link { margin-top: auto; padding-top: 4px; font-size: 13px; color: var(--link); text-decoration: none; min-height: 24px; }
 .hc-link:hover { text-decoration: underline; }
+
+.gsplit { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--track); margin: 2px 0; }
+.gsplit span { display: block; height: 100%; border-right: 1px solid var(--panel); }
+.gsplit span:last-child { border-right: 0; }
+.g-free { background: var(--band-free); }
+.g-shoulder { background: var(--band-shoulder); }
+.g-peak { background: var(--band-peak); }
+
+.vtabs { display: inline-flex; align-self: flex-start; border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden; }
+.vtab {
+  min-height: 44px; padding: 0 16px; background: none; border: 0; color: var(--muted);
+  font: inherit; font-weight: 500; cursor: pointer;
+}
+.vtab:hover { color: var(--fg); }
+.vtab[aria-selected="true"] { background: var(--active); color: var(--fg); font-weight: 600; }
+.vtab:focus-visible { outline-offset: -3px; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--fg-soft); padding: 0 2px 8px; }
+.lg { display: inline-flex; align-items: center; gap: 5px; }
+.lg-sw { width: 12px; height: 12px; border-radius: 2px; flex: none; }
+.barbox { position: relative; overflow-x: auto; }
+
+.tscroll { overflow-x: auto; }
+.tscroll:focus-visible { outline-offset: 0; }
+table.tariff-table { min-width: 520px; }
+table.tariff-table td, table.tariff-table th { white-space: nowrap; }
+table.tariff-table td.rate, table.tariff-table th:nth-child(2) { text-align: left; color: var(--muted); }
+.nm { display: inline-flex; align-items: center; gap: 8px; }
+table.tariff-table tfoot td { font-weight: 700; border-top: 1px solid var(--border-strong); padding-top: 12px; }
+.dot { width: 10px; height: 10px; border-radius: 3px; flex: none; background: var(--baseline); }
+.dot-free { background: var(--band-free); }
+.dot-shoulder { background: var(--band-shoulder); }
+.dot-peak { background: var(--band-peak); }
+.dot-super { background: var(--sold-super); }
+.dot-credit { background: var(--save-label); }
+.tnotes { margin: 10px 0 0; padding-left: 18px; }
+.tnotes:empty { display: none; }
 
 .chart { width: 100%; height: 320px; }
 .chart.tall { height: 380px; }
