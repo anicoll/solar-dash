@@ -25,6 +25,9 @@ use crate::modbus::Sample;
 
 /// The whole history since Feb 2023 is about 1,000 days; this leaves room to grow.
 const MAX_COSTS_DAYS: u64 = 1500;
+/// The longest range for `group=month` or `group=year`: 20 years. The answer is
+/// a few hundred small rows at most, and days already stored are not worked out again.
+const MAX_GROUPED_COSTS_DAYS: u64 = 366 * 20;
 /// Live samples are loaded this many days at a time. A year of them is
 /// millions of rows, too many to hold at once on a small machine.
 const LIVE_CHUNK_DAYS: usize = 31;
@@ -184,6 +187,159 @@ struct CostDay {
     load_kwh: f64,
     /// Dollars of zero-import credit earned this day.
     credit: f64,
+    /// Dollars of daily supply charge.
+    supply: f64,
+    /// Dollars paid for grid import.
+    import: f64,
+    /// Dollars earned for feed-in (export).
+    feed_in: f64,
+}
+
+/// How `/api/costs` groups its rows: one per day, or summed per month or year.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Group {
+    Day,
+    Month,
+    Year,
+}
+
+impl Group {
+    /// The `group` query value; absent means days.
+    fn parse(text: Option<&str>) -> Result<Self, ApiError> {
+        match text {
+            None | Some("day") => Ok(Self::Day),
+            Some("month") => Ok(Self::Month),
+            Some("year") => Ok(Self::Year),
+            Some(_) => Err(ApiError::bad_request("group must be day, month or year")),
+        }
+    }
+
+    /// The bucket a day falls in: "2026-09" for a month, "2026" for a year.
+    fn period_of(self, date: NaiveDate) -> String {
+        match self {
+            Self::Day => date.to_string(),
+            Self::Month => date.format("%Y-%m").to_string(),
+            Self::Year => date.format("%Y").to_string(),
+        }
+    }
+}
+
+/// Costs added up over any number of days, kept in unrounded cents so the
+/// sums do not drift from the true total by a cent per day.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Sums {
+    /// Days with data.
+    days: u32,
+    /// Days that earned the zero-import credit.
+    credit_days: u32,
+    supply_cents: f64,
+    import_cents: f64,
+    export_cents: f64,
+    credit_cents: f64,
+    actual_cents: f64,
+    baseline_cents: f64,
+    import_kwh: f64,
+    export_kwh: f64,
+    load_kwh: f64,
+}
+
+impl Sums {
+    fn add(&mut self, cost: &DayCost) {
+        self.days += 1;
+        if cost.zero_import_credit_cents > 0.0 {
+            self.credit_days += 1;
+        }
+        self.supply_cents += cost.supply_cents;
+        self.import_cents += cost.import_cents;
+        self.export_cents += cost.export_cents;
+        self.credit_cents += cost.zero_import_credit_cents;
+        self.actual_cents += cost.actual_cents;
+        self.baseline_cents += cost.baseline_cents;
+        self.import_kwh += cost.import_kwh;
+        self.export_kwh += cost.export_kwh;
+        self.load_kwh += cost.load_kwh;
+    }
+
+    /// The value of power not bought: what the load would have cost on the
+    /// grid (baseline), less what was still paid for supply and import.
+    /// `savings == not_bought + feed-in + credit`.
+    fn not_bought_cents(&self) -> f64 {
+        self.baseline_cents - self.supply_cents - self.import_cents
+    }
+
+    /// The bill-style breakdown, in dollars and kWh.
+    fn totals(&self) -> Totals {
+        Totals {
+            days: self.days,
+            credit_days: self.credit_days,
+            supply: dollars(self.supply_cents),
+            import: dollars(self.import_cents),
+            import_kwh: round2(self.import_kwh),
+            feed_in: dollars(self.export_cents),
+            export_kwh: round2(self.export_kwh),
+            load_kwh: round2(self.load_kwh),
+            credit: dollars(self.credit_cents),
+            actual: dollars(self.actual_cents),
+            baseline: dollars(self.baseline_cents),
+            savings: dollars(self.baseline_cents - self.actual_cents),
+            not_bought: dollars(self.not_bought_cents()),
+        }
+    }
+}
+
+/// A bill-style breakdown of a period, in dollars and kWh.
+#[derive(Debug, Serialize)]
+struct Totals {
+    /// Days with data.
+    days: u32,
+    /// Days that earned the zero-import credit.
+    credit_days: u32,
+    supply: f64,
+    import: f64,
+    import_kwh: f64,
+    /// Feed-in earnings, as a positive number.
+    feed_in: f64,
+    export_kwh: f64,
+    load_kwh: f64,
+    /// Zero-import credit earned.
+    credit: f64,
+    /// What was really paid.
+    actual: f64,
+    /// What it would have cost with no solar or battery.
+    baseline: f64,
+    savings: f64,
+    /// Value of the power not bought from the grid.
+    not_bought: f64,
+}
+
+/// A month or year of days added up.
+#[derive(Debug, Serialize)]
+struct Bucket {
+    /// "2026-09" for a month, "2026" for a year.
+    period: String,
+    #[serde(flatten)]
+    totals: Totals,
+}
+
+/// Adds up days (oldest first) into one [`Bucket`] per period that has data.
+fn bucket_days(group: Group, costed: &[CostedDay]) -> Vec<Bucket> {
+    let mut buckets: Vec<(String, Sums)> = Vec::new();
+    for day in costed {
+        let period = group.period_of(day.date);
+        if buckets.last().is_none_or(|(last, _)| *last != period) {
+            buckets.push((period, Sums::default()));
+        }
+        if let Some((_, sums)) = buckets.last_mut() {
+            sums.add(&day.cost);
+        }
+    }
+    buckets
+        .into_iter()
+        .map(|(period, sums)| Bucket {
+            period,
+            totals: sums.totals(),
+        })
+        .collect()
 }
 
 /// One priced local day, whether it came from the cache or was just worked out.
@@ -395,14 +551,21 @@ async fn costed_days_on(
 pub struct CostsParams {
     from: Option<String>,
     to: Option<String>,
+    /// "day" (the default), "month" or "year".
+    group: Option<String>,
 }
 
 pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsParams>) -> ApiResult {
+    let group = Group::parse(params.group.as_deref())?;
+    let max_days = match group {
+        Group::Day => MAX_COSTS_DAYS,
+        Group::Month | Group::Year => MAX_GROUPED_COSTS_DAYS,
+    };
     let (from, count) = date_range(
         params.from.as_deref(),
         params.to.as_deref(),
         state.tz,
-        MAX_COSTS_DAYS,
+        max_days,
         DEFAULT_DAILY_DAYS,
     )?;
     let Some(tariff) = &state.tariff else {
@@ -412,15 +575,24 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
     let dates: Vec<NaiveDate> = from.iter_days().take(count as usize).collect();
     let costed = costed_days(&state, tariff, &dates).await?;
 
-    let (mut actual, mut baseline, mut credit_days) = (0.0, 0.0, 0);
-    let mut days = Vec::with_capacity(costed.len());
-    for CostedDay { date, source, cost } in costed {
-        actual += cost.actual_cents;
-        baseline += cost.baseline_cents;
-        if cost.zero_import_credit_cents > 0.0 {
-            credit_days += 1;
-        }
-        days.push(CostDay {
+    let mut sums = Sums::default();
+    for day in &costed {
+        sums.add(&day.cost);
+    }
+    let totals = sums.totals();
+
+    if group != Group::Day {
+        return Ok(Json(json!({
+            "configured": true,
+            "group": if group == Group::Month { "month" } else { "year" },
+            "totals": totals,
+            "buckets": bucket_days(group, &costed),
+        })));
+    }
+
+    let days: Vec<CostDay> = costed
+        .iter()
+        .map(|CostedDay { date, source, cost }| CostDay {
             date: date.to_string(),
             source,
             actual: dollars(cost.actual_cents),
@@ -430,20 +602,15 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
             export_kwh: round2(cost.export_kwh),
             load_kwh: round2(cost.load_kwh),
             credit: dollars(cost.zero_import_credit_cents),
-        });
-    }
-
-    // Totals are added up from the unrounded cents, so they do not drift from
-    // the true sum by a cent per day.
+            supply: dollars(cost.supply_cents),
+            import: dollars(cost.import_cents),
+            feed_in: dollars(cost.export_cents),
+        })
+        .collect();
     Ok(Json(json!({
         "configured": true,
-        "totals": {
-            "actual": dollars(actual),
-            "baseline": dollars(baseline),
-            "savings": dollars(baseline - actual),
-            "credit_days": credit_days,
-            "days": days.len(),
-        },
+        "group": "day",
+        "totals": totals,
         "days": days,
     })))
 }
@@ -634,5 +801,84 @@ mod tests {
         assert_eq!(key, cache_key(adelaide, &make("30.0")));
         assert_ne!(key, cache_key(adelaide, &make("31.0")));
         assert_ne!(key, cache_key(chrono_tz::Australia::Perth, &make("30.0")));
+    }
+
+    /// A priced day: supply 100 c, import 40 c, feed-in 25 c, load priced at 90 c.
+    fn day_cost_of(date_text: &str, credit_cents: f64) -> CostedDay {
+        let actual = 100.0 + 40.0 - 25.0 - credit_cents;
+        CostedDay {
+            date: date(date_text),
+            source: "cloud",
+            cost: DayCost {
+                import_kwh: 2.0,
+                export_kwh: 3.0,
+                load_kwh: 4.0,
+                import_cents: 40.0,
+                export_cents: 25.0,
+                supply_cents: 100.0,
+                zero_import_credit_cents: credit_cents,
+                actual_cents: actual,
+                baseline_cents: 190.0,
+                savings_cents: 190.0 - actual,
+            },
+        }
+    }
+
+    #[test]
+    fn savings_are_power_not_bought_plus_feed_in_plus_credit() {
+        let mut sums = Sums::default();
+        sums.add(&day_cost_of("2026-09-01", 100.0).cost);
+        sums.add(&day_cost_of("2026-09-02", 0.0).cost);
+        // Baseline 380 - supply 200 - import 80 = 100 c not bought.
+        assert_eq!(sums.not_bought_cents(), 100.0);
+        let savings = sums.baseline_cents - sums.actual_cents;
+        assert_eq!(
+            savings,
+            sums.not_bought_cents() + sums.export_cents + sums.credit_cents
+        );
+        let totals = sums.totals();
+        assert_eq!((totals.days, totals.credit_days), (2, 1));
+        assert_eq!(totals.not_bought, 1.0);
+        assert_eq!(totals.feed_in, 0.5);
+        assert_eq!(totals.credit, 1.0);
+        assert_eq!(totals.savings, 2.5);
+    }
+
+    #[test]
+    fn the_group_parameter_is_checked() {
+        assert_eq!(Group::parse(None).unwrap(), Group::Day);
+        assert_eq!(Group::parse(Some("day")).unwrap(), Group::Day);
+        assert_eq!(Group::parse(Some("month")).unwrap(), Group::Month);
+        assert_eq!(Group::parse(Some("year")).unwrap(), Group::Year);
+        assert!(Group::parse(Some("week")).is_err());
+    }
+
+    #[test]
+    fn days_are_summed_into_months_and_years() {
+        let days = [
+            day_cost_of("2025-12-31", 0.0),
+            day_cost_of("2026-01-01", 100.0),
+            day_cost_of("2026-01-02", 0.0),
+            // February has no data: it gets no bucket.
+            day_cost_of("2026-03-05", 100.0),
+        ];
+        let months = bucket_days(Group::Month, &days);
+        let summary: Vec<_> = months
+            .iter()
+            .map(|b| (b.period.as_str(), b.totals.days, b.totals.credit_days))
+            .collect();
+        assert_eq!(
+            summary,
+            [("2025-12", 1, 0), ("2026-01", 2, 1), ("2026-03", 1, 1)]
+        );
+        assert_eq!(months[1].totals.supply, 2.0);
+
+        let years = bucket_days(Group::Year, &days);
+        let summary: Vec<_> = years
+            .iter()
+            .map(|b| (b.period.as_str(), b.totals.days, b.totals.credit_days))
+            .collect();
+        assert_eq!(summary, [("2025", 1, 0), ("2026", 3, 2)]);
+        assert!(bucket_days(Group::Year, &[]).is_empty());
     }
 }
