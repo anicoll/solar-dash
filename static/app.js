@@ -772,7 +772,7 @@
     ['battery_discharge_w', 'Battery discharge', '--c-discharge', 1, 'line'],
   ];
 
-  const SMOOTH_SECS = 5 * 60; // width of the rolling mean behind the Smooth toggle
+  const SMOOTH_SECS = 5 * 60; // minimum width of the rolling mean behind the Smooth toggle
   const dayDraws = {};        // chart id -> redraw of its last fetched data
 
   /** Inverter minute rows for [start, end) (unix seconds), or [] if unavailable. */
@@ -802,9 +802,14 @@
     }
   }
 
-  /** Centred rolling mean of a `[t, v]` series over `windowMs`; null points stay as gaps and are never averaged across. */
-  function smoothSeries(data, windowMs) {
-    const half = windowMs / 2;
+  /** Centred rolling mean of a `[t, v]` series, at least `minWidth` wide (same unit as t) and 4 samples wide; null points stay as gaps and are never averaged across. */
+  function smoothSeries(data, minWidth) {
+    const gaps = [];
+    for (let k = 1; k < data.length && gaps.length < 200; k++) {
+      if (data[k][1] != null && data[k - 1][1] != null) gaps.push(data[k][0] - data[k - 1][0]);
+    }
+    gaps.sort((x, y) => x - y);
+    const half = Math.max(minWidth, 4 * (gaps[gaps.length >> 1] || 0)) / 2;
     const out = new Array(data.length);
     let i = 0;
     while (i < data.length) {
@@ -922,7 +927,7 @@
       const s = {
         name: label, type: 'line', showSymbol: false, sync: true,
         smooth: smooth ? 0.3 : false,
-        data: (smooth ? smoothSeries(byKey[key] || [], SMOOTH_SECS) : byKey[key] || []).map(([t, v]) => [t * 1000, sign * v / 1000]),
+        data: (smooth ? smoothSeries(byKey[key] || [], SMOOTH_SECS) : byKey[key] || []).map(([t, v]) => [t * 1000, v == null ? null : sign * v / 1000]),
         lineStyle: { width: 2, color: colour }, itemStyle: { color: colour },
         emphasis: { disabled: true }, z: 3,
       };
