@@ -28,7 +28,7 @@ use crate::modbus::Sample;
 const MAX_COSTS_DAYS: u64 = 1500;
 /// The longest range for `group=month` or `group=year`: 20 years. The answer is
 /// a few hundred small rows at most, and days already stored are not worked out again.
-const MAX_GROUPED_COSTS_DAYS: u64 = 366 * 20;
+pub(super) const MAX_GROUPED_COSTS_DAYS: u64 = 366 * 20;
 /// Live samples are loaded this many days at a time. A year of them is
 /// millions of rows, too many to hold at once on a small machine.
 const LIVE_CHUNK_DAYS: usize = 31;
@@ -212,7 +212,7 @@ struct CostDay {
 
 /// How `/api/costs` groups its rows: one per day, or summed per month or year.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Group {
+pub(super) enum Group {
     Day,
     Month,
     Year,
@@ -220,7 +220,7 @@ enum Group {
 
 impl Group {
     /// The `group` query value; absent means days.
-    fn parse(text: Option<&str>) -> Result<Self, ApiError> {
+    pub(super) fn parse(text: Option<&str>) -> Result<Self, ApiError> {
         match text {
             None | Some("day") => Ok(Self::Day),
             Some("month") => Ok(Self::Month),
@@ -230,7 +230,7 @@ impl Group {
     }
 
     /// The bucket a day falls in: "2026-09" for a month, "2026" for a year.
-    fn period_of(self, date: NaiveDate) -> String {
+    pub(super) fn period_of(self, date: NaiveDate) -> String {
         match self {
             Self::Day => date.to_string(),
             Self::Month => date.format("%Y-%m").to_string(),

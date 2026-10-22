@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tracing::error;
 
 use super::AppState;
-use super::costs::round2;
+use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, round2};
 use crate::db::{self, LatestReading};
 use crate::ev_cost;
 use crate::modbus::Sample;
@@ -697,6 +697,8 @@ pub async fn day(State(state): State<AppState>, Query(params): Query<DayParams>)
 pub struct DailyParams {
     from: Option<String>,
     to: Option<String>,
+    /// "day" (the default), "month" or "year": sum the days into one row per period.
+    group: Option<String>,
 }
 
 /// Energy totals of one local day, in kWh. `None` means no data that day.
@@ -838,22 +840,128 @@ pub(super) fn date_range(
     Ok((from, count))
 }
 
+/// Energy added up over any number of days, in kWh. A figure is `None` when
+/// none of the days had it.
+#[derive(Debug, Default, Serialize, PartialEq)]
+struct EnergySums {
+    /// Days with any data.
+    days: u32,
+    pv_kwh: Option<f64>,
+    load_kwh: Option<f64>,
+    import_kwh: Option<f64>,
+    export_kwh: Option<f64>,
+    battery_charge_kwh: Option<f64>,
+    battery_discharge_kwh: Option<f64>,
+}
+
+impl EnergySums {
+    fn add_day(&mut self, day: &DayTotals) {
+        fn add(sum: &mut Option<f64>, v: Option<f64>) {
+            if let Some(v) = v {
+                *sum = Some(sum.unwrap_or(0.0) + v);
+            }
+        }
+        if day.has_data() {
+            self.days += 1;
+        }
+        add(&mut self.pv_kwh, day.pv_kwh);
+        add(&mut self.load_kwh, day.load_kwh);
+        add(&mut self.import_kwh, day.import_kwh);
+        add(&mut self.export_kwh, day.export_kwh);
+        add(&mut self.battery_charge_kwh, day.battery_charge_kwh);
+        add(&mut self.battery_discharge_kwh, day.battery_discharge_kwh);
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct EnergyBucket {
+    /// "2026-09" for a month, "2026" for a year.
+    period: String,
+    #[serde(flatten)]
+    sums: EnergySums,
+}
+
+/// Adds up days (oldest first) into one bucket per period that has data.
+fn bucket_energy(group: Group, days: &[(NaiveDate, DayTotals)]) -> Vec<EnergyBucket> {
+    let mut buckets: Vec<EnergyBucket> = Vec::new();
+    for (date, day) in days.iter().filter(|(_, d)| d.has_data()) {
+        let period = group.period_of(*date);
+        if buckets.last().is_none_or(|b| b.period != period) {
+            buckets.push(EnergyBucket {
+                period,
+                sums: EnergySums::default(),
+            });
+        }
+        if let Some(bucket) = buckets.last_mut() {
+            bucket.sums.add_day(day);
+        }
+    }
+    buckets
+}
+
+/// The points `day_totals` reads from the cloud.
+const DAILY_POINTS: [i64; 7] = [83022, 83118, 83102, 83072, 83322, 83323, 83097];
+
 pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyParams>) -> ApiResult {
-    let (from, count) = date_range(
+    let group = Group::parse(params.group.as_deref())?;
+    // Grouped rows can cover the whole history. The days are still read one by one,
+    // but only the answer (a few hundred rows at most) is sent.
+    let max_days = match group {
+        Group::Day => MAX_DAILY_DAYS,
+        Group::Month | Group::Year => MAX_GROUPED_COSTS_DAYS,
+    };
+    let (mut from, mut count) = date_range(
         params.from.as_deref(),
         params.to.as_deref(),
         state.tz,
-        MAX_DAILY_DAYS,
+        max_days,
         DEFAULT_DAILY_DAYS,
     )?;
 
     let live_range = db::live_ts_range(&state.pool).await?;
     let now = db::now();
+    if group != Group::Day {
+        // Days before the first reading have nothing in them; do not read them.
+        let cloud_first = db::first_reading_ts(&state.pool, state.plant_id, &DAILY_POINTS).await?;
+        let first = [cloud_first, live_range.map(|(first, _)| first)]
+            .into_iter()
+            .flatten()
+            .min();
+        let to = from + Days::new(count - 1);
+        let first_day = first
+            .and_then(|ts| DateTime::from_timestamp(ts, 0))
+            .map(|t| t.with_timezone(&state.tz).date_naive());
+        match first_day {
+            Some(day) if day > from => {
+                // Past `to` means no day in range can have data.
+                count = if day > to {
+                    0
+                } else {
+                    (to - day).num_days() as u64 + 1
+                };
+                from = day;
+            }
+            None => count = 0,
+            _ => {}
+        }
+    }
     let mut days = Vec::new();
     for date in from.iter_days().take(count as usize) {
-        days.push(day_totals(&state, date, live_range, now).await?);
+        days.push((date, day_totals(&state, date, live_range, now).await?));
     }
-    Ok(Json(json!({ "days": days })))
+    if group == Group::Day {
+        let days: Vec<_> = days.into_iter().map(|(_, d)| d).collect();
+        return Ok(Json(json!({ "days": days })));
+    }
+    let mut totals = EnergySums::default();
+    for (_, day) in &days {
+        totals.add_day(day);
+    }
+    Ok(Json(json!({
+        "group": if group == Group::Month { "month" } else { "year" },
+        "totals": totals,
+        "buckets": bucket_energy(group, &days),
+    })))
 }
 
 #[cfg(test)]
@@ -1186,5 +1294,149 @@ mod tests {
             .unwrap();
         assert_eq!(cloud_day.source, "cloud");
         assert_eq!(cloud_day.import_kwh, Some(5.0));
+    }
+
+    fn totals_of(date: &str, pv: Option<f64>, import: Option<f64>) -> (NaiveDate, DayTotals) {
+        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+        let day = DayTotals {
+            date: date.to_string(),
+            source: "cloud",
+            pv_kwh: pv,
+            load_kwh: None,
+            import_kwh: import,
+            export_kwh: None,
+            battery_charge_kwh: None,
+            battery_discharge_kwh: None,
+            self_consumed_kwh: None,
+        };
+        (date, day)
+    }
+
+    #[test]
+    fn energy_is_summed_into_months_and_years() {
+        let days = [
+            totals_of("2025-12-31", Some(10.0), Some(1.0)),
+            totals_of("2026-01-01", Some(20.0), None),
+            totals_of("2026-01-02", Some(5.5), Some(2.0)),
+            // No data: no day counted, and February gets no bucket.
+            totals_of("2026-02-01", None, None),
+            totals_of("2026-03-05", Some(1.0), None),
+        ];
+        let months = bucket_energy(Group::Month, &days);
+        let summary: Vec<_> = months
+            .iter()
+            .map(|b| {
+                (
+                    b.period.as_str(),
+                    b.sums.days,
+                    b.sums.pv_kwh,
+                    b.sums.import_kwh,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("2025-12", 1, Some(10.0), Some(1.0)),
+                ("2026-01", 2, Some(25.5), Some(2.0)),
+                ("2026-03", 1, Some(1.0), None),
+            ]
+        );
+        let years = bucket_energy(Group::Year, &days);
+        let summary: Vec<_> = years
+            .iter()
+            .map(|b| (b.period.as_str(), b.sums.days, b.sums.pv_kwh))
+            .collect();
+        assert_eq!(summary, [("2025", 1, Some(10.0)), ("2026", 3, Some(26.5))]);
+        assert!(bucket_energy(Group::Year, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn daily_group_sums_days_and_skips_the_time_before_the_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let point = Point {
+            point_id: 83022,
+            code: None,
+            name: None,
+            unit: Some("Wh".to_string()),
+        };
+        db::upsert_point(&pool, &point).await.unwrap();
+        let day_start = |s: &str| {
+            let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+            day_bounds(date, ADELAIDE).unwrap().0
+        };
+        let rows: Vec<Reading> = [
+            ("2025-12-30", 4000.0),
+            ("2026-01-02", 6000.0),
+            ("2026-01-03", 1000.0),
+        ]
+        .iter()
+        .map(|&(d, v)| Reading {
+            point_id: 83022,
+            ts: day_start(d) + 3600,
+            value: Some(v),
+        })
+        .collect();
+        db::upsert_readings(&pool, 7, &rows).await.unwrap();
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let ask = |from: &str, to: &str, group: &str| DailyParams {
+            from: Some(from.to_string()),
+            to: Some(to.to_string()),
+            group: Some(group.to_string()),
+        };
+
+        // Twenty years back: the empty years are skipped, not read.
+        let Json(json) = daily(
+            State(state.clone()),
+            Query(ask("2007-01-01", "2026-03-01", "year")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(json["group"], "year");
+        assert_eq!(json["totals"]["pv_kwh"], 11.0);
+        assert_eq!(json["totals"]["days"], 3);
+        let buckets = json["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0]["period"], "2025");
+        assert_eq!(buckets[0]["pv_kwh"], 4.0);
+        assert_eq!(buckets[1]["period"], "2026");
+        assert_eq!(buckets[1]["days"], 2);
+        assert_eq!(buckets[1]["pv_kwh"], 7.0);
+
+        // A range wholly before the data is empty.
+        let Json(json) = daily(
+            State(state.clone()),
+            Query(ask("2020-01-01", "2020-12-31", "month")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(json["buckets"].as_array().unwrap().len(), 0);
+        assert_eq!(json["totals"]["days"], 0);
+
+        // Without a group the answer is as before, and still capped at 400 days.
+        let plain = DailyParams {
+            from: Some("2025-12-30".to_string()),
+            to: Some("2025-12-31".to_string()),
+            group: None,
+        };
+        let Json(json) = daily(State(state.clone()), Query(plain)).await.unwrap();
+        assert_eq!(json["days"].as_array().unwrap().len(), 2);
+        assert!(
+            daily(
+                State(state.clone()),
+                Query(ask("2020-01-01", "2026-01-01", "day"))
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            daily(State(state), Query(ask("2025-12-30", "2025-12-31", "week")))
+                .await
+                .is_err()
+        );
     }
 }
