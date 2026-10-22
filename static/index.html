@@ -17,9 +17,8 @@
     <nav class="tabs" aria-label="Views">
       <a class="tab" href="#now" data-view="now">Now</a>
       <a class="tab" href="#day" data-view="history">History</a>
-      <a class="tab" href="#savings" data-view="savings">Savings</a>
+      <a class="tab" href="#money" data-view="money">Money</a>
       <a class="tab" href="#payback" data-view="payback">Payback</a>
-      <a class="tab" href="#cost" data-view="cost">Cost</a>
     </nav>
     <form method="post" action="/logout" class="logout">
       <button type="submit" class="btn">Log out</button>
@@ -143,46 +142,6 @@
     <h3 class="section">Totals</h3>
     <div class="grid tiles" id="year-totals"></div>
   </section>
-  <section id="view-savings" class="view" aria-labelledby="h-savings" hidden>
-    <h2 id="h-savings" class="sr-only">Savings</h2>
-    <div class="picker" role="group" aria-label="Range">
-      <span class="picker-label" aria-hidden="true">Range</span>
-      <button type="button" class="btn" data-range="month" aria-pressed="false">This month</button>
-      <button type="button" class="btn" data-range="year" aria-pressed="false">This year</button>
-      <button type="button" class="btn" data-range="all" aria-pressed="true">All time</button>
-    </div>
-    <p id="savings-unconfigured" class="panel notice" hidden></p>
-    <div id="savings-body" class="view-body" hidden>
-      <div class="cards" id="savings-cards"></div>
-      <section class="panel" aria-labelledby="h-run">
-        <h2 id="h-run" class="panel-title">Running total</h2>
-        <div class="card flat">
-          <div id="savings-chart" class="chart" role="img" aria-label="Running total of savings"></div>
-          <p id="savings-empty" class="empty" hidden>No data for this range</p>
-        </div>
-      </section>
-      <section class="panel" aria-labelledby="h-bymonth">
-        <h2 id="h-bymonth" class="panel-title"><span id="savings-table-title">By month</span></h2>
-        <div class="table-wrap">
-          <table class="data" id="savings-table">
-            <thead><tr><th scope="col">Month</th><th scope="col">Paid</th><th scope="col">Without solar</th><th scope="col">Saved</th><th scope="col">Credit days</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </section>
-    </div>
-    <section id="ev-compare" class="panel" aria-labelledby="h-evcmp" hidden>
-      <h2 id="h-evcmp" class="panel-title">Car vs petrol</h2>
-      <p id="ev-compare-unconfigured" class="notice" hidden></p>
-      <div id="ev-compare-body" class="stack" hidden>
-        <table class="data compact" id="ev-compare-table">
-          <thead><tr><th scope="col"></th><th scope="col">This month</th><th scope="col">Last 12 months</th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <p id="ev-compare-note" class="panel-note"></p>
-      </div>
-    </section>
-  </section>
   <section id="view-payback" class="view" aria-labelledby="h-payback" hidden>
     <h2 id="h-payback" class="page-title">Has it paid for itself?</h2>
     <p id="payback-unconfigured" class="panel notice" hidden></p>
@@ -214,41 +173,70 @@
       </details>
     </div>
   </section>
-
-  <section id="view-cost" class="view" aria-labelledby="h-cost" hidden>
-    <h2 id="h-cost" class="page-title">What power costs</h2>
-    <p id="cost-unconfigured" class="panel notice" hidden></p>
-    <div id="cost-body" class="view-body" hidden>
-      <div class="cards" id="cost-cards"></div>
-      <section class="panel" aria-labelledby="h-cost14">
-        <h2 id="h-cost14" class="panel-title">Last 14 days: paid vs without solar</h2>
+  <section id="view-money" class="view" aria-labelledby="h-money" hidden>
+    <h2 id="h-money" class="sr-only">Money</h2>
+    <div class="picker seg" role="group" aria-label="Period">
+      <button type="button" class="btn" data-money="month" aria-pressed="true">Month</button>
+      <button type="button" class="btn" data-money="year" aria-pressed="false">Year</button>
+      <button type="button" class="btn" data-money="all" aria-pressed="false">All time</button>
+    </div>
+    <div class="picker" id="money-nav">
+      <button type="button" class="btn" id="money-prev" aria-label="Previous month">&larr;</button>
+      <span class="money-label" id="money-label" aria-live="polite"></span>
+      <button type="button" class="btn" id="money-next" aria-label="Next month">&rarr;</button>
+      <button type="button" class="btn" id="money-today">This month</button>
+    </div>
+    <p id="money-unconfigured" class="panel notice" hidden></p>
+    <div id="money-body" class="view-body" hidden>
+      <div id="money-numbers" class="view-body">
+        <section class="hero" aria-labelledby="h-moneysaved">
+          <h2 id="h-moneysaved" class="hero-label">Saved</h2>
+          <div class="hero-total" id="money-saved"></div>
+          <div class="hero-since" id="money-pct"></div>
+          <div id="money-split"></div>
+          <div class="hero-pair">
+            <div><span class="hero-label">You paid</span><span class="hero-val" id="money-paid"></span></div>
+            <div><span class="hero-label">Without solar or battery</span><span class="hero-val" id="money-without"></span></div>
+          </div>
+        </section>
+        <div class="money-pair">
+          <section class="panel" aria-labelledby="h-bill">
+            <h2 id="h-bill" class="panel-title">Your bill</h2>
+            <p class="panel-note">Laid out like your power bill, so you can check one against the other.</p>
+            <div class="lines" id="money-bill"></div>
+          </section>
+          <section class="panel" aria-labelledby="h-sources">
+            <h2 id="h-sources" class="panel-title">Where the saving came from</h2>
+            <p class="panel-note">The supply charge is the same either way, so it is not part of the saving.</p>
+            <div class="lines" id="money-sources"></div>
+          </section>
+        </div>
+      </div>
+      <section class="panel" aria-labelledby="money-chart-title">
+        <h2 id="money-chart-title" class="panel-title">Day by day</h2>
         <div class="card flat">
-          <div id="cost-days-chart" class="chart" role="img" aria-label="Daily cost for the last 14 days"></div>
-          <p id="cost-days-empty" class="empty" hidden>No data for this range</p>
+          <div id="money-chart" class="chart" role="img" aria-label="Money chart"></div>
+          <p id="money-empty" class="empty" hidden>No data for this period</p>
         </div>
       </section>
-      <section class="panel" aria-labelledby="h-costm">
-        <h2 id="h-costm" class="panel-title">By month: paid vs without solar</h2>
-        <div class="card flat">
-          <div id="cost-months-chart" class="chart" role="img" aria-label="Monthly cost for the last 12 months"></div>
-          <p id="cost-months-empty" class="empty" hidden>No data for this range</p>
-        </div>
-        <div class="table-wrap">
-          <table class="data" id="cost-table">
-            <thead><tr><th scope="col">Month</th><th scope="col">Paid</th><th scope="col">Without solar</th><th scope="col">Paid a day</th><th scope="col">Without solar a day</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
+      <section class="panel" id="money-car" aria-labelledby="money-car-title" hidden>
+        <h2 id="money-car-title" class="panel-title">Car</h2>
+        <div class="cards" id="money-car-cards"></div>
+        <p id="money-car-note" class="panel-note"></p>
       </section>
-      <section class="panel" id="cost-sessions" aria-labelledby="h-costev" hidden>
-        <h2 id="h-costev" class="panel-title">Charging sessions</h2>
+      <section class="panel" id="money-sessions" aria-labelledby="h-moneyev" hidden>
+        <h2 id="h-moneyev" class="panel-title">Charging sessions</h2>
         <div class="table-wrap">
-          <table class="data" id="cost-sessions-table">
+          <table class="data" id="money-sessions-table">
             <thead><tr><th scope="col">Date</th><th scope="col">kWh</th><th scope="col">Solar</th><th scope="col">Cost</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
       </section>
+      <details class="panel how">
+        <summary>How this is calculated</summary>
+        <p>Each day is priced twice on your tariff: what you actually paid, and what the same usage would have cost with no solar or battery. The difference is the saving. The supply charge is in both, so the saving is the power you did not buy, plus feed-in and any credits. Days with no data are left out.</p>
+      </details>
     </div>
   </section>
 </main>

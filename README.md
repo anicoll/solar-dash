@@ -11,7 +11,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Backfill of historical data (automatic in `serve` with `history_from`, or `backfill --from`)
 - [x] Live sync (`serve` keeps the database current every 5 minutes)
 - [x] Web server with password login and JSON API
-- [x] Dashboard UI (Now, History (Day, Month, Year), Savings, Payback and Cost views; ECharts from cdnjs)
+- [x] Dashboard UI (Now, History (Day, Month, Year), Money and Payback views; ECharts from cdnjs)
 - [x] Local Modbus reader (`modbus-test`) for live power from the inverter
 - [x] `serve` polls Modbus when configured and stores live samples (`/api/live`, `/api/live/series`)
 - [x] `serve` follows the Tesla's charge state from TeslaMate over MQTT when configured (`/api/live`)

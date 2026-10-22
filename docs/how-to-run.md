@@ -121,11 +121,15 @@ it on the server too.
 
 ### Dashboard views
 
-The page has tabs for Now, History, Savings, Payback and Cost. History has a
+The page has tabs for Now, History, Money and Payback. History has a
 Day | Month | Year switch, and the address keeps the view (for example
 `#day=2026-10-20`, `#month=2026-10`, `#year=2026`), so refresh and bookmarks
 work. Clicking a bar in the Month chart opens that day, and a bar in the Year
-chart opens that month. All times are shown in Australia/Adelaide.
+chart opens that month. Money has a Month | Year | All time switch
+(`#money=month:2026-09`, `#money=year:2025`, `#money=all`; `#money` is this month):
+what you saved, a bill-style breakdown, where the saving came from, a bar chart
+that opens the day, month or year you click, and the car. The old `#savings` and
+`#cost` addresses open it. All times are shown in Australia/Adelaide.
 
 - **Now**: solar and load power, battery, and today's energy totals. With
   [Modbus](#local-modbus-optional) running it shows the inverter's live values
@@ -324,8 +328,8 @@ petrol_litres_per_100km = 7.5    # a comparable petrol car (the default)
 ```
 
 South Australian unleaded averages roughly 190-200 c/L in 2026; check a fuel
-price app for what you pay. The Savings view then shows a "Car vs petrol"
-panel with this month and the last 12 months. It is hidden until the car has
+price app for what you pay. The Money tab then shows a car
+panel for the month, year or (for All time) the last 12 months. It is hidden until the car has
 km or charging recorded, and it says which key to set if there is no petrol
 price. `GET /api/ev/summary` gives the same numbers.
 
