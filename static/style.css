@@ -40,6 +40,7 @@
 
   --free: rgba(61, 214, 176, 0.09);
   --peak: rgba(255, 122, 133, 0.08);
+  --warn: #f2b33d;
   --danger-bg: #3a1d1a;
   --danger-fg: #ffb4a9;
 
@@ -351,3 +352,14 @@ table.data td.save { color: var(--save); }
 .line .num.save { color: var(--save); }
 .line.total { border-top: 2px solid var(--border-strong); font-weight: 600; }
 .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+
+/* ---------- Bill check ---------- */
+.bill-headline { margin: 0 0 4px; font-size: 17px; font-weight: 600; }
+.bill-headline .diff { color: var(--muted); }
+.bill-headline .diff.warn, td.warn { color: var(--warn); }
+.sub-title { margin: 0 0 8px; font-size: 15px; font-weight: 600; color: var(--fg-soft); }
+.plain-list { list-style: none; margin: 0; padding: 0; }
+.plain-list li { padding: 10px 0; border-top: 1px solid var(--border); }
+.plain-list li:first-child { border-top: 0; }
+.plain-list .line-detail { display: block; }
+#bill-table { min-width: 440px; }

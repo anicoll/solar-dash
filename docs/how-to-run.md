@@ -128,7 +128,9 @@ work. Clicking a bar in the Month chart opens that day, and a bar in the Year
 chart opens that month. Money has a Month | Year | All time switch
 (`#money=month:2026-09`, `#money=year:2025`, `#money=all`; `#money` is this month):
 what you saved, a bill-style breakdown, where the saving came from, a bar chart
-that opens the day, month or year you click, and the car. The old `#savings` and
+that opens the day, month or year you click, the car, and, with a `[globird]` section,
+a Bill check card that sets GloBird's own bill beside our estimate for the same period
+(the last 400 days at most). The old `#savings` and
 `#cost` addresses open it. All times are shown in Australia/Adelaide.
 
 - **Now**: solar and load power, battery, and today's energy totals. With
