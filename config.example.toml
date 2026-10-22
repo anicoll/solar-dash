@@ -98,6 +98,15 @@ path = "data/solar.db"
 # "Home" (or no geofence at all).
 # away_cents_per_kwh = 65.0
 
+# Optional: your GloBird Energy customer portal login, used by `globird-probe`
+# (read-only access to your account at myaccount.globirdenergy.com.au). The
+# password is stored in plain text, so keep this file's mode at 600
+# (chmod 600 config.toml). This is an unofficial portal API and may break
+# without notice. Without this section the feature is off.
+# [globird]
+# email = "you@example.com"
+# password = "your-portal-password"
+
 # Optional: electricity prices, used to work out what each day cost and what
 # the solar and battery saved. Without this section cost features are off.
 # These values are Andrew's GloBird ZeroHero plan (plan details, Oct 2026):

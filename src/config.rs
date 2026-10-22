@@ -21,6 +21,9 @@ pub struct Config {
     /// TeslaMate's MQTT broker, for the car's charge state. `None` (no
     /// `[teslamate]` section) means it is off.
     pub teslamate: Option<Teslamate>,
+    /// Login for the GloBird customer portal, used by `globird-probe`. `None`
+    /// (no `[globird]` section) means it is off.
+    pub globird: Option<Globird>,
     /// Electricity prices, used to work out costs and savings. `None` (no
     /// `[tariff]` section) means cost features are off.
     pub tariff: Option<Tariff>,
@@ -213,6 +216,37 @@ impl Teslamate {
             );
         }
         Ok(())
+    }
+}
+
+/// Login for the GloBird customer portal; see config.example.toml.
+#[derive(Clone, Deserialize)]
+pub struct Globird {
+    pub email: String,
+    pub password: String,
+}
+
+impl Globird {
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.email.trim().is_empty(),
+            "email in [globird] must not be empty"
+        );
+        anyhow::ensure!(
+            !self.password.is_empty(),
+            "password in [globird] must not be empty"
+        );
+        Ok(())
+    }
+}
+
+// Written by hand for the same reason as `IsolarCloud`: keep the password out of logs.
+impl fmt::Debug for Globird {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Globird")
+            .field("email", &self.email)
+            .field("password", &"<redacted>")
+            .finish()
     }
 }
 
@@ -488,6 +522,11 @@ impl Config {
                 .check()
                 .with_context(|| format!("invalid config file {}", path.display()))?;
         }
+        if let Some(globird) = &config.globird {
+            globird
+                .check()
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+        }
         if let Some(tariff) = &config.tariff {
             tariff
                 .check("[tariff]")
@@ -562,6 +601,38 @@ mod tests {
         let text = format!("{MINIMAL}\n[modbus]\nhost = \"h\"\ninterval_secs = 0\n");
         let cfg: Config = toml::from_str(&text).unwrap();
         assert!(cfg.modbus.unwrap().check().is_err());
+    }
+
+    #[test]
+    fn globird_is_off_without_a_section() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.globird.is_none());
+    }
+
+    #[test]
+    fn globird_section_needs_email_and_password() {
+        let ok = format!("{MINIMAL}\n[globird]\nemail = \"a@b.c\"\npassword = \"pw\"\n");
+        let globird = toml::from_str::<Config>(&ok).unwrap().globird.unwrap();
+        assert_eq!(globird.email, "a@b.c");
+        assert!(globird.check().is_ok());
+
+        let no_password = format!("{MINIMAL}\n[globird]\nemail = \"a@b.c\"\n");
+        assert!(toml::from_str::<Config>(&no_password).is_err());
+
+        let empty = format!("{MINIMAL}\n[globird]\nemail = \"\"\npassword = \"pw\"\n");
+        let globird = toml::from_str::<Config>(&empty).unwrap().globird.unwrap();
+        assert!(globird.check().is_err());
+    }
+
+    #[test]
+    fn globird_password_is_not_in_debug_output() {
+        let globird = Globird {
+            email: "a@b.c".into(),
+            password: "hunter2".into(),
+        };
+        let text = format!("{globird:?}");
+        assert!(!text.contains("hunter2"));
+        assert!(text.contains("<redacted>"));
     }
 
     #[test]

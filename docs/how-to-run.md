@@ -352,6 +352,54 @@ If the broker is down, `serve` keeps running. The first failure is logged as
 a warning, then it retries after 1 second, doubling up to every 60 seconds,
 and `TeslaMate MQTT back` is logged when it reconnects.
 
+## GloBird (optional)
+
+solar-dash can log in to your GloBird Energy customer portal
+(myaccount.globirdenergy.com.au) and save what its endpoints return, so we can
+see the real response shapes before storing any GloBird data. The portal has
+no official API: this uses the same calls its web pages make, learned from the
+[bolagnaise/globird-ha](https://github.com/bolagnaise/globird-ha) Home
+Assistant integration. It is read-only, but it may break whenever GloBird
+changes the portal. Without a `[globird]` section nothing changes.
+
+1. Add your portal login to `config.toml` (see `config.example.toml`). The
+   password is stored in plain text, so keep the file's mode at 600:
+
+   ```toml
+   [globird]
+   email = "you@example.com"
+   password = "your-portal-password"
+   ```
+
+2. Run the probe:
+
+   ```sh
+   cargo run -- globird-probe
+   ```
+
+   On the deployed server (see [deploy.md](deploy.md)):
+
+   ```sh
+   sudo -u solar-dash /opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml globird-probe --out /tmp/globird-probe.json
+   ```
+
+   `--out` sets the file (default `globird-probe.json`) and `--days` how many
+   days of usage and cost to ask for (default 31). It calls each endpoint once
+   with a short pause between calls, so it takes a minute or so. A failing
+   endpoint is recorded as an error in the file and the rest carry on.
+
+It prints the file's path and, per service, the number of usage and cost
+rows, the `chargeCategory` values seen, the length of the first `usageArray`
+(48 or 288 intervals?) and how many cost rows come back for windows one and
+two years ago (how far back history goes).
+
+If GloBird asks for a captcha, login fails with a message saying so. Log in
+once in a browser at the portal and try again later.
+
+The file is written with mode 600 and names, addresses, account numbers, NMIs,
+meter serial numbers and tokens are replaced with `REDACTED`. The redaction
+goes by field name, so open the file and check it before sharing it.
+
 ## Backfill history
 
 `serve` downloads the 5-minute history by itself. Set the day your inverter

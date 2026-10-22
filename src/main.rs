@@ -2,17 +2,19 @@ mod config;
 mod cost;
 mod db;
 mod ev_cost;
+mod globird;
 mod ingest;
 mod isolar;
 mod modbus;
 mod teslamate;
 mod web;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::NaiveDate;
+use chrono_tz::Tz;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -53,6 +55,16 @@ enum Command {
         /// Keep reading every interval_secs until Ctrl+C, then print a summary.
         #[arg(long)]
         watch: bool,
+    },
+    /// Log in to the GloBird portal and save a redacted dump of what each endpoint
+    /// returns (needs a [globird] section).
+    GlobirdProbe {
+        /// Where to write the JSON dump.
+        #[arg(long, default_value = "globird-probe.json")]
+        out: PathBuf,
+        /// How many days of usage and cost to ask for.
+        #[arg(long, default_value_t = 31)]
+        days: u32,
     },
     /// Call any iSolarCloud endpoint and print the result (for exploring the API).
     Api {
@@ -125,6 +137,12 @@ async fn run() -> Result<()> {
         Command::ModbusTest { watch } => {
             if let Err(err) = modbus_test(config, watch).await {
                 eprintln!("Modbus test failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::GlobirdProbe { out, days } => {
+            if let Err(err) = globird_probe(config, &out, days).await {
+                eprintln!("GloBird probe failed: {err:#}");
                 std::process::exit(1);
             }
         }
@@ -261,6 +279,25 @@ fn with_leading_slash(path: &str) -> String {
     } else {
         format!("/{path}")
     }
+}
+
+/// Logs in to the GloBird portal and writes a redacted dump of its endpoints.
+async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
+    let globird = config.globird.context(
+        "globird-probe needs a [globird] section in config.toml (see config.example.toml)",
+    )?;
+    // Check the settings first, so mistakes fail before any network call.
+    if !(1..=366).contains(&days) {
+        bail!("--days must be between 1 and 366, got {days}");
+    }
+    // Local dates use the same time zone as the iSolarCloud plant.
+    let tz: Tz = config
+        .isolarcloud
+        .timezone
+        .parse()
+        .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.isolarcloud.timezone))?;
+    let client = globird::client::Client::new(globird)?;
+    globird::probe::run(client, tz, days, out).await
 }
 
 /// Reads the inverter once, or with `watch` every `interval_secs` until Ctrl+C.
