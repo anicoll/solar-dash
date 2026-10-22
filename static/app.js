@@ -525,15 +525,19 @@
     return view;
   }
 
-  /** Splits pv/load/battery/grid watts into the six pairwise flows (pv first to home, then battery, then grid; battery discharge serves home before export). */
+  /**
+   * Splits pv/load/battery/grid watts into the six pairwise flows the way the Sungrow app does:
+   * solar charges the battery first (the battery sits on the inverter's DC side), then feeds the
+   * home, then exports; battery discharge serves the home before export; the grid covers the rest.
+   */
   function splitFlows(s) {
     const pos = (w) => Math.max(w == null ? 0 : w, 0);
     const pv = pos(s.pv_w), load = pos(s.load_w), charge = pos(s.battery_w), discharge = pos(-s.battery_w);
     const imp = pos(s.grid_w), exp = pos(-s.grid_w);
-    const pvHome = Math.min(pv, load);
-    let r = pv - pvHome;
-    const pvBat = Math.min(r, charge);
-    r -= pvBat;
+    const pvBat = Math.min(pv, charge);
+    let r = pv - pvBat;
+    const pvHome = Math.min(r, load);
+    r -= pvHome;
     const pvGrid = Math.min(r, exp);
     let loadLeft = load - pvHome;
     const batHome = Math.min(discharge, loadLeft);
