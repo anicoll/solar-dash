@@ -238,7 +238,8 @@ struct Totals {
     diff: Diff,
 }
 
-/// Adds up the rows that have both sides. Sums of the rows' own rounded
+/// Adds up the rows that are complete and have both sides (a day GloBird has
+/// only posted the supply charge for would look like a big difference). Sums of the rows' own rounded
 /// figures, so the totals match the rows exactly. A day where GloBird has no
 /// kWh adds nothing to the kWh sums.
 fn totals_of(rows: &[CompareRow]) -> Totals {
@@ -246,6 +247,9 @@ fn totals_of(rows: &[CompareRow]) -> Totals {
     let (mut globird_import_kwh, mut globird_export_kwh) = (0.0, 0.0);
     for row in rows {
         let Some(ours) = &row.ours else { continue };
+        if !row.complete {
+            continue;
+        }
         let g = &row.globird.sums;
         totals.days_compared += 1;
         totals.globird.import += g.import;
@@ -546,6 +550,32 @@ mod tests {
         assert_eq!(totals.diff.total, 0.0);
         assert_eq!(totals.diff.export_kwh, Some(-0.5));
         assert_eq!(totals_of(&[]).days_compared, 0);
+    }
+
+    #[test]
+    fn totals_leave_out_incomplete_days() {
+        let cost = our_cost();
+        let kwh = DayKwh::default();
+        let complete = compare_row(
+            date("2026-10-09"),
+            &oct_9_lines(),
+            kwh,
+            Some((&cost, "cloud")),
+        );
+        // GloBird has only posted the supply charge for this day.
+        let supply_only = vec![line("SUPPLY", 174, 0.0)];
+        let incomplete = compare_row(
+            date("2026-10-10"),
+            &supply_only,
+            kwh,
+            Some((&cost, "cloud")),
+        );
+        assert!(complete.complete && !incomplete.complete);
+        assert!(incomplete.diff.is_some());
+        let totals = totals_of(&[complete, incomplete]);
+        assert_eq!(totals.days_compared, 1);
+        assert_eq!(totals.globird.total, -0.36);
+        assert_eq!(totals.ours.total, -0.36);
     }
 
     #[test]

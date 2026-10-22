@@ -233,6 +233,36 @@
           </table>
         </div>
       </section>
+      <section class="panel" id="bill-check" aria-labelledby="h-billcheck" hidden>
+        <h2 id="h-billcheck" class="panel-title">Bill check</h2>
+        <p id="bill-nodata" class="panel-note" hidden>No GloBird data yet. The first sync runs a minute after start-up.</p>
+        <div id="bill-body" class="view-body" hidden>
+          <div>
+            <p id="bill-headline" class="bill-headline"></p>
+            <p class="panel-note">A positive difference means we estimated more than GloBird charged. Only days where GloBird has posted its full bill and we have an estimate are counted.</p>
+          </div>
+          <div class="table-wrap">
+            <table class="data" id="bill-table">
+              <caption class="sr-only">GloBird's bill and our estimate for the same days</caption>
+              <thead><tr><th scope="col">Charge</th><th scope="col">GloBird</th><th scope="col">Ours</th><th scope="col"><span class="long">Difference</span><span class="short">Diff</span></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div>
+            <h3 class="sub-title" id="h-billchart">Difference each day</h3>
+            <div class="card flat">
+              <div id="bill-chart" class="chart" role="img" aria-label="Difference each day"></div>
+              <p id="bill-empty" class="empty" hidden>No days to compare</p>
+            </div>
+          </div>
+          <div>
+            <h3 class="sub-title">Days that differ</h3>
+            <ul id="bill-days" class="plain-list"></ul>
+            <button type="button" class="btn" id="bill-more" aria-expanded="false" aria-controls="bill-days" hidden></button>
+          </div>
+          <div id="bill-notes" class="panel-note" hidden></div>
+        </div>
+      </section>
       <details class="panel how">
         <summary>How this is calculated</summary>
         <p>Each day is priced twice on your tariff: what you actually paid, and what the same usage would have cost with no solar or battery. The difference is the saving. The supply charge is in both, so the saving is the power you did not buy, plus feed-in and any credits. Days with no data are left out.</p>

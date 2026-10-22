@@ -1547,6 +1547,186 @@
     }));
   }
 
+  // ---------- Money: Bill check ----------
+
+  // /api/globird/compare takes at most 400 days.
+  const BILL_MAX_DAYS = 400;
+  // A day or a period counts as different when it is out by more than this share of GloBird's bill...
+  const BILL_SHARE = 0.05;
+  // ...and by more than this many dollars (a day) or $1 (the whole period).
+  const BILL_DAY_DOLLARS = 0.5;
+  const BILL_PERIOD_DOLLARS = 1;
+  const BILL_NO_ESTIMATE = 'GloBird has bills for this period, but no complete day has an estimate of ours to compare with yet.';
+  // The "Days that differ" list shows this many days until "Show all" is pressed.
+  const BILL_DAYS_SHORT = 5;
+  const BILL_DAYS_MAX = 10;
+
+  /** The money columns of the breakdown: label, key in `globird`/`ours`. Our estimate has no "other". */
+  const BILL_ROWS = [
+    ['Import', 'Import', 'import'],
+    ['Feed-in and export credits', 'Export credits', 'export'],
+    ['Supply', 'Supply', 'supply'],
+    ['ZeroHero credit', 'ZeroHero', 'credit'],
+    ['Other', 'Other', 'other'],
+  ];
+
+  /** "+$1.20" or "-$1.20". */
+  const signedMoney = (v) => (v > 0 ? '+' : '') + money(v);
+
+  /** The plural-aware "4 days". */
+  const daysText = (n) => `${n} ${n === 1 ? 'day' : 'days'}`;
+
+  /** From and to for the Bill check: the Money period, cut to the last 400 days. */
+  function billRange(p) {
+    return { from: p.from > addDays(p.to, 1 - BILL_MAX_DAYS) ? p.from : addDays(p.to, 1 - BILL_MAX_DAYS), to: p.to };
+  }
+
+  /** "GloBird billed $X · we estimated $Y · difference $Z (P%)", with the difference amber when it is large. */
+  function renderBillHeadline(t) {
+    const diff = t.diff.total;
+    const base = Math.abs(t.globird.total);
+    const small = Math.abs(diff) <= BILL_PERIOD_DOLLARS || Math.abs(diff) <= base * BILL_SHARE;
+    const pct = base > 0 ? ` (${diff > 0 ? '+' : ''}${((diff / base) * 100).toFixed(1)}%)` : '';
+    const d = el('span', small ? 'diff' : 'diff warn', `difference ${signedMoney(diff)}${pct}`);
+    $('bill-headline').replaceChildren(
+      `GloBird billed ${money(t.globird.total)} · we estimated ${money(t.ours.total)} · `, d,
+      ` for ${daysText(t.days_compared)}`);
+  }
+
+  /** A table row: a label with a long and a short form (the short one shows on phones), then the numbers. */
+  function billRow(long, short, cells) {
+    const tr = document.createElement('tr');
+    const name = el('td');
+    name.append(el('span', 'long', long), el('span', 'short', short));
+    tr.append(name, ...cells.map((text) => el('td', '', text)));
+    return tr;
+  }
+
+  /** The breakdown table: money rows, then kWh rows. `t` is the compare `totals`. */
+  function renderBillTable(t) {
+    const rows = BILL_ROWS.map(([long, short, key]) => {
+      const g = t.globird[key];
+      const o = t.ours[key]; // undefined for "other"
+      return billRow(long, short, [money(g), o == null ? '–' : money(o), money((o || 0) - g)]);
+    });
+    rows.push(
+      billRow('Grid import (kWh)', 'Import kWh', [kwh(t.globird.import_kwh), kwh(t.ours.import_kwh), kwh(t.diff.import_kwh)]),
+      billRow('Export (kWh)', 'Export kWh', [kwh(t.globird.export_kwh), kwh(t.ours.export_kwh), kwh(t.diff.export_kwh)]),
+    );
+    $('bill-table').tBodies[0].replaceChildren(...rows);
+  }
+
+  /** Bars of ours minus GloBird per day. A day with no estimate gets no bar. */
+  function billOption(days) {
+    const th = baseTheme();
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 16, top: 40, bottom: 8, containLabel: true },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        formatter: (params) => {
+          const d = days[params[0].dataIndex];
+          return moneyTooltip([
+            ['', 'GloBird billed', money(d.globird.total)],
+            ['', 'We estimated', d.ours ? money(d.ours.total) : '–'],
+            [params[0].marker, 'Difference', d.diff ? signedMoney(d.diff.total) : '–'],
+          ], dayLabel(d.date));
+        },
+      },
+      xAxis: {
+        type: 'category', data: days.map((d) => dayLabel(d.date)),
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
+        axisLine: { lineStyle: { color: th.line } },
+      },
+      yAxis: {
+        type: 'value', name: 'Ours minus GloBird ($)', nameTextStyle: { color: th.muted, align: 'left' },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series: [{
+        name: 'Difference', type: 'bar', barMaxWidth: 28, itemStyle: { color: css('--c-load') },
+        data: days.map((d) => (d.diff && d.complete ? d.diff.total : null)),
+      }],
+    };
+  }
+
+  /** The bucket where our estimate is furthest from GloBird's on a day, as "Import +$1.20". */
+  function billBiggest(d) {
+    let best = null;
+    for (const [name, , key] of BILL_ROWS) {
+      if (key === 'other') continue;
+      const diff = d.ours[key] - d.globird[key];
+      if (best == null || Math.abs(diff) > Math.abs(best[1])) best = [name, diff];
+    }
+    return `${best[0]} ${signedMoney(best[1])}`;
+  }
+
+  let billExpanded = false;
+
+  /**
+   * The days where the two totals are far apart: the 5 furthest apart (up to 10
+   * after "Show all"), newest first. A day GloBird has only posted the supply
+   * charge for is skipped: it would always look wrong.
+   */
+  function renderBillDays(days) {
+    const differ = days.filter((d) => d.diff && d.complete
+      && Math.abs(d.diff.total) > Math.max(BILL_DAY_DOLLARS, BILL_SHARE * Math.abs(d.globird.total)));
+    const top = differ.sort((a, b) => Math.abs(b.diff.total) - Math.abs(a.diff.total)).slice(0, BILL_DAYS_MAX);
+    const shown = top.slice(0, billExpanded ? BILL_DAYS_MAX : BILL_DAYS_SHORT)
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+    const items = shown.map((d) => {
+      const li = el('li');
+      li.append(
+        el('b', '', dayLabel(d.date)),
+        el('span', 'line-detail',
+          `GloBird ${money(d.globird.total)}, ours ${money(d.ours.total)}, difference ${signedMoney(d.diff.total)}`),
+        el('span', 'line-detail', `Biggest: ${billBiggest(d)}`));
+      return li;
+    });
+    if (!items.length) items.push(el('li', '', 'None'));
+    $('bill-days').replaceChildren(...items);
+    const more = $('bill-more');
+    more.hidden = top.length <= BILL_DAYS_SHORT;
+    more.textContent = billExpanded ? 'Show fewer' : `Show all ${top.length}`;
+    more.setAttribute('aria-expanded', String(billExpanded));
+    more.onclick = () => { billExpanded = !billExpanded; renderBillDays(days); };
+  }
+
+  /** Categories our tariff has no place for, with what GloBird charged under them. */
+  function renderBillNotes(categories) {
+    const odd = categories.filter((c) => c.bucket === 'other' || /critical peak/i.test(c.category));
+    $('bill-notes').hidden = odd.length === 0;
+    $('bill-notes').replaceChildren(...odd.map((c) =>
+      el('div', '', `${c.category}: ${money(c.amount)} over ${daysText(c.days)}. Our tariff doesn't model this.`)));
+  }
+
+  /** The Bill check card. It stays hidden when there is no [globird] section (and no data). */
+  async function loadBillCheck(mode, when, p) {
+    const { from, to } = billRange(p);
+    const data = await quiet(api(`/api/globird/compare?from=${from}&to=${to}`));
+    if (state.view !== 'money' || state.mode !== mode || state.when !== when) return;
+    const hasDays = !!data && data.days.length > 0;
+    $('bill-check').hidden = !data || (!data.configured && !hasDays);
+    if ($('bill-check').hidden) return;
+    const compared = hasDays && data.totals.days_compared > 0;
+    $('bill-nodata').hidden = compared;
+    $('bill-nodata').textContent = hasDays
+      ? BILL_NO_ESTIMATE : 'No GloBird data yet. The first sync runs a minute after start-up.';
+    $('bill-body').hidden = !compared;
+    if (!compared) return;
+
+    renderBillHeadline(data.totals);
+    renderBillTable(data.totals);
+    renderBillDays(data.days);
+    renderBillNotes(data.categories);
+    const charted = data.days.filter((d) => d.diff && d.complete);
+    showChart('bill-chart', charted.length > 0, billOption(data.days),
+      `Difference each day: bars of our estimate minus what GloBird billed, in dollars, for ${daysText(data.days.length)}. `
+      + `${daysText(charted.length)} have an estimate and a complete bill. Select a bar to open that day.`);
+    onBarClick('bill-chart', (i) => go({ view: 'day', day: data.days[i].date }));
+  }
+
   async function loadMoneyView(mode, when) {
     for (const b of document.querySelectorAll('[data-money]')) {
       b.setAttribute('aria-pressed', String(b.dataset.money === mode));
@@ -1592,6 +1772,7 @@
       else go({ mode: mode === 'year' ? 'month' : 'year', when: key });
     });
     await loadMoneyCar(mode, when, p);
+    await loadBillCheck(mode, when, p);
   }
 
   // ---------- routing (hash) ----------
