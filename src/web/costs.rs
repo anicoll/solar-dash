@@ -4,7 +4,7 @@
 //! This file turns stored data into the [`Interval`]s that `cost::day_cost`
 //! prices. The interval builders are pure, so they are tested with plain numbers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use axum::Json;
@@ -20,7 +20,8 @@ use super::api::{
     day_bounds_or_error, live_totals, spread_steps, today,
 };
 use crate::cost::{self, DayCost, Interval, Tariff, TariffSchedule};
-use crate::db;
+use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
+use crate::globird::data::{self as globird_data, bucket_of, is_supply};
 use crate::modbus::Sample;
 
 /// The whole history since Feb 2023 is about 1,000 days; this leaves room to grow.
@@ -177,7 +178,8 @@ pub(super) fn round2(value: f64) -> f64 {
 #[derive(Debug, Serialize)]
 struct CostDay {
     date: String,
-    /// "inverter" (live samples) or "cloud", as in `/api/daily`.
+    /// "inverter" (live samples) or "cloud", as in `/api/daily`, or "globird"
+    /// when the money is from GloBird's own bill for the day.
     source: &'static str,
     actual: f64,
     baseline: f64,
@@ -232,6 +234,8 @@ struct Sums {
     days: u32,
     /// Days that earned the zero-import credit.
     credit_days: u32,
+    /// Days whose money is GloBird's own bill.
+    billed_days: u32,
     supply_cents: f64,
     import_cents: f64,
     export_cents: f64,
@@ -244,6 +248,14 @@ struct Sums {
 }
 
 impl Sums {
+    /// Like [`Sums::add`], and counts the day if it is GloBird's bill.
+    fn add_day(&mut self, day: &CostedDay) {
+        self.add(&day.cost);
+        if day.source == SOURCE_GLOBIRD {
+            self.billed_days += 1;
+        }
+    }
+
     fn add(&mut self, cost: &DayCost) {
         self.days += 1;
         if cost.zero_import_credit_cents > 0.0 {
@@ -272,6 +284,7 @@ impl Sums {
         Totals {
             days: self.days,
             credit_days: self.credit_days,
+            billed_days: self.billed_days,
             supply: dollars(self.supply_cents),
             import: dollars(self.import_cents),
             import_kwh: round2(self.import_kwh),
@@ -294,6 +307,8 @@ struct Totals {
     days: u32,
     /// Days that earned the zero-import credit.
     credit_days: u32,
+    /// Days whose money is GloBird's own bill rather than our estimate.
+    billed_days: u32,
     supply: f64,
     import: f64,
     import_kwh: f64,
@@ -330,7 +345,7 @@ fn bucket_days(group: Group, costed: &[CostedDay]) -> Vec<Bucket> {
             buckets.push((period, Sums::default()));
         }
         if let Some((_, sums)) = buckets.last_mut() {
-            sums.add(&day.cost);
+            sums.add_day(day);
         }
     }
     buckets
@@ -346,7 +361,8 @@ fn bucket_days(group: Group, costed: &[CostedDay]) -> Vec<Bucket> {
 #[derive(Debug, Clone)]
 pub(super) struct CostedDay {
     pub date: NaiveDate,
-    /// "inverter" or "cloud".
+    /// "inverter" or "cloud", or "globird" once [`billed_days`] has put
+    /// GloBird's bill in. Stored rows are never "globird".
     pub source: &'static str,
     pub cost: DayCost,
 }
@@ -547,6 +563,134 @@ async fn costed_days_on(
         .collect())
 }
 
+/// The kWh GloBird metered on one day. `None` means it has no figure.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct DayKwh {
+    pub import: Option<f64>,
+    pub export: Option<f64>,
+}
+
+/// Groups the kWh rows by day. The query already chose, per direction, the
+/// interval total or else the charge-period total.
+pub(super) fn kwh_by_date(rows: Vec<GlobirdDayKwh>) -> BTreeMap<String, DayKwh> {
+    let mut by_date: BTreeMap<String, DayKwh> = BTreeMap::new();
+    for row in rows {
+        let day = by_date.entry(row.date).or_default();
+        match row.direction.as_str() {
+            "import" => day.import = Some(row.kwh),
+            "export" => day.export = Some(row.kwh),
+            _ => {}
+        }
+    }
+    by_date
+}
+
+/// The `source` of a day whose money is GloBird's own bill.
+pub(super) const SOURCE_GLOBIRD: &str = "globird";
+
+/// GloBird's bill for one complete day, in whole cents (a credit is negative,
+/// as GloBird signs it), added up per bucket.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Bill {
+    import: i64,
+    export: i64,
+    supply: i64,
+    credit: i64,
+    other: i64,
+    kwh: DayKwh,
+}
+
+impl Bill {
+    /// The bill from a day's cost lines, or `None` while the day is incomplete
+    /// (GloBird has only posted the SUPPLY line so far).
+    fn from_lines(lines: &[GlobirdCostRow], kwh: DayKwh) -> Option<Self> {
+        if lines.iter().all(|line| is_supply(&line.category)) {
+            return None;
+        }
+        let mut bill = Self {
+            kwh,
+            ..Self::default()
+        };
+        for line in lines {
+            match bucket_of(&line.category) {
+                globird_data::Bucket::Import => bill.import += line.amount_cents,
+                globird_data::Bucket::Export => bill.export += line.amount_cents,
+                globird_data::Bucket::Supply => bill.supply += line.amount_cents,
+                globird_data::Bucket::Credit => bill.credit += line.amount_cents,
+                globird_data::Bucket::Other => bill.other += line.amount_cents,
+            }
+        }
+        Some(bill)
+    }
+
+    /// What the day cost: every line added up.
+    fn total(&self) -> i64 {
+        self.import + self.export + self.supply + self.credit + self.other
+    }
+}
+
+/// Our estimate of a day with GloBird's real figures put in. Money comes from
+/// the bill (feed-in and credit turned positive, as `DayCost` holds them) and
+/// the grid kWh from the meter, when GloBird has them. The load and the
+/// no-solar baseline stay ours, since GloBird can know neither. Savings are
+/// worked out again from the new bill.
+fn apply_bill(cost: &DayCost, bill: &Bill) -> DayCost {
+    let actual_cents = bill.total() as f64;
+    DayCost {
+        import_kwh: bill.kwh.import.unwrap_or(cost.import_kwh),
+        export_kwh: bill.kwh.export.unwrap_or(cost.export_kwh),
+        import_cents: bill.import as f64,
+        export_cents: -bill.export as f64,
+        supply_cents: bill.supply as f64,
+        zero_import_credit_cents: -bill.credit as f64,
+        actual_cents,
+        savings_cents: cost.baseline_cents - actual_cents,
+        ..cost.clone()
+    }
+}
+
+/// Like [`costed_days`], but a day GloBird has billed completely shows
+/// GloBird's figures (source "globird") instead of our estimate. A day without
+/// our estimate stays out, as we would have no baseline for it. The stored
+/// `daily_cost` rows are untouched; this is applied each time it is read, with
+/// one range query on the GloBird tables.
+///
+/// Use this to report money. Anything that compares with GloBird (the Bill
+/// check) must use [`costed_days`], or it would compare GloBird with itself.
+pub(super) async fn billed_days(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    dates: &[NaiveDate],
+) -> Result<Vec<CostedDay>, ApiError> {
+    let mut costed = costed_days(state, schedule, dates).await?;
+    let (Some(first), Some(last)) = (dates.first(), dates.last()) else {
+        return Ok(costed);
+    };
+    let (from, to) = (first.to_string(), last.to_string());
+    let cost_rows = db::globird_cost_in_range(&state.pool, &from, &to).await?;
+    if cost_rows.is_empty() {
+        return Ok(costed);
+    }
+    let mut kwh = kwh_by_date(db::globird_kwh_in_range(&state.pool, &from, &to).await?);
+
+    // The rows come ordered by date, so a day's lines are next to each other.
+    for lines in cost_rows.chunk_by(|a, b| a.date == b.date) {
+        let day_kwh = kwh.remove(&lines[0].date).unwrap_or_default();
+        let Some(bill) = Bill::from_lines(lines, day_kwh) else {
+            continue;
+        };
+        // `costed` is in date order, so the day is found by binary search.
+        let Ok(date) = NaiveDate::from_str(&lines[0].date) else {
+            continue;
+        };
+        if let Ok(i) = costed.binary_search_by_key(&date, |day| day.date) {
+            costed[i].cost = apply_bill(&costed[i].cost, &bill);
+            costed[i].source = SOURCE_GLOBIRD;
+        }
+    }
+    Ok(costed)
+}
+
 #[derive(Deserialize)]
 pub struct CostsParams {
     from: Option<String>,
@@ -573,11 +717,11 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
     };
 
     let dates: Vec<NaiveDate> = from.iter_days().take(count as usize).collect();
-    let costed = costed_days(&state, tariff, &dates).await?;
+    let costed = billed_days(&state, tariff, &dates).await?;
 
     let mut sums = Sums::default();
     for day in &costed {
-        sums.add(&day.cost);
+        sums.add_day(day);
     }
     let totals = sums.totals();
 
@@ -842,6 +986,74 @@ mod tests {
         assert_eq!(totals.feed_in, 0.5);
         assert_eq!(totals.credit, 1.0);
         assert_eq!(totals.savings, 2.5);
+    }
+
+    fn globird_line(category: &str, amount_cents: i64) -> GlobirdCostRow {
+        GlobirdCostRow {
+            date: "2026-09-01".to_string(),
+            category: category.to_string(),
+            amount_cents,
+            quantity: 1.0,
+        }
+    }
+
+    /// GloBird's 9 October bill: 75 usage, 32 + 118 + 35 export, 100 credit,
+    /// 174 supply and a made-up 10 c line we have no bucket for.
+    fn oct_9_bill(kwh: DayKwh) -> Bill {
+        let lines = [
+            globird_line("USAGE", 75),
+            globird_line("SOLAR", -32),
+            globird_line("Super Export top up", -118),
+            globird_line("Critical Peak - Export", -35),
+            globird_line("ZEROHERO Credit", -100),
+            globird_line("SUPPLY", 174),
+            globird_line("Something new", 10),
+        ];
+        Bill::from_lines(&lines, kwh).unwrap()
+    }
+
+    #[test]
+    fn a_bill_replaces_the_money_and_grid_kwh_of_an_estimate() {
+        let ours = day_cost_of("2026-09-01", 0.0).cost;
+        let kwh = DayKwh {
+            import: Some(20.5),
+            export: None,
+        };
+        let billed = apply_bill(&ours, &oct_9_bill(kwh));
+        // Positive, as `DayCost` holds them.
+        assert_eq!(billed.import_cents, 75.0);
+        assert_eq!(billed.export_cents, 185.0);
+        assert_eq!(billed.supply_cents, 174.0);
+        assert_eq!(billed.zero_import_credit_cents, 100.0);
+        // The bill is every line: 75 - 185 - 100 + 174 + 10.
+        assert_eq!(billed.actual_cents, -26.0);
+        // Savings: our baseline (190) less the bill.
+        assert_eq!(billed.baseline_cents, 190.0);
+        assert_eq!(billed.savings_cents, 216.0);
+        // The meter's import replaces ours; with no export figure ours stays.
+        assert_eq!(billed.import_kwh, 20.5);
+        assert_eq!(billed.export_kwh, ours.export_kwh);
+        // GloBird cannot know the load.
+        assert_eq!(billed.load_kwh, ours.load_kwh);
+    }
+
+    #[test]
+    fn a_day_with_only_the_supply_charge_has_no_bill_yet() {
+        let lines = [globird_line("SUPPLY", 174), globird_line(" supply ", 1)];
+        assert_eq!(Bill::from_lines(&lines, DayKwh::default()), None);
+        assert_eq!(Bill::from_lines(&[], DayKwh::default()), None);
+    }
+
+    #[test]
+    fn billed_days_are_counted_in_the_totals() {
+        let mut billed = day_cost_of("2026-09-01", 0.0);
+        billed.source = SOURCE_GLOBIRD;
+        let days = [billed, day_cost_of("2026-09-02", 0.0)];
+        let months = bucket_days(Group::Month, &days);
+        assert_eq!(
+            (months[0].totals.days, months[0].totals.billed_days),
+            (2, 1)
+        );
     }
 
     #[test]

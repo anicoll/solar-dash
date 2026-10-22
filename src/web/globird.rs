@@ -17,66 +17,20 @@ use serde_json::json;
 
 use super::AppState;
 use super::api::{ApiResult, date_range};
-use super::costs::{CostedDay, costed_days, round2};
+use super::costs::{CostedDay, DayKwh, costed_days, kwh_by_date, round2};
 use crate::cost::DayCost;
-use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
-use crate::globird::data::is_supply;
+use crate::db::{self, GlobirdCostRow};
+use crate::globird::data::{Bucket, bucket_of, is_supply};
 
 /// Without `from`, the compare covers this many days.
 const DEFAULT_COMPARE_DAYS: u64 = 31;
 /// The longest range one request may ask for.
 const MAX_COMPARE_DAYS: u64 = 400;
 
-/// Where a GloBird charge category lands in the comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Bucket {
-    Import,
-    Export,
-    Supply,
-    Credit,
-    Other,
-}
-
-impl Bucket {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Import => "import",
-            Self::Export => "export",
-            Self::Supply => "supply",
-            Self::Credit => "credit",
-            Self::Other => "other",
-        }
-    }
-}
-
-/// Maps GloBird's category text to a bucket, ignoring case:
-/// USAGE is import, SUPPLY is supply, "ZEROHERO Credit" is credit, and SOLAR,
-/// "Super Export top up" and anything containing "export" (such as
-/// "Critical Peak - Export") are export. New categories fall into `Other`,
-/// so they still count in the total.
-fn bucket_of(category: &str) -> Bucket {
-    let name = category.trim().to_ascii_lowercase();
-    match name.as_str() {
-        "usage" => Bucket::Import,
-        "supply" => Bucket::Supply,
-        "zerohero credit" => Bucket::Credit,
-        "solar" | "super export top up" => Bucket::Export,
-        _ if name.contains("export") => Bucket::Export,
-        _ => Bucket::Other,
-    }
-}
-
 /// Cents to dollars, rounded to 2 decimals. Adding 0.0 turns -0.0 into 0.0,
 /// so a zero never shows up as `-0.0` in the JSON.
 fn money(cents: f64) -> f64 {
     round2(cents / 100.0) + 0.0
-}
-
-/// The kWh GloBird metered on one day. `None` means it has no figure.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct DayKwh {
-    import: Option<f64>,
-    export: Option<f64>,
 }
 
 /// One GloBird charge line, as returned.
@@ -337,21 +291,6 @@ fn category_totals(rows: &[GlobirdCostRow]) -> Vec<CategoryTotal> {
         .collect()
 }
 
-/// Groups the kWh rows by day. The query already chose, per direction, the
-/// interval total or else the charge-period total.
-fn kwh_by_date(rows: Vec<GlobirdDayKwh>) -> BTreeMap<String, DayKwh> {
-    let mut by_date: BTreeMap<String, DayKwh> = BTreeMap::new();
-    for row in rows {
-        let day = by_date.entry(row.date).or_default();
-        match row.direction.as_str() {
-            "import" => day.import = Some(row.kwh),
-            "export" => day.export = Some(row.kwh),
-            _ => {}
-        }
-    }
-    by_date
-}
-
 #[derive(Deserialize)]
 pub struct CompareParams {
     from: Option<String>,
@@ -455,26 +394,6 @@ mod tests {
             actual_cents: -36.0,
             baseline_cents: 500.0,
             savings_cents: 536.0,
-        }
-    }
-
-    #[test]
-    fn categories_map_to_buckets_ignoring_case() {
-        for (category, bucket) in [
-            ("USAGE", Bucket::Import),
-            ("usage", Bucket::Import),
-            ("SUPPLY", Bucket::Supply),
-            (" Supply ", Bucket::Supply),
-            ("ZEROHERO Credit", Bucket::Credit),
-            ("zerohero credit", Bucket::Credit),
-            ("SOLAR", Bucket::Export),
-            ("Super Export top up", Bucket::Export),
-            ("Critical Peak - Export", Bucket::Export),
-            ("CRITICAL PEAK - EXPORT", Bucket::Export),
-            ("Something new", Bucket::Other),
-            ("", Bucket::Other),
-        ] {
-            assert_eq!(bucket_of(category), bucket, "{category:?}");
         }
     }
 

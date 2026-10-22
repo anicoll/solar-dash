@@ -1406,6 +1406,12 @@
     // Paid is coral, the rest of the without-solar cost is the saving.
     const paid = Math.max(0, Math.min(t.actual, t.baseline));
     $('money-split').replaceChildren(...(t.baseline > 0 ? [splitBar([[paid, '--cost'], [t.baseline - paid, '--save']])] : []));
+    // Days GloBird has billed use its figures; the rest are our estimate.
+    const note = $('money-billed');
+    note.hidden = !(t.billed_days > 0);
+    note.textContent = t.billed_days === t.days
+      ? `All ${daysText(t.days)} from your GloBird bill`
+      : `${t.billed_days} of ${daysText(t.days)} from your GloBird bill, the rest estimated`;
   }
 
   /** "Your bill": laid out like the power bill, so the total can be checked against it. */

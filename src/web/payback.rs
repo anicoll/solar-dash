@@ -1,7 +1,8 @@
 //! `/api/payback`: how much of what the system cost has been saved so far,
 //! and when it should be paid back.
 //!
-//! The savings come from [`costed_days`] (so finished days are cached). The
+//! The savings come from [`billed_days`]: our cached estimate, with GloBird's
+//! own figures put in for the days it has billed. The
 //! maths below is pure and works on plain `(date, dollars)` pairs, so it is
 //! tested with plain numbers.
 
@@ -16,7 +17,7 @@ use serde_json::{Value, json};
 
 use super::AppState;
 use super::api::{ApiResult, today};
-use super::costs::{costed_days, round2};
+use super::costs::{billed_days, round2};
 use crate::config;
 
 /// How many days of savings the rate is averaged over.
@@ -207,7 +208,7 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
     // From the first purchase until today (but not unreasonably far back).
     let start = first.date.max(today - Days::new(MAX_PAYBACK_DAYS));
     let dates: Vec<NaiveDate> = start.iter_days().take_while(|d| *d <= today).collect();
-    let days: Vec<DaySavings> = costed_days(&state, tariff, &dates)
+    let days: Vec<DaySavings> = billed_days(&state, tariff, &dates)
         .await?
         .into_iter()
         .map(|d| (d.date, d.cost.savings_cents / 100.0))

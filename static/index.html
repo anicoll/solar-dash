@@ -198,6 +198,7 @@
             <div><span class="hero-label">You paid</span><span class="hero-val" id="money-paid"></span></div>
             <div><span class="hero-label">Without solar or battery</span><span class="hero-val" id="money-without"></span></div>
           </div>
+          <p class="panel-note" id="money-billed" hidden></p>
         </section>
         <div class="money-pair">
           <section class="panel" aria-labelledby="h-bill">
@@ -265,7 +266,7 @@
       </section>
       <details class="panel how">
         <summary>How this is calculated</summary>
-        <p>Each day is priced twice on your tariff: what you actually paid, and what the same usage would have cost with no solar or battery. The difference is the saving. The supply charge is in both, so the saving is the power you did not buy, plus feed-in and any credits. Days with no data are left out.</p>
+        <p>Each day is priced twice on your tariff: what you actually paid, and what the same usage would have cost with no solar or battery. The difference is the saving. The supply charge is in both, so the saving is the power you did not buy, plus feed-in and any credits. Where GloBird has billed a whole day, its own figures are used instead (the day's bill, feed-in, credits and grid kWh), and the saving is that day's no-solar cost less the bill. The rest are our estimate. Days with no data are left out.</p>
       </details>
     </div>
   </section>
