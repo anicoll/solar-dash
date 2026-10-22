@@ -25,7 +25,20 @@ impl Window {
             minute >= self.start || minute < self.end
         }
     }
+
+    /// Whether `minute` falls in the last `minutes` of the window, counting
+    /// the closing instant itself. Works across midnight.
+    fn ends_within(&self, minute: u32, minutes: u32) -> bool {
+        let to_end = (self.end + MINUTES_PER_DAY - minute % MINUTES_PER_DAY) % MINUTES_PER_DAY;
+        to_end <= minutes
+    }
 }
+
+const MINUTES_PER_DAY: u32 = 24 * 60;
+
+/// How close to the end of the credit window the data must reach before the
+/// window counts as finished. One interval's worth, so a small gap is fine.
+const WINDOW_FINISHED_MINUTES: u32 = 15;
 
 /// A price that applies inside a window.
 #[derive(Debug, Clone, Copy)]
@@ -239,10 +252,12 @@ pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
         baseline_cents: 0.0,
         savings_cents: 0.0,
     };
-    // Import inside the credit window, and whether we saw any interval there.
-    // Without data we cannot claim the grid was unused.
+    // Import inside the credit window, and whether the window is finished in
+    // the data: an interval inside it that ends in its last 15 minutes.
+    // Without that we cannot claim the grid was unused, and a window still
+    // under way (today) must not show the credit yet.
     let mut window_import_kwh = 0.0;
-    let mut window_has_data = false;
+    let mut window_finished = false;
     let mut baseline_import_cents = 0.0;
 
     for iv in intervals {
@@ -262,12 +277,15 @@ pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
             && credit.window.contains(minute)
         {
             window_import_kwh += iv.import_kwh;
-            window_has_data = true;
+            let end_minute = local_minute_of_day(tz, iv.end_ts);
+            window_finished |= credit
+                .window
+                .ends_within(end_minute, WINDOW_FINISHED_MINUTES);
         }
     }
 
     if let Some(credit) = &tariff.zero_import_credit
-        && window_has_data
+        && window_finished
         && window_import_kwh <= credit.max_kwh
     {
         cost.zero_import_credit_cents = credit.credit_cents;
@@ -424,7 +442,8 @@ mod tests {
             &[
                 iv((18, 0), (19, 0), 0.05, 0.0, 1.0),
                 iv((19, 0), (20, 0), 0.05, 0.0, 1.0), // total 0.1: still allowed
-                iv((22, 0), (23, 0), 5.0, 0.0, 5.0),  // outside the window
+                iv((20, 0), (21, 0), 0.0, 0.0, 1.0),
+                iv((22, 0), (23, 0), 5.0, 0.0, 5.0), // outside the window
             ],
         );
         assert_eq!(day.zero_import_credit_cents, 100.0);
@@ -439,9 +458,48 @@ mod tests {
             &[
                 iv((18, 0), (19, 0), 0.06, 0.0, 1.0),
                 iv((19, 0), (20, 0), 0.06, 0.0, 1.0),
+                iv((20, 0), (21, 0), 0.0, 0.0, 1.0),
             ],
         );
         assert_eq!(day.zero_import_credit_cents, 0.0);
+    }
+
+    #[test]
+    fn credit_waits_for_the_window_to_finish() {
+        let t = zerohero();
+        // Today at 18:30: no import so far, but the window is not over.
+        let partial = day_cost(&t, ADELAIDE, &[iv((18, 0), (18, 30), 0.0, 0.0, 1.0)]);
+        assert_eq!(partial.zero_import_credit_cents, 0.0);
+        // Data up to 20:30 is still short of the last 15 minutes.
+        let nearly = day_cost(&t, ADELAIDE, &[iv((18, 0), (20, 30), 0.0, 0.0, 1.0)]);
+        assert_eq!(nearly.zero_import_credit_cents, 0.0);
+        // Data through to 21:00 earns it.
+        let full = day_cost(&t, ADELAIDE, &[iv((18, 0), (21, 0), 0.0, 0.0, 1.0)]);
+        assert_eq!(full.zero_import_credit_cents, 100.0);
+        // A small gap at the end on a past day: the last data ends at 20:50.
+        let gap = day_cost(&t, ADELAIDE, &[iv((18, 0), (20, 50), 0.0, 0.0, 1.0)]);
+        assert_eq!(gap.zero_import_credit_cents, 100.0);
+    }
+
+    #[test]
+    fn window_end_check_handles_midnight() {
+        // 21:00 to 06:00 wraps; its last 15 minutes are 05:45 to 06:00.
+        let w = Window {
+            start: 21 * 60,
+            end: 6 * 60,
+        };
+        assert!(w.ends_within(6 * 60, 15));
+        assert!(w.ends_within(5 * 60 + 45, 15));
+        assert!(!w.ends_within(5 * 60 + 44, 15));
+        assert!(!w.ends_within(6 * 60 + 1, 15));
+        // A window ending at midnight (end 0).
+        let late = Window {
+            start: 22 * 60,
+            end: 0,
+        };
+        assert!(late.ends_within(0, 15));
+        assert!(late.ends_within(23 * 60 + 50, 15));
+        assert!(!late.ends_within(23 * 60, 15));
     }
 
     #[test]
@@ -474,6 +532,7 @@ mod tests {
                 iv((18, 0), (19, 0), 0.0, 1.0, 2.0),
                 // 19:00-20:00 midpoint 19:30, 10c export, no import, load 1.
                 iv((19, 0), (20, 0), 0.0, 1.0, 1.0),
+                iv((20, 0), (21, 0), 0.0, 0.0, 0.0),
                 // 21:00-22:00 midpoint 21:30, 58.3c: buy 1 kWh, load 1 kWh.
                 iv((21, 0), (22, 0), 1.0, 0.0, 1.0),
             ],

@@ -33,9 +33,17 @@ pub(super) const MAX_SPREAD_SECS: i64 = 30 * 60;
 /// The longest time one live sample is held (see `integrate`). Samples come
 /// every ~15 s, so a longer step means the dongle dropped out.
 pub(super) const MAX_HOLD_SECS: i64 = 120;
-/// A day (or the elapsed part of today) needs this share covered by live
-/// samples before we trust them over the iSolarCloud counters.
+/// Today, or a day with no iSolarCloud counters, needs this share covered by
+/// live samples before we use them at all. For today it is the share of the
+/// time since midnight. It stays at 0.9 there because a stricter bar would
+/// flip today between live and cloud numbers as the dongle drops out, and the
+/// cloud counters lag behind anyway.
 const MIN_LIVE_COVERAGE: f64 = 0.9;
+/// A finished day needs this share covered by live samples to be preferred
+/// over the iSolarCloud counters. Below it (but at or above
+/// [`MIN_LIVE_COVERAGE`]) the live numbers are only a fallback for a day with
+/// no cloud data, because up to 10% of the day's energy could be missing.
+const MIN_FINISHED_LIVE_COVERAGE: f64 = 0.98;
 
 /// Battery state of charge. iSolarCloud stores it as a fraction (0.674),
 /// but its unit is "%", so the API scales it to a percentage (67.4).
@@ -557,17 +565,45 @@ fn integrate(samples: &[(i64, f64)]) -> Integral {
     }
 }
 
-/// Should this day use the live samples? `covered_secs` is the seconds the
-/// samples cover, `[start, end)` is the local day and `now` is the current
-/// time. A finished day needs 90% of its length. Today may instead have 90%
+/// How far the live samples can be trusted for one day.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LiveCoverage {
+    /// Too little: use the cloud counters.
+    Thin,
+    /// A finished day with 90% to 98% covered. Use it only when the cloud has
+    /// nothing for the day.
+    Partial,
+    /// Good enough to win over the cloud counters.
+    Solid,
+}
+
+/// How well do the live samples cover this day? `covered_secs` is the seconds
+/// the samples cover, `[start, end)` is the local day and `now` is the current
+/// time. A finished day is solid at 98% of its length. Today is solid at 90%
 /// of the time since midnight, so it can use live data before it is over.
-fn use_live(covered_secs: i64, start: i64, end: i64, now: i64) -> bool {
-    let enough = |len: i64| len > 0 && covered_secs as f64 >= MIN_LIVE_COVERAGE * len as f64;
-    enough(end - start) || (start <= now && now < end && enough(now - start))
+fn live_coverage(covered_secs: i64, start: i64, end: i64, now: i64) -> LiveCoverage {
+    let share = |min: f64, len: i64| len > 0 && covered_secs as f64 >= min * len as f64;
+    let day = end - start;
+    if now >= end {
+        if share(MIN_FINISHED_LIVE_COVERAGE, day) {
+            LiveCoverage::Solid
+        } else if share(MIN_LIVE_COVERAGE, day) {
+            LiveCoverage::Partial
+        } else {
+            LiveCoverage::Thin
+        }
+    } else if share(MIN_LIVE_COVERAGE, day)
+        || (start <= now && share(MIN_LIVE_COVERAGE, now - start))
+    {
+        LiveCoverage::Solid
+    } else {
+        LiveCoverage::Thin
+    }
 }
 
 /// Energy of one local day from the live samples, or `None` if they do not
-/// cover enough of it (see [`use_live`]).
+/// cover enough of it (see [`live_coverage`]). Check [`LiveTotals::usable`]
+/// before using the result.
 pub(super) fn live_totals(
     samples: &[Sample],
     start: i64,
@@ -591,7 +627,9 @@ pub(super) fn live_totals(
         .iter()
         .map(|i| i.covered_secs)
         .min()?;
-    use_live(covered, start, end, now).then_some(LiveTotals {
+    let coverage = live_coverage(covered, start, end, now);
+    (coverage != LiveCoverage::Thin).then_some(LiveTotals {
+        solid: coverage == LiveCoverage::Solid,
         pv_kwh: pv.positive_kwh,
         load_kwh: load.positive_kwh,
         import_kwh: grid.positive_kwh,
@@ -602,12 +640,22 @@ pub(super) fn live_totals(
 }
 
 pub(super) struct LiveTotals {
+    /// Covers the day well enough to win over the cloud counters.
+    pub(super) solid: bool,
     pv_kwh: f64,
     load_kwh: f64,
     import_kwh: f64,
     export_kwh: f64,
     battery_charge_kwh: f64,
     battery_discharge_kwh: f64,
+}
+
+impl LiveTotals {
+    /// Use these totals rather than the cloud's? Always when solid; a partial
+    /// day only when the cloud has no data for it, so the day is not blanked.
+    pub(super) fn usable(&self, cloud_has_data: bool) -> bool {
+        self.solid || !cloud_has_data
+    }
 }
 
 #[derive(Deserialize)]
@@ -688,27 +736,48 @@ async fn day_totals(
 ) -> Result<DayTotals, ApiError> {
     // Each day gets its own [start, end), so a 23 or 25 hour day is handled correctly.
     let (start, end) = day_bounds_or_error(date, state.tz)?;
-    if let Some((first, last)) = live_range
-        && first < end
-        && last >= start
-    {
-        let samples = db::live_samples_raw(&state.pool, start, end).await?;
-        if let Some(live) = live_totals(&samples, start, end, now) {
-            return Ok(DayTotals {
-                date: date.to_string(),
-                source: "inverter",
-                pv_kwh: Some(live.pv_kwh),
-                load_kwh: Some(live.load_kwh),
-                import_kwh: Some(live.import_kwh),
-                export_kwh: Some(live.export_kwh),
-                battery_charge_kwh: Some(live.battery_charge_kwh),
-                battery_discharge_kwh: Some(live.battery_discharge_kwh),
-                // Needs a pv-to-battery split we do not have; the cloud's value
-                // would not match the live numbers, so leave it out.
-                self_consumed_kwh: None,
-            });
+    let live = match live_range {
+        Some((first, last)) if first < end && last >= start => {
+            let samples = db::live_samples_raw(&state.pool, start, end).await?;
+            live_totals(&samples, start, end, now)
         }
+        _ => None,
+    };
+    // A solid live day never needs the cloud; skip its queries.
+    if let Some(live) = live.as_ref().filter(|live| live.solid) {
+        return Ok(live_day(date, live));
     }
+    let cloud = cloud_day(state, date, start, end).await?;
+    match live {
+        Some(live) if live.usable(cloud.has_data()) => Ok(live_day(date, &live)),
+        _ => Ok(cloud),
+    }
+}
+
+/// A day's totals from the live samples.
+fn live_day(date: NaiveDate, live: &LiveTotals) -> DayTotals {
+    DayTotals {
+        date: date.to_string(),
+        source: "inverter",
+        pv_kwh: Some(live.pv_kwh),
+        load_kwh: Some(live.load_kwh),
+        import_kwh: Some(live.import_kwh),
+        export_kwh: Some(live.export_kwh),
+        battery_charge_kwh: Some(live.battery_charge_kwh),
+        battery_discharge_kwh: Some(live.battery_discharge_kwh),
+        // Needs a pv-to-battery split we do not have; the cloud's value
+        // would not match the live numbers, so leave it out.
+        self_consumed_kwh: None,
+    }
+}
+
+/// A day's totals from the iSolarCloud counters.
+async fn cloud_day(
+    state: &AppState,
+    date: NaiveDate,
+    start: i64,
+    end: i64,
+) -> Result<DayTotals, ApiError> {
     Ok(DayTotals {
         date: date.to_string(),
         source: "cloud",
@@ -720,6 +789,23 @@ async fn day_totals(
         battery_discharge_kwh: day_max_kwh(state, 83323, start, end).await?,
         self_consumed_kwh: day_max_kwh(state, 83097, start, end).await?,
     })
+}
+
+impl DayTotals {
+    /// Does the day have any figure at all?
+    fn has_data(&self) -> bool {
+        [
+            self.pv_kwh,
+            self.load_kwh,
+            self.import_kwh,
+            self.export_kwh,
+            self.battery_charge_kwh,
+            self.battery_discharge_kwh,
+            self.self_consumed_kwh,
+        ]
+        .iter()
+        .any(Option::is_some)
+    }
 }
 
 /// Reads the optional `from` and `to` dates (default: the last
@@ -937,16 +1023,68 @@ mod tests {
 
     #[test]
     fn live_is_used_when_coverage_is_high_enough() {
+        use LiveCoverage::{Partial, Solid, Thin};
         let (start, end) = (0, 86_400);
-        let now = 1_000_000; // a later day: only the whole-day rule applies
-        assert!(use_live(77_760, start, end, now)); // exactly 90%
-        assert!(!use_live(77_759, start, end, now));
-        // Today at 06:00: 90% of the 6 hours so far is enough.
+        let later = 1_000_000; // a later day: the day is finished
+        // A finished day is solid from 98% (84,672 s).
+        assert_eq!(live_coverage(84_672, start, end, later), Solid);
+        assert_eq!(live_coverage(84_671, start, end, later), Partial);
+        assert_eq!(live_coverage(77_760, start, end, later), Partial); // exactly 90%
+        assert_eq!(live_coverage(77_759, start, end, later), Thin);
+        // Today at 06:00: 90% of the 6 hours so far is enough, and solid.
         let now = 6 * 3600;
-        assert!(use_live(19_440, start, end, now));
-        assert!(!use_live(19_439, start, end, now));
+        assert_eq!(live_coverage(19_440, start, end, now), Solid);
+        assert_eq!(live_coverage(19_439, start, end, now), Thin);
         // A future day has nothing elapsed, so it never uses live.
-        assert!(!use_live(0, start, end, -1));
+        assert_eq!(live_coverage(0, start, end, -1), Thin);
+    }
+
+    /// Live totals for a day, with or without cloud data to fall back on.
+    fn totals(solid: bool) -> LiveTotals {
+        LiveTotals {
+            solid,
+            pv_kwh: 0.0,
+            load_kwh: 0.0,
+            import_kwh: 0.0,
+            export_kwh: 0.0,
+            battery_charge_kwh: 0.0,
+            battery_discharge_kwh: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_partial_live_day_gives_way_to_the_cloud_only_when_it_has_data() {
+        // 95% live with cloud present: the cloud wins.
+        assert!(!totals(false).usable(true));
+        // 95% live and no cloud: keep the live numbers, do not blank the day.
+        assert!(totals(false).usable(false));
+        // 99% live: live wins either way.
+        assert!(totals(true).usable(true));
+        assert!(totals(true).usable(false));
+    }
+
+    #[test]
+    fn live_totals_marks_95_percent_partial_and_99_percent_solid() {
+        // One column of constant samples every 60 s with a hold of 120 s
+        // covers each step fully, so the share is set by where they stop.
+        let samples = |last_ts: i64| -> Vec<Sample> {
+            (0..=last_ts / 60)
+                .map(|i| Sample {
+                    ts: i * 60,
+                    pv_w: Some(1000.0),
+                    load_w: Some(500.0),
+                    grid_w: Some(0.0),
+                    battery_w: Some(0.0),
+                    soc_pct: None,
+                })
+                .collect()
+        };
+        let (start, end, now) = (0, 86_400, 1_000_000);
+        let partial = live_totals(&samples(82_080), start, end, now).unwrap(); // 95%
+        assert!(!partial.solid);
+        let solid = live_totals(&samples(85_500), start, end, now).unwrap(); // 99%
+        assert!(solid.solid);
+        assert!(live_totals(&samples(70_000), start, end, now).is_none());
     }
 
     #[tokio::test]
