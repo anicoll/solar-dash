@@ -4,6 +4,7 @@
 mod api;
 mod auth;
 mod costs;
+mod globird;
 mod payback;
 
 use std::future::Future;
@@ -76,6 +77,8 @@ pub struct AppState {
     purchases: Arc<[Purchase]>,
     /// Assumed yearly electricity price rise (percent) in the payback projection.
     price_rise_percent: f64,
+    /// Whether the config has a `[globird]` section.
+    globird_configured: bool,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -109,6 +112,7 @@ impl AppState {
             ev_prices: EvPrices::default(),
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
+            globird_configured: false,
         })
     }
 
@@ -139,6 +143,13 @@ impl AppState {
     /// Sets the yearly price rise (percent) the payback projection assumes.
     pub fn with_price_rise_percent(mut self, percent: f64) -> Self {
         self.price_rise_percent = percent;
+        self
+    }
+
+    /// Records whether a `[globird]` section is configured, which the compare
+    /// API reports as `configured`.
+    pub fn with_globird_configured(mut self, configured: bool) -> Self {
+        self.globird_configured = configured;
         self
     }
 
@@ -198,7 +209,8 @@ impl AppState {
             .with_tariff(tariff)
             .with_ev_prices(ev_prices)
             .with_purchases(purchases)
-            .with_price_rise_percent(config.system.price_rise_percent))
+            .with_price_rise_percent(config.system.price_rise_percent)
+            .with_globird_configured(config.globird.is_some()))
     }
 }
 
@@ -233,6 +245,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
         .route("/api/costs", get(costs::costs))
+        .route("/api/globird/compare", get(globird::compare))
         .route("/api/payback", get(payback::payback))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1681,6 +1694,136 @@ mod tests {
         let response = send(app, get_request("/api/payback", Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         body_json(response).await
+    }
+
+    /// Saves the two fixture GloBird days (2026-10-09 and 2026-10-17) the way the sync does.
+    async fn seed_globird(pool: &SqlitePool) {
+        use crate::globird::data::{group_days, parse_cost_rows, parse_usage_rows};
+        let data_of = |text: &str| -> Value {
+            let mut reply: Value = serde_json::from_str(text).unwrap();
+            reply["data"].take()
+        };
+        let cost = parse_cost_rows(data_of(include_str!(
+            "../globird/testdata/cost_detail.json"
+        )))
+        .unwrap();
+        let usage = parse_usage_rows(data_of(include_str!(
+            "../globird/testdata/smart_meter_read.json"
+        )))
+        .unwrap();
+        for day in group_days(&cost, &usage) {
+            db::save_globird_day(pool, &day, 1000).await.unwrap();
+        }
+    }
+
+    /// `/api/globird/compare` for a range, logging in on `app` first.
+    async fn compare_json(app: &Router, range: &str) -> Value {
+        let cookie = log_in(app).await;
+        let uri = format!("/api/globird/compare?{range}");
+        let response = send(app, get_request(&uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await
+    }
+
+    #[tokio::test]
+    async fn globird_compare_needs_a_session() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/globird/compare", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn globird_compare_is_empty_without_data() {
+        let (_dir, app) = test_app().await;
+        let json = compare_json(&app, "").await;
+        assert_eq!(json["configured"], false);
+        assert_eq!(json["days"], serde_json::json!([]));
+        assert_eq!(json["categories"], serde_json::json!([]));
+        assert_eq!(json["totals"]["days_compared"], 0);
+
+        for bad in [
+            "from=2026-10-09&to=2026-10-01",
+            "from=2025-01-01&to=2026-10-01",
+        ] {
+            let cookie = log_in(&app).await;
+            let uri = format!("/api/globird/compare?{bad}");
+            let response = send(&app, get_request(&uri, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn globird_compare_lines_up_with_our_estimate() {
+        let (_dir, app, pool) = costs_app().await;
+        seed_globird(&pool).await;
+        // Our counters for the 9th only: 1 kWh in, 2 kWh out.
+        let tz = chrono_tz::Australia::Adelaide;
+        let oct_9 = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let start = api::day_bounds_or_error(oct_9, tz).unwrap().0;
+        seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
+
+        let json = compare_json(&app, "from=2026-10-01&to=2026-10-20").await;
+        assert_eq!(json["configured"], false);
+        let days = json["days"].as_array().unwrap();
+        assert_eq!(days.len(), 2);
+
+        let day = &days[0];
+        assert_eq!(day["date"], "2026-10-09");
+        assert_eq!(day["complete"], true);
+        let g = &day["globird"];
+        assert_eq!(g["import"], 0.75);
+        assert_eq!(g["export"], -1.85);
+        assert_eq!(g["supply"], 1.74);
+        assert_eq!(g["credit"], -1.0);
+        assert_eq!(g["other"], 0.0);
+        assert_eq!(g["total"], -0.36);
+        assert_eq!(g["lines"].as_array().unwrap().len(), 6);
+        assert!(g["import_kwh"].as_f64().unwrap() > 20.0);
+        assert!(g["export_kwh"].as_f64().unwrap() > 19.0);
+        // 100 c supply + 25 c import - 10 c feed-in.
+        let ours = &day["ours"];
+        assert_eq!(ours["source"], "cloud");
+        assert_eq!(ours["import"], 0.25);
+        assert_eq!(ours["export"], -0.1);
+        assert_eq!(ours["supply"], 1.0);
+        assert_eq!(ours["credit"], 0.0);
+        assert_eq!(ours["total"], 1.15);
+        assert_eq!(ours["import_kwh"], 1.0);
+        assert_eq!(day["diff"]["total"], 1.51);
+
+        // The 17th has GloBird rows but no estimate of ours.
+        assert_eq!(days[1]["date"], "2026-10-17");
+        assert!(days[1]["ours"].is_null());
+        assert!(days[1]["diff"].is_null());
+
+        assert_eq!(json["totals"]["days_compared"], 1);
+        assert_eq!(json["totals"]["diff"]["total"], 1.51);
+        assert_eq!(json["totals"]["ours"]["total"], 1.15);
+        let categories = json["categories"].as_array().unwrap();
+        let peak = categories
+            .iter()
+            .find(|c| c["category"] == "Critical Peak - Export")
+            .unwrap();
+        assert_eq!(peak["amount"], -0.35);
+        assert_eq!(peak["bucket"], "export");
+
+        // A range with neither day is empty.
+        let json = compare_json(&app, "from=2026-10-10&to=2026-10-16").await;
+        assert_eq!(json["days"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn globird_compare_without_a_tariff_has_no_ours() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        seed_globird(&pool).await;
+        let json = compare_json(&app, "from=2026-10-09&to=2026-10-09").await;
+        let days = json["days"].as_array().unwrap();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0]["globird"]["total"], -0.36);
+        assert!(days[0]["ours"].is_null());
+        assert!(days[0]["diff"].is_null());
+        assert_eq!(json["totals"]["days_compared"], 0);
+        assert_eq!(json["totals"]["globird"]["total"], 0.0);
     }
 
     #[tokio::test]
