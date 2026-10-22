@@ -68,6 +68,9 @@
 
     <section class="panel" aria-labelledby="h-nowchart">
       <h2 id="h-nowchart" class="panel-title">Today's power</h2>
+      <div class="picker">
+        <button type="button" class="btn smooth-toggle" aria-pressed="true">Smooth</button>
+      </div>
       <div class="card flat">
         <div id="now-chart" class="chart tall" role="img" aria-label="Today's power chart"></div>
         <p id="now-source" class="source" hidden></p>
@@ -88,6 +91,7 @@
       <input type="date" id="day-input" aria-label="Date">
       <button type="button" class="btn" id="day-next" aria-label="Next day">&rarr;</button>
       <button type="button" class="btn" id="day-today">Today</button>
+      <button type="button" class="btn smooth-toggle" aria-pressed="true">Smooth</button>
     </div>
     <div class="card">
       <div id="day-chart" class="chart tall" role="img" aria-label="Day chart"></div>

@@ -780,6 +780,9 @@
     ['battery_discharge_w', 'Battery discharge', '--c-discharge', 1, 'line'],
   ];
 
+  const SMOOTH_SECS = 10 * 60; // minimum width of the rolling mean behind the Smooth toggle
+  const dayDraws = {};        // chart id -> redraw of its last fetched data
+
   /** Inverter minute rows for [start, end) (unix seconds), or [] if unavailable. */
   async function fetchLiveDay(start, end) {
     try {
@@ -805,6 +808,31 @@
       if (err.message === 'Not logged in.') throw err;
       return { name, sessions: [] };
     }
+  }
+
+  /** Centred rolling mean of a `[t, v]` series, at least `minWidth` wide (same unit as t) and 4 samples wide; null points stay as gaps and are never averaged across. */
+  function smoothSeries(data, minWidth) {
+    const gaps = [];
+    for (let k = 1; k < data.length && gaps.length < 200; k++) {
+      if (data[k][1] != null && data[k - 1][1] != null) gaps.push(data[k][0] - data[k - 1][0]);
+    }
+    gaps.sort((x, y) => x - y);
+    const half = Math.max(minWidth, 4 * (gaps[gaps.length >> 1] || 0)) / 2;
+    const out = new Array(data.length);
+    let i = 0;
+    while (i < data.length) {
+      if (data[i][1] == null) { out[i] = data[i]; i++; continue; }
+      let end = i;
+      while (end < data.length && data[end][1] != null) end++;
+      let lo = i, hi = i, sum = 0;
+      for (let k = i; k < end; k++) {
+        while (hi < end && data[hi][0] <= data[k][0] + half) sum += data[hi++][1];
+        while (data[lo][0] < data[k][0] - half) sum -= data[lo++][1];
+        out[k] = [data[k][0], sum / (hi - lo)];
+      }
+      i = end;
+    }
+    return out;
   }
 
   /** One `[ts, value]` series from inverter rows; `pick(row)` gives the value or null. */
@@ -877,14 +905,21 @@
    */
   async function loadDayChart(chartId, noteId, date, current, day) {
     day = day || await api(`/api/day?date=${date}`);
-    const start = day.start * 1000;
-    const end = day.end * 1000;
     const [live, charging] = await Promise.all([
       fetchLiveDay(day.start, day.end),
       fetchCharging(day.start, day.end),
     ]);
     if (!current()) return;
-    const { byKey, source } = mergeDay(day.series, live);
+    const merged = mergeDay(day.series, live);
+    // Kept so the Smooth toggle can redraw without refetching.
+    dayDraws[chartId] = () => drawDayChart(chartId, noteId, date, day, merged, charging);
+    drawDayChart(chartId, noteId, date, day, merged, charging);
+  }
+
+  /** Draws the power chart from fetched data, smoothed when the toggle is on. */
+  function drawDayChart(chartId, noteId, date, day, { byKey, source }, charging) {
+    const start = day.start * 1000;
+    const end = day.end * 1000;
     const hasData = Object.values(byKey).some((d) => d.length > 0);
     const note = $(noteId);
     note.textContent = source;
@@ -894,11 +929,13 @@
     const narrow = window.innerWidth < 560;
     const step = (narrow ? 6 : 3) * 3600 * 1000;
 
+    const smooth = state.smooth;
     const series = DAY_SERIES.map(([key, label, colourVar, sign, kind]) => {
       const colour = css(colourVar);
       const s = {
         name: label, type: 'line', showSymbol: false, sync: true,
-        data: (byKey[key] || []).map(([t, v]) => [t * 1000, sign * v / 1000]),
+        smooth: smooth ? 0.3 : false,
+        data: (smooth ? smoothSeries(byKey[key] || [], SMOOTH_SECS) : byKey[key] || []).map(([t, v]) => [t * 1000, v == null ? null : sign * v / 1000]),
         lineStyle: { width: 2, color: colour }, itemStyle: { color: colour },
         emphasis: { disabled: true }, z: 3,
       };
@@ -1183,7 +1220,7 @@
       series: [
         { name: `Saved per ${unit}`, type: 'bar', data: buckets.map((b) => +b.savings.toFixed(2)), itemStyle: { color: css('--save-bar') }, barMaxWidth: 28 },
         {
-          name: 'Saved (cumulative)', type: 'line', data: cumulative, showSymbol: false,
+          name: 'Saved (cumulative)', type: 'line', data: cumulative, showSymbol: false, smooth: 0.3,
           lineStyle: { width: 3, color: css('--save') }, itemStyle: { color: css('--save') }, z: 5,
           markLine: marks.length ? {
             silent: true, symbol: 'none', lineStyle: { color: css('--save-label'), type: 'dashed' },
@@ -1329,7 +1366,7 @@
     const labels = months.map(ymLabel);
     const series = [
       {
-        name: 'Actual', type: 'line', data: actual, showSymbol: false,
+        name: 'Actual', type: 'line', data: actual, showSymbol: false, smooth: 0.3,
         lineStyle: { width: 3, color: css('--save') }, itemStyle: { color: css('--save') }, z: 4,
         markLine: {
           silent: true, symbol: 'none', label: { show: false },
@@ -1339,7 +1376,7 @@
     ];
     if (projected) {
       series.push({
-        name: 'Projected', type: 'line', data: projected, showSymbol: false,
+        name: 'Projected', type: 'line', data: projected, showSymbol: false, smooth: 0.3,
         lineStyle: { width: 3, type: 'dashed', color: css('--save') }, itemStyle: { color: css('--save') },
         markPoint: {
           symbol: 'circle', symbolSize: 12, label: { show: false },
@@ -1537,7 +1574,8 @@
   // Day, Month and Year are the periods of the History tab.
   const PERIODS = ['day', 'month', 'year'];
   let period = 'day'; // the period History opens on: the last one shown
-  const state = { view: 'now', day: '', month: '', year: 0, range: 'all' };
+  const state = { view: 'now', day: '', month: '', year: 0, range: 'all', smooth: true };
+  const SMOOTH_KEY = 'solar-dash.smooth';
   let timer = null;
   let pollToken = 0;
 
@@ -1627,7 +1665,21 @@
 
   function go(patch) { Object.assign(state, patch); setHash(); }
 
+  /** Syncs the Smooth buttons and remembers the choice (best effort) when `save` is set. */
+  function setSmooth(on, save) {
+    state.smooth = on;
+    for (const b of document.querySelectorAll('.smooth-toggle')) b.setAttribute('aria-pressed', String(on));
+    if (!save) return;
+    try { localStorage.setItem(SMOOTH_KEY, on ? '1' : '0'); } catch (err) { /* private window or blocked storage */ }
+    for (const draw of Object.values(dayDraws)) draw();
+  }
+
   function init() {
+    try { state.smooth = localStorage.getItem(SMOOTH_KEY) !== '0'; } catch (err) { /* keep the default */ }
+    for (const b of document.querySelectorAll('.smooth-toggle')) {
+      b.onclick = () => setSmooth(b.getAttribute('aria-pressed') !== 'true', true);
+    }
+    setSmooth(state.smooth, false);
     if (!chartsAvailable()) {
       chartsError = "Charts couldn't load (no internet to cdnjs?)";
       updateBanner();
