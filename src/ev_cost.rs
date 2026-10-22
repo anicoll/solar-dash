@@ -5,7 +5,8 @@
 //!
 //! The car's own power is not stored. It sits behind the house meter, so it
 //! is already part of the house load in the live samples. We cannot see which
-//! watts went to the car, so we give it the same mix as the whole house load.
+//! watts went to the car, so we give it the same mix as the whole house load,
+//! with solar charging the home battery before it reaches the load.
 
 use std::collections::BTreeMap;
 
@@ -120,8 +121,11 @@ pub fn session_cost(
         covered_secs += to - from;
 
         let pv_w = pair[0].pv_w.unwrap_or(0.0).max(0.0);
-        let discharge_w = (-pair[0].battery_w.unwrap_or(0.0)).max(0.0);
-        let solar_w = pv_w.min(load_w);
+        let battery_now_w = pair[0].battery_w.unwrap_or(0.0);
+        let discharge_w = (-battery_now_w).max(0.0);
+        // Solar charges the battery first (it sits on the inverter's DC
+        // side, as the Sungrow app shows it); only the rest reaches the load.
+        let solar_w = (pv_w - battery_now_w.max(0.0)).max(0.0).min(load_w);
         let battery_w = discharge_w.min(load_w - solar_w);
         let grid_w = load_w - solar_w - battery_w;
 
@@ -437,6 +441,17 @@ mod tests {
         close(got.battery_kwh, 7.4 * 0.25);
         close(got.grid_kwh, 7.4 * 0.5);
         close(got.cost_cents, 7.4 * 0.5 * 58.3);
+    }
+
+    #[test]
+    fn solar_charges_the_battery_before_it_reaches_the_car() {
+        let (from, to) = (at(18, 0), at(19, 0));
+        // 6 kW of sun, 3 kW into the battery, load 8 kW: 3 kW solar, 5 kW grid.
+        let samples = steady(from, to, sample(0, 6000.0, 8000.0, 5000.0, 3000.0));
+        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        close(got.solar_kwh, 7.4 * 3.0 / 8.0);
+        close(got.battery_kwh, 0.0);
+        close(got.grid_kwh, 7.4 * 5.0 / 8.0);
     }
 
     #[test]
