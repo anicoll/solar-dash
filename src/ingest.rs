@@ -312,7 +312,7 @@ async fn sync_points(
 struct PlantSetup {
     plant_id: i64,
     tz: Tz,
-    /// Device key used by the history API, e.g. "1204811_11_0_0".
+    /// Device key used by the history API, e.g. "1234567_11_0_0".
     ps_key: String,
     /// The configured points as the API wants them, e.g. "p83022,p83033".
     points: String,
@@ -340,7 +340,7 @@ impl PlantSetup {
             .as_deref()
             .map(|text| {
                 let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| {
-                    anyhow!("history_from must look like \"2023-02-21\", got {text:?}")
+                    anyhow!("history_from must look like \"2024-01-01\", got {text:?}")
                 })?;
                 parse_local(&date.format("%Y%m%d000000").to_string(), tz)
                     .ok_or_else(|| anyhow!("{date} has no local midnight in {tz}"))
@@ -744,7 +744,7 @@ mod tests {
 
     #[test]
     fn history_from_must_be_a_date() {
-        assert!(check_sync_config(&offline_config(Some("2023-02-21"))).is_ok());
+        assert!(check_sync_config(&offline_config(Some("2024-01-01"))).is_ok());
         let err = check_sync_config(&offline_config(Some("21/02/2023"))).unwrap_err();
         assert!(err.to_string().contains("history_from"), "{err}");
     }
@@ -771,7 +771,7 @@ mod tests {
         // History already reaches the live sync: the end point is saved (at
         // most midnight today) and no call is made, which would fail here.
         db::set_cursor(&pool, BACKFILL_JOB, now).await.unwrap();
-        let config = offline_config(Some("2023-02-21"));
+        let config = offline_config(Some("2024-01-01"));
         backfill_step(&client, &pool, &config).await.unwrap();
         let until = db::get_cursor(&pool, BACKFILL_UNTIL_JOB).await.unwrap();
         let midnight = local_midnight(now, PlantSetup::from_config(&config).unwrap().tz);
@@ -798,7 +798,7 @@ mod tests {
     }
 
     const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
-    const KEY: &str = "1204811_11_0_0";
+    const KEY: &str = "1234567_11_0_0";
 
     #[test]
     fn parses_point_keys() {

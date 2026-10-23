@@ -983,7 +983,7 @@
     };
   }
 
-  /** What the tariff is at hour `h`, for the tooltip: "Peak 58.3c · Super Export 10c". */
+  /** What the tariff is at hour `h`, for the tooltip: "Peak 60c · Super Export 10c". */
   function tariffAt(h, tf) {
     const imp = tf.importWindows.find((w) => h >= w.from && h < w.to);
     const exp = tf.exportWindows.find((w) => h >= w.from && h < w.to);

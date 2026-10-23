@@ -260,7 +260,7 @@ fn hash_password_command() -> Result<()> {
 async fn run_backfill(config: Config, from: &str) -> Result<()> {
     // Check the date first, so a typo fails before any network call.
     let from = NaiveDate::parse_from_str(from, "%Y-%m-%d")
-        .with_context(|| format!("--from must look like 2023-02-21, got {from:?}"))?;
+        .with_context(|| format!("--from must look like 2024-01-01, got {from:?}"))?;
     let pool = db::open(&config.database.path).await?;
     let mut client = Client::new(config.isolarcloud.clone())?;
     client.login().await?;

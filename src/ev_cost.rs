@@ -325,8 +325,8 @@ mod tests {
 
     const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
 
-    /// The ZeroHero-like plan: free from 11:00 to 14:00, 58.3 c from 15:00 to
-    /// 23:00, 44 c otherwise, and 5 c for exporting.
+    /// The ZeroHero-like plan: free from 11:00 to 14:00, 60.0 c from 15:00 to
+    /// 23:00, 40 c otherwise, and 5 c for exporting.
     fn schedule() -> TariffSchedule {
         #[derive(serde::Deserialize)]
         struct Wrapper {
@@ -336,10 +336,10 @@ mod tests {
             r#"
             [tariff]
             supply_cents_per_day = 100.0
-            default_import_cents = 44.0
+            default_import_cents = 40.0
             import = [
               { from = "11:00", to = "14:00", cents = 0.0 },
-              { from = "15:00", to = "23:00", cents = 58.3 },
+              { from = "15:00", to = "23:00", cents = 60.0 },
             ]
             default_export_cents = 5.0
             "#,
@@ -418,7 +418,7 @@ mod tests {
         let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
         close(got.grid_kwh, 7.4);
         close(got.solar_kwh, 0.0);
-        close(got.cost_cents, 7.4 * 58.3);
+        close(got.cost_cents, 7.4 * 60.0);
         close(got.solar_value_cents, 0.0);
     }
 
@@ -440,7 +440,7 @@ mod tests {
         close(got.solar_kwh, 7.4 * 0.25);
         close(got.battery_kwh, 7.4 * 0.25);
         close(got.grid_kwh, 7.4 * 0.5);
-        close(got.cost_cents, 7.4 * 0.5 * 58.3);
+        close(got.cost_cents, 7.4 * 0.5 * 60.0);
     }
 
     #[test]
