@@ -8,6 +8,7 @@ mod ingest;
 mod isolar;
 mod modbus;
 mod teslamate;
+mod teslamate_history;
 mod web;
 
 use std::path::{Path, PathBuf};
@@ -208,6 +209,19 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    // The TeslaMate history sync needs `database_url` in [teslamate]; without
+    // it this finishes at once. It does not log the URL, which has a password.
+    let sync_teslamate_history = async {
+        if let Some(url) = config
+            .teslamate
+            .as_ref()
+            .and_then(|teslamate| teslamate.database_url.clone())
+            && let Err(err) = teslamate_history::run(url, pool.clone(), tz, shutdown_signal()).await
+        {
+            error!("TeslaMate history sync stopped: {err:#}; the dashboard keeps running");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     // The live sync must never take the others down: if it fails for a
     // fatal reason (say a database error) we log it and keep serving.
     let live_sync = async {
@@ -218,16 +232,17 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
-    // Run all five until Ctrl+C. `try_join!` polls them together on this
+    // Run all six until Ctrl+C. `try_join!` polls them together on this
     // task and returns early if one fails (neither the live sync, the
-    // Modbus poller, the TeslaMate reader nor the GloBird sync does: their
-    // errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
+    // Modbus poller, the TeslaMate reader, the GloBird sync nor the
+    // TeslaMate history sync does: their errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
     tokio::try_join!(
         live_sync,
         web::serve(listener, state, shutdown_signal()),
         poll_modbus,
         follow_car,
         sync_globird,
+        sync_teslamate_history,
     )?;
     Ok(())
 }

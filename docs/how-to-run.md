@@ -385,6 +385,49 @@ If the broker is down, `serve` keeps running. The first failure is logged as
 a warning, then it retries after 1 second, doubling up to every 60 seconds,
 and `TeslaMate MQTT back` is logged when it reconnects.
 
+### History sync
+
+The MQTT feed only knows the present. To keep the past too, give `[teslamate]`
+the address of TeslaMate's Postgres database:
+
+```toml
+[teslamate]
+host = "192.168.1.70"
+database_url = "postgres://solar_dash:change-me@192.168.1.70:5432/teslamate"
+```
+
+Without `database_url` this is off. With it, `serve` copies summaries (never
+TeslaMate's raw rows) of every car's history into its own database, 30 seconds
+after startup and then every 15 minutes:
+
+- `tm_car`: the cars.
+- `tm_drive_daily`: km and number of drives per car per local day (in your
+  `timezone`), added up in Postgres.
+- `tm_charge`: one row per charging session, with energy, battery levels, the
+  geofence name and whether a fast charger was used.
+
+It backfills by itself: the first run copies the whole history, and later runs
+only look at new or unfinished drives and sessions and the last 3 days. Nothing
+is written to TeslaMate. The URL holds a password, so it is never logged.
+
+solar-dash only needs to read, so make it a read-only login in TeslaMate's
+database (for example with `psql` as the `postgres` user):
+
+```sql
+CREATE ROLE solar_dash LOGIN PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE teslamate TO solar_dash;
+GRANT USAGE ON SCHEMA public TO solar_dash;
+GRANT SELECT ON cars, drives, charging_processes, charges, geofences TO solar_dash;
+```
+
+TeslaMate's compose file does not publish its database to the network by
+default. Publish port 5432 of the database container on the LAN (a `ports:`
+entry such as `"5432:5432"`), and keep it off the internet. The connection is
+not encrypted, which is fine on a home network.
+
+If the database cannot be reached, a warning is logged and the next run tries
+again; `serve` keeps running.
+
 ## GloBird (optional)
 
 solar-dash can log in to your GloBird Energy customer portal

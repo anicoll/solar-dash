@@ -97,6 +97,12 @@ path = "data/solar.db"
 # Without it, away sessions are listed as uncosted. Home is the geofence
 # "Home" (or no geofence at all).
 # away_cents_per_kwh = 65.0
+# Optional: copy TeslaMate's whole history (drives and charging sessions of
+# every car) from its Postgres database into solar-dash's own, so later views
+# can cover more than the live MQTT data. Use a read-only login (see
+# docs/how-to-run.md). Without it the history sync is off. The URL holds a
+# password, so keep this file private; it is never logged.
+# database_url = "postgres://solar_dash:change-me@192.168.1.70:5432/teslamate"
 
 # Optional: your GloBird Energy customer portal login, used by `globird-probe`
 # and by `serve`, which keeps GloBird's daily cost and usage in the database
