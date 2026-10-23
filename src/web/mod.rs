@@ -2302,11 +2302,12 @@ mod tests {
                 "estimated_sessions": 1
             })
         );
-        // The total also has the 17th, which has no row of its own.
+        // The total is the two rows added up; the 17th has no house data, so
+        // its 50 km are left out.
         assert_eq!(
             json["totals"]["cars"],
             serde_json::json!({
-                "km": 150.0, "petrol": 24.0, "charging": 10.95, "fuel_saved": 13.05,
+                "km": 100.0, "petrol": 16.0, "charging": 10.95, "fuel_saved": 5.05,
                 "estimated_sessions": 1
             })
         );
@@ -2317,7 +2318,7 @@ mod tests {
         assert_eq!(months["cars_available"], true);
         assert_eq!(months["buckets"][0]["cars"], months["totals"]["cars"]);
         let years = costs_json(&app, "from=2026-01-01&to=2026-12-31&group=year").await;
-        assert_eq!(years["buckets"][0]["cars"]["fuel_saved"], 13.05);
+        assert_eq!(years["buckets"][0]["cars"]["fuel_saved"], 5.05);
 
         // A period with house data but no car activity gets zeros.
         let (day_start, _) = api::day_bounds_or_error("2026-08-01".parse().unwrap(), tz).unwrap();

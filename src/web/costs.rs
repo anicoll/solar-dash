@@ -4,7 +4,7 @@
 //! This file turns stored data into the [`Interval`]s that `cost::day_cost`
 //! prices. The interval builders are pure, so they are tested with plain numbers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
@@ -498,6 +498,9 @@ struct Totals {
 /// charging the cars at grid prices (the car is part of the house load), so
 /// the system's share of the car's savings is in `savings` already. Adding
 /// the "with the system" saving of `/api/ev/cars` as well would count it twice.
+///
+/// Only days that have a cost row count, so the day rows and buckets add up
+/// to the totals. Car activity on a day with no house data is left out.
 #[derive(Debug, Serialize)]
 struct Cars {
     km: f64,
@@ -1059,8 +1062,13 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
     }
     let mut totals = sums.totals();
     let last = from + Days::new(count - 1);
-    let car_days = car_days(&state, tariff, from, last).await?;
-    // Every day in the range counts, even one with no house data.
+    // Only days that have a cost row count, so the rows and buckets add up to
+    // the totals. Car activity on a day with no house data is left out.
+    let car_days = car_days(&state, tariff, from, last).await?.map(|mut days| {
+        let costed_dates: HashSet<String> = costed.iter().map(|d| d.date.to_string()).collect();
+        days.retain(|date, _| costed_dates.contains(date));
+        days
+    });
     totals.cars = car_days.as_ref().map(|days| {
         let mut sums = CarSums::default();
         days.values().for_each(|day| sums.add(day));
