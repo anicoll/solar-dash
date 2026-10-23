@@ -232,6 +232,11 @@ impl Tariff {
         tier_kwh * tier_cents + rest_kwh * self.export_cents_at(minute_of_day)
     }
 
+    /// The import price averaged over the 24 hours of a day, in cents per kWh.
+    pub fn average_import_cents(&self) -> f64 {
+        (0..24 * 60).map(|m| self.import_cents_at(m)).sum::<f64>() / (24.0 * 60.0)
+    }
+
     /// Cents per kWh paid to import at this local time (minutes since midnight).
     pub fn import_cents_at(&self, minute_of_day: u32) -> f64 {
         price_at(&self.import, self.default_import_cents, minute_of_day)

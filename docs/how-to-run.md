@@ -540,8 +540,15 @@ How a bill becomes days:
 - A day we have data for uses its own import, export and load kWh. A day with
   no data uses the bill's average daily import and export, and the average daily
   load of the same calendar month from the days we do have (the bill's average
-  daily import if that month has none). The no-solar baseline is the supply
-  share plus that load at the average import rate.
+  daily import if that month has none).
+- The no-solar baseline is not taken from the bill. A battery that buys when
+  power is cheap makes a bill's average import price much lower than a home
+  without one would pay, which would make the savings look far too small.
+  So a day with data keeps our baseline, priced on the `[tariff]` or
+  `[[previous_tariff]]` plan for that day. A day without data gets that plan's
+  supply charge plus its estimated load at the price per kWh of load the
+  bill's days with data paid on the plan (or the plan's average import price
+  if the bill has no day with data).
 - The averages never add up to the bill exactly, so the leftover is shared
   equally over all the days of the bill (even the ones we have no data for) and
   added to the import cost, or taken off as extra export credit if negative.

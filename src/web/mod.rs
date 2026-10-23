@@ -2007,12 +2007,14 @@ mod tests {
         let (_dir, _app, pool) = costs_app().await;
         // Two days, no data at all. First pass per day: 100 c supply + 400 c
         // import (10 kWh at 40 c) = 500 c; the bill says 6.00, so 300 c a day.
-        // The load falls back to the 10 kWh bought, so each day saves 200 c.
+        // The load falls back to the 10 kWh bought, and with no data it is
+        // priced on the flat plan: 100 c + 10 kWh at 25 c = 350 c, so each
+        // day saves 50 c.
         let csv = format!("{BILLS_HEADER}2026-10-01,2026-10-02,6.00,0,20,8.00,0,0,2.00,\n");
         let app = bills_router(&pool, &csv, vec![solar_purchase("2026-10-01", 10.0)]);
         let json = payback_json(&app).await;
-        assert_eq!(json["saved"], 4.0);
-        assert_eq!(json["net"], -6.0);
+        assert_eq!(json["saved"], 1.0);
+        assert_eq!(json["net"], -9.0);
     }
 
     #[tokio::test]
