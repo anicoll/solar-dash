@@ -145,6 +145,18 @@ pub struct Metered {
     pub import_kwh: f64,
     pub export_kwh: f64,
     pub load_kwh: f64,
+    /// Our estimate's baseline for the day: the load priced on the plan in
+    /// the tariff schedule, plus its supply charge.
+    pub baseline_cents: f64,
+}
+
+/// The plan in the tariff schedule for one day, as far as a baseline needs it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Plan {
+    pub supply_cents: f64,
+    /// The plan's import price averaged over the day, used when a bill has
+    /// no day with data to learn a better average from.
+    pub average_import_cents: f64,
 }
 
 /// The cost of every day of `bill`, oldest first.
@@ -154,6 +166,15 @@ pub struct Metered {
 /// load of the same calendar month (`monthly_load`, keyed 1 to 12; see
 /// `db::average_load_by_month`), or the bill's average daily import when that
 /// month has no data at all.
+///
+/// The baseline (what the day would have cost with no solar or battery) is
+/// not taken from the bill: a battery that buys when power is cheap makes the
+/// bill's average import price far lower than a home without one would pay.
+/// A day with data keeps our estimate's baseline, priced on the plan in the
+/// tariff schedule. A day without data gets that plan's supply charge (`plan`)
+/// plus its estimated load at the average price the days with data in this
+/// bill paid per kWh of load, or the plan's daily average price when the bill
+/// has no day with data.
 ///
 /// Each day is priced at the bill's average rates. Because those are only
 /// averages, the days rarely add up to the bill exactly. The leftover is
@@ -165,8 +186,21 @@ pub fn bill_days(
     bill: &PastBill,
     ours: &HashMap<NaiveDate, Metered>,
     monthly_load: &HashMap<u32, f64>,
+    plan: impl Fn(NaiveDate) -> Plan,
 ) -> Vec<(NaiveDate, DayCost)> {
     let days = bill.days() as f64;
+    // What the days with data paid per kWh of load on the plan, past supply.
+    let (load, load_cents) = bill
+        .from
+        .iter_days()
+        .take_while(|date| *date <= bill.to)
+        .filter_map(|date| ours.get(&date).map(|m| (date, m)))
+        .fold((0.0, 0.0), |(kwh, cents), (date, m)| {
+            (
+                kwh + m.load_kwh,
+                cents + m.baseline_cents - plan(date).supply_cents,
+            )
+        });
     let avg_import = cents_per_kwh(bill.import_dollars, bill.import_kwh);
     let avg_export = cents_per_kwh(bill.export_dollars, bill.export_kwh);
     let supply_day = bill.supply_dollars * 100.0 / days;
@@ -178,18 +212,28 @@ pub fn bill_days(
         .iter_days()
         .take_while(|date| *date <= bill.to)
         .map(|date| {
-            let m = ours.get(&date).copied().unwrap_or(Metered {
-                import_kwh: flat_import,
-                export_kwh: flat_export,
-                load_kwh: monthly_load
+            let m = ours.get(&date).copied().unwrap_or_else(|| {
+                let load_kwh = monthly_load
                     .get(&date.month())
                     .copied()
-                    .unwrap_or(flat_import),
+                    .unwrap_or(flat_import);
+                let plan = plan(date);
+                let price = if load > 0.0 {
+                    load_cents / load
+                } else {
+                    plan.average_import_cents
+                };
+                Metered {
+                    import_kwh: flat_import,
+                    export_kwh: flat_export,
+                    load_kwh,
+                    baseline_cents: plan.supply_cents + load_kwh * price,
+                }
             });
             let import_cents = m.import_kwh * avg_import;
             let export_cents = m.export_kwh * avg_export;
             let actual_cents = supply_day + import_cents - export_cents;
-            let baseline_cents = supply_day + m.load_kwh * avg_import;
+            let baseline_cents = m.baseline_cents;
             let cost = DayCost {
                 import_kwh: m.import_kwh,
                 export_kwh: m.export_kwh,
@@ -293,11 +337,21 @@ mod tests {
         parse(GOOD).unwrap().remove(0)
     }
 
+    /// Our estimate's day, with its load priced on the plan at 30 c/kWh.
     fn metered(import_kwh: f64, export_kwh: f64, load_kwh: f64) -> Metered {
         Metered {
             import_kwh,
             export_kwh,
             load_kwh,
+            baseline_cents: 100.0 + load_kwh * 30.0,
+        }
+    }
+
+    /// The plan in the tariff schedule: supply 100 c a day, 25 c/kWh on average.
+    fn plan(_: NaiveDate) -> Plan {
+        Plan {
+            supply_cents: 100.0,
+            average_import_cents: 25.0,
         }
     }
 
@@ -309,7 +363,7 @@ mod tests {
             (date("2026-01-02"), metered(3.0, 8.0, 12.0)),
             (date("2026-01-03"), metered(3.0, 8.0, 12.0)),
         ]);
-        let days = bill_days(&bill, &ours, &HashMap::new());
+        let days = bill_days(&bill, &ours, &HashMap::new(), plan);
         assert_eq!(days.len(), 10);
         let total: f64 = days.iter().map(|(_, c)| c.actual_cents).sum();
         assert!((total - 5000.0).abs() < 1e-6, "{total}");
@@ -326,7 +380,7 @@ mod tests {
         let mut bill = january_bill();
         bill.bill_total = 40.0;
         bill.excluded = 10.0;
-        let days = bill_days(&bill, &HashMap::new(), &HashMap::new());
+        let days = bill_days(&bill, &HashMap::new(), &HashMap::new(), plan);
         let total: f64 = days.iter().map(|(_, c)| c.actual_cents).sum();
         assert!((total - 5000.0).abs() < 1e-6);
     }
@@ -335,7 +389,7 @@ mod tests {
     fn a_negative_leftover_goes_into_export() {
         let mut bill = january_bill();
         bill.bill_total = 0.0;
-        let days = bill_days(&bill, &HashMap::new(), &HashMap::new());
+        let days = bill_days(&bill, &HashMap::new(), &HashMap::new(), plan);
         let total: f64 = days.iter().map(|(_, c)| c.actual_cents).sum();
         assert!(total.abs() < 1e-6);
         // First pass: 120 + 400 - 50 = 470 c a day, so 470 c more export credit.
@@ -348,22 +402,26 @@ mod tests {
         let bill = january_bill();
         let ours = HashMap::from([(date("2026-01-02"), metered(3.0, 8.0, 12.0))]);
         let monthly = HashMap::from([(1, 15.0)]);
-        let days = bill_days(&bill, &ours, &monthly);
+        let days = bill_days(&bill, &ours, &monthly, plan);
 
         let with_data = &days[1].1;
         assert_eq!(with_data.import_kwh, 3.0);
         assert_eq!(with_data.load_kwh, 12.0);
+        // Our estimate's baseline on the plan, not the bill's cheap average.
+        assert_eq!(with_data.baseline_cents, 460.0);
 
         let without = &days[0].1;
         assert_eq!(without.import_kwh, 10.0); // 100 kWh over 10 days
         assert_eq!(without.export_kwh, 5.0);
         assert_eq!(without.load_kwh, 15.0); // January's average
-        // Supply 120 c plus 15 kWh at 40 c.
-        assert!((without.baseline_cents - 720.0).abs() < 1e-9);
+        // The plan's supply plus 15 kWh at the 30 c the day with data paid.
+        assert!((without.baseline_cents - 550.0).abs() < 1e-9);
 
-        // With no monthly average, the load falls back to the bill's import.
-        let days = bill_days(&bill, &HashMap::new(), &HashMap::new());
+        // With no monthly average, the load falls back to the bill's import,
+        // and with no day of data it is priced at the plan's average.
+        let days = bill_days(&bill, &HashMap::new(), &HashMap::new(), plan);
         assert_eq!(days[0].1.load_kwh, 10.0);
+        assert!((days[0].1.baseline_cents - 350.0).abs() < 1e-9);
     }
 
     #[test]
@@ -371,7 +429,7 @@ mod tests {
         let mut bill = january_bill();
         bill.import_kwh = 0.0;
         bill.export_kwh = 0.0;
-        let days = bill_days(&bill, &HashMap::new(), &HashMap::new());
+        let days = bill_days(&bill, &HashMap::new(), &HashMap::new(), plan);
         let total: f64 = days.iter().map(|(_, c)| c.actual_cents).sum();
         assert!((total - 5000.0).abs() < 1e-6);
     }

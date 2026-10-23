@@ -786,12 +786,20 @@ pub(super) async fn billed_days(
                     import_kwh: c.import_kwh,
                     export_kwh: c.export_kwh,
                     load_kwh: c.load_kwh,
+                    baseline_cents: c.baseline_cents,
                 };
                 (day.date, metered)
             })
             .collect();
         for bill in touched {
-            bill_days.extend(bills::bill_days(bill, &ours, &monthly_load));
+            let plan = |date: NaiveDate| {
+                let tariff = schedule.for_date(date);
+                bills::Plan {
+                    supply_cents: tariff.supply_cents_per_day(),
+                    average_import_cents: tariff.average_import_cents(),
+                }
+            };
+            bill_days.extend(bills::bill_days(bill, &ours, &monthly_load, plan));
         }
     }
 
