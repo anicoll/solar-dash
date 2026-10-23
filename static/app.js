@@ -2374,15 +2374,25 @@
   }
 
   /** The big "Saved" panel at the top. `t` is /api/costs' `totals`. */
-  function renderMoneyHero(t, words) {
-    const pct = t.baseline > 0 ? Math.round((t.savings / t.baseline) * 100) : null;
-    $('money-saved').textContent = money(t.savings, 0);
+  function renderMoneyHero(t, words, cars) {
+    // With cars: a petrol car instead of charging, so the no-solar cost swaps charging for petrol and the fuel saved joins the saving.
+    const saved = t.savings + (cars ? cars.fuel_saved : 0);
+    const baseline = t.baseline + (cars ? cars.petrol - cars.charging : 0);
+    const pct = baseline > 0 ? Math.round((saved / baseline) * 100) : null;
+    $('money-saved').textContent = money(saved, 0);
+    $('money-without-label').textContent = cars ? 'Without solar, battery or EVs' : 'Without solar or battery';
+    const carsNote = $('money-cars-note');
+    carsNote.hidden = !cars;
+    if (cars) {
+      const est = cars.estimated_sessions > 0 ? ` (${cars.estimated_sessions} ${cars.estimated_sessions === 1 ? 'session' : 'sessions'} estimated)` : '';
+      carsNote.textContent = `Includes ${money(cars.fuel_saved)} fuel saved by driving ${Math.round(cars.km).toLocaleString('en-AU')} km electric${est}`;
+    }
     $('money-pct').textContent = pct == null ? '' : `${pct}% of what ${words === 'all time' ? 'your power' : words} would have cost`;
     $('money-paid').textContent = money(t.actual);
-    $('money-without').textContent = money(t.baseline);
+    $('money-without').textContent = money(baseline);
     // Paid is coral, the rest of the without-solar cost is the saving.
-    const paid = Math.max(0, Math.min(t.actual, t.baseline));
-    $('money-split').replaceChildren(...(t.baseline > 0 ? [splitBar([[paid, '--cost'], [t.baseline - paid, '--save']])] : []));
+    const paid = Math.max(0, Math.min(t.actual, baseline));
+    $('money-split').replaceChildren(...(baseline > 0 ? [splitBar([[paid, '--cost'], [baseline - paid, '--save']])] : []));
     // Days with a real bill (GloBird's, or one from [bills]) use its figures; the rest are our estimate.
     const note = $('money-billed');
     note.hidden = !(t.billed_days > 0);
@@ -2408,20 +2418,23 @@
   }
 
   /** "Where the saving came from": the three parts of `savings`, as a bar and rows. */
-  function renderMoneySources(t) {
+  function renderMoneySources(t, cars) {
     const parts = [
       ['Power you didn\'t have to buy', t.not_bought, '--save'],
       ['ZeroHero credits', t.credit, '--c-grid'],
       ['Feed-in', t.feed_in, '--c-pv'],
     ];
+    if (cars) parts.push(['Fuel saved (cars)', cars.fuel_saved, '--save-cars']);
     const sum = parts.reduce((a, p) => a + Math.max(0, p[1]), 0);
     const rows = parts.map(([name, v, colour]) =>
       moneyLine(name, sum > 0 && v > 0 ? `${Math.round((v / sum) * 100)}% of the saving` : '', money(v), '', colour));
     $('money-sources').replaceChildren(...(sum > 0 ? [splitBar(parts.map(([, v, c]) => [Math.max(0, v), c]))] : []), ...rows);
   }
 
+  const carsOr0 = (r) => r.cars || { km: 0, petrol: 0, charging: 0, fuel_saved: 0, estimated_sessions: 0 };
+
   /** Stacked bars: what you paid at the bottom, the rest of the without-solar cost (the saving) on top. */
-  function moneyOption(rows) {
+  function moneyOption(rows, withCars) {
     const th = baseTheme();
     return {
       animation: false,
@@ -2432,11 +2445,15 @@
         trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
         formatter: (params) => {
           const r = rows[params[0].dataIndex];
+          const c = withCars ? carsOr0(r) : null;
           const lines = [
             [params[0].marker, 'You paid', money(r.actual)],
-            ['', 'Without solar or battery', money(r.baseline)],
+            ['', c ? 'Without solar, battery or EVs' : 'Without solar or battery', money(r.baseline + (c ? c.petrol - c.charging : 0))],
             [params[1].marker, 'Saved', money(r.savings)],
           ];
+          if (c) {
+            lines.push([params[2].marker, 'Fuel saved (cars)', money(c.fuel_saved)], ['', 'Saved in total', money(r.savings + c.fuel_saved)]);
+          }
           const note = r.actual < 0 ? '<div style="margin-top:4px;color:var(--muted)">Credits were more than the bill, so the paid bar shows $0.</div>' : '';
           return moneyTooltip(lines, r.title) + note;
         },
@@ -2454,6 +2471,7 @@
       series: [
         { name: 'You paid', type: 'bar', stack: 'cost', data: rows.map((r) => +Math.max(0, r.actual).toFixed(2)), itemStyle: { color: css('--cost') }, barMaxWidth: 28 },
         { name: 'Saved', type: 'bar', stack: 'cost', data: rows.map((r) => +Math.max(0, r.savings).toFixed(2)), itemStyle: { color: css('--save-bar') }, barMaxWidth: 28 },
+        ...(withCars ? [{ name: 'Fuel saved (cars)', type: 'bar', stack: 'cost', data: rows.map((r) => +carsOr0(r).fuel_saved.toFixed(2)), itemStyle: { color: css('--save-cars') }, barMaxWidth: 28 }] : []),
       ],
     };
   }
@@ -3052,6 +3070,39 @@
   initFolds();
   initJumpLinks();
 
+  /** Draws the parts of Money that change with "Include cars": the hero, where the saving came from and the chart. */
+  function renderMoneyCars() {
+    const v = moneyView;
+    if (!v) return;
+    const tog = $('money-cars-toggle');
+    tog.hidden = !v.carsAvailable;
+    const on = v.carsAvailable && includeCars;
+    tog.setAttribute('aria-checked', String(on));
+    if (v.hasData) {
+      const cars = on ? carsOr0(v.t) : null;
+      renderMoneyHero(v.t, v.words, cars);
+      renderMoneySources(v.t, cars);
+      setCardSummary('money-sources-card', 'Saved ' + money(v.t.savings + (cars ? cars.fuel_saved : 0), 0));
+    }
+    showChart('money-chart', v.rows.length > 0, moneyOption(v.rows, on),
+      `${v.chartTitle}: stacked bars of what you paid and what you saved${on ? ', with the fuel saved by the cars' : ''}, in dollars. Select a bar to look closer.`);
+    onBarClick('money-chart', (i) => {
+      const key = v.rows[i].key;
+      if (v.mode === 'month') go({ view: 'home', period: 'day', day: key });
+      else go({ mode: v.mode === 'year' ? 'month' : 'year', when: key });
+    });
+  }
+
+  const CARS_INCLUDE_KEY = 'solar-dash.money.cars';
+  let includeCars = false;
+  let moneyView = null; // what the last Money load drew, so the toggle can redraw without asking again
+  try { includeCars = localStorage.getItem(CARS_INCLUDE_KEY) === '1'; } catch (err) { /* private window or blocked storage */ }
+  $('money-cars-toggle').onclick = () => {
+    includeCars = !includeCars;
+    try { localStorage.setItem(CARS_INCLUDE_KEY, includeCars ? '1' : '0'); } catch (err) { /* private window or blocked storage */ }
+    renderMoneyCars();
+  };
+
   async function loadMoneyView(mode, when) {
     for (const b of document.querySelectorAll('[data-money]')) {
       b.setAttribute('aria-pressed', String(b.dataset.money === mode));
@@ -3076,11 +3127,7 @@
     const t = data.totals;
     const hasData = t.days > 0;
     $('money-numbers').hidden = !hasData;
-    if (hasData) {
-      renderMoneyHero(t, p.words);
-      renderMoneyBill(t);
-      renderMoneySources(t);
-    }
+    if (hasData) renderMoneyBill(t);
     // One row per bar: a day, a month or a year.
     const rows = (data.days || data.buckets).map((r) => {
       const key = r.date || r.period;
@@ -3089,13 +3136,8 @@
       return { ...r, key, title, label };
     });
     $('money-chart-title').textContent = p.chartTitle;
-    showChart('money-chart', rows.length > 0, moneyOption(rows),
-      `${p.chartTitle}: stacked bars of what you paid and what you saved, in dollars. Select a bar to look closer.`);
-    onBarClick('money-chart', (i) => {
-      const key = rows[i].key;
-      if (mode === 'month') go({ view: 'home', period: 'day', day: key });
-      else go({ mode: mode === 'year' ? 'month' : 'year', when: key });
-    });
+    moneyView = { t, hasData, rows, mode, words: p.words, chartTitle: p.chartTitle, carsAvailable: !!data.cars_available };
+    renderMoneyCars();
     await loadMoneyCar(mode, when, p);
     await loadBillCheck(mode, when, p);
     await loadBatteryCard(mode, when);
