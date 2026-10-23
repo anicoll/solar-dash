@@ -1,0 +1,22 @@
+[
+  {
+    "id": "01ABCDEFGHJKMNPQRSTVWXYZ00",
+    "nmi": "4102345678",
+    "channels": [
+      { "identifier": "E1", "type": "general", "tariff": "EA116" },
+      { "identifier": "B1", "type": "feedIn", "tariff": "EA116" }
+    ],
+    "network": "Ausgrid",
+    "status": "closed",
+    "activeFrom": "2024-07-14",
+    "closedOn": "2026-05-25",
+    "intervalLength": 30
+  },
+  {
+    "id": "01ABCDEFGHJKMNPQRSTVWXYZ01",
+    "nmi": "4109999999",
+    "channels": [],
+    "status": "pending",
+    "someFutureField": true
+  }
+]

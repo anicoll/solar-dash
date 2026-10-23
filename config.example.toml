@@ -112,6 +112,17 @@ path = "data/solar.db"
 # # Default: "09:00".
 # sync_time = "09:00"
 
+# Optional: your Amber Electric API token, used by `amber-probe` (read-only
+# access to your usage at api.amber.com.au). Create the token at
+# app.amber.com.au under Developers. It is stored in plain text, so keep this
+# file's mode at 600 (chmod 600 config.toml). Without this section the
+# feature is off.
+# [amber]
+# token = "psk_your-token"
+# # Only needed if your account has more than one site. `amber-probe` lists
+# # the site ids.
+# site_id = "01ABCDEFGHJKMNPQRSTVWXYZ00"
+
 # Optional: electricity prices, used to work out what each day cost and what
 # the solar and battery saved. Without this section cost features are off.
 # These values are Andrew's GloBird ZeroHero plan (plan details, Oct 2026):

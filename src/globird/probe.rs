@@ -344,7 +344,7 @@ fn summary_lines(dump: &Value) -> Vec<String> {
 }
 
 /// Writes `text` to `path`, readable only by the owner on unix.
-fn write_private(path: &Path, text: &str) -> Result<()> {
+pub fn write_private(path: &Path, text: &str) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]

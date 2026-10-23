@@ -25,6 +25,9 @@ pub struct Config {
     /// `serve`'s daily GloBird sync. `None` (no `[globird]` section) means it
     /// is off.
     pub globird: Option<Globird>,
+    /// API token for Amber Electric, used by `amber-probe`. `None` (no
+    /// `[amber]` section) means it is off.
+    pub amber: Option<Amber>,
     /// Electricity prices, used to work out costs and savings. `None` (no
     /// `[tariff]` section) means cost features are off.
     pub tariff: Option<Tariff>,
@@ -260,6 +263,34 @@ impl fmt::Debug for Globird {
             .field("email", &self.email)
             .field("password", &"<redacted>")
             .field("sync_time", &self.sync_time)
+            .finish()
+    }
+}
+
+/// Access to the Amber Electric API; see config.example.toml.
+#[derive(Clone, Deserialize)]
+pub struct Amber {
+    pub token: String,
+    /// Which site to use. Optional when the account has exactly one.
+    pub site_id: Option<String>,
+}
+
+impl Amber {
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.token.trim().is_empty(),
+            "token in [amber] must not be empty"
+        );
+        Ok(())
+    }
+}
+
+// Written by hand for the same reason as `IsolarCloud`: keep the token out of logs.
+impl fmt::Debug for Amber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Amber")
+            .field("token", &"<redacted>")
+            .field("site_id", &self.site_id)
             .finish()
     }
 }
@@ -568,6 +599,11 @@ impl Config {
                 .check()
                 .with_context(|| format!("invalid config file {}", path.display()))?;
         }
+        if let Some(amber) = &config.amber {
+            amber
+                .check()
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+        }
         if let Some(tariff) = &config.tariff {
             tariff
                 .check("[tariff]")
@@ -642,6 +678,33 @@ mod tests {
         let text = format!("{MINIMAL}\n[modbus]\nhost = \"h\"\ninterval_secs = 0\n");
         let cfg: Config = toml::from_str(&text).unwrap();
         assert!(cfg.modbus.unwrap().check().is_err());
+    }
+
+    #[test]
+    fn amber_is_off_without_a_section() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.amber.is_none());
+    }
+
+    #[test]
+    fn amber_section_needs_a_token() {
+        let ok = format!("{MINIMAL}\n[amber]\ntoken = \"psk_abc\"\n");
+        let amber = toml::from_str::<Config>(&ok).unwrap().amber.unwrap();
+        assert!(amber.site_id.is_none());
+        assert!(amber.check().is_ok());
+        // The token stays out of Debug output.
+        assert!(!format!("{amber:?}").contains("psk_abc"));
+
+        let with_site = format!("{MINIMAL}\n[amber]\ntoken = \"t\"\nsite_id = \"01X\"\n");
+        let amber = toml::from_str::<Config>(&with_site).unwrap().amber.unwrap();
+        assert_eq!(amber.site_id.as_deref(), Some("01X"));
+
+        let no_token = format!("{MINIMAL}\n[amber]\nsite_id = \"01X\"\n");
+        assert!(toml::from_str::<Config>(&no_token).is_err());
+
+        let empty = format!("{MINIMAL}\n[amber]\ntoken = \" \"\n");
+        let amber = toml::from_str::<Config>(&empty).unwrap().amber.unwrap();
+        assert!(amber.check().is_err());
     }
 
     #[test]

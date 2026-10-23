@@ -1,3 +1,4 @@
+mod amber;
 mod config;
 mod cost;
 mod db;
@@ -64,6 +65,19 @@ enum Command {
         out: PathBuf,
         /// How many days of usage and cost to ask for.
         #[arg(long, default_value_t = 31)]
+        days: u32,
+    },
+    /// Call the Amber Electric API to see what it returns and how much history it
+    /// gives (needs an [amber] section). Saves the raw replies in a directory.
+    AmberProbe {
+        /// Directory for the raw JSON replies (created if missing).
+        #[arg(long, default_value = "amber-probe")]
+        out: PathBuf,
+        /// First day of the sample window (YYYY-MM-DD).
+        #[arg(long, default_value = "2024-07-14")]
+        date: NaiveDate,
+        /// How many days the sample window covers.
+        #[arg(long, default_value_t = 3)]
         days: u32,
     },
     /// Call any iSolarCloud endpoint and print the result (for exploring the API).
@@ -143,6 +157,12 @@ async fn run() -> Result<()> {
         Command::GlobirdProbe { out, days } => {
             if let Err(err) = globird_probe(config, &out, days).await {
                 eprintln!("GloBird probe failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::AmberProbe { out, date, days } => {
+            if let Err(err) = amber_probe(config, &out, date, days).await {
+                eprintln!("Amber probe failed: {err:#}");
                 std::process::exit(1);
             }
         }
@@ -309,6 +329,19 @@ async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
         .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.isolarcloud.timezone))?;
     let client = globird::client::Client::new(globird)?;
     globird::probe::run(client, tz, days, out).await
+}
+
+/// Calls the Amber API and prints what it learned.
+async fn amber_probe(config: Config, out: &Path, date: NaiveDate, days: u32) -> Result<()> {
+    let amber = config
+        .amber
+        .context("amber-probe needs an [amber] section in config.toml (see config.example.toml)")?;
+    // Check the settings first, so mistakes fail before any network call.
+    if !(1..=31).contains(&days) {
+        bail!("--days must be between 1 and 31, got {days}");
+    }
+    let client = amber::client::Client::new(&amber)?;
+    amber::probe::run(client, amber.site_id.as_deref(), date, days, out).await
 }
 
 /// Reads the inverter once, or with `watch` every `interval_secs` until Ctrl+C.
