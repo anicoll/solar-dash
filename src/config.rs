@@ -202,6 +202,10 @@ pub struct Teslamate {
     /// A flat price per kWh for charging away from home. Without it, away
     /// sessions are left uncosted.
     pub away_cents_per_kwh: Option<f64>,
+    /// TeslaMate's Postgres database, such as
+    /// `postgres://solar_dash:secret@192.168.10.84:5432/teslamate`. Without
+    /// it the history sync is off. It holds a password, so it is never logged.
+    pub database_url: Option<String>,
 }
 
 impl Teslamate {
@@ -223,6 +227,13 @@ impl Teslamate {
             anyhow::ensure!(
                 value.is_none_or(|v| v > 0.0),
                 "{name} in [teslamate] must be more than 0"
+            );
+        }
+        if let Some(url) = &self.database_url {
+            // Not echoed in the error: it holds a password.
+            anyhow::ensure!(
+                url.starts_with("postgres://") || url.starts_with("postgresql://"),
+                "database_url in [teslamate] must start with postgres:// or postgresql://"
             );
         }
         Ok(())
@@ -776,6 +787,28 @@ mod tests {
             let err = parse(bad).check().unwrap_err();
             assert!(format!("{err:#}").contains("more than 0"), "{bad}: {err:#}");
         }
+    }
+
+    #[test]
+    fn teslamate_database_url_must_be_postgres() {
+        let parse = |extra: &str| -> Teslamate {
+            let text = format!("{MINIMAL}\n[teslamate]\nhost = \"h\"\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().teslamate.unwrap()
+        };
+        assert_eq!(parse("").database_url, None);
+        for good in [
+            "postgres://u:p@h:5432/teslamate",
+            "postgresql://u@h/teslamate",
+        ] {
+            let teslamate = parse(&format!("database_url = \"{good}\""));
+            assert!(teslamate.check().is_ok(), "{good}");
+            assert_eq!(teslamate.database_url.as_deref(), Some(good));
+        }
+        let err = parse("database_url = \"mysql://u:secret@h/db\"")
+            .check()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("postgres://"), "{err:#}");
+        assert!(!format!("{err:#}").contains("secret"));
     }
 
     const TARIFF: &str = r#"

@@ -939,6 +939,136 @@ pub async fn globird_kwh_in_range(
     .context("could not read GloBird kWh")
 }
 
+/// One car from TeslaMate, as stored in `tm_car`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmCar {
+    pub id: i64,
+    pub name: Option<String>,
+    pub model: Option<String>,
+}
+
+/// One car's driving on one local day, as stored in `tm_drive_daily`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmDriveDay {
+    pub car_id: i64,
+    /// The local day, YYYY-MM-DD.
+    pub date: String,
+    pub km: f64,
+    pub drives: i64,
+}
+
+/// One charging session from TeslaMate, as stored in `tm_charge`. Times are
+/// unix seconds, UTC.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmCharge {
+    pub id: i64,
+    pub car_id: i64,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub energy_added_kwh: Option<f64>,
+    pub energy_used_kwh: Option<f64>,
+    pub start_soc_pct: Option<f64>,
+    pub end_soc_pct: Option<f64>,
+    pub geofence: Option<String>,
+    pub fast_charger: bool,
+}
+
+/// Saves TeslaMate's cars, replacing the ones already stored, in one transaction.
+pub async fn upsert_tm_cars(pool: &SqlitePool, cars: &[TmCar], now: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for car in cars {
+        sqlx::query(
+            "INSERT INTO tm_car (id, name, model, updated_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT (id) DO UPDATE SET name = excluded.name, model = excluded.model,
+                                            updated_at = excluded.updated_at",
+        )
+        .bind(car.id)
+        .bind(&car.name)
+        .bind(&car.model)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .context("could not save a TeslaMate car")?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Saves daily driving totals, replacing the stored ones for the same car
+/// and day, in one transaction.
+pub async fn upsert_tm_drive_days(pool: &SqlitePool, days: &[TmDriveDay]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for d in days {
+        sqlx::query(
+            "INSERT INTO tm_drive_daily (car_id, date, km, drives) VALUES (?, ?, ?, ?)
+             ON CONFLICT (car_id, date) DO UPDATE SET km = excluded.km, drives = excluded.drives",
+        )
+        .bind(d.car_id)
+        .bind(&d.date)
+        .bind(d.km)
+        .bind(d.drives)
+        .execute(&mut *tx)
+        .await
+        .context("could not save TeslaMate daily driving")?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The highest charging session id stored for a car (see [`max_tm_drive_id`]).
+pub async fn max_tm_charge_id(pool: &SqlitePool, car_id: i64) -> Result<Option<i64>> {
+    sqlx::query_scalar("SELECT MAX(id) FROM tm_charge WHERE car_id = ?")
+        .bind(car_id)
+        .fetch_one(pool)
+        .await
+        .context("could not read the newest stored charge")
+}
+
+/// The ids of a car's stored charging sessions that had not ended when they
+/// were last read.
+pub async fn open_tm_charge_ids(pool: &SqlitePool, car_id: i64) -> Result<Vec<i64>> {
+    sqlx::query_scalar("SELECT id FROM tm_charge WHERE car_id = ? AND ended_at IS NULL")
+        .bind(car_id)
+        .fetch_all(pool)
+        .await
+        .context("could not read the open charges")
+}
+
+/// Saves charging sessions, replacing any stored with the same id, in one
+/// transaction.
+pub async fn save_tm_charges(pool: &SqlitePool, charges: &[TmCharge]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for c in charges {
+        sqlx::query(
+            "INSERT INTO tm_charge (id, car_id, started_at, ended_at, energy_added_kwh,
+                                    energy_used_kwh, start_soc_pct, end_soc_pct, geofence,
+                                    fast_charger)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (id) DO UPDATE SET car_id = excluded.car_id,
+               started_at = excluded.started_at, ended_at = excluded.ended_at,
+               energy_added_kwh = excluded.energy_added_kwh,
+               energy_used_kwh = excluded.energy_used_kwh,
+               start_soc_pct = excluded.start_soc_pct, end_soc_pct = excluded.end_soc_pct,
+               geofence = excluded.geofence, fast_charger = excluded.fast_charger",
+        )
+        .bind(c.id)
+        .bind(c.car_id)
+        .bind(c.started_at)
+        .bind(c.ended_at)
+        .bind(c.energy_added_kwh)
+        .bind(c.energy_used_kwh)
+        .bind(c.start_soc_pct)
+        .bind(c.end_soc_pct)
+        .bind(&c.geofence)
+        .bind(c.fast_charger)
+        .execute(&mut *tx)
+        .await
+        .context("could not save a TeslaMate charge")?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,12 +1106,13 @@ mod tests {
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
              ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session',
-              'ev_odometer_daily', 'globird_cost', 'globird_usage', 'globird_interval')",
+              'ev_odometer_daily', 'globird_cost', 'globird_usage', 'globird_interval',
+              'tm_car', 'tm_drive_daily', 'tm_charge')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 10);
+        assert_eq!(tables.len(), 13);
     }
 
     #[tokio::test]
@@ -1585,5 +1716,102 @@ mod tests {
         assert!(globird_day_is_complete(&pool, date(20)).await.unwrap());
         assert!(!globird_day_is_complete(&pool, date(21)).await.unwrap());
         assert!(!globird_day_is_complete(&pool, date(22)).await.unwrap());
+    }
+
+    fn tm_charge(id: i64, car_id: i64, ended_at: Option<i64>) -> TmCharge {
+        TmCharge {
+            id,
+            car_id,
+            started_at: 2000 + id,
+            ended_at,
+            energy_added_kwh: Some(10.0),
+            energy_used_kwh: Some(11.0),
+            start_soc_pct: Some(20.0),
+            end_soc_pct: Some(40.0),
+            geofence: Some("Home".to_string()),
+            fast_charger: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn tm_cars_are_replaced_by_id() {
+        let (_dir, pool) = test_db().await;
+        let car = |name: &str| TmCar {
+            id: 10001,
+            name: Some(name.to_string()),
+            model: Some("3".to_string()),
+        };
+        upsert_tm_cars(&pool, &[car("Old")], 5).await.unwrap();
+        upsert_tm_cars(&pool, &[car("Renamed")], 9).await.unwrap();
+        let rows: Vec<(i64, Option<String>, i64)> =
+            sqlx::query_as("SELECT id, name, updated_at FROM tm_car")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(10001, Some("Renamed".to_string()), 9)]);
+    }
+
+    #[tokio::test]
+    async fn tm_drive_days_are_replaced_per_car_and_day() {
+        let (_dir, pool) = test_db().await;
+        let day = |car_id: i64, date: &str, km: f64, drives: i64| TmDriveDay {
+            car_id,
+            date: date.to_string(),
+            km,
+            drives,
+        };
+        upsert_tm_drive_days(
+            &pool,
+            &[day(1, "2026-10-20", 5.0, 1), day(2, "2026-10-20", 9.0, 2)],
+        )
+        .await
+        .unwrap();
+        // The same day again, after another drive.
+        upsert_tm_drive_days(&pool, &[day(1, "2026-10-20", 12.5, 2)])
+            .await
+            .unwrap();
+        let rows: Vec<(i64, String, f64, i64)> =
+            sqlx::query_as("SELECT car_id, date, km, drives FROM tm_drive_daily ORDER BY car_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "2026-10-20".to_string(), 12.5, 2),
+                (2, "2026-10-20".to_string(), 9.0, 2)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tm_charges_track_newest_and_open_per_car() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(max_tm_charge_id(&pool, 1).await.unwrap(), None);
+        // The old car's ids are far above the new car's.
+        save_tm_charges(
+            &pool,
+            &[
+                tm_charge(100_000_005, 10001, Some(9)),
+                tm_charge(3, 1, None),
+                tm_charge(4, 1, Some(9)),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(max_tm_charge_id(&pool, 1).await.unwrap(), Some(4));
+        assert_eq!(open_tm_charge_ids(&pool, 1).await.unwrap(), vec![3]);
+
+        // The open session ends and is saved again in place.
+        let mut done = tm_charge(3, 1, Some(300));
+        done.fast_charger = true;
+        save_tm_charges(&pool, &[done]).await.unwrap();
+        assert!(open_tm_charge_ids(&pool, 1).await.unwrap().is_empty());
+        let (count, fast): (i64, bool) =
+            sqlx::query_as("SELECT COUNT(*), MAX(fast_charger) FROM tm_charge WHERE car_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((count, fast), (2, true));
     }
 }
