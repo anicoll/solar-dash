@@ -208,13 +208,17 @@
     <div id="money-body" class="view-body" hidden>
       <div id="money-numbers" class="view-body">
         <section class="hero" id="money-hero" aria-labelledby="h-moneysaved">
-          <h2 id="h-moneysaved" class="hero-label">Saved</h2>
+          <div class="hero-head">
+            <h2 id="h-moneysaved" class="hero-label">Saved</h2>
+            <button type="button" class="switch" id="money-cars-toggle" role="switch" aria-checked="false" hidden><span class="switch-track" aria-hidden="true"></span>Include cars</button>
+          </div>
           <div class="hero-total" id="money-saved"></div>
           <div class="hero-since" id="money-pct"></div>
           <div id="money-split"></div>
+          <div class="hero-since" id="money-cars-note" hidden></div>
           <div class="hero-pair">
             <div><span class="hero-label">You paid</span><span class="hero-val" id="money-paid"></span></div>
-            <div><span class="hero-label">Without solar or battery</span><span class="hero-val" id="money-without"></span></div>
+            <div><span class="hero-label" id="money-without-label">Without solar or battery</span><span class="hero-val" id="money-without"></span></div>
           </div>
           <p class="panel-note" id="money-billed" hidden></p>
         </section>
@@ -331,6 +335,7 @@
       <details class="panel how">
         <summary>How this is calculated</summary>
         <p>Each day is priced twice on your tariff: what you actually paid, and what the same usage would have cost with no solar or battery. The difference is the saving. The supply charge is in both, so the saving is the power you did not buy, plus feed-in and any credits. Where a real bill covers the day (GloBird's own, or a past bill you listed in the config, spread evenly over its days), the bill's figures are used instead (the day's bill, feed-in, credits and grid kWh), and the saving is that day's no-solar cost less the bill. The rest are our estimate. Days with no data are left out.</p>
+        <p>Include cars adds the fuel the cars saved. For each day that is the petrol the same driving would have cost, less what charging the cars would have cost from the grid with no solar or battery. The system's own share of the car savings is already in the normal saving, because the cars are part of the house load, so adding the fuel saved never counts anything twice. A day where the cars were only charged shows a negative number.</p>
       </details>
     </div>
   </section>
