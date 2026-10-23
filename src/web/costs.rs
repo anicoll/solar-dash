@@ -19,6 +19,7 @@ use super::api::{
     ApiError, ApiResult, DEFAULT_DAILY_DAYS, MAX_HOLD_SECS, Spread, date_range,
     day_bounds_or_error, live_totals, spread_steps, today,
 };
+use crate::bills::{self, Metered, PastBill};
 use crate::cost::{self, DayCost, GridSplit, Interval, Tariff, TariffSchedule};
 use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
 use crate::globird::data::{self as globird_data, bucket_of, is_supply};
@@ -247,7 +248,7 @@ pub(super) fn round2(value: f64) -> f64 {
 struct CostDay {
     date: String,
     /// "inverter" (live samples) or "cloud", as in `/api/daily`, or "globird"
-    /// when the money is from GloBird's own bill for the day.
+    /// or "bill" when the money is from a real bill for the day.
     source: &'static str,
     actual: f64,
     baseline: f64,
@@ -302,7 +303,7 @@ struct Sums {
     days: u32,
     /// Days that earned the zero-import credit.
     credit_days: u32,
-    /// Days whose money is GloBird's own bill.
+    /// Days whose money is a real bill.
     billed_days: u32,
     supply_cents: f64,
     import_cents: f64,
@@ -316,10 +317,10 @@ struct Sums {
 }
 
 impl Sums {
-    /// Like [`Sums::add`], and counts the day if it is GloBird's bill.
+    /// Like [`Sums::add`], and counts the day if it is a real bill (GloBird's or a past bill).
     fn add_day(&mut self, day: &CostedDay) {
         self.add(&day.cost);
-        if day.source == SOURCE_GLOBIRD {
+        if day.source == SOURCE_GLOBIRD || day.source == SOURCE_BILL {
             self.billed_days += 1;
         }
     }
@@ -375,7 +376,7 @@ struct Totals {
     days: u32,
     /// Days that earned the zero-import credit.
     credit_days: u32,
-    /// Days whose money is GloBird's own bill rather than our estimate.
+    /// Days whose money is a real bill (GloBird's or a past bill) rather than our estimate.
     billed_days: u32,
     supply: f64,
     import: f64,
@@ -429,8 +430,8 @@ fn bucket_days(group: Group, costed: &[CostedDay]) -> Vec<Bucket> {
 #[derive(Debug, Clone)]
 pub(super) struct CostedDay {
     pub date: NaiveDate,
-    /// "inverter" or "cloud", or "globird" once [`billed_days`] has put
-    /// GloBird's bill in. Stored rows are never "globird".
+    /// "inverter" or "cloud", or "globird" or "bill" once [`billed_days`] has
+    /// put a real bill in. Stored rows are never "globird" or "bill".
     pub source: &'static str,
     pub cost: DayCost,
 }
@@ -667,6 +668,9 @@ pub(super) fn kwh_by_date(rows: Vec<GlobirdDayKwh>) -> BTreeMap<String, DayKwh> 
 /// The `source` of a day whose money is GloBird's own bill.
 pub(super) const SOURCE_GLOBIRD: &str = "globird";
 
+/// The `source` of a day whose money is a real bill from `[bills]`.
+pub(super) const SOURCE_BILL: &str = "bill";
+
 /// GloBird's bill for one complete day, in whole cents (a credit is negative,
 /// as GloBird signs it), added up per bucket.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -728,11 +732,21 @@ fn apply_bill(cost: &DayCost, bill: &Bill) -> DayCost {
     }
 }
 
-/// Like [`costed_days`], but a day GloBird has billed completely shows
-/// GloBird's figures (source "globird") instead of our estimate. A day without
-/// our estimate stays out, as we would have no baseline for it. The stored
-/// `daily_cost` rows are untouched; this is applied each time it is read, with
-/// one range query on the GloBird tables.
+/// Like [`costed_days`], but a day that has a real bill shows the bill's
+/// figures instead of our estimate:
+///
+/// - a day inside a past bill from `[bills]` (source "bill"), including days
+///   we have no data for, which are added in date order; and
+/// - a day GloBird has billed completely (source "globird"), with our
+///   estimate's load and baseline. A past bill wins if both cover a day.
+///
+/// A day with neither and no estimate stays out. The stored `daily_cost` rows
+/// are untouched; this is applied each time it is read.
+///
+/// A past bill is smoothed over its whole period, so a request that covers
+/// only part of one still costs the full period (one `costed_days` call over
+/// the request plus the bills it touches) and then returns just the
+/// requested days.
 ///
 /// Use this to report money. Anything that compares with GloBird (the Bill
 /// check) must use [`costed_days`], or it would compare GloBird with itself.
@@ -741,33 +755,83 @@ pub(super) async fn billed_days(
     schedule: &TariffSchedule,
     dates: &[NaiveDate],
 ) -> Result<Vec<CostedDay>, ApiError> {
-    let mut costed = costed_days(state, schedule, dates).await?;
-    let (Some(first), Some(last)) = (dates.first(), dates.last()) else {
-        return Ok(costed);
+    let (Some(&first), Some(&last)) = (dates.first(), dates.last()) else {
+        return Ok(Vec::new());
     };
-    let (from, to) = (first.to_string(), last.to_string());
-    let cost_rows = db::globird_cost_in_range(&state.pool, &from, &to).await?;
-    if cost_rows.is_empty() {
-        return Ok(costed);
-    }
-    let mut kwh = kwh_by_date(db::globird_kwh_in_range(&state.pool, &from, &to).await?);
+    // The bills that touch the request, and the span that covers them all.
+    let touched: Vec<&PastBill> = state
+        .bills
+        .iter()
+        .filter(|bill| bill.from <= last && bill.to >= first)
+        .collect();
+    let wide_first = touched.iter().map(|b| b.from).fold(first, NaiveDate::min);
+    let wide_last = touched.iter().map(|b| b.to).fold(last, NaiveDate::max);
+    let wide: Vec<NaiveDate> = wide_first
+        .iter_days()
+        .take_while(|d| *d <= wide_last)
+        .collect();
 
-    // The rows come ordered by date, so a day's lines are next to each other.
-    for lines in cost_rows.chunk_by(|a, b| a.date == b.date) {
-        let day_kwh = kwh.remove(&lines[0].date).unwrap_or_default();
-        let Some(bill) = Bill::from_lines(lines, day_kwh) else {
-            continue;
-        };
-        // `costed` is in date order, so the day is found by binary search.
-        let Ok(date) = NaiveDate::from_str(&lines[0].date) else {
-            continue;
-        };
-        if let Ok(i) = costed.binary_search_by_key(&date, |day| day.date) {
-            costed[i].cost = apply_bill(&costed[i].cost, &bill);
-            costed[i].source = SOURCE_GLOBIRD;
+    let mut costed = costed_days(state, schedule, &wide).await?;
+
+    // Past bills first, from our estimate before GloBird's figures change it.
+    let mut bill_days: Vec<(NaiveDate, DayCost)> = Vec::new();
+    if !touched.is_empty() {
+        // Read after `costed_days`, which stores the finished days it worked out.
+        let monthly_load = db::average_load_by_month(&state.pool).await?;
+        let ours: HashMap<NaiveDate, Metered> = costed
+            .iter()
+            .map(|day| {
+                let c = &day.cost;
+                let metered = Metered {
+                    import_kwh: c.import_kwh,
+                    export_kwh: c.export_kwh,
+                    load_kwh: c.load_kwh,
+                };
+                (day.date, metered)
+            })
+            .collect();
+        for bill in touched {
+            bill_days.extend(bills::bill_days(bill, &ours, &monthly_load));
         }
     }
-    Ok(costed)
+
+    let (from, to) = (wide_first.to_string(), wide_last.to_string());
+    let cost_rows = db::globird_cost_in_range(&state.pool, &from, &to).await?;
+    if !cost_rows.is_empty() {
+        let mut kwh = kwh_by_date(db::globird_kwh_in_range(&state.pool, &from, &to).await?);
+
+        // The rows come ordered by date, so a day's lines are next to each other.
+        for lines in cost_rows.chunk_by(|a, b| a.date == b.date) {
+            let day_kwh = kwh.remove(&lines[0].date).unwrap_or_default();
+            let Some(bill) = Bill::from_lines(lines, day_kwh) else {
+                continue;
+            };
+            // `costed` is in date order, so the day is found by binary search.
+            let Ok(date) = NaiveDate::from_str(&lines[0].date) else {
+                continue;
+            };
+            if let Ok(i) = costed.binary_search_by_key(&date, |day| day.date) {
+                costed[i].cost = apply_bill(&costed[i].cost, &bill);
+                costed[i].source = SOURCE_GLOBIRD;
+            }
+        }
+    }
+
+    if bill_days.is_empty() && wide_first == first && wide_last == last {
+        return Ok(costed);
+    }
+    // Put the bill days in (over anything already there, in date order), then
+    // keep only the days that were asked for.
+    let mut by_date: BTreeMap<NaiveDate, CostedDay> =
+        costed.into_iter().map(|day| (day.date, day)).collect();
+    for (date, cost) in bill_days {
+        let source = SOURCE_BILL;
+        by_date.insert(date, CostedDay { date, source, cost });
+    }
+    Ok(by_date
+        .into_values()
+        .filter(|day| day.date >= first && day.date <= last)
+        .collect())
 }
 
 #[derive(Deserialize)]

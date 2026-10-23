@@ -1,3 +1,4 @@
+mod bills;
 mod config;
 mod cost;
 mod db;

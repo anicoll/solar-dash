@@ -1786,7 +1786,7 @@
     } else {
       const billed = costs.totals.billed_days;
       notes.push(`The Cost card shows ${money(costs.totals.actual)}, ${money(Math.abs(diff))} ${diff > 0 ? 'less' : 'more'} than this total`
-        + `${billed ? `: ${billed} ${billed === 1 ? 'day uses' : 'days use'} GloBird's own bill` : ' (rounding of the energy figures, or days costed from different meter data)'}.`);
+        + `${billed ? `: ${billed} ${billed === 1 ? 'day uses' : 'days use'} a real bill` : ' (rounding of the energy figures, or days costed from different meter data)'}.`);
     }
     $('tt-notes').replaceChildren(...notes.map((n) => el('li', '', n)));
     $('tt-scroll').hidden = false;
@@ -2383,12 +2383,12 @@
     // Paid is coral, the rest of the without-solar cost is the saving.
     const paid = Math.max(0, Math.min(t.actual, t.baseline));
     $('money-split').replaceChildren(...(t.baseline > 0 ? [splitBar([[paid, '--cost'], [t.baseline - paid, '--save']])] : []));
-    // Days GloBird has billed use its figures; the rest are our estimate.
+    // Days with a real bill (GloBird's, or one from [bills]) use its figures; the rest are our estimate.
     const note = $('money-billed');
     note.hidden = !(t.billed_days > 0);
     note.textContent = t.billed_days === t.days
-      ? `All ${daysText(t.days)} from your GloBird bill`
-      : `${t.billed_days} of ${daysText(t.days)} from your GloBird bill, the rest estimated`;
+      ? `All ${daysText(t.days)} from your bills`
+      : `${t.billed_days} of ${daysText(t.days)} from your bills, the rest estimated`;
   }
 
   /** "Your bill": laid out like the power bill, so the total can be checked against it. */
