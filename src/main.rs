@@ -211,12 +211,14 @@ async fn run_serve(config: Config) -> Result<()> {
     };
     // The TeslaMate history sync needs `database_url` in [teslamate]; without
     // it this finishes at once. It does not log the URL, which has a password.
+    let costing = state.cost_setup();
     let sync_teslamate_history = async {
         if let Some(url) = config
             .teslamate
             .as_ref()
             .and_then(|teslamate| teslamate.database_url.clone())
-            && let Err(err) = teslamate_history::run(url, pool.clone(), tz, shutdown_signal()).await
+            && let Err(err) =
+                teslamate_history::run(url, pool.clone(), tz, costing, shutdown_signal()).await
         {
             error!("TeslaMate history sync stopped: {err:#}; the dashboard keeps running");
         }

@@ -314,6 +314,19 @@
           <p class="panel-note">Credits are from GloBird's bill where it has posted the day, otherwise our estimate. The reason is our best guess.</p>
         </div>
       </section>
+      <section class="panel" id="cars-card" aria-labelledby="h-cars" hidden>
+        <h2 id="h-cars" class="panel-title">Cars</h2>
+        <p id="cars-sub" class="panel-note"></p>
+        <p id="cars-unconfigured" class="panel-note" hidden></p>
+        <div id="cars-body" class="view-body">
+          <div class="picker seg" role="group" aria-label="Savings view">
+            <button type="button" class="btn" data-cars="with" aria-pressed="true">With the system</button>
+            <button type="button" class="btn" data-cars="without" aria-pressed="false">Without the system</button>
+          </div>
+          <p id="cars-explain" class="panel-note"></p>
+          <div id="cars-list" class="view-body"></div>
+        </div>
+      </section>
       <details class="panel how">
         <summary>How this is calculated</summary>
         <p>Each day is priced twice on your tariff: what you actually paid, and what the same usage would have cost with no solar or battery. The difference is the saving. The supply charge is in both, so the saving is the power you did not buy, plus feed-in and any credits. Where a real bill covers the day (GloBird's own, or a past bill you listed in the config, spread evenly over its days), the bill's figures are used instead (the day's bill, feed-in, credits and grid kWh), and the saving is that day's no-solar cost less the bill. The rest are our estimate. Days with no data are left out.</p>

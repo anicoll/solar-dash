@@ -1069,6 +1069,130 @@ pub async fn save_tm_charges(pool: &SqlitePool, charges: &[TmCharge]) -> Result<
     Ok(())
 }
 
+/// A finished session at home, as far as costing it needs.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct TmChargeToCost {
+    pub id: i64,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub energy_used_kwh: Option<f64>,
+    /// What it was costed with, `None` if it was not.
+    pub cost_key: Option<String>,
+}
+
+/// What a session cost, as stored on its `tm_charge` row (see
+/// `ev_cost::HistoricCost`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmChargeCost {
+    pub cost_key: String,
+    pub grid_kwh: f64,
+    pub self_kwh: f64,
+    pub uncovered_kwh: f64,
+    pub cost_cents: f64,
+    pub baseline_cents: f64,
+    pub feed_in_forgone_cents: f64,
+}
+
+/// The sessions at home (geofence "Home") that ended at or before
+/// `ended_by`, newest first, with the key they were costed with. The caller
+/// picks those whose key is out of date, because the right key depends on the
+/// session's day.
+pub async fn tm_charges_at_home(pool: &SqlitePool, ended_by: i64) -> Result<Vec<TmChargeToCost>> {
+    sqlx::query_as(
+        "SELECT id, started_at, ended_at, energy_used_kwh, cost_key FROM tm_charge
+         WHERE geofence = 'Home' AND ended_at IS NOT NULL AND ended_at <= ?
+         ORDER BY started_at DESC",
+    )
+    .bind(ended_by)
+    .fetch_all(pool)
+    .await
+    .context("could not read the charges at home")
+}
+
+/// Stores what a session cost on its row.
+pub async fn save_tm_charge_cost(pool: &SqlitePool, id: i64, cost: &TmChargeCost) -> Result<()> {
+    sqlx::query(
+        "UPDATE tm_charge SET cost_key = ?, grid_kwh = ?, self_kwh = ?, uncovered_kwh = ?,
+                              cost_cents = ?, baseline_cents = ?, feed_in_forgone_cents = ?
+         WHERE id = ?",
+    )
+    .bind(&cost.cost_key)
+    .bind(cost.grid_kwh)
+    .bind(cost.self_kwh)
+    .bind(cost.uncovered_kwh)
+    .bind(cost.cost_cents)
+    .bind(cost.baseline_cents)
+    .bind(cost.feed_in_forgone_cents)
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("could not save a charge's cost")?;
+    Ok(())
+}
+
+/// Every car in `tm_car`, by id.
+pub async fn tm_cars(pool: &SqlitePool) -> Result<Vec<TmCar>> {
+    let rows: Vec<(i64, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT id, name, model FROM tm_car ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .context("could not read the TeslaMate cars")?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, model)| TmCar { id, name, model })
+        .collect())
+}
+
+/// A car's km on each local day it drove, oldest first.
+pub async fn tm_drive_days(pool: &SqlitePool, car_id: i64) -> Result<Vec<TmDriveDay>> {
+    let rows: Vec<(String, f64, i64)> = sqlx::query_as(
+        "SELECT date, km, drives FROM tm_drive_daily WHERE car_id = ? ORDER BY date",
+    )
+    .bind(car_id)
+    .fetch_all(pool)
+    .await
+    .context("could not read a car's daily km")?;
+    Ok(rows
+        .into_iter()
+        .map(|(date, km, drives)| TmDriveDay {
+            car_id,
+            date,
+            km,
+            drives,
+        })
+        .collect())
+}
+
+/// A charging session with what it cost, as far as the savings summary needs.
+/// The cost columns are `None` until the session has been costed.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct TmChargeRow {
+    pub started_at: i64,
+    pub energy_added_kwh: Option<f64>,
+    pub energy_used_kwh: Option<f64>,
+    pub geofence: Option<String>,
+    pub cost_key: Option<String>,
+    pub grid_kwh: Option<f64>,
+    pub self_kwh: Option<f64>,
+    pub uncovered_kwh: Option<f64>,
+    pub cost_cents: Option<f64>,
+    pub baseline_cents: Option<f64>,
+    pub feed_in_forgone_cents: Option<f64>,
+}
+
+/// A car's charging sessions, oldest first.
+pub async fn tm_charge_rows(pool: &SqlitePool, car_id: i64) -> Result<Vec<TmChargeRow>> {
+    sqlx::query_as(
+        "SELECT started_at, energy_added_kwh, energy_used_kwh, geofence, cost_key, grid_kwh,
+                self_kwh, uncovered_kwh, cost_cents, baseline_cents, feed_in_forgone_cents
+         FROM tm_charge WHERE car_id = ? ORDER BY started_at, id",
+    )
+    .bind(car_id)
+    .fetch_all(pool)
+    .await
+    .context("could not read a car's charges")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1813,5 +1937,140 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((count, fast), (2, true));
+    }
+
+    #[tokio::test]
+    async fn tm_charge_costs_are_saved_on_the_row() {
+        let (_dir, pool) = test_db().await;
+        let mut away = tm_charge(2, 1, Some(100));
+        away.geofence = Some("Work".to_string());
+        let mut nowhere = tm_charge(3, 1, Some(100));
+        nowhere.geofence = None;
+        save_tm_charges(
+            &pool,
+            &[
+                tm_charge(1, 1, Some(100)),
+                away,
+                nowhere,
+                tm_charge(4, 1, None),
+                tm_charge(5, 1, Some(900)),
+            ],
+        )
+        .await
+        .unwrap();
+        // Only finished sessions at Home that ended in time, newest first.
+        let todo = tm_charges_at_home(&pool, 500).await.unwrap();
+        assert_eq!(todo.len(), 1);
+        assert_eq!((todo[0].id, todo[0].ended_at), (1, 100));
+        assert_eq!(todo[0].energy_used_kwh, Some(11.0));
+        assert_eq!(todo[0].cost_key, None);
+
+        let cost = TmChargeCost {
+            cost_key: "k1".to_string(),
+            grid_kwh: 6.0,
+            self_kwh: 5.0,
+            uncovered_kwh: 1.0,
+            cost_cents: 150.0,
+            baseline_cents: 330.0,
+            feed_in_forgone_cents: 25.0,
+        };
+        save_tm_charge_cost(&pool, 1, &cost).await.unwrap();
+        let todo = tm_charges_at_home(&pool, 1000).await.unwrap();
+        assert_eq!(todo.iter().map(|t| t.id).collect::<Vec<_>>(), vec![5, 1]);
+        assert_eq!(todo[1].cost_key.as_deref(), Some("k1"));
+        assert_eq!(todo[0].cost_key, None);
+
+        // Costing again replaces the figures; the session itself is untouched.
+        let again = TmChargeCost {
+            cost_key: "k2".to_string(),
+            cost_cents: 99.0,
+            ..cost
+        };
+        save_tm_charge_cost(&pool, 1, &again).await.unwrap();
+        let row: (String, f64, f64, i64) = sqlx::query_as(
+            "SELECT cost_key, cost_cents, energy_used_kwh, started_at FROM tm_charge WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, ("k2".to_string(), 99.0, 11.0, 2001));
+        // A save keeps the cost when the session is read from TeslaMate again.
+        save_tm_charges(&pool, &[tm_charge(1, 1, Some(100))])
+            .await
+            .unwrap();
+        let key: Option<String> = sqlx::query_scalar("SELECT cost_key FROM tm_charge WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(key.as_deref(), Some("k2"));
+    }
+
+    #[tokio::test]
+    async fn tm_history_is_read_per_car() {
+        let (_dir, pool) = test_db().await;
+        assert!(tm_cars(&pool).await.unwrap().is_empty());
+        let car = |id: i64, name: &str| TmCar {
+            id,
+            name: Some(name.to_string()),
+            model: None,
+        };
+        upsert_tm_cars(&pool, &[car(10001, "B"), car(1, "A")], 5)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = tm_cars(&pool).await.unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![1, 10001]);
+
+        let day = |car_id: i64, date: &str, km: f64| TmDriveDay {
+            car_id,
+            date: date.to_string(),
+            km,
+            drives: 2,
+        };
+        upsert_tm_drive_days(
+            &pool,
+            &[
+                day(1, "2026-10-21", 3.0),
+                day(1, "2026-10-20", 12.5),
+                day(10001, "2026-10-20", 99.0),
+            ],
+        )
+        .await
+        .unwrap();
+        let days = tm_drive_days(&pool, 1).await.unwrap();
+        assert_eq!(
+            days,
+            vec![day(1, "2026-10-20", 12.5), day(1, "2026-10-21", 3.0)]
+        );
+        assert!(tm_drive_days(&pool, 7).await.unwrap().is_empty());
+
+        let mut away = tm_charge(2, 1, Some(100));
+        away.geofence = None;
+        save_tm_charges(
+            &pool,
+            &[tm_charge(3, 1, Some(100)), away, tm_charge(4, 10001, None)],
+        )
+        .await
+        .unwrap();
+        let cost = TmChargeCost {
+            cost_key: "k".to_string(),
+            grid_kwh: 6.0,
+            self_kwh: 5.0,
+            uncovered_kwh: 1.0,
+            cost_cents: 150.0,
+            baseline_cents: 330.0,
+            feed_in_forgone_cents: 25.0,
+        };
+        save_tm_charge_cost(&pool, 3, &cost).await.unwrap();
+        let rows = tm_charge_rows(&pool, 1).await.unwrap();
+        // Oldest first; the costed one carries its figures, the other none.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].started_at, 2002);
+        assert_eq!(rows[0].geofence, None);
+        assert_eq!(rows[0].cost_key, None);
+        assert_eq!(rows[0].cost_cents, None);
+        assert_eq!(rows[1].energy_used_kwh, Some(11.0));
+        assert_eq!(rows[1].cost_key.as_deref(), Some("k"));
+        assert_eq!(rows[1].baseline_cents, Some(330.0));
+        assert_eq!(rows[1].feed_in_forgone_cents, Some(25.0));
     }
 }

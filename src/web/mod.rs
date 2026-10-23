@@ -8,6 +8,8 @@ mod costs;
 mod globird;
 mod payback;
 
+pub(crate) use costs::house_intervals;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -35,7 +37,7 @@ use tower_http::compression::CompressionLayer;
 use crate::bills::PastBill;
 use crate::config::Config;
 use crate::cost::TariffSchedule;
-use crate::ev_cost::EvPrices;
+use crate::ev_cost::{CostSetup, EvPrices, PetrolHistory};
 use crate::modbus::Latest;
 use crate::teslamate::Car;
 use auth::LockoutMap;
@@ -76,6 +78,9 @@ pub struct AppState {
     tariff: Option<Arc<TariffSchedule>>,
     /// The petrol and away-from-home prices from `[teslamate]`.
     ev_prices: EvPrices,
+    /// What petrol cost on each day: `petrol_cents_per_litre` and the
+    /// `[[teslamate.petrol_price]]` entries.
+    petrol_history: PetrolHistory,
     /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
     purchases: Arc<[Purchase]>,
     /// Assumed yearly electricity price rise (percent) in the payback projection.
@@ -115,6 +120,7 @@ impl AppState {
             car: Car::default(),
             tariff: None,
             ev_prices: EvPrices::default(),
+            petrol_history: PetrolHistory::default(),
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
             globird_configured: false,
@@ -137,6 +143,12 @@ impl AppState {
     /// Sets the prices the car-versus-petrol summary uses.
     pub fn with_ev_prices(mut self, prices: EvPrices) -> Self {
         self.ev_prices = prices;
+        self
+    }
+
+    /// Sets the petrol prices by day that the per-car history uses.
+    pub fn with_petrol_history(mut self, history: PetrolHistory) -> Self {
+        self.petrol_history = history;
         self
     }
 
@@ -173,6 +185,16 @@ impl AppState {
     /// The slot the TeslaMate task writes the car's state to.
     pub fn car(&self) -> Car {
         self.car.clone()
+    }
+
+    /// What the TeslaMate history sync needs to cost past sessions, or `None`
+    /// without a `[tariff]`.
+    pub fn cost_setup(&self) -> Option<CostSetup> {
+        Some(CostSetup {
+            schedule: self.tariff.clone()?,
+            bills: self.bills.clone(),
+            plant_id: self.plant_id,
+        })
     }
 
     /// The plant's time zone, which decides where a day ends.
@@ -221,10 +243,22 @@ impl AppState {
                 away_cents_per_kwh: t.away_cents_per_kwh,
             })
             .unwrap_or_default();
+        let petrol_history = match &config.teslamate {
+            Some(t) => {
+                let changes = t
+                    .petrol_price
+                    .iter()
+                    .map(|p| Ok((crate::config::parse_date(&p.from)?, p.cents_per_litre)))
+                    .collect::<Result<Vec<_>>>()?;
+                PetrolHistory::new(t.petrol_cents_per_litre, changes)
+            }
+            None => PetrolHistory::default(),
+        };
         Ok(Self::new(pool, plant_id, tz, password_hash, key)?
             .with_cookie_secure(config.server.cookie_secure)
             .with_tariff(tariff)
             .with_ev_prices(ev_prices)
+            .with_petrol_history(petrol_history)
             .with_purchases(purchases)
             .with_bills(bills)
             .with_price_rise_percent(config.system.price_rise_percent)
@@ -259,6 +293,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/live/series", get(api::live_series))
         .route("/api/ev/sessions", get(api::ev_sessions))
         .route("/api/ev/summary", get(api::ev_summary))
+        .route("/api/ev/cars", get(api::ev_cars))
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
@@ -1182,6 +1217,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ev_cars_summarises_each_car_over_its_history() {
+        let (_dir, _app, pool) = costs_app().await;
+        let router_with = |petrol: PetrolHistory| {
+            let hash = hash_password(PASSWORD).unwrap();
+            let tz = chrono_tz::Australia::Adelaide;
+            let prices = EvPrices {
+                petrol_cents_per_litre: None,
+                petrol_litres_per_100km: 8.0,
+                away_cents_per_kwh: Some(60.0),
+            };
+            router(
+                AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+                    .unwrap()
+                    .with_ev_prices(prices)
+                    .with_petrol_history(petrol),
+            )
+        };
+        let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        let app = router_with(PetrolHistory::new(Some(190.0), vec![(day(10), 200.0)]));
+        let response = send(&app, get_request("/api/ev/cars", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The history sync has not run yet.
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["petrol_litres_per_100km"], 8.0);
+        assert_eq!(json["cars"], serde_json::json!([]));
+
+        let car = |id: i64, name: &str, model: Option<&str>| db::TmCar {
+            id,
+            name: Some(name.to_string()),
+            model: model.map(str::to_string),
+        };
+        db::upsert_tm_cars(
+            &pool,
+            &[
+                car(1, "Daily", Some("3")),
+                car(2, "Weekend", Some("Y")),
+                car(3, "Unused", None),
+                car(4, "Spare", Some("Y")),
+            ],
+            1,
+        )
+        .await
+        .unwrap();
+        let drive = |car_id: i64, date: &str, km: f64| db::TmDriveDay {
+            car_id,
+            date: date.to_string(),
+            km,
+            drives: 1,
+        };
+        db::upsert_tm_drive_days(
+            &pool,
+            &[
+                drive(1, "2026-09-05", 100.0),
+                drive(1, "2026-09-12", 50.0),
+                drive(2, "2026-09-20", 10.0),
+            ],
+        )
+        .await
+        .unwrap();
+        // Car 1: a costed session at home (7.4 kWh), one at home not costed
+        // yet (5 kWh) and 10 kWh away. Car 4 only charged, with no geofence.
+        let start = SEP_15_START + 10 * 3600;
+        let charge =
+            |id: i64, car_id: i64, at: i64, geofence: Option<&str>, kwh: f64| db::TmCharge {
+                id,
+                car_id,
+                started_at: at,
+                ended_at: Some(at + 3600),
+                energy_added_kwh: Some(kwh - 0.5),
+                energy_used_kwh: Some(kwh),
+                start_soc_pct: None,
+                end_soc_pct: None,
+                geofence: geofence.map(str::to_string),
+                fast_charger: false,
+            };
+        db::save_tm_charges(
+            &pool,
+            &[
+                charge(1, 1, start, Some("Home"), 7.4),
+                charge(2, 1, start + 86_400, Some("Home"), 5.0),
+                charge(3, 1, start + 2 * 86_400, Some("Servo"), 10.0),
+                charge(4, 4, start + 10 * 86_400, None, 4.0),
+            ],
+        )
+        .await
+        .unwrap();
+        let cost = db::TmChargeCost {
+            cost_key: "k".to_string(),
+            grid_kwh: 7.4,
+            self_kwh: 0.0,
+            uncovered_kwh: 0.0,
+            cost_cents: 185.0,
+            baseline_cents: 370.0,
+            feed_in_forgone_cents: 0.0,
+        };
+        db::save_tm_charge_cost(&pool, 1, &cost).await.unwrap();
+
+        let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
+        let json = body_json(response).await;
+        let cars = json["cars"].as_array().unwrap();
+        // Newest first; the car with nothing is left out; the two Model Y get
+        // their names added.
+        let ids: Vec<_> = cars.iter().map(|c| c["car_id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, [4, 2, 1]);
+        assert_eq!(cars[0]["label"], "Model Y (Spare)");
+        assert_eq!(cars[1]["label"], "Model Y (Weekend)");
+        assert_eq!(cars[2]["label"], "Model 3");
+        assert_eq!(cars[2]["name"], "Daily");
+        assert_eq!(cars[2]["first_day"], "2026-09-05");
+        assert_eq!(cars[2]["last_day"], "2026-09-17");
+
+        // 100 km at $1.90 and 50 km at $2.00 (the price changed on the 10th).
+        let total = &cars[2]["total"];
+        assert_eq!(total["km"], 150.0);
+        assert_eq!(total["petrol_litres"], 12.0);
+        assert_eq!(total["petrol_cost"], 23.2);
+        assert_eq!(total["home_kwh"], 12.4);
+        assert_eq!(total["away_kwh"], 10.0);
+        assert_eq!(total["away_cost"], 6.0);
+        assert_eq!(total["pending_sessions"], 1);
+        assert_eq!(total["with_system"]["charging_cost"], 7.85);
+        assert_eq!(total["with_system"]["saved"], 15.35);
+        assert_eq!(total["with_system"]["cents_per_km"], 5.23);
+        assert_eq!(total["without_system"]["charging_cost"], 9.7);
+        assert_eq!(total["without_system"]["saved"], 13.5);
+        assert_eq!(total["system_added"], 1.85);
+        assert_eq!(total["grid_kwh"], 7.4);
+        let months = cars[2]["months"].as_array().unwrap();
+        assert_eq!(months.len(), 1);
+        assert_eq!(months[0]["month"], "2026-09");
+        assert_eq!(months[0]["system_added"], 1.85);
+
+        // The only km of car 2 are on a day with a price; car 4's session is
+        // away from home (no geofence), costed at the away price.
+        assert_eq!(cars[1]["total"]["petrol_cost"], 1.6);
+        assert_eq!(cars[0]["total"]["away_kwh"], 4.0);
+        assert_eq!(cars[0]["total"]["with_system"]["charging_cost"], 2.4);
+        assert_eq!(
+            cars[0]["total"]["with_system"]["cents_per_km"],
+            serde_json::Value::Null
+        );
+
+        // With no petrol price at all the savings are null, the charging
+        // costs stay.
+        let app = router_with(PetrolHistory::default());
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], false);
+        let total = &json["cars"][2]["total"];
+        assert!(total["petrol_cost"].is_null());
+        assert!(total["with_system"]["saved"].is_null());
+        assert_eq!(total["with_system"]["charging_cost"], 7.85);
+        assert_eq!(total["system_added"], 1.85);
+    }
+
+    #[tokio::test]
     async fn live_returns_a_fresh_sample_but_not_a_stale_one() {
         let (_dir, app, pool) = test_app_with_pool().await;
         let cookie = log_in(&app).await;
@@ -1573,6 +1770,45 @@ mod tests {
             }
         }
         db::upsert_readings(pool, PLANT, &readings).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn house_intervals_cover_the_days_a_time_touches() {
+        let (_dir, _app, pool) = costs_app().await;
+        let tz = chrono_tz::Australia::Adelaide;
+        // The 15th has counters all day; the 16th has none.
+        seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
+        let now = SEP_15_START + 3 * 86_400;
+        let (start, end) = (SEP_15_START + 3 * 3600, SEP_15_START + 5 * 3600);
+        let (intervals, covered) = costs::house_intervals(&pool, PLANT, tz, start, end, now)
+            .await
+            .unwrap();
+        assert!(!intervals.is_empty());
+        // The whole day is the source, so these are the day's intervals.
+        assert!(intervals.iter().any(|i| i.start_ts < start));
+        assert!(intervals.windows(2).all(|w| w[0].end_ts <= w[1].start_ts));
+        assert!((0.0..=1.0).contains(&covered));
+
+        // A session across midnight loads both days; the empty one adds none.
+        let night = (SEP_15_START + 86_400 - 1800, SEP_15_START + 86_400 + 1800);
+        let (_, covered) = costs::house_intervals(&pool, PLANT, tz, night.0, night.1, now)
+            .await
+            .unwrap();
+        assert!(covered < 0.6, "the 16th has no data, got {covered}");
+
+        // Nothing stored, or no length: nothing covered.
+        let later = SEP_15_START + 10 * 86_400;
+        let (intervals, covered) =
+            costs::house_intervals(&pool, PLANT, tz, later, later + 3600, now)
+                .await
+                .unwrap();
+        assert!(intervals.is_empty());
+        assert_eq!(covered, 0.0);
+        let (intervals, covered) = costs::house_intervals(&pool, PLANT, tz, start, start, now)
+            .await
+            .unwrap();
+        assert!(intervals.is_empty());
+        assert_eq!(covered, 0.0);
     }
 
     /// How many days are stored in the `daily_cost` table.

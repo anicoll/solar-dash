@@ -266,7 +266,7 @@ pub fn bill_days(
 }
 
 /// Cents per kWh from a dollar amount and the kWh, 0 when there was no energy.
-fn cents_per_kwh(dollars: f64, kwh: f64) -> f64 {
+pub fn cents_per_kwh(dollars: f64, kwh: f64) -> f64 {
     if kwh > 0.0 {
         dollars * 100.0 / kwh
     } else {
