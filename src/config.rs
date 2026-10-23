@@ -103,6 +103,26 @@ pub struct Server {
     /// (the default) behind https; set false only for plain-http LAN testing.
     #[serde(default = "default_cookie_secure")]
     pub cookie_secure: bool,
+    /// A secret for scripts: `Authorization: Bearer <token>` is accepted on
+    /// `/api/` routes as well as the login cookie. Off when unset.
+    pub api_token: Option<String>,
+}
+
+/// The shortest `api_token` allowed (`openssl rand -hex 32` makes 64).
+const MIN_API_TOKEN_LEN: usize = 32;
+
+impl Server {
+    fn check(&self) -> Result<()> {
+        if let Some(token) = &self.api_token {
+            // Not echoed in the error: it is a secret.
+            anyhow::ensure!(
+                token.len() >= MIN_API_TOKEN_LEN,
+                "api_token in [server] must be at least {MIN_API_TOKEN_LEN} characters \
+                 (make one with `openssl rand -hex 32`)"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for Server {
@@ -112,6 +132,7 @@ impl Default for Server {
             password_hash: None,
             session_secret: None,
             cookie_secure: default_cookie_secure(),
+            api_token: None,
         }
     }
 }
@@ -130,6 +151,7 @@ impl fmt::Debug for Server {
                 &self.session_secret.as_ref().map(|_| "<redacted>"),
             )
             .field("cookie_secure", &self.cookie_secure)
+            .field("api_token", &self.api_token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -203,6 +225,11 @@ pub struct Teslamate {
     /// as repeated `[[teslamate.petrol_price]]` tables.
     #[serde(default)]
     pub petrol_price: Vec<PetrolPrice>,
+    /// A CSV file of petrol prices that changed over time, which replaces the
+    /// `[[teslamate.petrol_price]]` entries (set one or the other). It can be
+    /// edited by hand or through `/api/petrol-prices`; see `petrol_prices.rs`.
+    /// A missing file is treated as empty and created on the first change.
+    pub petrol_prices_file: Option<String>,
     /// A flat price per kWh for charging away from home. Without it, away
     /// sessions are left uncosted.
     pub away_cents_per_kwh: Option<f64>,
@@ -231,6 +258,17 @@ impl Teslamate {
             anyhow::ensure!(
                 value.is_none_or(|v| v > 0.0),
                 "{name} in [teslamate] must be more than 0"
+            );
+        }
+        if let Some(file) = &self.petrol_prices_file {
+            anyhow::ensure!(
+                !file.trim().is_empty(),
+                "petrol_prices_file in [teslamate] must not be empty"
+            );
+            anyhow::ensure!(
+                self.petrol_price.is_empty(),
+                "[teslamate] sets both petrol_prices_file and [[teslamate.petrol_price]]; \
+                 use one or the other (the file's entries replace the tables)"
             );
         }
         let mut last: Option<NaiveDate> = None;
@@ -600,6 +638,10 @@ impl Config {
         })?;
         let config: Self = toml::from_str(&text)
             .with_context(|| format!("invalid config file {}", path.display()))?;
+        config
+            .server
+            .check()
+            .with_context(|| format!("invalid config file {}", path.display()))?;
         if let Some(modbus) = &config.modbus {
             modbus
                 .check()
@@ -861,6 +903,52 @@ mod tests {
             let err = parse(&bad).check().unwrap_err();
             assert!(format!("{err:#}").contains(expect), "{bad}: {err:#}");
         }
+    }
+
+    #[test]
+    fn server_api_token_must_be_long_enough() {
+        let parse = |extra: &str| -> Server {
+            let text = format!("{MINIMAL}\n[server]\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().server
+        };
+        assert_eq!(parse("").api_token, None);
+        assert!(parse("").check().is_ok());
+        let good = parse(&format!("api_token = \"{}\"\n", "a".repeat(32)));
+        assert!(good.check().is_ok());
+        for bad in ["", "short", &"a".repeat(31)] {
+            let err = parse(&format!("api_token = \"{bad}\"\n"))
+                .check()
+                .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("at least 32"), "{message}");
+            assert!(bad.is_empty() || !message.contains(bad), "{message}");
+        }
+        // The Debug output hides it.
+        assert!(!format!("{good:?}").contains("aaaa"));
+    }
+
+    #[test]
+    fn teslamate_petrol_prices_file_excludes_the_tables() {
+        let parse = |extra: &str| -> Teslamate {
+            let text = format!("{MINIMAL}\n[teslamate]\nhost = \"h\"\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().teslamate.unwrap()
+        };
+        assert_eq!(parse("").petrol_prices_file, None);
+        let good = parse("petrol_prices_file = \"/tmp/petrol.csv\"\n");
+        assert!(good.check().is_ok());
+        assert_eq!(good.petrol_prices_file.as_deref(), Some("/tmp/petrol.csv"));
+
+        let both = parse(
+            "petrol_prices_file = \"/tmp/petrol.csv\"\n\
+             [[teslamate.petrol_price]]\nfrom = \"2026-03-01\"\ncents_per_litre = 199.0\n",
+        );
+        let err = both.check().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("both petrol_prices_file"),
+            "{err:#}"
+        );
+        let err = parse("petrol_prices_file = \" \"\n").check().unwrap_err();
+        assert!(format!("{err:#}").contains("must not be empty"), "{err:#}");
     }
 
     #[test]

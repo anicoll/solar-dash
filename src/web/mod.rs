@@ -7,6 +7,7 @@ mod battery;
 mod costs;
 mod globird;
 mod payback;
+mod petrol;
 
 pub(crate) use costs::house_intervals;
 
@@ -23,7 +24,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum_extra::extract::cookie::Key;
 use base64::Engine;
 use chrono_tz::Tz;
@@ -37,8 +38,9 @@ use tower_http::compression::CompressionLayer;
 use crate::bills::PastBill;
 use crate::config::Config;
 use crate::cost::TariffSchedule;
-use crate::ev_cost::{CostSetup, EvPrices, PetrolHistory};
+use crate::ev_cost::{CostSetup, EvPrices};
 use crate::modbus::Latest;
+use crate::petrol_prices::PetrolPrices;
 use crate::teslamate::Car;
 use auth::LockoutMap;
 pub use auth::hash_password;
@@ -70,6 +72,9 @@ pub struct AppState {
     verify_gate: Arc<Semaphore>,
     /// Whether the session cookie gets the `Secure` flag.
     cookie_secure: bool,
+    /// `api_token` from `[server]`: a Bearer token accepted on `/api/` routes.
+    /// Never logged.
+    api_token: Option<Arc<str>>,
     /// The newest Modbus sample, kept by the poller.
     latest: Latest,
     /// The car's charge state from TeslaMate, kept by the MQTT task.
@@ -78,9 +83,9 @@ pub struct AppState {
     tariff: Option<Arc<TariffSchedule>>,
     /// The petrol and away-from-home prices from `[teslamate]`.
     ev_prices: EvPrices,
-    /// What petrol cost on each day: `petrol_cents_per_litre` and the
-    /// `[[teslamate.petrol_price]]` entries.
-    petrol_history: PetrolHistory,
+    /// What petrol cost on each day: `petrol_cents_per_litre` and either the
+    /// `[[teslamate.petrol_price]]` entries or the `petrol_prices_file`.
+    petrol: PetrolPrices,
     /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
     purchases: Arc<[Purchase]>,
     /// Assumed yearly electricity price rise (percent) in the payback projection.
@@ -116,11 +121,12 @@ impl AppState {
             lockout: Arc::new(Mutex::new(LockoutMap::default())),
             verify_gate: Arc::new(Semaphore::new(1)),
             cookie_secure: true,
+            api_token: None,
             latest: Latest::default(),
             car: Car::default(),
             tariff: None,
             ev_prices: EvPrices::default(),
-            petrol_history: PetrolHistory::default(),
+            petrol: PetrolPrices::default(),
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
             globird_configured: false,
@@ -131,6 +137,12 @@ impl AppState {
     /// Sets the cookie `Secure` flag (on by default).
     pub fn with_cookie_secure(mut self, secure: bool) -> Self {
         self.cookie_secure = secure;
+        self
+    }
+
+    /// Accepts `Authorization: Bearer <token>` on `/api/` routes (off by default).
+    pub fn with_api_token(mut self, token: Option<&str>) -> Self {
+        self.api_token = token.map(Arc::from);
         self
     }
 
@@ -147,8 +159,8 @@ impl AppState {
     }
 
     /// Sets the petrol prices by day that the per-car history uses.
-    pub fn with_petrol_history(mut self, history: PetrolHistory) -> Self {
-        self.petrol_history = history;
+    pub fn with_petrol_prices(mut self, petrol: PetrolPrices) -> Self {
+        self.petrol = petrol;
         self
     }
 
@@ -243,22 +255,29 @@ impl AppState {
                 away_cents_per_kwh: t.away_cents_per_kwh,
             })
             .unwrap_or_default();
-        let petrol_history = match &config.teslamate {
-            Some(t) => {
-                let changes = t
-                    .petrol_price
-                    .iter()
-                    .map(|p| Ok((crate::config::parse_date(&p.from)?, p.cents_per_litre)))
-                    .collect::<Result<Vec<_>>>()?;
-                PetrolHistory::new(t.petrol_cents_per_litre, changes)
-            }
-            None => PetrolHistory::default(),
+        // A bad petrol prices file stops `serve` here, with the line in the message.
+        let petrol = match &config.teslamate {
+            Some(t) => match &t.petrol_prices_file {
+                Some(file) => {
+                    PetrolPrices::open(t.petrol_cents_per_litre, std::path::Path::new(file))?
+                }
+                None => {
+                    let changes = t
+                        .petrol_price
+                        .iter()
+                        .map(|p| Ok((crate::config::parse_date(&p.from)?, p.cents_per_litre)))
+                        .collect::<Result<Vec<_>>>()?;
+                    PetrolPrices::fixed(t.petrol_cents_per_litre, changes)
+                }
+            },
+            None => PetrolPrices::default(),
         };
         Ok(Self::new(pool, plant_id, tz, password_hash, key)?
             .with_cookie_secure(config.server.cookie_secure)
+            .with_api_token(config.server.api_token.as_deref())
             .with_tariff(tariff)
             .with_ev_prices(ev_prices)
-            .with_petrol_history(petrol_history)
+            .with_petrol_prices(petrol)
             .with_purchases(purchases)
             .with_bills(bills)
             .with_price_rise_percent(config.system.price_rise_percent)
@@ -294,6 +313,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ev/sessions", get(api::ev_sessions))
         .route("/api/ev/summary", get(api::ev_summary))
         .route("/api/ev/cars", get(api::ev_cars))
+        .route("/api/petrol-prices", get(petrol::list).put(petrol::put))
+        .route("/api/petrol-prices/{from}", delete(petrol::remove))
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
@@ -589,6 +610,281 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A router whose petrol prices live in `petrol.csv` in `dir` (or are
+    /// not kept in a file), with an API token.
+    async fn petrol_app(
+        file: bool,
+        token: Option<&str>,
+    ) -> (tempfile::TempDir, Router, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let path = dir.path().join("petrol.csv");
+        let petrol = if file {
+            PetrolPrices::open(Some(190.0), &path).unwrap()
+        } else {
+            PetrolPrices::fixed(Some(190.0), vec![])
+        };
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool, PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_api_token(token)
+            .with_petrol_prices(petrol);
+        (dir, router(state), path)
+    }
+
+    fn json_request(method: &str, uri: &str, cookie: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn delete_request(uri: &str, cookie: &str) -> Request<Body> {
+        Request::delete(uri)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn petrol_prices_need_a_session() {
+        let (_dir, app, path) = petrol_app(true, None).await;
+        let put = Request::put("/api/petrol-prices")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"from":"2026-03-01","cents_per_litre":199.0}"#,
+            ))
+            .unwrap();
+        for request in [
+            get_request("/api/petrol-prices", None),
+            put,
+            Request::delete("/api/petrol-prices/2026-03-01")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = send(&app, request).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn petrol_prices_can_be_put_listed_edited_by_hand_and_deleted() {
+        let (_dir, app, path) = petrol_app(true, None).await;
+        let cookie = log_in(&app).await;
+
+        let response = send(&app, get_request("/api/petrol-prices", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"file": true, "fallback_cents_per_litre": 190.0, "prices": []})
+        );
+
+        let put = |body: &str| json_request("PUT", "/api/petrol-prices", &cookie, body);
+        let response = send(
+            &app,
+            put(r#"{"from":"2026-03-01","cents_per_litre":199.0}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(
+            &app,
+            put(r#"{"from":"2025-01-01","cents_per_litre":185.5}"#),
+        )
+        .await;
+        assert_eq!(
+            body_json(response).await["prices"],
+            serde_json::json!([
+                {"from": "2025-01-01", "cents_per_litre": 185.5},
+                {"from": "2026-03-01", "cents_per_litre": 199.0},
+            ])
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("from,cents_per_litre\n2025-01-01,185.5\n2026-03-01,199.0\n"));
+
+        // A hand edit shows on the next request, for the list and for the cars.
+        std::fs::write(
+            &path,
+            "from,cents_per_litre\n2026-03-01,150.0\n2026-04-01,160.25\n",
+        )
+        .unwrap();
+        let response = send(&app, get_request("/api/petrol-prices", Some(&cookie))).await;
+        assert_eq!(
+            body_json(response).await["prices"],
+            serde_json::json!([
+                {"from": "2026-03-01", "cents_per_litre": 150.0},
+                {"from": "2026-04-01", "cents_per_litre": 160.25},
+            ])
+        );
+        let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
+        assert_eq!(body_json(response).await["configured"], true);
+
+        // Replacing a date keeps the hand edit's other rows.
+        let response = send(
+            &app,
+            put(r#"{"from":"2026-04-01","cents_per_litre":170.0}"#),
+        )
+        .await;
+        assert_eq!(
+            body_json(response).await["prices"][1]["cents_per_litre"],
+            170.0
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("2026-03-01,150.0")
+        );
+
+        let response = send(
+            &app,
+            delete_request("/api/petrol-prices/2026-03-01", &cookie),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["prices"],
+            serde_json::json!([{"from": "2026-04-01", "cents_per_litre": 170.0}])
+        );
+        let response = send(
+            &app,
+            delete_request("/api/petrol-prices/2026-03-01", &cookie),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = send(&app, delete_request("/api/petrol-prices/March", &cookie)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn petrol_prices_reject_bad_input() {
+        let (_dir, app, path) = petrol_app(true, None).await;
+        let cookie = log_in(&app).await;
+        for body in [
+            r#"{"from":"March","cents_per_litre":199.0}"#,
+            r#"{"from":"2026-03-01","cents_per_litre":0}"#,
+            r#"{"from":"2026-03-01","cents_per_litre":-3.5}"#,
+            r#"{"from":"2026-03-01","cents_per_litre":"lots"}"#,
+            r#"{"from":"2026-03-01"}"#,
+            "not json",
+        ] {
+            let response = send(
+                &app,
+                json_request("PUT", "/api/petrol-prices", &cookie, body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert!(body_json(response).await["error"].is_string(), "{body}");
+        }
+        // A form cannot write: the body must be JSON.
+        let form = Request::put("/api/petrol-prices")
+            .header(header::COOKIE, &cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("from=2026-03-01&cents_per_litre=199"))
+            .unwrap();
+        let response = send(&app, form).await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn petrol_price_writes_need_the_file_setting() {
+        let (_dir, app, _path) = petrol_app(false, None).await;
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/petrol-prices", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["file"], false);
+        assert_eq!(json["fallback_cents_per_litre"], 190.0);
+
+        let body = r#"{"from":"2026-03-01","cents_per_litre":199.0}"#;
+        let response = send(
+            &app,
+            json_request("PUT", "/api/petrol-prices", &cookie, body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            body_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("petrol_prices_file")
+        );
+        let response = send(
+            &app,
+            delete_request("/api/petrol-prices/2026-03-01", &cookie),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn api_token_is_accepted_as_a_bearer_on_api_routes() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bearer = |uri: &str, value: &str| {
+            Request::get(uri)
+                .header(header::AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (_dir, app, _path) = petrol_app(true, Some(token)).await;
+
+        let response = send(
+            &app,
+            bearer("/api/petrol-prices", &format!("Bearer {token}")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // No cookie is issued for token requests.
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        let put = Request::put("/api/petrol-prices")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"from":"2026-03-01","cents_per_litre":199.0}"#,
+            ))
+            .unwrap();
+        assert_eq!(send(&app, put).await.status(), StatusCode::OK);
+
+        for value in [
+            "Bearer wrong",
+            "Bearer ",
+            "Bearer",
+            &format!("Bearer {token}x"),
+            &format!("Bearer {}", &token[1..]),
+            &format!("Basic {token}"),
+            token,
+        ] {
+            let response = send(&app, bearer("/api/petrol-prices", value)).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{value}");
+        }
+
+        // Pages outside /api/ still want the login.
+        let response = send(&app, bearer("/", &format!("Bearer {token}"))).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/login");
+    }
+
+    #[tokio::test]
+    async fn bearer_header_is_ignored_without_an_api_token() {
+        let (_dir, app, _path) = petrol_app(true, None).await;
+        for value in [
+            "Bearer ",
+            "Bearer anything",
+            "Bearer 0123456789abcdef0123456789abcdef",
+        ] {
+            let request = Request::get("/api/petrol-prices")
+                .header(header::AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(send(&app, request).await.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[tokio::test]
@@ -1219,7 +1515,7 @@ mod tests {
     #[tokio::test]
     async fn ev_cars_summarises_each_car_over_its_history() {
         let (_dir, _app, pool) = costs_app().await;
-        let router_with = |petrol: PetrolHistory| {
+        let router_with = |petrol: PetrolPrices| {
             let hash = hash_password(PASSWORD).unwrap();
             let tz = chrono_tz::Australia::Adelaide;
             let prices = EvPrices {
@@ -1231,11 +1527,11 @@ mod tests {
                 AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
                     .unwrap()
                     .with_ev_prices(prices)
-                    .with_petrol_history(petrol),
+                    .with_petrol_prices(petrol),
             )
         };
         let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
-        let app = router_with(PetrolHistory::new(Some(190.0), vec![(day(10), 200.0)]));
+        let app = router_with(PetrolPrices::fixed(Some(190.0), vec![(day(10), 200.0)]));
         let response = send(&app, get_request("/api/ev/cars", None)).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
@@ -1366,7 +1662,7 @@ mod tests {
 
         // With no petrol price at all the savings are null, the charging
         // costs stay.
-        let app = router_with(PetrolHistory::default());
+        let app = router_with(PetrolPrices::default());
         let cookie = log_in(&app).await;
         let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
         let json = body_json(response).await;

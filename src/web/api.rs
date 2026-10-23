@@ -86,6 +86,13 @@ impl ApiError {
         }
     }
 
+    pub(super) fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -423,8 +430,8 @@ pub async fn ev_summary(
 
 /// Each TeslaMate car's fuel savings over its whole history, newest car
 /// first: `{"configured":bool,"petrol_litres_per_100km":..,"cars":[{car_id,name,model,label,first_day,last_day,total:{...},months:[{month,...},...]},...]}`.
-/// `configured` is true with a `petrol_cents_per_litre` or any
-/// `[[teslamate.petrol_price]]` in `[teslamate]`. Money is in dollars. Each
+/// `configured` is true with a `petrol_cents_per_litre`, any
+/// `[[teslamate.petrol_price]]` or any entry in the `petrol_prices_file`. Money is in dollars. Each
 /// period has the km, petrol litres and cost (each day at that day's price),
 /// the home and away kWh, and the charging cost and saving `with_system` (as
 /// the home sessions were costed) and `without_system` (home charging at the
@@ -440,6 +447,8 @@ pub async fn ev_summary(
 /// charges are left out.
 pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
     let prices = state.ev_prices;
+    // Looks at the petrol prices file, so a hand edit shows on this request.
+    let petrol = state.petrol.current();
     let mut cars = Vec::new();
     for car in db::tm_cars(&state.pool).await? {
         let days: Vec<ev_cost::CarDay> = db::tm_drive_days(&state.pool, car.id)
@@ -455,7 +464,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
             .into_iter()
             .filter_map(|row| car_charge(&row, state.tz))
             .collect();
-        let history = ev_cost::summarise_car(&prices, &state.petrol_history, &days, &charges);
+        let history = ev_cost::summarise_car(&prices, &petrol, &days, &charges);
         if history.first_day.is_some() {
             cars.push((car, history));
         }
@@ -489,7 +498,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
         })
         .collect();
     Ok(Json(json!({
-        "configured": state.petrol_history.is_configured(),
+        "configured": petrol.is_configured(),
         "petrol_litres_per_100km": prices.petrol_litres_per_100km,
         "cars": cars,
     })))
