@@ -7,6 +7,7 @@ mod globird;
 mod ingest;
 mod isolar;
 mod modbus;
+mod petrol_prices;
 mod teslamate;
 mod teslamate_history;
 mod web;

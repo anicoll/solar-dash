@@ -11,11 +11,12 @@ use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use axum::Extension;
 use axum::Form;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::{Cookie, SameSite, SignedCookieJar};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use time::Duration;
 
@@ -200,13 +201,45 @@ fn session_cookie(state: &AppState, id: String) -> Cookie<'static> {
         .build()
 }
 
-/// Middleware: lets the request through only with a valid session.
+/// Whether the request carries `Authorization: Bearer <token>` matching the
+/// configured `api_token`. False when no token is configured.
+fn bearer_matches(headers: &HeaderMap, token: Option<&str>) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    let given = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    // Both sides are hashed first, so the comparison takes the same time
+    // whatever the length of the guess or where it first differs.
+    given.is_some_and(|given| {
+        !given.is_empty() && {
+            let a = Sha256::digest(given.as_bytes());
+            let b = Sha256::digest(token.as_bytes());
+            a.iter()
+                .zip(b.iter())
+                .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                == 0
+        }
+    })
+}
+
+/// Middleware: lets the request through only with a valid session, or, on
+/// `/api/` routes, the configured `api_token` as a Bearer token (no cookie is
+/// issued for those).
 pub async fn require_session(
     State(state): State<AppState>,
     jar: SignedCookieJar,
     request: Request,
     next: Next,
 ) -> Response {
+    if request.uri().path().starts_with("/api/")
+        && bearer_matches(request.headers(), state.api_token.as_deref())
+    {
+        return next.run(request).await;
+    }
     // `get` returns `None` unless the signature checks out.
     let id = jar.get(COOKIE_NAME).map(|c| c.value().to_string());
     if let Some(id) = id {

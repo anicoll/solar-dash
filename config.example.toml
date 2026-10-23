@@ -47,6 +47,12 @@ bind = "127.0.0.1:8080"
 # Required by `serve`: without it the app refuses to start (a random key per
 # start would log you out on every restart).
 # session_secret = "..."
+# Optional: a secret for scripts. With it, `Authorization: Bearer <token>` is
+# accepted on /api/ routes as well as the login cookie. At least 32 characters;
+# make one with
+#   openssl rand -hex 32
+# Without it the header is ignored. Keep this file private; it is never logged.
+# api_token = "..."
 # Adds the `Secure` flag to the login cookie, so browsers only send it over
 # https. Leave this true (the default) when you reach the dashboard through
 # Cloudflare Tunnel. Set it to false ONLY to test over plain http on your LAN
@@ -103,6 +109,14 @@ path = "data/solar.db"
 # docs/how-to-run.md). Without it the history sync is off. The URL holds a
 # password, so keep this file private; it is never logged.
 # database_url = "postgres://solar_dash:change-me@192.168.1.70:5432/teslamate"
+# Optional: keep the petrol prices that changed over time in a CSV file instead
+# of the [[teslamate.petrol_price]] tables below (set one or the other). The file
+# can be edited by hand (it is re-read when it changes) or updated through
+# /api/petrol-prices. It starts with the line `from,cents_per_litre`, then one
+# `YYYY-MM-DD,195.0` row per change. A missing file counts as empty and is
+# created on the first change, so the solar-dash user must be able to write
+# there. petrol_cents_per_litre still applies before the first row.
+# petrol_prices_file = "/var/lib/solar-dash/petrol-prices.csv"
 # Optional: petrol prices that changed over time, for the per-car savings over
 # the whole history (/api/ev/cars). A day uses the entry with the latest
 # `from` on or before it; before the first entry it uses petrol_cents_per_litre.
