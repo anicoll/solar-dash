@@ -284,6 +284,19 @@ pub struct Tariff {
     pub export: Vec<PriceWindow>,
     /// Optional daily credit for (almost) no grid import in a window.
     pub zero_import_credit: Option<ZeroImportCredit>,
+    /// Optional daily tiered feed-in: the first kWh exported each day earn a
+    /// different rate. Left out of the stored key when unset, so plans without
+    /// it keep their stored costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_tier: Option<ExportTier>,
+}
+
+/// A feed-in rate for the first `first_kwh_per_day` kWh exported in each local
+/// day (in time order from midnight), instead of the time-of-day rate.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExportTier {
+    pub first_kwh_per_day: f64,
+    pub cents: f64,
 }
 
 /// A daily time window with a price. `from` is inclusive and `to` exclusive,
@@ -354,6 +367,16 @@ impl Tariff {
         }
         if let Some(c) = &self.zero_import_credit {
             check_window(section, "zero_import_credit", &c.from, &c.to)?;
+        }
+        if let Some(t) = &self.export_tier {
+            anyhow::ensure!(
+                t.first_kwh_per_day.is_finite() && t.first_kwh_per_day > 0.0,
+                "export_tier.first_kwh_per_day in {section} must be greater than 0"
+            );
+            anyhow::ensure!(
+                t.cents.is_finite() && t.cents >= 0.0,
+                "export_tier.cents in {section} must not be negative"
+            );
         }
         Ok(())
     }
@@ -830,6 +853,56 @@ mod tests {
             let err = check_tariff(&format!("[tariff]\n{body}")).unwrap_err();
             assert!(format!("{err:#}").contains(field), "{field}: {err:#}");
         }
+    }
+
+    #[test]
+    fn export_tier_parses_and_is_checked() {
+        let ok = format!("{CURRENT}[tariff.export_tier]\nfirst_kwh_per_day = 14.0\ncents = 15.0\n");
+        check_tariff(&ok).unwrap();
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{ok}")).unwrap();
+        let tier = cfg.tariff.unwrap().export_tier.unwrap();
+        assert_eq!((tier.first_kwh_per_day, tier.cents), (14.0, 15.0));
+        // Zero cents is a valid (if odd) rate.
+        check_tariff(&ok.replace("15.0", "0.0")).unwrap();
+        check_tariff(CURRENT).unwrap();
+        let cases = [
+            (
+                "first_kwh_per_day = 0.0\ncents = 15.0",
+                "export_tier.first_kwh_per_day in [tariff]",
+            ),
+            (
+                "first_kwh_per_day = -1.0\ncents = 15.0",
+                "export_tier.first_kwh_per_day in [tariff]",
+            ),
+            (
+                "first_kwh_per_day = 14.0\ncents = -1.0",
+                "export_tier.cents in [tariff]",
+            ),
+        ];
+        for (body, expected) in cases {
+            let text = format!("{CURRENT}[tariff.export_tier]\n{body}\n");
+            let err = check_tariff(&text).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{expected}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn export_tier_in_a_previous_tariff() {
+        let text = format!(
+            "{CURRENT}{}[previous_tariff.export_tier]\nfirst_kwh_per_day = 14.0\ncents = 15.0\n",
+            previous("2025-06-30")
+        );
+        check_previous(&text).unwrap();
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{text}")).unwrap();
+        assert!(cfg.tariff.unwrap().export_tier.is_none());
+        let tier = cfg.previous_tariff[0].tariff.export_tier.as_ref().unwrap();
+        assert_eq!((tier.first_kwh_per_day, tier.cents), (14.0, 15.0));
+        let bad = text.replace("14.0", "0.0");
+        let err = check_previous(&bad).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("export_tier.first_kwh_per_day in [[previous_tariff]] #1"),
+            "{err:#}"
+        );
     }
 
     /// Parse MINIMAL plus these sections and run the previous-plan checks.

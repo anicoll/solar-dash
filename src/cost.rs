@@ -62,6 +62,12 @@ struct ZeroImportCredit {
     credit_cents: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExportTier {
+    first_kwh: f64,
+    cents: f64,
+}
+
 /// A tariff with its times already parsed to minutes, so lookups are cheap
 /// and cannot fail. Build it from the config with [`Tariff::from_config`].
 #[derive(Debug, Clone)]
@@ -72,6 +78,7 @@ pub struct Tariff {
     default_export_cents: f64,
     export: Vec<PricedWindow>,
     zero_import_credit: Option<ZeroImportCredit>,
+    export_tier: Option<ExportTier>,
     /// Identifies these exact rates; see [`Tariff::key`].
     key: String,
 }
@@ -125,6 +132,10 @@ impl Tariff {
             default_export_cents: cfg.default_export_cents,
             export: parse_priced(&cfg.export).context("invalid export window in [tariff]")?,
             zero_import_credit,
+            export_tier: cfg.export_tier.as_ref().map(|t| ExportTier {
+                first_kwh: t.first_kwh_per_day,
+                cents: t.cents,
+            }),
             key: serde_json::to_string(cfg).context("could not describe the [tariff] section")?,
         })
     }
@@ -194,6 +205,31 @@ impl Tariff {
     /// The most grid import (kWh) in the credit window that still earns the credit.
     pub fn credit_max_kwh(&self) -> Option<f64> {
         self.zero_import_credit.as_ref().map(|c| c.max_kwh)
+    }
+
+    /// The daily feed-in tier as `(first_kwh_per_day, cents)`, or `None`.
+    pub fn export_tier(&self) -> Option<(f64, f64)> {
+        self.export_tier.map(|t| (t.first_kwh, t.cents))
+    }
+
+    /// Splits `kwh` exported now, after `already_kwh` earlier the same local
+    /// day, into `(tier_kwh, rest_kwh)`: the part still inside the daily tier
+    /// (paid the tier rate) and the part paid by time of day. Without a tier
+    /// everything is `rest`.
+    fn split_export_tier(&self, already_kwh: f64, kwh: f64) -> (f64, f64) {
+        let Some(tier) = self.export_tier else {
+            return (0.0, kwh);
+        };
+        let tier_kwh = (tier.first_kwh - already_kwh).max(0.0).min(kwh);
+        (tier_kwh, kwh - tier_kwh)
+    }
+
+    /// Cents earned for exporting `kwh` at this local time, after
+    /// `already_kwh` earlier the same local day (for the daily export tier).
+    pub fn export_value_cents(&self, minute_of_day: u32, already_kwh: f64, kwh: f64) -> f64 {
+        let (tier_kwh, rest_kwh) = self.split_export_tier(already_kwh, kwh);
+        let tier_cents = self.export_tier.map_or(0.0, |t| t.cents);
+        tier_kwh * tier_cents + rest_kwh * self.export_cents_at(minute_of_day)
     }
 
     /// Cents per kWh paid to import at this local time (minutes since midnight).
@@ -368,6 +404,24 @@ pub struct GridSplit {
     pub export_super_kwh: f64,
     pub export_peak_kwh: f64,
     pub export_other_kwh: f64,
+    /// Export paid the daily tier rate (`export_tier`), whatever the time of
+    /// day. The other `export_*` parts hold only the exports after the tier.
+    pub export_tier_kwh: f64,
+}
+
+/// The intervals in time order, which the daily export tier needs (it counts
+/// kWh from midnight). Only copies when a tier exists and they are out of order.
+fn in_time_order<'a>(
+    tariff: &Tariff,
+    intervals: &'a [Interval],
+) -> std::borrow::Cow<'a, [Interval]> {
+    let sorted = intervals.windows(2).all(|p| p[0].start_ts <= p[1].start_ts);
+    if tariff.export_tier.is_none() || sorted {
+        return std::borrow::Cow::Borrowed(intervals);
+    }
+    let mut copy = intervals.to_vec();
+    copy.sort_by_key(|iv| iv.start_ts);
+    std::borrow::Cow::Owned(copy)
 }
 
 /// The local minute an interval is priced at: its midpoint.
@@ -380,19 +434,26 @@ fn interval_minute(tz: Tz, iv: &Interval) -> u32 {
 /// Splits a day's grid import and export by tariff band, classifying each
 /// interval at its midpoint exactly as [`day_cost`] prices it, so the parts add
 /// up to `day_cost`'s `import_kwh` and `export_kwh` for the same intervals.
+/// Export inside the daily `export_tier` is counted in `export_tier_kwh`
+/// (splitting an interval that crosses the threshold); only the rest is
+/// classified by time of day.
 pub fn grid_split(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> GridSplit {
     let mut split = GridSplit::default();
-    for iv in intervals {
+    let mut exported = 0.0;
+    for iv in in_time_order(tariff, intervals).iter() {
         let minute = interval_minute(tz, iv);
         match tariff.import_band_at(minute) {
             ImportBand::Free => split.import_free_kwh += iv.import_kwh,
             ImportBand::Shoulder => split.import_shoulder_kwh += iv.import_kwh,
             ImportBand::Peak => split.import_peak_kwh += iv.import_kwh,
         }
+        let (tier_kwh, rest_kwh) = tariff.split_export_tier(exported, iv.export_kwh);
+        exported += iv.export_kwh;
+        split.export_tier_kwh += tier_kwh;
         match tariff.export_band_at(minute) {
-            ExportBand::Super => split.export_super_kwh += iv.export_kwh,
-            ExportBand::Peak => split.export_peak_kwh += iv.export_kwh,
-            ExportBand::Other => split.export_other_kwh += iv.export_kwh,
+            ExportBand::Super => split.export_super_kwh += rest_kwh,
+            ExportBand::Peak => split.export_peak_kwh += rest_kwh,
+            ExportBand::Other => split.export_other_kwh += rest_kwh,
         }
     }
     split
@@ -431,8 +492,10 @@ pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
     let mut window_import_kwh = 0.0;
     let mut window_finished = false;
     let mut baseline_import_cents = 0.0;
+    // Export so far today, for the daily export tier.
+    let mut exported = 0.0;
 
-    for iv in intervals {
+    for iv in in_time_order(tariff, intervals).iter() {
         let minute = interval_minute(tz, iv);
         let import_price = tariff.import_cents_at(minute);
 
@@ -440,7 +503,8 @@ pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
         cost.export_kwh += iv.export_kwh;
         cost.load_kwh += iv.load_kwh;
         cost.import_cents += iv.import_kwh * import_price;
-        cost.export_cents += iv.export_kwh * tariff.export_cents_at(minute);
+        cost.export_cents += tariff.export_value_cents(minute, exported, iv.export_kwh);
+        exported += iv.export_kwh;
         baseline_import_cents += iv.load_kwh * import_price;
 
         if let Some(credit) = &tariff.zero_import_credit
@@ -917,5 +981,109 @@ mod tests {
         );
         assert_eq!(bands(&split_at(&flat, 12, 0)), (1, 2));
         assert_eq!(bands(&split_at(&flat, 19, 0)), (1, 2));
+    }
+
+    /// The old plan: first 14 kWh a day at 15c, then 5c (with a 10c window).
+    const TIERED: &str = r#"
+        [tariff]
+        supply_cents_per_day = 100.0
+        default_import_cents = 30.0
+        default_export_cents = 5.0
+        export = [{ from = "18:00", to = "21:00", cents = 10.0 }]
+        [tariff.export_tier]
+        first_kwh_per_day = 14.0
+        cents = 15.0
+    "#;
+
+    #[test]
+    fn the_tier_boundary_splits_one_interval() {
+        let t = tariff(TIERED);
+        // 13.9 kWh by midday, then 0.5 kWh: 0.1 in the tier, 0.4 after it.
+        let intervals = [
+            iv((10, 0), (10, 5), 0.0, 13.9, 0.0),
+            iv((12, 0), (12, 5), 0.0, 0.5, 0.0),
+        ];
+        let cost = day_cost(&t, ADELAIDE, &intervals);
+        assert!(close(cost.export_kwh, 14.4));
+        assert!(close(cost.export_cents, 14.0 * 15.0 + 0.4 * 5.0));
+        let split = grid_split(&t, ADELAIDE, &intervals);
+        assert!(close(split.export_tier_kwh, 14.0));
+        assert!(close(split.export_other_kwh, 0.4));
+        assert!(close(split.export_super_kwh + split.export_peak_kwh, 0.0));
+    }
+
+    #[test]
+    fn days_below_and_above_the_threshold() {
+        let t = tariff(TIERED);
+        let below = [iv((12, 0), (12, 5), 0.0, 6.0, 0.0)];
+        let cost = day_cost(&t, ADELAIDE, &below);
+        assert!(close(cost.export_cents, 6.0 * 15.0));
+        let split = grid_split(&t, ADELAIDE, &below);
+        assert!(close(split.export_tier_kwh, 6.0));
+        assert!(close(split.export_other_kwh, 0.0));
+
+        // 20 kWh: the first 14 in time order are at 15c wherever they fall,
+        // so the 10c evening window is only paid after the tier is used up.
+        let above = [
+            iv((9, 0), (9, 5), 0.0, 10.0, 0.0),
+            iv((17, 0), (17, 5), 0.0, 4.0, 0.0),
+            iv((19, 0), (19, 5), 0.0, 6.0, 0.0),
+        ];
+        let cost = day_cost(&t, ADELAIDE, &above);
+        assert!(close(cost.export_cents, 14.0 * 15.0 + 6.0 * 10.0));
+        let split = grid_split(&t, ADELAIDE, &above);
+        assert!(close(split.export_tier_kwh, 14.0));
+        assert!(close(split.export_super_kwh + split.export_peak_kwh, 6.0));
+        // Parts add up to the exported energy, and out-of-order input is sorted.
+        let reversed: Vec<_> = above.iter().rev().copied().collect();
+        assert!(close(
+            day_cost(&t, ADELAIDE, &reversed).export_cents,
+            cost.export_cents
+        ));
+        assert_eq!(grid_split(&t, ADELAIDE, &reversed), split);
+    }
+
+    #[test]
+    fn plans_without_a_tier_are_unchanged() {
+        let t = zerohero();
+        assert!(t.export_tier().is_none());
+        let cost = day_cost(&t, ADELAIDE, &[iv((19, 0), (19, 5), 0.0, 30.0, 0.0)]);
+        assert!(close(cost.export_cents, 300.0));
+        // The key does not mention the tier, so stored costs stay valid.
+        assert!(!t.key().contains("export_tier"));
+        assert!(tariff(TIERED).key().contains("export_tier"));
+    }
+
+    #[test]
+    fn the_tier_on_a_previous_plan_only_applies_to_its_days() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: config::Tariff,
+            previous_tariff: Vec<config::PreviousTariff>,
+        }
+        let w: Wrapper = toml::from_str(
+            r#"
+            [tariff]
+            supply_cents_per_day = 1.0
+            default_import_cents = 30.0
+            default_export_cents = 5.0
+            [[previous_tariff]]
+            until = "2026-06-30"
+            supply_cents_per_day = 1.0
+            default_import_cents = 30.0
+            default_export_cents = 5.0
+            [previous_tariff.export_tier]
+            first_kwh_per_day = 14.0
+            cents = 15.0
+            "#,
+        )
+        .unwrap();
+        let schedule = TariffSchedule::from_config(&w.tariff, &w.previous_tariff).unwrap();
+        let day = [iv((12, 0), (12, 5), 0.0, 20.0, 0.0)];
+        let cost_on = |date: &str| {
+            day_cost(schedule.for_date(date.parse().unwrap()), ADELAIDE, &day).export_cents
+        };
+        assert!(close(cost_on("2026-06-30"), 14.0 * 15.0 + 6.0 * 5.0));
+        assert!(close(cost_on("2026-07-01"), 20.0 * 5.0));
     }
 }

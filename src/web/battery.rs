@@ -122,6 +122,8 @@ fn peak_load_kw(spells: &BTreeMap<i64, (f64, i64)>) -> Option<f64> {
 fn day_sums(tariff: &Tariff, tz: Tz, free_start: u32, intervals: &[Interval]) -> DaySums {
     let mut sums = DaySums::default();
     let mut spells: BTreeMap<i64, (f64, i64)> = BTreeMap::new();
+    // Export so far today, so the daily export tier is valued where it falls.
+    let mut exported = 0.0;
     for iv in intervals {
         let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
         let minute = local_minute_of_day(tz, mid);
@@ -129,11 +131,12 @@ fn day_sums(tariff: &Tariff, tz: Tz, free_start: u32, intervals: &[Interval]) ->
             sums.has_window_data = true;
             sums.window_import_kwh += iv.import_kwh;
             sums.window_export_kwh += iv.export_kwh;
-            sums.window_export_cents += iv.export_kwh * tariff.export_cents_at(minute);
+            sums.window_export_cents += tariff.export_value_cents(minute, exported, iv.export_kwh);
             let spell = spells.entry(iv.start_ts / LOAD_SPELL_SECS).or_default();
             spell.0 += iv.load_kwh;
             spell.1 += iv.end_ts - iv.start_ts;
         }
+        exported += iv.export_kwh;
         if minute < free_start {
             sums.morning_import_kwh += iv.import_kwh;
             sums.morning_import_cents += iv.import_kwh * tariff.import_cents_at(minute);

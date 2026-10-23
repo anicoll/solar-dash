@@ -730,6 +730,7 @@ struct SplitSums {
     export_super_kwh: Option<f64>,
     export_peak_kwh: Option<f64>,
     export_other_kwh: Option<f64>,
+    export_tier_kwh: Option<f64>,
 }
 
 impl SplitSums {
@@ -743,6 +744,7 @@ impl SplitSums {
         add(&mut self.export_super_kwh, split.export_super_kwh);
         add(&mut self.export_peak_kwh, split.export_peak_kwh);
         add(&mut self.export_other_kwh, split.export_other_kwh);
+        add(&mut self.export_tier_kwh, split.export_tier_kwh);
     }
 
     fn merge(&mut self, other: &SplitSums) {
@@ -757,6 +759,7 @@ impl SplitSums {
         add(&mut self.export_super_kwh, other.export_super_kwh);
         add(&mut self.export_peak_kwh, other.export_peak_kwh);
         add(&mut self.export_other_kwh, other.export_other_kwh);
+        add(&mut self.export_tier_kwh, other.export_tier_kwh);
     }
 }
 
@@ -1534,6 +1537,7 @@ mod tests {
         assert!(near(&day["export_super_kwh"], 2.0));
         assert!(near(&day["export_peak_kwh"], 1.0));
         assert!(near(&day["export_other_kwh"], 0.0));
+        assert!(near(&day["export_tier_kwh"], 0.0));
         // The existing fields are unchanged, and the parts add up to them.
         assert_eq!(day["import_kwh"], 1.5);
         assert_eq!(day["export_kwh"], 3.0);
