@@ -421,6 +421,118 @@ pub async fn ev_summary(
     })))
 }
 
+/// Each TeslaMate car's fuel savings over its whole history, newest car
+/// first: `{"configured":bool,"petrol_litres_per_100km":..,"cars":[{car_id,name,model,label,first_day,last_day,total:{...},months:[{month,...},...]},...]}`.
+/// `configured` is true with a `petrol_cents_per_litre` or any
+/// `[[teslamate.petrol_price]]` in `[teslamate]`. Money is in dollars. Each
+/// period has the km, petrol litres and cost (each day at that day's price),
+/// the home and away kWh, and the charging cost and saving `with_system` (as
+/// the home sessions were costed) and `without_system` (home charging at the
+/// baseline), with `system_added` the difference; see `ev_cost::CarPeriod`.
+///
+/// The numbers come from the synced `tm_*` tables (the Postgres history
+/// sync), not the live MQTT data, so the list is empty until that has run.
+/// Sessions count in the local month they started, and only the home ones
+/// (geofence "Home") are costed from the house's energy; home sessions not
+/// costed yet are counted in `pending_sessions` and left out of the money.
+/// `label` is "Model <model>", else the car's name, else "Car <id>", with the
+/// name added when two cars would share a label. Cars with no drives and no
+/// charges are left out.
+pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
+    let prices = state.ev_prices;
+    let mut cars = Vec::new();
+    for car in db::tm_cars(&state.pool).await? {
+        let days: Vec<ev_cost::CarDay> = db::tm_drive_days(&state.pool, car.id)
+            .await?
+            .into_iter()
+            .map(|day| ev_cost::CarDay {
+                date: day.date,
+                km: day.km,
+            })
+            .collect();
+        let charges: Vec<ev_cost::CarCharge> = db::tm_charge_rows(&state.pool, car.id)
+            .await?
+            .into_iter()
+            .filter_map(|row| car_charge(&row, state.tz))
+            .collect();
+        let history = ev_cost::summarise_car(&prices, &state.petrol_history, &days, &charges);
+        if history.first_day.is_some() {
+            cars.push((car, history));
+        }
+    }
+    // Newest car first.
+    cars.sort_by(|a, b| {
+        b.1.first_day
+            .cmp(&a.1.first_day)
+            .then_with(|| a.0.id.cmp(&b.0.id))
+    });
+    let labels: Vec<String> = cars.iter().map(|(car, _)| car_label(car)).collect();
+    let cars: Vec<Value> = cars
+        .iter()
+        .zip(&labels)
+        .map(|((car, history), label)| {
+            let shared = labels.iter().filter(|other| *other == label).count() > 1;
+            let label = match (&car.name, shared) {
+                (Some(name), true) => format!("{label} ({name})"),
+                _ => label.clone(),
+            };
+            json!({
+                "car_id": car.id,
+                "name": car.name,
+                "model": car.model,
+                "label": label,
+                "first_day": history.first_day,
+                "last_day": history.last_day,
+                "total": history.total,
+                "months": history.months,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "configured": state.petrol_history.is_configured(),
+        "petrol_litres_per_100km": prices.petrol_litres_per_100km,
+        "cars": cars,
+    })))
+}
+
+/// "Model 3" for a car with a model, else its name, else "Car 1".
+fn car_label(car: &db::TmCar) -> String {
+    let set = |text: &Option<String>| text.clone().filter(|t| !t.trim().is_empty());
+    match (set(&car.model), set(&car.name)) {
+        (Some(model), _) => format!("Model {model}"),
+        (None, Some(name)) => name,
+        (None, None) => format!("Car {}", car.id),
+    }
+}
+
+/// A stored session as the savings summary adds it up, or `None` if it took
+/// no energy. Only a session at "Home" with all its cost columns is costed.
+fn car_charge(row: &db::TmChargeRow, tz: Tz) -> Option<ev_cost::CarCharge> {
+    let kwh = row
+        .energy_used_kwh
+        .or(row.energy_added_kwh)
+        .filter(|kwh| *kwh > 0.0)?;
+    let started = DateTime::from_timestamp(row.started_at, 0)?;
+    let cost = match (row.cost_key.as_ref(), row.cost_cents, row.baseline_cents) {
+        (Some(_), Some(cost_cents), Some(baseline_cents)) => Some(ev_cost::HistoricCost {
+            kwh,
+            grid_kwh: row.grid_kwh.unwrap_or(0.0),
+            self_kwh: row.self_kwh.unwrap_or(0.0),
+            uncovered_kwh: row.uncovered_kwh.unwrap_or(0.0),
+            cost_cents,
+            baseline_cents,
+            feed_in_forgone_cents: row.feed_in_forgone_cents.unwrap_or(0.0),
+        }),
+        _ => None,
+    };
+    Some(ev_cost::CarCharge {
+        date: started.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+        kwh,
+        at_home: row.geofence.as_deref() == Some("Home"),
+        cost,
+    })
+}
+
 fn parse_date(name: &str, text: &str) -> Result<NaiveDate, ApiError> {
     NaiveDate::parse_from_str(text, "%Y-%m-%d")
         .map_err(|_| ApiError::bad_request(format!("{name} must look like 2026-10-20")))

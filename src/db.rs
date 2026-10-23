@@ -1130,6 +1130,69 @@ pub async fn save_tm_charge_cost(pool: &SqlitePool, id: i64, cost: &TmChargeCost
     Ok(())
 }
 
+/// Every car in `tm_car`, by id.
+pub async fn tm_cars(pool: &SqlitePool) -> Result<Vec<TmCar>> {
+    let rows: Vec<(i64, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT id, name, model FROM tm_car ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .context("could not read the TeslaMate cars")?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, model)| TmCar { id, name, model })
+        .collect())
+}
+
+/// A car's km on each local day it drove, oldest first.
+pub async fn tm_drive_days(pool: &SqlitePool, car_id: i64) -> Result<Vec<TmDriveDay>> {
+    let rows: Vec<(String, f64, i64)> = sqlx::query_as(
+        "SELECT date, km, drives FROM tm_drive_daily WHERE car_id = ? ORDER BY date",
+    )
+    .bind(car_id)
+    .fetch_all(pool)
+    .await
+    .context("could not read a car's daily km")?;
+    Ok(rows
+        .into_iter()
+        .map(|(date, km, drives)| TmDriveDay {
+            car_id,
+            date,
+            km,
+            drives,
+        })
+        .collect())
+}
+
+/// A charging session with what it cost, as far as the savings summary needs.
+/// The cost columns are `None` until the session has been costed.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct TmChargeRow {
+    pub started_at: i64,
+    pub energy_added_kwh: Option<f64>,
+    pub energy_used_kwh: Option<f64>,
+    pub geofence: Option<String>,
+    pub cost_key: Option<String>,
+    pub grid_kwh: Option<f64>,
+    pub self_kwh: Option<f64>,
+    pub uncovered_kwh: Option<f64>,
+    pub cost_cents: Option<f64>,
+    pub baseline_cents: Option<f64>,
+    pub feed_in_forgone_cents: Option<f64>,
+}
+
+/// A car's charging sessions, oldest first.
+pub async fn tm_charge_rows(pool: &SqlitePool, car_id: i64) -> Result<Vec<TmChargeRow>> {
+    sqlx::query_as(
+        "SELECT started_at, energy_added_kwh, energy_used_kwh, geofence, cost_key, grid_kwh,
+                self_kwh, uncovered_kwh, cost_cents, baseline_cents, feed_in_forgone_cents
+         FROM tm_charge WHERE car_id = ? ORDER BY started_at, id",
+    )
+    .bind(car_id)
+    .fetch_all(pool)
+    .await
+    .context("could not read a car's charges")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1940,5 +2003,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(key.as_deref(), Some("k2"));
+    }
+
+    #[tokio::test]
+    async fn tm_history_is_read_per_car() {
+        let (_dir, pool) = test_db().await;
+        assert!(tm_cars(&pool).await.unwrap().is_empty());
+        let car = |id: i64, name: &str| TmCar {
+            id,
+            name: Some(name.to_string()),
+            model: None,
+        };
+        upsert_tm_cars(&pool, &[car(10001, "B"), car(1, "A")], 5)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = tm_cars(&pool).await.unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![1, 10001]);
+
+        let day = |car_id: i64, date: &str, km: f64| TmDriveDay {
+            car_id,
+            date: date.to_string(),
+            km,
+            drives: 2,
+        };
+        upsert_tm_drive_days(
+            &pool,
+            &[
+                day(1, "2026-10-21", 3.0),
+                day(1, "2026-10-20", 12.5),
+                day(10001, "2026-10-20", 99.0),
+            ],
+        )
+        .await
+        .unwrap();
+        let days = tm_drive_days(&pool, 1).await.unwrap();
+        assert_eq!(
+            days,
+            vec![day(1, "2026-10-20", 12.5), day(1, "2026-10-21", 3.0)]
+        );
+        assert!(tm_drive_days(&pool, 7).await.unwrap().is_empty());
+
+        let mut away = tm_charge(2, 1, Some(100));
+        away.geofence = None;
+        save_tm_charges(
+            &pool,
+            &[tm_charge(3, 1, Some(100)), away, tm_charge(4, 10001, None)],
+        )
+        .await
+        .unwrap();
+        let cost = TmChargeCost {
+            cost_key: "k".to_string(),
+            grid_kwh: 6.0,
+            self_kwh: 5.0,
+            uncovered_kwh: 1.0,
+            cost_cents: 150.0,
+            baseline_cents: 330.0,
+            feed_in_forgone_cents: 25.0,
+        };
+        save_tm_charge_cost(&pool, 3, &cost).await.unwrap();
+        let rows = tm_charge_rows(&pool, 1).await.unwrap();
+        // Oldest first; the costed one carries its figures, the other none.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].started_at, 2002);
+        assert_eq!(rows[0].geofence, None);
+        assert_eq!(rows[0].cost_key, None);
+        assert_eq!(rows[0].cost_cents, None);
+        assert_eq!(rows[1].energy_used_kwh, Some(11.0));
+        assert_eq!(rows[1].cost_key.as_deref(), Some("k"));
+        assert_eq!(rows[1].baseline_cents, Some(330.0));
+        assert_eq!(rows[1].feed_in_forgone_cents, Some(25.0));
     }
 }

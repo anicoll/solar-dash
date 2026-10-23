@@ -92,7 +92,7 @@ path = "data/solar.db"
 # what you really pay.
 # petrol_cents_per_litre = 195.0
 # How much petrol a comparable petrol car uses per 100 km.
-# petrol_litres_per_100km = 7.5
+# petrol_litres_per_100km = 6.9
 # A flat price per kWh for charging away from home (a public charger, say).
 # Without it, away sessions are listed as uncosted. Home is the geofence
 # "Home" (or no geofence at all).
@@ -103,6 +103,19 @@ path = "data/solar.db"
 # docs/how-to-run.md). Without it the history sync is off. The URL holds a
 # password, so keep this file private; it is never logged.
 # database_url = "postgres://solar_dash:change-me@192.168.1.70:5432/teslamate"
+# Optional: petrol prices that changed over time, for the per-car savings over
+# the whole history (/api/ev/cars). A day uses the entry with the latest
+# `from` on or before it; before the first entry it uses petrol_cents_per_litre.
+# Dates are YYYY-MM-DD, oldest first, each later than the one before. With
+# entries but no petrol_cents_per_litre, km before the first entry have no
+# price and the petrol cost stays empty. Keep these
+# after the other [teslamate] keys, as TOML needs.
+# [[teslamate.petrol_price]]
+# from = "2025-01-01"
+# cents_per_litre = 185.0
+# [[teslamate.petrol_price]]
+# from = "2026-03-01"
+# cents_per_litre = 199.0
 
 # Optional: your GloBird Energy customer portal login, used by `globird-probe`
 # and by `serve`, which keeps GloBird's daily cost and usage in the database

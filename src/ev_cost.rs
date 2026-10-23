@@ -1,7 +1,8 @@
 //! Where a charging session's energy came from (solar, the home battery or
 //! the grid) and what it cost. Pure functions only: no database, no network,
 //! so the rules can be tested with plain numbers. It also adds sessions and
-//! km up into the car-versus-petrol summary.
+//! km up into the car-versus-petrol summary, and the whole TeslaMate history
+//! into a per-car fuel savings summary.
 //!
 //! The car's own power is not stored. It sits behind the house meter, so it
 //! is already part of the house load in the live samples. We cannot see which
@@ -594,6 +595,270 @@ pub fn summarise(
         configured: prices.petrol_cents_per_litre.is_some(),
         months,
         total: period(prices, total_km, &all),
+    }
+}
+
+/// What petrol cost on each day; see `[teslamate]` in config.example.toml.
+/// The price of a day is the latest change that started on or before it;
+/// before the first change (or with none) it is the base price.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PetrolHistory {
+    /// `petrol_cents_per_litre`, which applies before the first change.
+    base: Option<f64>,
+    /// Local day ("YYYY-MM-DD") a price started on and the price in cents per
+    /// litre, oldest first.
+    changes: Vec<(String, f64)>,
+}
+
+impl PetrolHistory {
+    pub fn new(base: Option<f64>, mut changes: Vec<(NaiveDate, f64)>) -> Self {
+        changes.sort_by_key(|(from, _)| *from);
+        Self {
+            base,
+            changes: changes
+                .into_iter()
+                .map(|(from, cents)| (from.format("%Y-%m-%d").to_string(), cents))
+                .collect(),
+        }
+    }
+
+    /// Whether any petrol price is known at all.
+    pub fn is_configured(&self) -> bool {
+        self.base.is_some() || !self.changes.is_empty()
+    }
+
+    /// The price in cents per litre on a local day ("YYYY-MM-DD"), or `None`
+    /// before the first change when there is no base price.
+    pub fn on(&self, day: &str) -> Option<f64> {
+        self.changes
+            .iter()
+            .rev()
+            .find(|(from, _)| from.as_str() <= day)
+            .map(|(_, cents)| *cents)
+            .or(self.base)
+    }
+}
+
+/// One day of a car's driving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarDay {
+    /// The local day, "YYYY-MM-DD".
+    pub date: String,
+    pub km: f64,
+}
+
+/// One charging session of a car, ready to be added up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarCharge {
+    /// The local day it started, "YYYY-MM-DD".
+    pub date: String,
+    /// The energy it took, as in [`session_energy_kwh`].
+    pub kwh: f64,
+    /// Geofence "Home". No geofence counts as away here.
+    pub at_home: bool,
+    /// What the session cost with the system, from the house's energy. `None`
+    /// for a home session that is not costed yet; unused for away sessions.
+    pub cost: Option<HistoricCost>,
+}
+
+/// What charging cost one way, and what that saved against petrol.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Scenario {
+    /// Dollars: home sessions plus away sessions at `away_cents_per_kwh`.
+    /// Away sessions without that price count as nothing.
+    pub charging_cost: f64,
+    /// Petrol cost minus `charging_cost`; `None` without a petrol price.
+    pub saved: Option<f64>,
+    /// `None` when the car did not drive.
+    pub cents_per_km: Option<f64>,
+}
+
+/// One month, or the whole history, of one car. Money is in dollars, energy
+/// in kWh. `with_system` costs home charging as it was (solar and battery
+/// first, the grid for the rest) and `without_system` as if all of it came
+/// from the grid at the plan's prices.
+///
+/// Home sessions that are not costed yet (`pending_sessions`) are in
+/// `home_kwh` but left out of every money figure and of `grid_kwh`,
+/// `self_kwh`, `uncovered_kwh` and `feed_in_forgone`, so a big pending count
+/// means the savings are too small.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CarPeriod {
+    pub km: f64,
+    pub petrol_litres: f64,
+    /// Each day's km at that day's price. `None` when a day that drove has no
+    /// price (no base `petrol_cents_per_litre` before the first change).
+    pub petrol_cost: Option<f64>,
+    pub home_kwh: f64,
+    pub away_kwh: f64,
+    /// `None` when there were away sessions and no `away_cents_per_kwh`.
+    pub away_cost: Option<f64>,
+    /// The away kWh left out of the charging costs for want of a price.
+    pub away_uncosted_kwh: f64,
+    pub with_system: Scenario,
+    pub without_system: Scenario,
+    /// What the solar and battery added: `without_system` charging cost less
+    /// `with_system` charging cost.
+    pub system_added: f64,
+    pub grid_kwh: f64,
+    /// From solar or the home battery.
+    pub self_kwh: f64,
+    /// The part of the costed home charging in time the house data does not
+    /// cover; counted as grid, so it shows how much is an estimate.
+    pub uncovered_kwh: f64,
+    pub feed_in_forgone: f64,
+    pub pending_sessions: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CarMonth {
+    /// "YYYY-MM"
+    pub month: String,
+    #[serde(flatten)]
+    pub period: CarPeriod,
+}
+
+/// A car's whole history, by month (oldest first) and in total.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CarHistory {
+    /// The first and last local day with driving or charging; `None` for a
+    /// car with neither.
+    pub first_day: Option<String>,
+    pub last_day: Option<String>,
+    pub total: CarPeriod,
+    pub months: Vec<CarMonth>,
+}
+
+/// Running sums for one month or the whole history. Money is in cents.
+#[derive(Default)]
+struct CarSums {
+    km: f64,
+    litres: f64,
+    petrol_cents: f64,
+    /// A day that drove had no petrol price.
+    unpriced: bool,
+    home_kwh: f64,
+    away_kwh: f64,
+    home_cost: f64,
+    home_baseline: f64,
+    grid_kwh: f64,
+    self_kwh: f64,
+    uncovered_kwh: f64,
+    forgone: f64,
+    pending: u32,
+}
+
+impl CarSums {
+    fn add_day(&mut self, prices: &EvPrices, petrol: &PetrolHistory, day: &CarDay) {
+        let litres = day.km * prices.petrol_litres_per_100km / 100.0;
+        self.km += day.km;
+        self.litres += litres;
+        match petrol.on(&day.date) {
+            Some(cents) => self.petrol_cents += litres * cents,
+            None if day.km > 0.0 => self.unpriced = true,
+            None => {}
+        }
+    }
+
+    fn add_charge(&mut self, charge: &CarCharge) {
+        if !charge.at_home {
+            self.away_kwh += charge.kwh;
+            return;
+        }
+        self.home_kwh += charge.kwh;
+        let Some(cost) = &charge.cost else {
+            self.pending += 1;
+            return;
+        };
+        self.home_cost += cost.cost_cents;
+        self.home_baseline += cost.baseline_cents;
+        self.grid_kwh += cost.grid_kwh;
+        self.self_kwh += cost.self_kwh;
+        self.uncovered_kwh += cost.uncovered_kwh;
+        self.forgone += cost.feed_in_forgone_cents;
+    }
+
+    fn finish(&self, prices: &EvPrices) -> CarPeriod {
+        let away_cents = prices.away_cents_per_kwh.map(|c| c * self.away_kwh);
+        let petrol_cents = (!self.unpriced).then_some(self.petrol_cents);
+        let scenario = |home_cents: f64| {
+            let cents = home_cents + away_cents.unwrap_or(0.0);
+            Scenario {
+                charging_cost: round2(cents / 100.0),
+                saved: petrol_cents.map(|p| round2((p - cents) / 100.0)),
+                cents_per_km: (self.km > 0.0).then(|| round2(cents / self.km)),
+            }
+        };
+        CarPeriod {
+            km: round2(self.km),
+            petrol_litres: round2(self.litres),
+            petrol_cost: petrol_cents.map(|c| round2(c / 100.0)),
+            home_kwh: round2(self.home_kwh),
+            away_kwh: round2(self.away_kwh),
+            away_cost: if self.away_kwh > 0.0 {
+                away_cents.map(|c| round2(c / 100.0))
+            } else {
+                Some(0.0)
+            },
+            away_uncosted_kwh: if away_cents.is_none() {
+                round2(self.away_kwh)
+            } else {
+                0.0
+            },
+            with_system: scenario(self.home_cost),
+            without_system: scenario(self.home_baseline),
+            system_added: round2((self.home_baseline - self.home_cost) / 100.0),
+            grid_kwh: round2(self.grid_kwh),
+            self_kwh: round2(self.self_kwh),
+            uncovered_kwh: round2(self.uncovered_kwh),
+            feed_in_forgone: round2(self.forgone / 100.0),
+            pending_sessions: self.pending,
+        }
+    }
+}
+
+/// Adds one car's days and charging sessions up by month and for the whole
+/// history. Each day's petrol uses that day's price from `petrol`, and a
+/// session counts in the month it started. A month with km or sessions gets a
+/// row, oldest first.
+pub fn summarise_car(
+    prices: &EvPrices,
+    petrol: &PetrolHistory,
+    days: &[CarDay],
+    charges: &[CarCharge],
+) -> CarHistory {
+    let mut total = CarSums::default();
+    let mut months: BTreeMap<&str, CarSums> = BTreeMap::new();
+    for day in days {
+        total.add_day(prices, petrol, day);
+        months
+            .entry(&day.date[..7])
+            .or_default()
+            .add_day(prices, petrol, day);
+    }
+    for charge in charges {
+        total.add_charge(charge);
+        months
+            .entry(&charge.date[..7])
+            .or_default()
+            .add_charge(charge);
+    }
+    let dates = || {
+        days.iter()
+            .map(|d| &d.date)
+            .chain(charges.iter().map(|c| &c.date))
+    };
+    CarHistory {
+        first_day: dates().min().cloned(),
+        last_day: dates().max().cloned(),
+        total: total.finish(prices),
+        months: months
+            .into_iter()
+            .map(|(month, sums)| CarMonth {
+                month: month.to_string(),
+                period: sums.finish(prices),
+            })
+            .collect(),
     }
 }
 
@@ -1299,5 +1564,166 @@ mod tests {
             TariffSchedule::from_config(&w.tariff, &[]).unwrap()
         };
         assert_ne!(plain, historic_cost_key(&other, &[], ADELAIDE, start));
+    }
+
+    fn car_day(date: &str, km: f64) -> CarDay {
+        CarDay {
+            date: date.to_string(),
+            km,
+        }
+    }
+
+    fn home_charge(date: &str, kwh: f64, costed: bool) -> CarCharge {
+        CarCharge {
+            date: date.to_string(),
+            kwh,
+            at_home: true,
+            cost: costed.then(|| HistoricCost {
+                kwh,
+                grid_kwh: kwh / 2.0,
+                self_kwh: kwh / 2.0,
+                uncovered_kwh: 1.0,
+                cost_cents: 100.0,
+                baseline_cents: 400.0,
+                feed_in_forgone_cents: 10.0,
+            }),
+        }
+    }
+
+    fn away_charge(date: &str, kwh: f64) -> CarCharge {
+        CarCharge {
+            date: date.to_string(),
+            kwh,
+            at_home: false,
+            cost: None,
+        }
+    }
+
+    fn naive(text: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn petrol_price_follows_the_latest_change() {
+        let history = PetrolHistory::new(
+            Some(180.0),
+            vec![(naive("2026-03-01"), 199.0), (naive("2025-06-01"), 185.0)],
+        );
+        assert!(history.is_configured());
+        assert_eq!(history.on("2025-05-31"), Some(180.0));
+        assert_eq!(history.on("2025-06-01"), Some(185.0));
+        assert_eq!(history.on("2026-02-28"), Some(185.0));
+        assert_eq!(history.on("2026-03-01"), Some(199.0));
+        assert_eq!(history.on("2030-01-01"), Some(199.0));
+        // Without a base price, days before the first change have none.
+        let dated = PetrolHistory::new(None, vec![(naive("2026-03-01"), 199.0)]);
+        assert!(dated.is_configured());
+        assert_eq!(dated.on("2026-02-28"), None);
+        assert_eq!(dated.on("2026-03-01"), Some(199.0));
+        let none = PetrolHistory::default();
+        assert!(!none.is_configured());
+        assert_eq!(none.on("2026-03-01"), None);
+    }
+
+    #[test]
+    fn car_history_adds_up_by_month_with_a_price_per_day() {
+        let prices = EvPrices {
+            petrol_cents_per_litre: None,
+            petrol_litres_per_100km: 10.0,
+            away_cents_per_kwh: Some(60.0),
+        };
+        let petrol = PetrolHistory::new(Some(100.0), vec![(naive("2026-02-01"), 200.0)]);
+        let days = [
+            car_day("2026-01-31", 100.0),
+            car_day("2026-02-01", 100.0),
+            car_day("2026-02-02", 50.0),
+        ];
+        let charges = [
+            home_charge("2026-01-30", 10.0, true),
+            home_charge("2026-02-03", 20.0, true),
+            home_charge("2026-02-04", 5.0, false),
+            away_charge("2026-02-05", 10.0),
+        ];
+        let history = summarise_car(&prices, &petrol, &days, &charges);
+        assert_eq!(history.first_day.as_deref(), Some("2026-01-30"));
+        assert_eq!(history.last_day.as_deref(), Some("2026-02-05"));
+        let months: Vec<_> = history.months.iter().map(|m| m.month.as_str()).collect();
+        assert_eq!(months, ["2026-01", "2026-02"]);
+
+        // January: 100 km is 10 L at $1.00.
+        let jan = &history.months[0].period;
+        assert_eq!(
+            (jan.km, jan.petrol_litres, jan.petrol_cost),
+            (100.0, 10.0, Some(10.0))
+        );
+        assert_eq!((jan.home_kwh, jan.away_kwh), (10.0, 0.0));
+        assert_eq!(jan.away_cost, Some(0.0));
+        assert_eq!(jan.with_system.charging_cost, 1.0);
+        assert_eq!(jan.with_system.saved, Some(9.0));
+        assert_eq!(jan.without_system.charging_cost, 4.0);
+        assert_eq!(jan.without_system.saved, Some(6.0));
+        assert_eq!(jan.system_added, 3.0);
+
+        // February: 150 km is 15 L; 10 L at $2.00 and 5 L at $2.00.
+        let feb = &history.months[1].period;
+        assert_eq!(
+            (feb.km, feb.petrol_litres, feb.petrol_cost),
+            (150.0, 15.0, Some(30.0))
+        );
+        assert_eq!((feb.home_kwh, feb.away_kwh), (25.0, 10.0));
+        assert_eq!((feb.away_cost, feb.away_uncosted_kwh), (Some(6.0), 0.0));
+        assert_eq!(feb.pending_sessions, 1);
+        // One costed home session ($1.00) plus $6.00 away.
+        assert_eq!(feb.with_system.charging_cost, 7.0);
+        assert_eq!(feb.with_system.saved, Some(23.0));
+        assert_eq!(feb.with_system.cents_per_km, Some(4.67));
+        assert_eq!(feb.without_system.charging_cost, 10.0);
+        assert_eq!(feb.system_added, 3.0);
+        assert_eq!((feb.grid_kwh, feb.self_kwh), (10.0, 10.0));
+        assert_eq!((feb.uncovered_kwh, feb.feed_in_forgone), (1.0, 0.1));
+
+        let total = &history.total;
+        assert_eq!((total.km, total.petrol_cost), (250.0, Some(40.0)));
+        assert_eq!((total.home_kwh, total.away_kwh), (35.0, 10.0));
+        assert_eq!(total.with_system.charging_cost, 8.0);
+        assert_eq!(total.without_system.charging_cost, 14.0);
+        assert_eq!(total.system_added, 6.0);
+        assert_eq!(
+            total.system_added,
+            round2(total.with_system.saved.unwrap() - total.without_system.saved.unwrap())
+        );
+        assert_eq!(total.pending_sessions, 1);
+    }
+
+    #[test]
+    fn car_history_without_prices_keeps_charging_costs() {
+        let prices = EvPrices::default();
+        let days = [car_day("2026-02-01", 100.0)];
+        let charges = [
+            home_charge("2026-02-03", 20.0, true),
+            away_charge("2026-02-05", 10.0),
+        ];
+        let history = summarise_car(&prices, &PetrolHistory::default(), &days, &charges);
+        let total = &history.total;
+        assert_eq!(total.petrol_cost, None);
+        assert_eq!(total.petrol_litres, 7.5);
+        assert_eq!(total.with_system.saved, None);
+        assert_eq!(total.without_system.saved, None);
+        // Away sessions without a price are uncosted, and count as nothing.
+        assert_eq!((total.away_cost, total.away_uncosted_kwh), (None, 10.0));
+        assert_eq!(total.with_system.charging_cost, 1.0);
+        assert_eq!(total.with_system.cents_per_km, Some(1.0));
+        assert_eq!(total.system_added, 3.0);
+
+        // A price that starts later leaves the earlier km without a price.
+        let late = PetrolHistory::new(None, vec![(naive("2026-03-01"), 200.0)]);
+        let history = summarise_car(&prices, &late, &days, &charges);
+        assert_eq!(history.total.petrol_cost, None);
+        // A car that never drove has no cents per km and no first day.
+        let idle = summarise_car(&prices, &late, &[], &[]);
+        assert_eq!((idle.first_day, idle.last_day), (None, None));
+        assert!(idle.months.is_empty());
+        assert_eq!(idle.total.with_system.cents_per_km, None);
+        assert_eq!(idle.total.petrol_cost, Some(0.0));
     }
 }

@@ -199,6 +199,10 @@ pub struct Teslamate {
     /// How much petrol the comparison car uses per 100 km.
     #[serde(default = "default_petrol_litres_per_100km")]
     pub petrol_litres_per_100km: f64,
+    /// Petrol prices that changed over time, for the per-car history. Written
+    /// as repeated `[[teslamate.petrol_price]]` tables.
+    #[serde(default)]
+    pub petrol_price: Vec<PetrolPrice>,
     /// A flat price per kWh for charging away from home. Without it, away
     /// sessions are left uncosted.
     pub away_cents_per_kwh: Option<f64>,
@@ -229,6 +233,20 @@ impl Teslamate {
                 "{name} in [teslamate] must be more than 0"
             );
         }
+        let mut last: Option<NaiveDate> = None;
+        for (i, p) in self.petrol_price.iter().enumerate() {
+            let section = format!("[[teslamate.petrol_price]] #{}", i + 1);
+            let from = parse_date(&p.from).with_context(|| format!("from in {section}"))?;
+            anyhow::ensure!(
+                last.is_none_or(|prev| from > prev),
+                "from in {section} must be later than the one before it"
+            );
+            last = Some(from);
+            anyhow::ensure!(
+                p.cents_per_litre > 0.0,
+                "cents_per_litre in {section} must be more than 0"
+            );
+        }
         if let Some(url) = &self.database_url {
             // Not echoed in the error: it holds a password.
             anyhow::ensure!(
@@ -238,6 +256,15 @@ impl Teslamate {
         }
         Ok(())
     }
+}
+
+/// What petrol cost from one day on; see `[[teslamate.petrol_price]]` in
+/// config.example.toml.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PetrolPrice {
+    /// First local day ("YYYY-MM-DD") this price applies.
+    pub from: String,
+    pub cents_per_litre: f64,
 }
 
 /// Login for the GloBird customer portal; see config.example.toml.
@@ -786,6 +813,53 @@ mod tests {
         ] {
             let err = parse(bad).check().unwrap_err();
             assert!(format!("{err:#}").contains("more than 0"), "{bad}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn teslamate_petrol_prices_are_dated_and_increasing() {
+        let parse = |extra: &str| -> Teslamate {
+            let text = format!("{MINIMAL}\n[teslamate]\nhost = \"h\"\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().teslamate.unwrap()
+        };
+        let entry = |from: &str, cents: &str| {
+            format!("[[teslamate.petrol_price]]\nfrom = \"{from}\"\ncents_per_litre = {cents}\n")
+        };
+        assert!(parse("").petrol_price.is_empty());
+        let good = parse(&format!(
+            "{}{}",
+            entry("2025-01-01", "185.0"),
+            entry("2026-03-01", "199.0")
+        ));
+        assert!(good.check().is_ok());
+        assert_eq!(good.petrol_price.len(), 2);
+        assert_eq!(good.petrol_price[1].cents_per_litre, 199.0);
+        for (bad, expect) in [
+            (
+                entry("March", "199.0"),
+                "from in [[teslamate.petrol_price]] #1",
+            ),
+            (entry("2026-03-01", "0.0"), "more than 0"),
+            (entry("2026-03-01", "-5.0"), "more than 0"),
+            (
+                format!(
+                    "{}{}",
+                    entry("2026-03-01", "199.0"),
+                    entry("2026-03-01", "200.0")
+                ),
+                "#2 must be later",
+            ),
+            (
+                format!(
+                    "{}{}",
+                    entry("2026-03-01", "199.0"),
+                    entry("2025-03-01", "200.0")
+                ),
+                "#2 must be later",
+            ),
+        ] {
+            let err = parse(&bad).check().unwrap_err();
+            assert!(format!("{err:#}").contains(expect), "{bad}: {err:#}");
         }
     }
 
