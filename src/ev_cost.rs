@@ -862,6 +862,76 @@ pub fn summarise_car(
     }
 }
 
+/// What all the cars did on one local day, for adding to the house's savings.
+/// Money is in cents.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CarDayTotals {
+    pub km: f64,
+    /// The km at that day's petrol price; `None` when the day has no price.
+    pub petrol_cents: Option<f64>,
+    /// What charging the cars would cost from the grid with no solar or
+    /// battery: costed home sessions at their baseline, home sessions not
+    /// costed yet at the plan's average import price, and away sessions at
+    /// `away_cents_per_kwh` (nothing without it).
+    pub charging_cents: f64,
+    /// Home sessions in `charging_cents` that are only estimated.
+    pub estimated_sessions: u32,
+}
+
+impl CarDayTotals {
+    /// Petrol cost less the grid-priced charging; `None` without a petrol price.
+    ///
+    /// This is the "without the system" saving of [`CarPeriod`] on purpose.
+    /// The house's no-solar baseline already prices the cars' charging at
+    /// grid prices (the car is part of the house load), so what the system
+    /// saves on that charging is already in the house's savings. Only the
+    /// electric-versus-petrol part is new. Adding the "with the system"
+    /// saving would count the system's share twice.
+    pub fn fuel_saved_cents(&self) -> Option<f64> {
+        self.petrol_cents.map(|p| p - self.charging_cents)
+    }
+}
+
+/// All the cars' driving and charging added up by local day ("YYYY-MM-DD").
+/// A day of driving is the day in `days`, a session counts on the day it
+/// started. `average_import_cents` gives the plan's average import price on
+/// a day, for home sessions not costed yet. Days with neither are absent.
+pub fn car_day_totals(
+    prices: &EvPrices,
+    petrol: &PetrolHistory,
+    average_import_cents: impl Fn(&str) -> f64,
+    days: &[CarDay],
+    charges: &[CarCharge],
+) -> BTreeMap<String, CarDayTotals> {
+    let mut totals: BTreeMap<String, CarDayTotals> = BTreeMap::new();
+    for day in days {
+        let entry = totals.entry(day.date.clone()).or_default();
+        entry.km += day.km;
+        let litres = day.km * prices.petrol_litres_per_100km / 100.0;
+        if let Some(cents) = petrol.on(&day.date) {
+            *entry.petrol_cents.get_or_insert(0.0) += litres * cents;
+        }
+    }
+    for charge in charges {
+        let entry = totals.entry(charge.date.clone()).or_default();
+        entry.charging_cents += match (charge.at_home, &charge.cost) {
+            (false, _) => prices.away_cents_per_kwh.unwrap_or(0.0) * charge.kwh,
+            (true, Some(cost)) => cost.baseline_cents,
+            (true, None) => {
+                entry.estimated_sessions += 1;
+                average_import_cents(&charge.date) * charge.kwh
+            }
+        };
+    }
+    // A day that only has charging still needs a petrol price to be priced.
+    for (date, entry) in &mut totals {
+        if entry.petrol_cents.is_none() && petrol.on(date).is_some() {
+            entry.petrol_cents = Some(0.0);
+        }
+    }
+    totals
+}
+
 /// The km driven in each month, from the odometer readings (local date
 /// "YYYY-MM-DD" and km, oldest first). A day's km is its reading minus the
 /// reading before it, so a day with no reading passes its km on to the next
@@ -1725,5 +1795,52 @@ mod tests {
         assert!(idle.months.is_empty());
         assert_eq!(idle.total.with_system.cents_per_km, None);
         assert_eq!(idle.total.petrol_cost, Some(0.0));
+    }
+
+    #[test]
+    fn car_days_add_up_all_cars_and_price_each_session_by_where_it_was() {
+        let prices = EvPrices {
+            petrol_cents_per_litre: None,
+            petrol_litres_per_100km: 10.0,
+            away_cents_per_kwh: Some(60.0),
+        };
+        let petrol = PetrolHistory::new(None, vec![(naive("2026-02-01"), 200.0)]);
+        // Two cars drove on the 2nd; the 1st has a price but no driving.
+        let days = [
+            car_day("2026-01-31", 10.0),
+            car_day("2026-02-02", 50.0),
+            car_day("2026-02-02", 30.0),
+        ];
+        let charges = [
+            // Costed home: its baseline of 400 c. Not costed: 5 kWh at 30 c.
+            home_charge("2026-02-01", 20.0, true),
+            home_charge("2026-02-02", 5.0, false),
+            away_charge("2026-02-02", 10.0),
+        ];
+        let got = car_day_totals(&prices, &petrol, |_| 30.0, &days, &charges);
+        let dates: Vec<_> = got.keys().map(String::as_str).collect();
+        assert_eq!(dates, ["2026-01-31", "2026-02-01", "2026-02-02"]);
+        // Before the first price: no petrol cost, so no saving.
+        assert_eq!(got["2026-01-31"].km, 10.0);
+        assert_eq!(got["2026-01-31"].petrol_cents, None);
+        assert_eq!(got["2026-01-31"].fuel_saved_cents(), None);
+        // Charging only: petrol is nothing, so the saving is minus the charging.
+        assert_eq!(got["2026-02-01"].petrol_cents, Some(0.0));
+        assert_eq!(got["2026-02-01"].charging_cents, 400.0);
+        assert_eq!(got["2026-02-01"].fuel_saved_cents(), Some(-400.0));
+        // 80 km is 8 L at 200 c; charging is 150 + 600 c.
+        let day = &got["2026-02-02"];
+        assert_eq!((day.km, day.petrol_cents), (80.0, Some(1600.0)));
+        assert_eq!((day.charging_cents, day.estimated_sessions), (750.0, 1));
+        assert_eq!(day.fuel_saved_cents(), Some(850.0));
+
+        // Away charging without a price counts as nothing.
+        let free = EvPrices {
+            away_cents_per_kwh: None,
+            ..prices
+        };
+        let got = car_day_totals(&free, &petrol, |_| 30.0, &days, &charges);
+        assert_eq!(got["2026-02-02"].charging_cents, 150.0);
+        assert!(car_day_totals(&prices, &petrol, |_| 0.0, &[], &[]).is_empty());
     }
 }
