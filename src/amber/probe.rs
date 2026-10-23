@@ -26,14 +26,27 @@ const PAUSE: Duration = Duration::from_millis(500);
 /// Window lengths, in days, tried to find the most one call allows.
 const RANGE_DAYS: [u64; 3] = [7, 31, 90];
 
-/// Single days asked for to see how far back history goes.
-const HISTORY_DATES: [(i32, u32, u32); 5] = [
-    (2024, 7, 1),
-    (2024, 7, 14),
-    (2025, 1, 1),
-    (2026, 5, 20),
-    (2026, 6, 1),
-];
+/// The site's first and last day, from `activeFrom` and `closedOn`.
+fn site_span(site: &Site) -> (Option<NaiveDate>, Option<NaiveDate>) {
+    let parse = |text: &Option<String>| text.as_deref().and_then(|t| t.parse().ok());
+    (parse(&site.active_from), parse(&site.closed_on))
+}
+
+/// Single days asked for to see how far back history goes: just before and on
+/// the site's first day, half a year in, and either side of its last day (or
+/// a week ago, for a site that is still open).
+fn history_dates(site: &Site, today: NaiveDate) -> Vec<NaiveDate> {
+    let (from, closed) = site_span(site);
+    let mut dates = Vec::new();
+    if let Some(from) = from {
+        dates.extend([from - Days::new(14), from, from + Days::new(180)]);
+    }
+    match closed {
+        Some(closed) => dates.extend([closed - Days::new(5), closed + Days::new(6)]),
+        None => dates.push(today - Days::new(7)),
+    }
+    dates
+}
 
 /// Totals for one channel on one day.
 #[derive(Default)]
@@ -235,7 +248,7 @@ fn note_rate_limit(
 pub async fn run(
     client: Client,
     site_id: Option<&str>,
-    date: NaiveDate,
+    date: Option<NaiveDate>,
     days: u32,
     out: &Path,
 ) -> Result<()> {
@@ -258,7 +271,10 @@ pub async fn run(
     report.extend(sites.iter().map(site_line));
     report.push(format!("Probing site {}", site.id));
 
-    // The sample window.
+    // The sample window starts on the site's first day unless --date says
+    // otherwise, or 30 days ago if the site does not say when it started.
+    let today = chrono::Local::now().date_naive();
+    let date = date.or(site_span(site).0).unwrap_or(today - Days::new(30));
     let last = date + Days::new(u64::from(days) - 1);
     println!("Fetching the sample window {date} to {last} ...");
     let sample = probed(out, "usage-sample.json", client.usage(&site.id, date, last)).await;
@@ -295,8 +311,7 @@ pub async fn run(
 
     // One day each, to see how far back history goes.
     report.push("History depth (one day each):".to_string());
-    for (y, m, d) in HISTORY_DATES {
-        let day = NaiveDate::from_ymd_opt(y, m, d).context("bad history date")?;
+    for day in history_dates(site, today) {
         println!("Fetching {day} ...");
         let result = probed(
             out,
@@ -360,7 +375,7 @@ mod tests {
         let rows = parse_usage(USAGE_JSON).unwrap();
         let days = summarise(&rows);
         assert_eq!(days.len(), 3);
-        let general = &days[&("2024-07-14".to_string(), "E1/general".to_string())];
+        let general = &days[&("2024-01-15".to_string(), "E1/general".to_string())];
         assert_eq!(general.intervals, 2);
         assert_eq!(general.kwh, 1.5);
         assert_eq!(general.cost, 40.0);
@@ -416,10 +431,32 @@ mod tests {
     }
 
     #[test]
+    fn history_dates_bracket_the_site_span() {
+        let sites = parse_sites(SITES_JSON).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
+        let dates: Vec<String> = history_dates(&sites[0], today)
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        assert_eq!(
+            dates,
+            [
+                "2024-01-01",
+                "2024-01-15",
+                "2024-07-13",
+                "2025-12-26",
+                "2026-01-06"
+            ]
+        );
+        // An open site with no dates: just a week ago.
+        assert_eq!(history_dates(&sites[1], today), [today - Days::new(7)]);
+    }
+
+    #[test]
     fn site_line_shows_dates_and_channels() {
         let sites = parse_sites(SITES_JSON).unwrap();
         let line = site_line(&sites[0]);
-        assert!(line.contains("closed on 2026-05-25"), "{line}");
+        assert!(line.contains("closed on 2025-12-31"), "{line}");
         assert!(line.contains("B1 feedIn EA116"), "{line}");
         assert!(!line.contains("4102345678"), "{line}");
     }

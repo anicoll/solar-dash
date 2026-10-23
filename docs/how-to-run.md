@@ -523,7 +523,8 @@ sudo -u solar-dash /opt/solar-dash/solar-dash --config /etc/solar-dash/config.to
 ```
 
 `--out` is a directory for the raw replies (default `amber-probe`), `--date`
-the first day of the sample window (default `2024-07-14`) and `--days` its
+the first day of the sample window (default: the site's first day with
+Amber) and `--days` its
 length (default 3). It makes about ten calls with a short pause between them.
 
 It lists your sites (NMI shown as its last 3 digits only), then prints, for the
@@ -531,8 +532,8 @@ sample window, one line per day and channel: interval count, kWh, cost, lowest
 and highest `perKwh` (cents, GST included) and how many intervals are
 `billable` or `estimated`. It also says whether feed-in prices and costs come
 back negative. Then it asks for 7, 31 and 90 days at once to find the most one
-call allows, one day each at five dates (2024-07-01, 2024-07-14, 2025-01-01,
-2026-05-20 and 2026-06-01) to see how far back history goes, and prints the
+call allows, one day each around the site's first and last days to see how far back
+history goes, and prints the
 rate limit headers. Copy what it prints after "Paste everything below this
 line back".
 

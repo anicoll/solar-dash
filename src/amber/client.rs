@@ -182,8 +182,8 @@ mod tests {
         let sites = parse_sites(SITES_JSON).unwrap();
         assert_eq!(sites.len(), 2);
         assert_eq!(sites[0].status.as_deref(), Some("closed"));
-        assert_eq!(sites[0].active_from.as_deref(), Some("2024-07-14"));
-        assert_eq!(sites[0].closed_on.as_deref(), Some("2026-05-25"));
+        assert_eq!(sites[0].active_from.as_deref(), Some("2024-01-15"));
+        assert_eq!(sites[0].closed_on.as_deref(), Some("2025-12-31"));
         assert_eq!(sites[0].channels.len(), 2);
         assert_eq!(sites[0].channels[1].kind.as_deref(), Some("feedIn"));
         // Missing fields become None or empty rather than errors.

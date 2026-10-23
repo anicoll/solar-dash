@@ -73,9 +73,10 @@ enum Command {
         /// Directory for the raw JSON replies (created if missing).
         #[arg(long, default_value = "amber-probe")]
         out: PathBuf,
-        /// First day of the sample window (YYYY-MM-DD).
-        #[arg(long, default_value = "2024-07-14")]
-        date: NaiveDate,
+        /// First day of the sample window (YYYY-MM-DD). Defaults to the
+        /// site's first day with Amber.
+        #[arg(long)]
+        date: Option<NaiveDate>,
         /// How many days the sample window covers.
         #[arg(long, default_value_t = 3)]
         days: u32,
@@ -332,7 +333,7 @@ async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
 }
 
 /// Calls the Amber API and prints what it learned.
-async fn amber_probe(config: Config, out: &Path, date: NaiveDate, days: u32) -> Result<()> {
+async fn amber_probe(config: Config, out: &Path, date: Option<NaiveDate>, days: u32) -> Result<()> {
     let amber = config
         .amber
         .context("amber-probe needs an [amber] section in config.toml (see config.example.toml)")?;
