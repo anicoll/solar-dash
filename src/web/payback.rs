@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn month_ends_include_leap_days_and_december() {
         assert_eq!(month_end(date("2024-02-10")), date("2024-02-29"));
-        assert_eq!(month_end(date("2023-02-21")), date("2023-02-28"));
+        assert_eq!(month_end(date("2023-02-10")), date("2023-02-28"));
         assert_eq!(month_end(date("2025-12-31")), date("2025-12-31"));
     }
 
@@ -403,7 +403,7 @@ mod tests {
             cost_dollars: 1.0,
         };
         let sorted =
-            purchases_from_config(&[list("late", "2025-10-01"), list("early", "2023-02-21")])
+            purchases_from_config(&[list("late", "2025-10-01"), list("early", "2024-01-01")])
                 .unwrap();
         assert_eq!(sorted[0].name, "early");
         assert!(purchases_from_config(&[list("bad", "nope")]).is_err());

@@ -771,8 +771,8 @@ mod tests {
 
     const TARIFF: &str = r#"
         [tariff]
-        supply_cents_per_day = 173.8
-        default_import_cents = 44.0
+        supply_cents_per_day = 150.0
+        default_import_cents = 40.0
         import = [{ from = "11:00", to = "14:00", cents = 0.0 }]
         export = [{ from = "18:00", to = "21:00", cents = 10.0 }]
         [tariff.zero_import_credit]
@@ -987,12 +987,12 @@ mod tests {
     const PURCHASES: &str = r#"
         [[system.purchase]]
         name = "Solar"
-        date = "2023-02-21"
-        cost_dollars = 19490.00
+        date = "2024-01-01"
+        cost_dollars = 12000.00
         [[system.purchase]]
         name = "Battery 2"
-        date = "2025-10-01"
-        cost_dollars = 7690.20
+        date = "2025-06-01"
+        cost_dollars = 8000.00
     "#;
 
     /// Parse MINIMAL plus a `[system]` section and run its check.
@@ -1008,7 +1008,7 @@ mod tests {
         check_system(PURCHASES).unwrap();
         let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{PURCHASES}")).unwrap();
         assert_eq!(cfg.system.purchase.len(), 2);
-        assert_eq!(cfg.system.purchase[1].cost_dollars, 7690.20);
+        assert_eq!(cfg.system.purchase[1].cost_dollars, 8000.00);
     }
 
     #[test]
@@ -1028,7 +1028,7 @@ mod tests {
         let one = |body: &str| format!("[[system.purchase]]\n{body}");
         let cases = [
             (
-                one("name = \" \"\ndate = \"2023-02-21\"\ncost_dollars = 1.0"),
+                one("name = \" \"\ndate = \"2024-01-01\"\ncost_dollars = 1.0"),
                 "purchase[0].name",
             ),
             (
@@ -1040,14 +1040,14 @@ mod tests {
                 "purchase[0].date",
             ),
             (
-                one("name = \"a\"\ndate = \"2023-02-21\"\ncost_dollars = -5.0"),
+                one("name = \"a\"\ndate = \"2024-01-01\"\ncost_dollars = -5.0"),
                 "purchase[0].cost_dollars",
             ),
             (
                 format!(
                     "{}\n{}",
-                    one("name = \"a\"\ndate = \"2023-02-21\"\ncost_dollars = 1.0"),
-                    one("name = \"b\"\ndate = \"2023-02-21\"\ncost_dollars = nan")
+                    one("name = \"a\"\ndate = \"2024-01-01\"\ncost_dollars = 1.0"),
+                    one("name = \"b\"\ndate = \"2024-01-01\"\ncost_dollars = nan")
                 ),
                 "purchase[1].cost_dollars",
             ),

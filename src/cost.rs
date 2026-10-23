@@ -553,11 +553,11 @@ mod tests {
         tariff(
             r#"
             [tariff]
-            supply_cents_per_day = 173.8
-            default_import_cents = 44.0
+            supply_cents_per_day = 150.0
+            default_import_cents = 40.0
             import = [
               { from = "11:00", to = "14:00", cents = 0.0 },
-              { from = "15:00", to = "23:00", cents = 58.3 },
+              { from = "15:00", to = "23:00", cents = 60.0 },
             ]
             default_export_cents = 0.0
             export = [{ from = "18:00", to = "21:00", cents = 10.0 }]
@@ -605,8 +605,8 @@ mod tests {
     #[test]
     fn default_rates_apply_outside_windows() {
         let t = zerohero();
-        assert_eq!(t.import_cents_at(6 * 60), 44.0); // 06:00
-        assert_eq!(t.import_cents_at(14 * 60 + 30), 44.0); // between the windows
+        assert_eq!(t.import_cents_at(6 * 60), 40.0); // 06:00
+        assert_eq!(t.import_cents_at(14 * 60 + 30), 40.0); // between the windows
         assert_eq!(t.export_cents_at(12 * 60), 0.0);
     }
 
@@ -615,10 +615,10 @@ mod tests {
         let t = zerohero();
         assert_eq!(t.import_cents_at(11 * 60), 0.0);
         assert_eq!(t.import_cents_at(14 * 60 - 1), 0.0);
-        assert_eq!(t.import_cents_at(14 * 60), 44.0);
-        assert_eq!(t.import_cents_at(15 * 60), 58.3);
-        assert_eq!(t.import_cents_at(23 * 60 - 1), 58.3);
-        assert_eq!(t.import_cents_at(23 * 60), 44.0);
+        assert_eq!(t.import_cents_at(14 * 60), 40.0);
+        assert_eq!(t.import_cents_at(15 * 60), 60.0);
+        assert_eq!(t.import_cents_at(23 * 60 - 1), 60.0);
+        assert_eq!(t.import_cents_at(23 * 60), 40.0);
     }
 
     #[test]
@@ -658,13 +658,13 @@ mod tests {
     #[test]
     fn intervals_are_priced_at_their_midpoint() {
         let t = zerohero();
-        // 10:00-12:30 has its midpoint at 11:15 (free), though it starts at 44c.
+        // 10:00-12:30 has its midpoint at 11:15 (free), though it starts at 40c.
         let early = day_cost(&t, ADELAIDE, &[iv((10, 0), (12, 30), 1.0, 0.0, 0.0)]);
         assert_eq!(early.import_cents, 0.0);
         // 12:30-15:30 has its midpoint at 14:00 exactly, which is outside the
-        // free window (end-exclusive), so it costs the default 44c.
+        // free window (end-exclusive), so it costs the default 40c.
         let late = day_cost(&t, ADELAIDE, &[iv((12, 30), (15, 30), 1.0, 0.0, 0.0)]);
-        assert!(close(late.import_cents, 44.0));
+        assert!(close(late.import_cents, 40.0));
     }
 
     #[test]
@@ -745,7 +745,7 @@ mod tests {
         let empty = day_cost(&t, ADELAIDE, &[]);
         assert_eq!(empty.zero_import_credit_cents, 0.0);
         // An empty day still pays supply.
-        assert_eq!(empty.actual_cents, 173.8);
+        assert_eq!(empty.actual_cents, 150.0);
         assert_eq!(empty.savings_cents, 0.0);
     }
 
@@ -756,7 +756,7 @@ mod tests {
             &t,
             ADELAIDE,
             &[
-                // 06:00-07:00 midpoint 06:30, default 44c: buy 2 kWh, load 2 kWh.
+                // 06:00-07:00 midpoint 06:30, default 40c: buy 2 kWh, load 2 kWh.
                 iv((6, 0), (7, 0), 2.0, 0.0, 2.0),
                 // 12:00-13:00 midpoint 12:30, free import, 0c export: sell
                 // 3 kWh, load 1 kWh (the rest of the sun went to the grid).
@@ -767,27 +767,27 @@ mod tests {
                 // 19:00-20:00 midpoint 19:30, 10c export, no import, load 1.
                 iv((19, 0), (20, 0), 0.0, 1.0, 1.0),
                 iv((20, 0), (21, 0), 0.0, 0.0, 0.0),
-                // 21:00-22:00 midpoint 21:30, 58.3c: buy 1 kWh, load 1 kWh.
+                // 21:00-22:00 midpoint 21:30, 60.0c: buy 1 kWh, load 1 kWh.
                 iv((21, 0), (22, 0), 1.0, 0.0, 1.0),
             ],
         );
         assert!(close(day.import_kwh, 3.0));
         assert!(close(day.export_kwh, 5.0));
         assert!(close(day.load_kwh, 7.0));
-        // Import: 2 * 44 + 1 * 58.3 = 146.3
-        assert!(close(day.import_cents, 146.3));
+        // Import: 2 * 40 + 1 * 60 = 140
+        assert!(close(day.import_cents, 140.0));
         // Export: 3 * 0 + 1 * 10 + 1 * 10 = 20
         assert!(close(day.export_cents, 20.0));
-        assert!(close(day.supply_cents, 173.8));
+        assert!(close(day.supply_cents, 150.0));
         // No import 18:00-21:00, so the credit is earned.
         assert!(close(day.zero_import_credit_cents, 100.0));
-        // Actual: 173.8 + 146.3 - 20 - 100 = 200.1
-        assert!(close(day.actual_cents, 200.1));
-        // Baseline prices the load at import rates (06:30 is 44c, 12:30 is
-        // free, the evening is 58.3c):
-        // 2*44 + 1*0 + 2*58.3 + 1*58.3 + 1*58.3 = 321.2, plus supply 173.8.
-        assert!(close(day.baseline_cents, 495.0));
-        assert!(close(day.savings_cents, 495.0 - 200.1));
+        // Actual: 150 + 140 - 20 - 100 = 170
+        assert!(close(day.actual_cents, 170.0));
+        // Baseline prices the load at import rates (06:30 is 40c, 12:30 is
+        // free, the evening is 60.0c):
+        // 2*40 + 1*0 + 2*60.0 + 1*60.0 + 1*60.0 = 320, plus supply 150.0.
+        assert!(close(day.baseline_cents, 470.0));
+        assert!(close(day.savings_cents, 470.0 - 170.0));
     }
 
     /// A schedule with plans importing at 10 c (to 2025-06-30), 20 c (to
@@ -845,11 +845,11 @@ mod tests {
         tariff(
             r#"
             [tariff]
-            supply_cents_per_day = 173.8
-            default_import_cents = 44.0
+            supply_cents_per_day = 150.0
+            default_import_cents = 40.0
             import = [
               { from = "11:00", to = "14:00", cents = 0.0 },
-              { from = "16:00", to = "23:00", cents = 58.3 },
+              { from = "16:00", to = "23:00", cents = 60.0 },
             ]
             default_export_cents = 0.0
             export = [

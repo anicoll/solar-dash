@@ -296,7 +296,7 @@ Tesla itself. It is optional: without a `[teslamate]` section nothing changes.
    what TeslaMate publishes, subscribe to the car's topics:
 
    ```sh
-   mosquitto_sub -h 192.168.10.84 -t 'teslamate/cars/1/#' -v
+   mosquitto_sub -h 192.168.1.70 -t 'teslamate/cars/1/#' -v
    ```
 
    You should see lines like `teslamate/cars/1/battery_level 43`. TeslaMate
@@ -307,7 +307,7 @@ Tesla itself. It is optional: without a `[teslamate]` section nothing changes.
 
    ```toml
    [teslamate]
-   host = "192.168.10.84"   # the MQTT broker
+   host = "192.168.1.70"   # the MQTT broker
    port = 1883
    car_id = 1
    topic_prefix = "teslamate"
@@ -503,7 +503,7 @@ before sharing it.
 was connected in the `[isolarcloud]` section of `config.toml`:
 
 ```toml
-history_from = "2023-02-21"
+history_from = "2024-01-01"
 ```
 
 After each live sync (every 5 minutes) `serve` fetches up to 18 more days of
@@ -518,7 +518,7 @@ You can also download history without the dashboard, for example on a
 laptop:
 
 ```sh
-cargo run -- backfill --from 2023-02-21
+cargo run -- backfill --from 2024-01-01
 ```
 
 This needs `plant_id` in `config.toml` (run `login-test` to see your plants).

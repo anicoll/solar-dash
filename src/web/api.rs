@@ -1455,11 +1455,11 @@ mod tests {
         let globird: Wrapper = toml::from_str(
             r#"
             [tariff]
-            supply_cents_per_day = 173.8
-            default_import_cents = 44.0
+            supply_cents_per_day = 150.0
+            default_import_cents = 40.0
             import = [
               { from = "11:00", to = "14:00", cents = 0.0 },
-              { from = "16:00", to = "23:00", cents = 58.3 },
+              { from = "16:00", to = "23:00", cents = 60.0 },
             ]
             default_export_cents = 0.0
             export = [

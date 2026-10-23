@@ -419,7 +419,7 @@ mod tests {
 
     use super::*;
 
-    // Real readings from the owner's inverter.
+    // Real readings from a Sungrow inverter.
     const BLOCK: [u16; 16] = [
         708, 0, 0, 0, 55, 13409, 0, 0, 0, 36, 40835, 1, 2659, 65374, 4248, 434,
     ];

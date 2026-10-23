@@ -1304,11 +1304,11 @@ mod tests {
         let w: Wrapper = toml::from_str(
             r#"
             [tariff]
-            supply_cents_per_day = 173.8
-            default_import_cents = 44.0
+            supply_cents_per_day = 150.0
+            default_import_cents = 40.0
             import = [
               { from = "11:00", to = "14:00", cents = 0.0 },
-              { from = "16:00", to = "23:00", cents = 58.3 },
+              { from = "16:00", to = "23:00", cents = 60.0 },
             ]
             default_export_cents = 0.0
             export = [
@@ -1350,13 +1350,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(now["configured"], true);
-        assert_eq!(now["supply_cents_per_day"], 173.8);
-        assert_eq!(now["default_import_cents"], 44.0);
+        assert_eq!(now["supply_cents_per_day"], 150.0);
+        assert_eq!(now["default_import_cents"], 40.0);
         assert_eq!(now["default_export_cents"], 0.0);
         assert_eq!(now["import"][0]["from"], "11:00");
         assert_eq!(now["import"][0]["to"], "14:00");
         assert_eq!(now["import"][0]["band"], "free");
-        assert_eq!(now["import"][1]["cents"], 58.3);
+        assert_eq!(now["import"][1]["cents"], 60.0);
         assert_eq!(now["import"][1]["band"], "peak");
         assert_eq!(now["export"][0]["band"], "super");
         assert_eq!(now["export"][1]["band"], "peak");
