@@ -146,6 +146,37 @@ input[type="number"] { width: 6.5em; }
 }
 @media (min-width: 760px) { .panel-title, .section { font-size: 15px; } }
 .section { margin-top: 8px; }
+
+/* Collapsible Money cards and the jump chips */
+.panel > .panel-title { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 12px; }
+.fold-btn {
+  display: inline-flex; align-items: center; gap: 8px; margin: 0 -6px; padding: 4px 6px; min-height: 32px;
+  background: none; border: 0; border-radius: 8px; color: inherit; font: inherit;
+  text-transform: inherit; letter-spacing: inherit; cursor: pointer; text-align: left;
+}
+.fold-btn:hover { color: var(--fg); }
+.fold-btn:focus-visible { outline-offset: 0; }
+.fold-chev {
+  width: 7px; height: 7px; flex: none; margin-top: -3px; border: solid currentColor; border-width: 0 2px 2px 0;
+  transform: rotate(45deg); transition: transform 0.15s;
+}
+.folded .fold-chev { margin-top: 0; margin-left: 2px; transform: rotate(-45deg); }
+.fold-body { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.fold-body[hidden] { display: none; }
+.fold-sum { display: none; font-size: 13px; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--fg-soft); }
+.folded .fold-sum:not(:empty) { display: inline; }
+@media (prefers-reduced-motion: reduce) { .fold-chev { transition: none; } }
+.jump {
+  display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; padding: 2px;
+}
+.jump::-webkit-scrollbar { display: none; }
+.jump[hidden], .chip[hidden] { display: none; }
+.chip {
+  flex: none; padding: 6px 12px; border: 1px solid var(--border-strong); border-radius: 999px;
+  background: var(--panel); color: var(--fg-soft); font: inherit; font-size: 13px; white-space: nowrap; cursor: pointer;
+}
+.chip:hover { border-color: var(--muted); color: var(--fg); }
+.panel, .hero { scroll-margin-top: 12px; }
 .panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .panel-note { font-size: 13px; color: var(--muted); }
 .stack { display: flex; flex-direction: column; gap: 12px; }

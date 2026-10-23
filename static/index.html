@@ -203,10 +203,11 @@
       <button type="button" class="btn" id="money-next" aria-label="Next month">&rarr;</button>
       <button type="button" class="btn" id="money-today">This month</button>
     </div>
+    <nav id="money-jump" class="jump" aria-label="Jump to a section" hidden></nav>
     <p id="money-unconfigured" class="panel notice" hidden></p>
     <div id="money-body" class="view-body" hidden>
       <div id="money-numbers" class="view-body">
-        <section class="hero" aria-labelledby="h-moneysaved">
+        <section class="hero" id="money-hero" aria-labelledby="h-moneysaved">
           <h2 id="h-moneysaved" class="hero-label">Saved</h2>
           <div class="hero-total" id="money-saved"></div>
           <div class="hero-since" id="money-pct"></div>
@@ -218,19 +219,19 @@
           <p class="panel-note" id="money-billed" hidden></p>
         </section>
         <div class="money-pair">
-          <section class="panel" aria-labelledby="h-bill">
+          <section class="panel" id="money-bill-card" aria-labelledby="h-bill">
             <h2 id="h-bill" class="panel-title">Your bill</h2>
             <p class="panel-note">Laid out like your power bill, so you can check one against the other.</p>
             <div class="lines" id="money-bill"></div>
           </section>
-          <section class="panel" aria-labelledby="h-sources">
+          <section class="panel" id="money-sources-card" aria-labelledby="h-sources">
             <h2 id="h-sources" class="panel-title">Where the saving came from</h2>
             <p class="panel-note">The supply charge is the same either way, so it is not part of the saving.</p>
             <div class="lines" id="money-sources"></div>
           </section>
         </div>
       </div>
-      <section class="panel" aria-labelledby="money-chart-title">
+      <section class="panel" id="money-chart-card" aria-labelledby="money-chart-title">
         <h2 id="money-chart-title" class="panel-title">Day by day</h2>
         <div class="card flat">
           <div id="money-chart" class="chart" role="img" aria-label="Money chart"></div>

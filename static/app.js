@@ -2514,6 +2514,7 @@
     }
     $('money-car-cards').replaceChildren(...cards);
     $('money-car-note').textContent = note;
+    setCardSummary('money-car', summary.configured ? `Saved ${money(t.saved)} vs petrol` : '');
   }
 
   /** Fills the "Charging sessions" table with the month's last 10 sessions; the panel is hidden when there are none. */
@@ -2571,6 +2572,7 @@
     const small = Math.abs(diff) <= BILL_PERIOD_DOLLARS || Math.abs(diff) <= base * BILL_SHARE;
     const pct = base > 0 ? ` (${diff > 0 ? '+' : ''}${((diff / base) * 100).toFixed(1)}%)` : '';
     const d = el('span', small ? 'diff' : 'diff warn', `difference ${signedMoney(diff)}${pct}`);
+    setCardSummary('bill-check', `difference ${signedMoney(diff)}${pct}`);
     $('bill-headline').replaceChildren(
       `GloBird billed ${money(t.globird.total)} · we estimated ${money(t.ours.total)} · `, d,
       ` for ${daysText(t.days_compared)}`);
@@ -2697,7 +2699,7 @@
     $('bill-nodata').textContent = hasDays
       ? BILL_NO_ESTIMATE : 'No GloBird data yet. The first sync runs a minute after start-up.';
     $('bill-body').hidden = !compared;
-    if (!compared) return;
+    if (!compared) { setCardSummary('bill-check', ''); return; }
 
     renderBillHeadline(data.totals);
     renderBillTable(data.totals);
@@ -2801,9 +2803,10 @@
     const known = s.earned + s.missed;
     $('battery-nodata').hidden = known > 0;
     $('battery-body').hidden = known === 0;
-    if (known === 0) return;
+    if (known === 0) { setCardSummary('battery-card', ''); return; }
 
     $('battery-headline').textContent = `Credit earned ${s.earned} of ${known} days`;
+    setCardSummary('battery-card', `Credit earned ${s.earned} of ${known} days`);
     const missed = $('battery-missed');
     missed.className = s.missed ? 'battery-missed' : 'battery-missed none';
     missed.textContent = s.missed ? `${money(s.missed_dollars, s.missed_dollars % 1 ? 2 : 0)} missed` : 'None missed';
@@ -2878,7 +2881,7 @@
       kpi('', 'Cents per km', `${centsPerKm(s.cents_per_km)} vs ${centsPerKm(petrolCents)}`, 'EV vs petrol'),
     ];
     if (view === 'with') {
-      stats.push(kpi('', 'The system added', carMoney(t.system_added)));
+      stats.push(kpi('', 'Solar and battery saved on charging', carMoney(t.system_added), '', 'vs buying it all from the grid'));
       const energy = t.grid_kwh + t.self_kwh;
       if (energy > 0) {
         stats.push(kpi('', 'Solar and battery share', percent((t.self_kwh / energy) * 100), '', 'of costed home charging'));
@@ -2922,6 +2925,8 @@
       b.setAttribute('aria-pressed', String(b.dataset.cars === carsView));
     }
     $('cars-explain').textContent = CARS_EXPLAIN[carsView];
+    const saved = data.cars.reduce((a, c) => a + (c.total[`${carsView}_system`].saved || 0), 0);
+    setCardSummary('cars-card', `Saved ${carMoney(saved)}`);
     // The charts live in the list being replaced.
     for (const id of Object.keys(charts)) {
       if (id.startsWith('cars-chart-')) { charts[id].dispose(); delete charts[id]; }
@@ -2942,6 +2947,7 @@
     $('cars-unconfigured').textContent = NOT_CONFIGURED_PETROL;
     $('cars-unconfigured').hidden = data.configured;
     $('cars-body').hidden = !data.configured;
+    if (!data.configured) setCardSummary('cars-card', '');
     if (data.configured) renderCars();
   }
 
@@ -2952,6 +2958,99 @@
       if (carsData) renderCars();
     };
   }
+
+  // ---------- Money: collapsible cards and jump links ----------
+
+  const FOLD_KEY = 'solar-dash.fold.';
+  /** The Money cards below the hero: [card id, title element id]. */
+  const FOLD_CARDS = [
+    ['money-bill-card', 'h-bill'], ['money-sources-card', 'h-sources'], ['money-chart-card', 'money-chart-title'],
+    ['money-car', 'money-car-title'], ['money-sessions', 'h-moneyev'], ['bill-check', 'h-billcheck'],
+    ['battery-card', 'h-battery'], ['cars-card', 'h-cars'],
+  ];
+  /** The jump chips: [card id, title element id, fixed label (when the title is long or changes)]. */
+  const JUMP_LINKS = [['money-hero', 'h-moneysaved'], ...FOLD_CARDS.map((c) => (c[0] === 'money-car' ? [...c, 'Car'] : c))];
+
+  function setFolded(card, folded, remember) {
+    const btn = card.querySelector('.fold-btn');
+    const body = card.querySelector('.fold-body');
+    if (!btn || !body) return;
+    const wasHidden = body.hidden;
+    body.hidden = folded;
+    card.classList.toggle('folded', folded);
+    btn.setAttribute('aria-expanded', String(!folded));
+    if (remember) { try { localStorage.setItem(FOLD_KEY + card.id, folded ? '0' : '1'); } catch (err) { /* private window or blocked storage */ } }
+    if (wasHidden && !folded) {
+      // Charts drawn while hidden have no size yet.
+      requestAnimationFrame(() => {
+        for (const c of Object.values(charts)) { if (body.contains(c.getDom())) c.resize(); }
+      });
+    }
+  }
+
+  /** Shows `text` next to the card's title while the card is collapsed; empty text clears it. */
+  function setCardSummary(id, text) {
+    const sum = document.querySelector(`#${id} > .panel-title .fold-sum`);
+    if (sum) sum.textContent = text || '';
+  }
+
+  function initFolds() {
+    for (const [id, titleId] of FOLD_CARDS) {
+      const card = $(id);
+      const h = card.querySelector(':scope > .panel-title');
+      const body = el('div', 'fold-body');
+      body.id = `${id}-fold`;
+      while (h.nextSibling) body.append(h.nextSibling);
+      const title = el('span', 'fold-title');
+      title.id = titleId;
+      title.append(...h.childNodes);
+      h.removeAttribute('id');
+      const btn = el('button', 'fold-btn');
+      btn.type = 'button';
+      btn.setAttribute('aria-controls', body.id);
+      btn.append(title, el('span', 'fold-chev'));
+      btn.querySelector('.fold-chev').setAttribute('aria-hidden', 'true');
+      btn.onclick = () => setFolded(card, !card.classList.contains('folded'), true);
+      h.append(btn, el('span', 'fold-sum'));
+      card.append(body);
+      let folded = false;
+      try { folded = localStorage.getItem(FOLD_KEY + id) === '0'; } catch (err) { /* private window or blocked storage */ }
+      setFolded(card, folded, false);
+    }
+  }
+
+  function initJumpLinks() {
+    const nav = $('money-jump');
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    for (const [id, titleId, label] of JUMP_LINKS) {
+      const b = el('button', 'chip', label || '');
+      b.type = 'button';
+      b.dataset.card = id;
+      b.onclick = () => {
+        const card = $(id);
+        if (card.classList.contains('folded')) setFolded(card, false, true);
+        card.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+      };
+      nav.append(b);
+    }
+    const sync = () => {
+      let shown = 0;
+      for (const b of nav.children) {
+        const [, titleId, label] = JUMP_LINKS.find((l) => l[0] === b.dataset.card);
+        const card = $(b.dataset.card);
+        b.hidden = !!card.closest('[hidden]');
+        if (!label) b.textContent = $(titleId).textContent;
+        if (!b.hidden) shown += 1;
+      }
+      nav.hidden = shown === 0 || !!$('money-body').closest('[hidden]');
+    };
+    new MutationObserver(sync).observe($('money-body'), { attributes: true, attributeFilter: ['hidden'], childList: true, characterData: true, subtree: true });
+    new MutationObserver(sync).observe($('view-money'), { attributes: true, attributeFilter: ['hidden'] });
+    sync();
+  }
+
+  initFolds();
+  initJumpLinks();
 
   async function loadMoneyView(mode, when) {
     for (const b of document.querySelectorAll('[data-money]')) {
