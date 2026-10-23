@@ -114,7 +114,7 @@ path = "data/solar.db"
 
 # Optional: electricity prices, used to work out what each day cost and what
 # the solar and battery saved. Without this section cost features are off.
-# These values are Andrew's GloBird ZeroHero plan (plan details, Oct 2026):
+# These values are a GloBird ZeroHero plan (plan details, Oct 2026):
 # peak 16:00-23:00, free 11:00-14:00, shoulder the rest of the day; feed-in
 # 2c 16:00-23:00 plus the 8c Super Export top up 18:00-21:00, 0c otherwise.
 # Rates are in cents (per kWh, except the daily supply charge). Times are
