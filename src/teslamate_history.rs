@@ -24,7 +24,16 @@
 //! car's drives.
 //!
 //! The minute-by-minute charger power is not copied. [`charge_power`] reads
-//! it from Postgres when a session needs costing.
+//! it from Postgres when a session needs costing, and it is thrown away once
+//! the session is costed.
+//!
+//! **Costing** comes last in a run, and only with a `[tariff]`. A session at
+//! home (geofence "Home") that ended at least 2 hours ago is costed once from
+//! the house's energy (see `ev_cost::historic_session_cost`) and the result is
+//! stored on its row. It is costed again if the plan, the bills or the costing
+//! rules change. A session the house data covers by less than 98% waits up to
+//! 3 days for the data to arrive. A run costs at most 50 sessions, so the first
+//! backfill is spread over a few runs.
 //!
 //! When it runs: 30 seconds after startup, then every 15 minutes. A run opens
 //! a small connection pool and closes it at the end, so nothing stays
@@ -42,7 +51,9 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
-use crate::db::{self, TmCar, TmCharge, TmDriveDay};
+use crate::db::{self, TmCar, TmCharge, TmChargeCost, TmChargeToCost, TmDriveDay};
+use crate::ev_cost::{self, CostSetup};
+use crate::web;
 
 /// How long after startup the first run happens.
 const STARTUP_DELAY: Duration = Duration::from_secs(30);
@@ -53,6 +64,16 @@ const RUN_EVERY: Duration = Duration::from_secs(15 * 60);
 const RECENT_DAYS: u64 = 3;
 /// How long to wait for a connection to TeslaMate's database.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A session is costed once it has been over this long, so the house's last
+/// readings have been saved.
+const COST_AFTER_SECS: i64 = 2 * 3600;
+/// A session with less house data than this share waits for more...
+const MIN_COVERAGE: f64 = 0.98;
+/// ...until it has been over this long, and is then costed with what there is.
+const WAIT_FOR_DATA_SECS: i64 = 3 * 86_400;
+/// The most sessions one run costs.
+const MAX_COSTED_PER_RUN: usize = 50;
 
 /// What one run did, for the log line.
 #[derive(Debug, Default, PartialEq)]
@@ -104,6 +125,28 @@ fn power_curve(readings: &[ChargeReading]) -> Vec<(i64, f64)> {
         .iter()
         .filter_map(|r| power_w(r).map(|w| (r.ts, w)))
         .collect()
+}
+
+/// The sessions that need costing now, newest first: those whose stored key
+/// is not the one they would get today.
+fn needing_cost(
+    sessions: Vec<TmChargeToCost>,
+    setup: &CostSetup,
+    tz: Tz,
+) -> Vec<(TmChargeToCost, String)> {
+    sessions
+        .into_iter()
+        .filter_map(|s| {
+            let key = ev_cost::historic_cost_key(&setup.schedule, &setup.bills, tz, s.started_at);
+            (s.cost_key.as_deref() != Some(key.as_str())).then_some((s, key))
+        })
+        .collect()
+}
+
+/// Whether to leave a session for a later run: the house data covers too
+/// little of it and it ended recently enough that more may still arrive.
+fn should_wait(coverage: f64, ended_at: i64, now: i64) -> bool {
+    coverage < MIN_COVERAGE && ended_at > now - WAIT_FOR_DATA_SECS
 }
 
 // ---------------------------------------------------------------------------
@@ -237,8 +280,6 @@ async fn fetch_charges(
 /// The charger power during one charging session, read from TeslaMate when
 /// needed instead of being copied: `(unix seconds, watts)`, about one a minute,
 /// oldest first. Readings with no usable power are left out.
-// Nothing calls it yet; the session costing that will is a later change.
-#[allow(dead_code)]
 pub async fn charge_power(pg: &PgPool, charge_id: i64) -> Result<Vec<(i64, f64)>> {
     let rows = sqlx::query(
         "SELECT EXTRACT(EPOCH FROM date)::bigint AS ts,
@@ -270,9 +311,85 @@ pub async fn charge_power(pg: &PgPool, charge_id: i64) -> Result<Vec<(i64, f64)>
     Ok(power_curve(&readings))
 }
 
-/// One run: copies what is new or unfinished from TeslaMate. Each table is
-/// written in one transaction per car.
-async fn run_once(pg: &PgPool, pool: &sqlx::SqlitePool, tz: Tz) -> Result<Counts> {
+/// Costs the finished sessions at home that need it, at most
+/// [`MAX_COSTED_PER_RUN`]. A failure on one session is logged and the rest go on.
+async fn cost_sessions(
+    pg: &PgPool,
+    pool: &sqlx::SqlitePool,
+    tz: Tz,
+    setup: &CostSetup,
+) -> Result<()> {
+    let now = db::now();
+    let finished = db::tm_charges_at_home(pool, now - COST_AFTER_SECS).await?;
+    let todo = needing_cost(finished, setup, tz);
+    let prices = ev_cost::session_prices(&setup.schedule, &setup.bills, tz);
+    let mut costed = 0;
+    for (session, key) in &todo {
+        if costed >= MAX_COSTED_PER_RUN {
+            break;
+        }
+        let outcome: Result<bool> = async {
+            let (intervals, coverage) = web::house_intervals(
+                pool,
+                setup.plant_id,
+                tz,
+                session.started_at,
+                session.ended_at,
+                now,
+            )
+            .await?;
+            if should_wait(coverage, session.ended_at, now) {
+                return Ok(false);
+            }
+            let power = charge_power(pg, session.id).await?;
+            let cost = ev_cost::historic_session_cost(
+                &power,
+                session.started_at,
+                session.ended_at,
+                session.energy_used_kwh,
+                &intervals,
+                &prices,
+            );
+            let stored = TmChargeCost {
+                cost_key: key.clone(),
+                grid_kwh: cost.grid_kwh,
+                self_kwh: cost.self_kwh,
+                uncovered_kwh: cost.uncovered_kwh,
+                cost_cents: cost.cost_cents,
+                baseline_cents: cost.baseline_cents,
+                feed_in_forgone_cents: cost.feed_in_forgone_cents,
+            };
+            db::save_tm_charge_cost(pool, session.id, &stored).await?;
+            Ok(true)
+        }
+        .await;
+        match outcome {
+            Ok(done) => costed += usize::from(done),
+            Err(err) => warn!(
+                charge = session.id,
+                "could not cost a charging session: {err:#}"
+            ),
+        }
+    }
+    if costed > 0 {
+        info!(
+            costed,
+            remaining = todo.len() - costed,
+            "TeslaMate charging sessions costed"
+        );
+    }
+    Ok(())
+}
+
+/// One run: copies what is new or unfinished from TeslaMate, then costs the
+/// finished sessions at home if there is a tariff. Each table is written in
+/// one transaction per car.
+async fn run_once(
+    pg: &PgPool,
+    pool: &sqlx::SqlitePool,
+    tz: Tz,
+    costing: Option<&CostSetup>,
+) -> Result<Counts> {
     let mut counts = Counts::default();
 
     let cars = fetch_cars(pg).await?;
@@ -299,28 +416,38 @@ async fn run_once(pg: &PgPool, pool: &sqlx::SqlitePool, tz: Tz) -> Result<Counts
         counts.charges_updated += updated;
         counts.charges_new += charges.len() - updated;
     }
+    if let Some(setup) = costing {
+        cost_sessions(pg, pool, tz, setup).await?;
+    }
     Ok(counts)
 }
 
 /// Connects, does one run and closes the connections again.
-async fn connect_and_run(database_url: &str, pool: &sqlx::SqlitePool, tz: Tz) -> Result<Counts> {
+async fn connect_and_run(
+    database_url: &str,
+    pool: &sqlx::SqlitePool,
+    tz: Tz,
+    costing: Option<&CostSetup>,
+) -> Result<Counts> {
     let pg = PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(CONNECT_TIMEOUT)
         .connect(database_url)
         .await
         .context("could not connect to TeslaMate's database")?;
-    let outcome = run_once(&pg, pool, tz).await;
+    let outcome = run_once(&pg, pool, tz, costing).await;
     pg.close().await;
     outcome
 }
 
 /// Runs the sync until `shutdown` completes. A failed run is logged and the
 /// next one tries again. `tz` decides which local day a drive belongs to.
+/// `costing` is `None` without a `[tariff]`, and sessions are then not costed.
 pub async fn run(
     database_url: String,
     pool: sqlx::SqlitePool,
     tz: Tz,
+    costing: Option<CostSetup>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     tokio::pin!(shutdown);
@@ -333,7 +460,7 @@ pub async fn run(
         }
         let outcome = tokio::select! {
             _ = &mut shutdown => break,
-            outcome = connect_and_run(&database_url, &pool, tz) => outcome,
+            outcome = connect_and_run(&database_url, &pool, tz, costing.as_ref()) => outcome,
         };
         match outcome {
             Ok(c) => info!(
@@ -409,6 +536,67 @@ mod tests {
         let mut c = reading(Some(3.0), None, None, None);
         c.ts = 180;
         assert_eq!(power_curve(&[a, b, c]), vec![(60, 7000.0), (180, 3000.0)]);
+    }
+
+    fn setup() -> CostSetup {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+        }
+        let w: Wrapper = toml::from_str(
+            "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 40.0\n\
+             default_export_cents = 5.0\n",
+        )
+        .unwrap();
+        CostSetup {
+            schedule: std::sync::Arc::new(
+                crate::cost::TariffSchedule::from_config(&w.tariff, &[]).unwrap(),
+            ),
+            bills: std::sync::Arc::from([]),
+            plant_id: 1,
+        }
+    }
+
+    fn session(id: i64, cost_key: Option<String>) -> TmChargeToCost {
+        TmChargeToCost {
+            id,
+            started_at: 1_789_000_000,
+            ended_at: 1_789_003_600,
+            energy_used_kwh: Some(10.0),
+            cost_key,
+        }
+    }
+
+    #[test]
+    fn only_sessions_with_a_stale_key_need_costing() {
+        let setup = setup();
+        let tz: Tz = "Australia/Adelaide".parse().unwrap();
+        let key = ev_cost::historic_cost_key(&setup.schedule, &setup.bills, tz, 1_789_000_000);
+        let todo = needing_cost(
+            vec![
+                session(1, None),
+                session(2, Some(key.clone())),
+                session(3, Some("old".to_string())),
+            ],
+            &setup,
+            tz,
+        );
+        let ids: Vec<i64> = todo.iter().map(|(s, _)| s.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert!(todo.iter().all(|(_, k)| *k == key));
+    }
+
+    #[test]
+    fn a_recent_session_with_little_house_data_waits() {
+        let now = 10_000_000;
+        let recent = now - 3600 * 5;
+        let old = now - WAIT_FOR_DATA_SECS - 1;
+        assert!(should_wait(0.5, recent, now));
+        assert!(should_wait(0.979, recent, now));
+        assert!(!should_wait(0.98, recent, now));
+        assert!(!should_wait(1.0, recent, now));
+        // After 3 days it is costed with what there is.
+        assert!(!should_wait(0.0, old, now));
     }
 
     #[test]

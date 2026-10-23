@@ -410,6 +410,20 @@ It backfills by itself: the first run copies the whole history, and later runs
 only look at new or unfinished drives and sessions and the last 3 days. Nothing
 is written to TeslaMate. The URL holds a password, so it is never logged.
 
+With a `[tariff]` too, each session at Home (the geofence name) is costed once
+it has been over for 2 hours, and the result is stored on its `tm_charge` row.
+The car's power for the session is read from TeslaMate for that and not kept.
+The car sits inside the house load, so in each stretch of time it gets the
+house's share from the grid at that time, and the rest counts as solar or
+home battery. The grid part is priced on the plan of the day; on days covered by
+a `[bills]` entry (say Amber, which has no prices per interval) it is priced at
+that bill's average import price instead. Time the house data does not cover
+counts as grid, and each row says how much that was (`uncovered_kwh`). A session
+the house data covers by less than 98% waits up to 3 days for it to arrive. A
+run costs at most 50 sessions, so the first backfill takes a few runs.
+Sessions are costed again if the tariff or the bills change. Sessions with no
+geofence or somewhere else are not costed.
+
 solar-dash only needs to read, so make it a read-only login in TeslaMate's
 database (for example with `psql` as the `postgres` user):
 

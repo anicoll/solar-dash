@@ -9,12 +9,14 @@
 //! with solar charging the home battery before it reaches the load.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Timelike};
 use chrono_tz::Tz;
 use serde::Serialize;
 
-use crate::cost::TariffSchedule;
+use crate::bills::{self, PastBill};
+use crate::cost::{Interval, TariffSchedule};
 use crate::db::ChargeSession;
 use crate::modbus::Sample;
 
@@ -145,6 +147,301 @@ pub fn session_cost(
     }
     cost.coverage = covered_secs as f64 / (end - start) as f64;
     Some(cost)
+}
+
+// ---------------------------------------------------------------------------
+// Finished sessions, from TeslaMate's history
+// ---------------------------------------------------------------------------
+
+/// A power sample is held until the next one for at most this long. TeslaMate
+/// writes about one a minute, so a longer gap is unknown time and adds nothing.
+const MAX_POWER_HOLD_SECS: i64 = 300;
+
+/// Bump this when the way a past session is costed changes, so sessions stored
+/// by the old rules are worked out again.
+pub const HISTORIC_COST_VERSION: u32 = 1;
+
+/// What the sync needs to cost past sessions, built from the config the same
+/// way the web side builds it.
+#[derive(Debug, Clone)]
+pub struct CostSetup {
+    pub schedule: Arc<TariffSchedule>,
+    pub bills: Arc<[PastBill]>,
+    pub plant_id: i64,
+}
+
+/// The prices in cents per kWh at one moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Prices {
+    /// What a kWh bought from the grid costs.
+    pub import_cents: f64,
+    /// What a kWh costs on the plan of the day, with no solar or battery.
+    pub baseline_cents: f64,
+    /// What a kWh sent to the grid earns.
+    pub export_cents: f64,
+}
+
+/// A finished session worked out from the house's energy. Energy is in kWh,
+/// money in cents.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HistoricCost {
+    /// All the energy the car took.
+    pub kwh: f64,
+    /// The part bought from the grid, including `uncovered_kwh`.
+    pub grid_kwh: f64,
+    /// The part from solar or the home battery. The cloud counters cannot tell
+    /// those two apart, so they are one figure.
+    pub self_kwh: f64,
+    /// The part in time that no house interval covers. It is counted as grid,
+    /// so this tells how much of the cost is an estimate.
+    pub uncovered_kwh: f64,
+    /// What the grid part cost.
+    pub cost_cents: f64,
+    /// What all of it would have cost with no solar or battery.
+    pub baseline_cents: f64,
+    /// What the solar and battery part would have earned if exported
+    /// instead: money not earned, not money spent.
+    pub feed_in_forgone_cents: f64,
+}
+
+/// A stretch of the car's energy: `kwh` drawn evenly over `[from, to)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Draw {
+    from: i64,
+    to: i64,
+    kwh: f64,
+}
+
+/// The car's energy over time from its power samples (`(ts, watts)`, oldest
+/// first). Each sample is held until the next one, for at most
+/// [`MAX_POWER_HOLD_SECS`], and clipped to `[start, end)`. If
+/// `energy_used_kwh` is known and above 0, the profile is scaled to add up to
+/// it, because the samples are rounded. With no usable samples the energy is
+/// spread evenly over the whole session.
+fn car_draws(
+    power: &[(i64, f64)],
+    start: i64,
+    end: i64,
+    energy_used_kwh: Option<f64>,
+) -> Vec<Draw> {
+    let mut draws: Vec<Draw> = power
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(ts, watts))| {
+            let next = power.get(i + 1).map_or(i64::MAX, |p| p.0);
+            let (from, to) = (ts.max(start), (ts + MAX_POWER_HOLD_SECS).min(next).min(end));
+            (to > from).then(|| Draw {
+                from,
+                to,
+                kwh: watts.max(0.0) * (to - from) as f64 / WS_PER_KWH,
+            })
+        })
+        .collect();
+    let total: f64 = draws.iter().map(|d| d.kwh).sum();
+    let energy = energy_used_kwh.filter(|kwh| *kwh > 0.0);
+    match energy {
+        Some(energy) if total > 0.0 => {
+            for draw in &mut draws {
+                draw.kwh *= energy / total;
+            }
+        }
+        Some(energy) if end > start => {
+            draws = vec![Draw {
+                from: start,
+                to: end,
+                kwh: energy,
+            }];
+        }
+        _ => {}
+    }
+    draws
+}
+
+/// The share (0 to 1) of `[start, end)` that `intervals` cover. They must be
+/// sorted and must not overlap.
+pub fn coverage(intervals: &[Interval], start: i64, end: i64) -> f64 {
+    if end <= start {
+        return 0.0;
+    }
+    let covered: i64 = intervals
+        .iter()
+        .map(|i| (i.end_ts.min(end) - i.start_ts.max(start)).max(0))
+        .sum();
+    covered as f64 / (end - start) as f64
+}
+
+/// One part of a draw: the time it lies in, its energy and the house interval
+/// it falls in (`None` if no interval covers that time).
+struct Piece {
+    mid: i64,
+    kwh: f64,
+    interval: Option<usize>,
+}
+
+/// Cuts the draws at the boundaries of the intervals. Both are sorted, so one
+/// pass is enough.
+fn cut_pieces(draws: &[Draw], intervals: &[Interval]) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    // The first interval that has not ended before the current draw began.
+    let mut first = 0;
+    for draw in draws {
+        while first < intervals.len() && intervals[first].end_ts <= draw.from {
+            first += 1;
+        }
+        let per_sec = draw.kwh / (draw.to - draw.from) as f64;
+        let mut piece = |from: i64, to: i64, interval: Option<usize>| {
+            if to > from {
+                pieces.push(Piece {
+                    mid: from + (to - from) / 2,
+                    kwh: per_sec * (to - from) as f64,
+                    interval,
+                });
+            }
+        };
+        // `at` is how far into the draw has been handed out.
+        let mut at = draw.from;
+        for (i, interval) in intervals.iter().enumerate().skip(first) {
+            if interval.start_ts >= draw.to {
+                break;
+            }
+            let (from, to) = (
+                interval.start_ts.max(draw.from),
+                interval.end_ts.min(draw.to),
+            );
+            piece(at, from, None);
+            piece(from.max(at), to, Some(i));
+            at = at.max(to);
+        }
+        piece(at, draw.to, None);
+    }
+    pieces
+}
+
+/// Works out a finished session `[start, end)` from the car's `power`
+/// (`(ts, watts)`, oldest first) and the house `intervals` (sorted).
+///
+/// The car's energy over time comes from [`car_draws`]. Inside a house
+/// interval the car is part of the house load, so it gets the load's grid
+/// share (import over load); what is left comes from solar or the home
+/// battery. If the car took more than the whole load in an interval (the
+/// data does not agree), the excess counts as grid. Car energy in time no
+/// interval covers counts as grid too and is reported as `uncovered_kwh`.
+///
+/// Every piece is priced at its own middle moment with `prices`.
+pub fn historic_session_cost(
+    power: &[(i64, f64)],
+    start: i64,
+    end: i64,
+    energy_used_kwh: Option<f64>,
+    intervals: &[Interval],
+    prices: impl Fn(i64) -> Prices,
+) -> HistoricCost {
+    let draws = car_draws(power, start, end, energy_used_kwh);
+    let pieces = cut_pieces(&draws, intervals);
+
+    // The car's energy in each interval, to find its grid share.
+    let mut car = vec![0.0; intervals.len()];
+    for piece in &pieces {
+        if let Some(i) = piece.interval {
+            car[i] += piece.kwh;
+        }
+    }
+    // The share of the car's energy in each interval that came from the grid.
+    let grid_part: Vec<f64> = intervals
+        .iter()
+        .zip(&car)
+        .map(|(interval, &car)| {
+            if car <= 0.0 {
+                return 0.0;
+            }
+            let load = interval.load_kwh;
+            let share = if load > 0.0 {
+                (interval.import_kwh / load).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let car_in = car.min(load.max(0.0));
+            let grid = car_in * share + (car - car_in);
+            grid / car
+        })
+        .collect();
+
+    let mut cost = HistoricCost::default();
+    for piece in &pieces {
+        let price = prices(piece.mid);
+        let grid = match piece.interval {
+            Some(i) => piece.kwh * grid_part[i],
+            None => {
+                cost.uncovered_kwh += piece.kwh;
+                piece.kwh
+            }
+        };
+        let own = piece.kwh - grid;
+        cost.kwh += piece.kwh;
+        cost.grid_kwh += grid;
+        cost.self_kwh += own;
+        cost.cost_cents += grid * price.import_cents;
+        cost.baseline_cents += piece.kwh * price.baseline_cents;
+        cost.feed_in_forgone_cents += own * price.export_cents;
+    }
+    cost
+}
+
+/// The bill that covers a local day, if there is one.
+fn bill_on(bills: &[PastBill], date: NaiveDate) -> Option<&PastBill> {
+    bills.iter().find(|b| b.from <= date && date <= b.to)
+}
+
+/// The prices at a unix time, on the plan in effect that local day.
+///
+/// - Import: on a day inside a past bill, the bill's average import price,
+///   because spot pricing (Amber) has no prices per interval. Otherwise the
+///   plan's price at that time.
+/// - Baseline: always the plan's import price at that time, the same
+///   no-solar baseline Payback uses, bill days included.
+/// - Export: always the plan's feed-in price. A bill's average export price is
+///   skewed by the battery's spike exports, so the plan stands in for it.
+///
+/// A time far outside real data gets all zeros.
+pub fn session_prices<'a>(
+    schedule: &'a TariffSchedule,
+    bills: &'a [PastBill],
+    tz: Tz,
+) -> impl Fn(i64) -> Prices + 'a {
+    move |ts| {
+        let Some((date, minute)) = local_time(tz, ts) else {
+            return Prices::default();
+        };
+        let tariff = schedule.for_date(date);
+        let baseline_cents = tariff.import_cents_at(minute);
+        let import_cents = match bill_on(bills, date) {
+            Some(bill) => bills::cents_per_kwh(bill.import_dollars, bill.import_kwh),
+            None => baseline_cents,
+        };
+        Prices {
+            import_cents,
+            baseline_cents,
+            export_cents: tariff.export_cents_at(minute),
+        }
+    }
+}
+
+/// What a stored session cost is tagged with: the costing rules, the time
+/// zone, the plan on the day the session started and the bill covering that
+/// day (its `from..to`, or "-"). A session whose tag differs from this is
+/// worked out again.
+pub fn historic_cost_key(
+    schedule: &TariffSchedule,
+    bills: &[PastBill],
+    tz: Tz,
+    started_at: i64,
+) -> String {
+    let date = local_time(tz, started_at).map(|(date, _)| date);
+    let plan = date.map_or("-", |d| schedule.for_date(d).key());
+    let bill = date
+        .and_then(|d| bill_on(bills, d))
+        .map_or("-".to_string(), |b| format!("{}..{}", b.from, b.to));
+    format!("{HISTORIC_COST_VERSION}|{tz}|{plan}|{bill}")
 }
 
 /// What the comparison with petrol is based on; see `[teslamate]` in
@@ -667,5 +964,340 @@ mod tests {
         let p = &summary.total;
         assert_eq!((p.ev_cents_per_km, p.petrol_cents_per_km), (None, None));
         assert_eq!(p.saved, Some(-2.5));
+    }
+
+    // --- Finished sessions ---
+
+    fn interval(start_ts: i64, end_ts: i64, import: f64, export: f64, load: f64) -> Interval {
+        Interval {
+            start_ts,
+            end_ts,
+            import_kwh: import,
+            export_kwh: export,
+            load_kwh: load,
+        }
+    }
+
+    /// The same prices at any time: 30 c import, 40 c baseline, 5 c export.
+    fn flat(_ts: i64) -> Prices {
+        Prices {
+            import_cents: 30.0,
+            baseline_cents: 40.0,
+            export_cents: 5.0,
+        }
+    }
+
+    /// 7.2 kW once a minute from `start` for `minutes`.
+    fn steady_power(start: i64, minutes: i64) -> Vec<(i64, f64)> {
+        (0..minutes).map(|m| (start + m * 60, 7200.0)).collect()
+    }
+
+    #[test]
+    fn a_power_sample_is_held_until_the_next_but_not_past_five_minutes() {
+        // 7.2 kW for 1 minute, then a 20 minute gap: only 5 minutes count.
+        let draws = car_draws(&[(0, 7200.0), (60, 7200.0), (1260, 0.0)], 0, 3600, None);
+        let kwh: Vec<f64> = draws.iter().map(|d| d.kwh).collect();
+        close(kwh[0], 0.12);
+        close(kwh[1], 0.6);
+        close(kwh[2], 0.0);
+        assert_eq!((draws[1].from, draws[1].to), (60, 360));
+    }
+
+    #[test]
+    fn power_is_clipped_to_the_session() {
+        let draws = car_draws(&[(0, 3600.0), (600, 3600.0)], 100, 700, None);
+        // A sample is held from its own time, not from where the clip starts.
+        assert_eq!((draws[0].from, draws[0].to), (100, 300));
+        assert_eq!((draws[1].from, draws[1].to), (600, 700));
+        // Samples wholly outside add nothing.
+        assert!(car_draws(&[(5000, 3600.0)], 0, 100, None).is_empty());
+    }
+
+    #[test]
+    fn the_profile_is_scaled_to_the_energy_used() {
+        let power = steady_power(0, 60);
+        let total = |energy| -> f64 {
+            car_draws(&power, 0, 3600, energy)
+                .iter()
+                .map(|d| d.kwh)
+                .sum()
+        };
+        close(total(None), 7.2);
+        close(total(Some(6.0)), 6.0);
+        // No energy to scale to: the profile stays as it is.
+        close(total(Some(0.0)), 7.2);
+    }
+
+    #[test]
+    fn without_power_the_energy_is_spread_evenly() {
+        for power in [vec![], vec![(0, 0.0), (60, 0.0)]] {
+            let draws = car_draws(&power, 1000, 4600, Some(5.0));
+            assert_eq!(
+                draws,
+                vec![Draw {
+                    from: 1000,
+                    to: 4600,
+                    kwh: 5.0
+                }]
+            );
+        }
+        assert!(car_draws(&[], 1000, 4600, None).is_empty());
+        assert!(car_draws(&[], 1000, 1000, Some(5.0)).is_empty());
+    }
+
+    #[test]
+    fn coverage_is_the_share_of_the_session_inside_intervals() {
+        let intervals = [
+            interval(0, 1000, 0.0, 0.0, 0.0),
+            interval(1000, 1500, 0.0, 0.0, 0.0),
+            interval(3000, 4000, 0.0, 0.0, 0.0),
+        ];
+        close(coverage(&intervals, 500, 2500), 1000.0 / 2000.0);
+        close(coverage(&intervals, 0, 1500), 1.0);
+        close(coverage(&intervals, 5000, 6000), 0.0);
+        close(coverage(&[], 0, 100), 0.0);
+        close(coverage(&intervals, 100, 100), 0.0);
+    }
+
+    #[test]
+    fn the_car_gets_the_loads_grid_share_in_an_interval() {
+        // 1 kWh of the house's 4 kWh load came from the grid: a quarter.
+        let intervals = [interval(0, 3600, 1.0, 0.0, 4.0)];
+        let power = steady_power(0, 60);
+        let got = historic_session_cost(&power, 0, 3600, Some(2.0), &intervals, flat);
+        close(got.kwh, 2.0);
+        close(got.grid_kwh, 0.5);
+        close(got.self_kwh, 1.5);
+        close(got.uncovered_kwh, 0.0);
+        close(got.cost_cents, 0.5 * 30.0);
+        close(got.baseline_cents, 2.0 * 40.0);
+        close(got.feed_in_forgone_cents, 1.5 * 5.0);
+    }
+
+    #[test]
+    fn all_solar_costs_nothing_and_forgoes_the_feed_in() {
+        let intervals = [interval(0, 3600, 0.0, 3.0, 5.0)];
+        let got = historic_session_cost(&steady_power(0, 60), 0, 3600, Some(4.0), &intervals, flat);
+        close(got.grid_kwh, 0.0);
+        close(got.self_kwh, 4.0);
+        close(got.cost_cents, 0.0);
+        close(got.feed_in_forgone_cents, 20.0);
+        close(got.baseline_cents, 160.0);
+    }
+
+    #[test]
+    fn a_car_bigger_than_the_load_counts_the_excess_as_grid() {
+        // The house load says 1 kWh, all from the grid... or half of it.
+        let intervals = [interval(0, 3600, 0.5, 0.0, 1.0)];
+        let got = historic_session_cost(&steady_power(0, 60), 0, 3600, Some(3.0), &intervals, flat);
+        // 1 kWh fits in the load, half of it grid; the other 2 kWh are excess.
+        close(got.grid_kwh, 0.5 + 2.0);
+        close(got.self_kwh, 0.5);
+    }
+
+    #[test]
+    fn an_interval_with_no_load_counts_as_grid() {
+        let intervals = [interval(0, 3600, 0.0, 0.0, 0.0)];
+        let got = historic_session_cost(&steady_power(0, 60), 0, 3600, Some(3.0), &intervals, flat);
+        close(got.grid_kwh, 3.0);
+        close(got.self_kwh, 0.0);
+        close(got.uncovered_kwh, 0.0);
+    }
+
+    #[test]
+    fn a_grid_share_above_one_is_capped() {
+        // Import is more than load (meters disagree): all grid, never more.
+        let intervals = [interval(0, 3600, 5.0, 0.0, 2.0)];
+        let got = historic_session_cost(&steady_power(0, 60), 0, 3600, Some(2.0), &intervals, flat);
+        close(got.grid_kwh, 2.0);
+        close(got.self_kwh, 0.0);
+    }
+
+    #[test]
+    fn time_without_intervals_is_uncovered_and_counted_as_grid() {
+        // The house data covers only the first half hour.
+        let intervals = [interval(0, 1800, 0.0, 0.0, 10.0)];
+        let got = historic_session_cost(&steady_power(0, 60), 0, 3600, Some(4.0), &intervals, flat);
+        close(got.kwh, 4.0);
+        close(got.uncovered_kwh, 2.0);
+        // The covered half is all solar; the uncovered half is grid.
+        close(got.grid_kwh, 2.0);
+        close(got.self_kwh, 2.0);
+        close(got.cost_cents, 60.0);
+        // No interval at all: everything is uncovered.
+        let none = historic_session_cost(&steady_power(0, 60), 0, 3600, Some(4.0), &[], flat);
+        close(none.uncovered_kwh, 4.0);
+        close(none.grid_kwh, 4.0);
+        close(none.cost_cents, 120.0);
+    }
+
+    #[test]
+    fn the_car_energy_in_an_interval_is_shared_across_its_pieces() {
+        // Two power samples fall in one interval; the load cap is on the sum.
+        let intervals = [interval(0, 3600, 0.0, 0.0, 1.0)];
+        let power = [(0, 7200.0), (1800, 7200.0)];
+        let got = historic_session_cost(&power, 0, 3600, Some(4.0), &intervals, flat);
+        // 1 kWh of the 4 is in the load (all solar); 3 kWh are excess.
+        close(got.self_kwh, 1.0);
+        close(got.grid_kwh, 3.0);
+    }
+
+    #[test]
+    fn each_piece_is_priced_at_its_own_time() {
+        // Cheap before t=1800, dear after.
+        let prices = |ts: i64| Prices {
+            import_cents: if ts < 1800 { 10.0 } else { 50.0 },
+            baseline_cents: if ts < 1800 { 10.0 } else { 50.0 },
+            export_cents: 0.0,
+        };
+        // One interval spans the change; the power samples are hourly in
+        // effect (held 5 minutes each), so cut at the interval edges too.
+        let intervals = [
+            interval(0, 1800, 4.0, 0.0, 4.0),
+            interval(1800, 3600, 4.0, 0.0, 4.0),
+        ];
+        let power = [(0, 3600.0), (1800, 3600.0)];
+        let got = historic_session_cost(&power, 0, 3600, Some(2.0), &intervals, prices);
+        // Half of the 2 kWh at each price, all from the grid.
+        close(got.cost_cents, 1.0 * 10.0 + 1.0 * 50.0);
+        close(got.baseline_cents, 60.0);
+    }
+
+    #[test]
+    fn a_draw_spanning_several_intervals_is_cut_at_their_edges() {
+        let draws = [Draw {
+            from: 100,
+            to: 400,
+            kwh: 3.0,
+        }];
+        let intervals = [
+            interval(0, 200, 0.0, 0.0, 1.0),
+            interval(200, 300, 0.0, 0.0, 1.0),
+            interval(350, 500, 0.0, 0.0, 1.0),
+        ];
+        let pieces = cut_pieces(&draws, &intervals);
+        let got: Vec<(Option<usize>, i64, f64)> =
+            pieces.iter().map(|p| (p.interval, p.mid, p.kwh)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(0), 150, 1.0),
+                (Some(1), 250, 1.0),
+                (None, 325, 0.5),
+                (Some(2), 375, 0.5),
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_to_cost_gives_zeros() {
+        let got = historic_session_cost(&[], 0, 3600, None, &[], flat);
+        assert_eq!(got, HistoricCost::default());
+    }
+
+    #[test]
+    fn energy_adds_up_whatever_the_intervals_are() {
+        let intervals = [
+            interval(500, 1500, 0.3, 0.1, 2.0),
+            interval(1500, 2500, 1.9, 0.0, 2.0),
+        ];
+        let got = historic_session_cost(&steady_power(0, 60), 0, 3600, Some(5.5), &intervals, flat);
+        close(got.kwh, 5.5);
+        close(got.grid_kwh + got.self_kwh, 5.5);
+        assert!(got.uncovered_kwh <= got.grid_kwh + 1e-9);
+    }
+
+    fn bill(from: &str, to: &str) -> PastBill {
+        PastBill {
+            from: from.parse().unwrap(),
+            to: to.parse().unwrap(),
+            bill_total: 0.0,
+            excluded: 0.0,
+            import_kwh: 200.0,
+            import_dollars: 50.0,
+            export_kwh: 100.0,
+            export_dollars: 40.0,
+            supply_dollars: 0.0,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn prices_follow_the_plan_at_that_time() {
+        let schedule = schedule();
+        let prices = session_prices(&schedule, &[], ADELAIDE);
+        let peak = prices(at(18, 0));
+        assert_eq!(
+            peak,
+            Prices {
+                import_cents: 60.0,
+                baseline_cents: 60.0,
+                export_cents: 5.0
+            }
+        );
+        assert_eq!(prices(at(12, 0)).import_cents, 0.0);
+        assert_eq!(prices(at(2, 0)).import_cents, 40.0);
+    }
+
+    #[test]
+    fn a_bill_day_imports_at_the_bills_average_but_keeps_the_plan_baseline() {
+        let schedule = schedule();
+        let bills = [bill("2026-09-10", "2026-09-15")];
+        let prices = session_prices(&schedule, &bills, ADELAIDE);
+        let got = prices(at(18, 0));
+        // $50 over 200 kWh.
+        close(got.import_cents, 25.0);
+        close(got.baseline_cents, 60.0);
+        close(got.export_cents, 5.0);
+        // The free window of the plan is no longer free on a bill day.
+        close(prices(at(12, 0)).import_cents, 25.0);
+        close(prices(at(12, 0)).baseline_cents, 0.0);
+        // The day after the bill is on the plan again.
+        let next = at(18, 0) + 86_400;
+        close(prices(next).import_cents, 60.0);
+    }
+
+    #[test]
+    fn the_cost_key_follows_the_rules_zone_plan_and_bill() {
+        let schedule = schedule();
+        let start = at(18, 0);
+        let plain = historic_cost_key(&schedule, &[], ADELAIDE, start);
+        assert!(plain.starts_with(&format!("{HISTORIC_COST_VERSION}|Australia/Adelaide|")));
+        assert!(plain.ends_with("|-"));
+        assert_eq!(plain, historic_cost_key(&schedule, &[], ADELAIDE, start));
+        let billed = historic_cost_key(
+            &schedule,
+            &[bill("2026-09-10", "2026-09-15")],
+            ADELAIDE,
+            start,
+        );
+        assert!(billed.ends_with("|2026-09-10..2026-09-15"));
+        assert_ne!(plain, billed);
+        // A bill elsewhere does not matter.
+        let elsewhere = historic_cost_key(
+            &schedule,
+            &[bill("2026-08-01", "2026-08-31")],
+            ADELAIDE,
+            start,
+        );
+        assert_eq!(plain, elsewhere);
+        // Another zone, or a changed plan, changes it.
+        assert_ne!(
+            plain,
+            historic_cost_key(&schedule, &[], chrono_tz::Australia::Perth, start)
+        );
+        let other = {
+            #[derive(serde::Deserialize)]
+            struct Wrapper {
+                tariff: config::Tariff,
+            }
+            let w: Wrapper = toml::from_str(
+                "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 41.0\n\
+                 default_export_cents = 5.0\n",
+            )
+            .unwrap();
+            TariffSchedule::from_config(&w.tariff, &[]).unwrap()
+        };
+        assert_ne!(plain, historic_cost_key(&other, &[], ADELAIDE, start));
     }
 }

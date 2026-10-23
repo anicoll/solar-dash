@@ -445,7 +445,7 @@ fn local_midnight(date: NaiveDate, tz: Tz) -> Option<i64> {
 
 /// The local day `date` as `[start, end)` in unix seconds. On a daylight
 /// saving change this is 23 or 25 hours long, not 24.
-fn day_bounds(date: NaiveDate, tz: Tz) -> Option<(i64, i64)> {
+pub(super) fn day_bounds(date: NaiveDate, tz: Tz) -> Option<(i64, i64)> {
     let next = date.checked_add_days(Days::new(1))?;
     Some((local_midnight(date, tz)?, local_midnight(next, tz)?))
 }

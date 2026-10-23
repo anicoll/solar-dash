@@ -7,21 +7,24 @@
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
+use anyhow::{Context, Result};
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::SqlitePool;
 
 use super::AppState;
 use super::api::{
-    ApiError, ApiResult, DEFAULT_DAILY_DAYS, MAX_HOLD_SECS, Spread, date_range,
+    ApiError, ApiResult, DEFAULT_DAILY_DAYS, MAX_HOLD_SECS, Spread, date_range, day_bounds,
     day_bounds_or_error, live_totals, spread_steps, today,
 };
 use crate::bills::{self, Metered, PastBill};
 use crate::cost::{self, DayCost, GridSplit, Interval, Tariff, TariffSchedule};
 use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
+use crate::ev_cost;
 use crate::globird::data::{self as globird_data, bucket_of, is_supply};
 use crate::modbus::Sample;
 
@@ -168,6 +171,107 @@ pub(super) fn day_intervals(
     Some(("cloud", intervals, true))
 }
 
+/// The three cloud counters over a range, `(ts, Wh)` oldest first.
+#[derive(Default)]
+struct Counters {
+    import: Vec<(i64, f64)>,
+    export: Vec<(i64, f64)>,
+    load: Vec<(i64, f64)>,
+}
+
+/// Reads the import, export and load counters in `[start, end)` with one query.
+async fn counters_in(pool: &SqlitePool, plant_id: i64, start: i64, end: i64) -> Result<Counters> {
+    let rows = db::readings_for_points(
+        pool,
+        plant_id,
+        &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER],
+        start,
+        end,
+    )
+    .await?;
+    let counter = |point_id: i64| -> Vec<(i64, f64)> {
+        rows.iter()
+            .filter(|row| row.0 == point_id)
+            .map(|row| (row.1, row.2))
+            .collect()
+    };
+    Ok(Counters {
+        import: counter(IMPORT_COUNTER),
+        export: counter(EXPORT_COUNTER),
+        load: counter(LOAD_COUNTER),
+    })
+}
+
+/// The live samples in `[start, end)`. Only the part the live samples cover
+/// (`live_range`, from [`db::live_ts_range`]) is loaded.
+async fn live_in(
+    pool: &SqlitePool,
+    live_range: Option<(i64, i64)>,
+    start: i64,
+    end: i64,
+) -> Result<Vec<Sample>> {
+    match live_range {
+        Some((first, last)) if first < end && last >= start => {
+            db::live_samples_raw(pool, start.max(first), end.min(last + 1)).await
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// The house intervals over the time `[start, end)` and the share of it that
+/// they cover (0 to 1), for costing something that sits inside the house load,
+/// say a charging session. It loads the local days the time touches the way
+/// `compute_days` does and picks each day's source with [`day_intervals`], so
+/// the intervals are the same ones `/api/costs` prices. They are returned
+/// whole days at a time, so some lie outside `[start, end)`. A day with no
+/// data adds none.
+pub(crate) async fn house_intervals(
+    pool: &SqlitePool,
+    plant_id: i64,
+    tz: Tz,
+    start: i64,
+    end: i64,
+    now: i64,
+) -> Result<(Vec<Interval>, f64)> {
+    let local_date = |ts: i64| {
+        DateTime::from_timestamp(ts, 0)
+            .map(|t| t.with_timezone(&tz).date_naive())
+            .context("time is out of range")
+    };
+    if end <= start {
+        return Ok((Vec::new(), 0.0));
+    }
+    let (first, last) = (local_date(start)?, local_date(end - 1)?);
+    let mut bounds = Vec::new();
+    let mut date = first;
+    while date <= last {
+        bounds.push(day_bounds(date, tz).context("date is out of range")?);
+        date = date.succ_opt().context("date is out of range")?;
+    }
+    let range_start = bounds[0].0;
+    let range_end = bounds[bounds.len() - 1].1;
+    let counters = counters_in(pool, plant_id, range_start, range_end).await?;
+    let live_range = db::live_ts_range(pool).await?;
+    let live = live_in(pool, live_range, range_start, range_end).await?;
+
+    let mut intervals = Vec::new();
+    for &(day_start, day_end) in &bounds {
+        let day = DayData {
+            start: day_start,
+            end: day_end,
+            live: slice_between(&live, |s| s.ts, day_start, day_end),
+            import: slice_between(&counters.import, |r| r.0, day_start, day_end),
+            export: slice_between(&counters.export, |r| r.0, day_start, day_end),
+            load: slice_between(&counters.load, |r| r.0, day_start, day_end),
+        };
+        if let Some((_, day_intervals, _)) = day_intervals(&day, now) {
+            intervals.extend(day_intervals);
+        }
+    }
+    let covered = ev_cost::coverage(&intervals, start, end);
+    Ok((intervals, covered))
+}
+
 /// One day's grid energy split by tariff band, priced on the plan in effect
 /// that day, or `None` when the day has no interval data (or no tariff).
 ///
@@ -188,36 +292,18 @@ pub(super) async fn day_grid_split(
 ) -> Result<Option<GridSplit>, ApiError> {
     let (start, end) = day_bounds_or_error(date, state.tz)?;
     let solid = live_totals(live, start, end, now).is_some_and(|l| l.solid);
-    let rows = if solid {
-        Vec::new()
+    let counters = if solid {
+        Counters::default()
     } else {
-        db::readings_for_points(
-            &state.pool,
-            state.plant_id,
-            &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER],
-            start,
-            end,
-        )
-        .await?
+        counters_in(&state.pool, state.plant_id, start, end).await?
     };
-    let counter = |point_id: i64| -> Vec<(i64, f64)> {
-        rows.iter()
-            .filter(|row| row.0 == point_id)
-            .map(|row| (row.1, row.2))
-            .collect()
-    };
-    let (import, export, load) = (
-        counter(IMPORT_COUNTER),
-        counter(EXPORT_COUNTER),
-        counter(LOAD_COUNTER),
-    );
     let day = DayData {
         start,
         end,
         live,
-        import: &import,
-        export: &export,
-        load: &load,
+        import: &counters.import,
+        export: &counters.export,
+        load: &counters.load,
     };
     Ok(day_intervals(&day, now)
         .map(|(_, intervals, _)| cost::grid_split(schedule.for_date(date), state.tz, &intervals)))
@@ -505,25 +591,7 @@ async fn compute_days(
     let range_end = bounds[bounds.len() - 1].1;
 
     // One query for all three counters over the whole range, then split.
-    let rows = db::readings_for_points(
-        &state.pool,
-        state.plant_id,
-        &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER],
-        range_start,
-        range_end,
-    )
-    .await?;
-    let counter = |point_id: i64| -> Vec<(i64, f64)> {
-        rows.iter()
-            .filter(|row| row.0 == point_id)
-            .map(|row| (row.1, row.2))
-            .collect()
-    };
-    let (import, export, load) = (
-        counter(IMPORT_COUNTER),
-        counter(EXPORT_COUNTER),
-        counter(LOAD_COUNTER),
-    );
+    let counters = counters_in(&state.pool, state.plant_id, range_start, range_end).await?;
 
     let live_range = db::live_ts_range(&state.pool).await?;
     let now = db::now();
@@ -536,23 +604,16 @@ async fn compute_days(
         // Only the part of the chunk the live samples cover is loaded.
         let chunk_start = chunk_bounds[0].0;
         let chunk_end = chunk_bounds[chunk_bounds.len() - 1].1;
-        let live = match live_range {
-            Some((first, last)) if first < chunk_end && last >= chunk_start => {
-                let from = chunk_start.max(first);
-                let to = chunk_end.min(last + 1);
-                db::live_samples_raw(&state.pool, from, to).await?
-            }
-            _ => Vec::new(),
-        };
+        let live = live_in(&state.pool, live_range, chunk_start, chunk_end).await?;
 
         for (&date, &(start, end)) in chunk_dates.iter().zip(chunk_bounds) {
             let day = DayData {
                 start,
                 end,
                 live: slice_between(&live, |s| s.ts, start, end),
-                import: slice_between(&import, |r| r.0, start, end),
-                export: slice_between(&export, |r| r.0, start, end),
-                load: slice_between(&load, |r| r.0, start, end),
+                import: slice_between(&counters.import, |r| r.0, start, end),
+                export: slice_between(&counters.export, |r| r.0, start, end),
+                load: slice_between(&counters.load, |r| r.0, start, end),
             };
             let Some((source, intervals, live_solid)) = day_intervals(&day, now) else {
                 continue;

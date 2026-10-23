@@ -8,6 +8,8 @@ mod costs;
 mod globird;
 mod payback;
 
+pub(crate) use costs::house_intervals;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -35,7 +37,7 @@ use tower_http::compression::CompressionLayer;
 use crate::bills::PastBill;
 use crate::config::Config;
 use crate::cost::TariffSchedule;
-use crate::ev_cost::EvPrices;
+use crate::ev_cost::{CostSetup, EvPrices};
 use crate::modbus::Latest;
 use crate::teslamate::Car;
 use auth::LockoutMap;
@@ -173,6 +175,16 @@ impl AppState {
     /// The slot the TeslaMate task writes the car's state to.
     pub fn car(&self) -> Car {
         self.car.clone()
+    }
+
+    /// What the TeslaMate history sync needs to cost past sessions, or `None`
+    /// without a `[tariff]`.
+    pub fn cost_setup(&self) -> Option<CostSetup> {
+        Some(CostSetup {
+            schedule: self.tariff.clone()?,
+            bills: self.bills.clone(),
+            plant_id: self.plant_id,
+        })
     }
 
     /// The plant's time zone, which decides where a day ends.
@@ -1573,6 +1585,45 @@ mod tests {
             }
         }
         db::upsert_readings(pool, PLANT, &readings).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn house_intervals_cover_the_days_a_time_touches() {
+        let (_dir, _app, pool) = costs_app().await;
+        let tz = chrono_tz::Australia::Adelaide;
+        // The 15th has counters all day; the 16th has none.
+        seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
+        let now = SEP_15_START + 3 * 86_400;
+        let (start, end) = (SEP_15_START + 3 * 3600, SEP_15_START + 5 * 3600);
+        let (intervals, covered) = costs::house_intervals(&pool, PLANT, tz, start, end, now)
+            .await
+            .unwrap();
+        assert!(!intervals.is_empty());
+        // The whole day is the source, so these are the day's intervals.
+        assert!(intervals.iter().any(|i| i.start_ts < start));
+        assert!(intervals.windows(2).all(|w| w[0].end_ts <= w[1].start_ts));
+        assert!((0.0..=1.0).contains(&covered));
+
+        // A session across midnight loads both days; the empty one adds none.
+        let night = (SEP_15_START + 86_400 - 1800, SEP_15_START + 86_400 + 1800);
+        let (_, covered) = costs::house_intervals(&pool, PLANT, tz, night.0, night.1, now)
+            .await
+            .unwrap();
+        assert!(covered < 0.6, "the 16th has no data, got {covered}");
+
+        // Nothing stored, or no length: nothing covered.
+        let later = SEP_15_START + 10 * 86_400;
+        let (intervals, covered) =
+            costs::house_intervals(&pool, PLANT, tz, later, later + 3600, now)
+                .await
+                .unwrap();
+        assert!(intervals.is_empty());
+        assert_eq!(covered, 0.0);
+        let (intervals, covered) = costs::house_intervals(&pool, PLANT, tz, start, start, now)
+            .await
+            .unwrap();
+        assert!(intervals.is_empty());
+        assert_eq!(covered, 0.0);
     }
 
     /// How many days are stored in the `daily_cost` table.
