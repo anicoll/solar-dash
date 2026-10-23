@@ -572,3 +572,26 @@ table.data td.save { color: var(--save); }
   #battery-table .short { display: inline; }
 }
 .battery-stats .kpi .unit { font-family: var(--font); }
+
+/* ---------- Money: Cars ---------- */
+.car-section { display: flex; flex-direction: column; gap: 12px; padding-top: 16px; border-top: 1px solid var(--border); }
+.car-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 12px; }
+.car-name { margin: 0; font-size: 17px; font-weight: 600; color: var(--fg); }
+.car-dates { font-size: 13px; color: var(--muted); }
+.car-saved { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 32px; font-weight: 600; line-height: 1.1; color: var(--save); }
+.car-saved .unit { font-family: var(--font); font-size: 15px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+.car-stats { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; }
+@media (min-width: 760px) { .car-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; } }
+.car-stats .kpi { border-radius: 0; border-width: 0 0 1px; background: none; padding: 10px 0; flex-direction: row; flex-wrap: wrap; justify-content: space-between; align-items: baseline; }
+.car-stats .kpi:last-child { border-bottom: 0; }
+.car-stats .kpi .label { font-size: 15px; color: var(--fg-soft); }
+.car-stats .kpi .value { font-size: 18px; }
+.car-stats .kpi .unit { font-family: var(--font); }
+@media (min-width: 760px) {
+  .car-stats .kpi { border-width: 1px; border-radius: 12px; background: var(--panel-2); flex-direction: column; flex-wrap: nowrap; align-items: stretch; justify-content: flex-start; padding: 14px 16px; }
+  .car-stats .kpi:last-child { border-bottom-width: 1px; }
+  .car-stats .kpi .label { font-size: 13px; color: var(--muted); }
+  .car-stats .kpi .value { font-size: 22px; }
+}
+.car-chart { width: 100%; height: 200px; }
+.car-section .panel-note { margin: 0; }

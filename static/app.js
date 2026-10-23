@@ -2813,6 +2813,146 @@
     renderBatteryMissed(data.days);
   }
 
+  // ---------- Money: Cars ----------
+
+  const CARS_KEY = 'solar-dash.cars-view';
+  const CARS_EXPLAIN = {
+    with: 'What charging really cost: grid power on your plan, solar and battery free.',
+    without: 'Every kWh bought from the grid on the plan of the day, as if there were no solar or battery.',
+  };
+  let carsData = null;
+  let carsView = 'with';
+  try { if (localStorage.getItem(CARS_KEY) === 'without') carsView = 'without'; } catch (err) { /* private window or blocked storage */ }
+
+  /** Whole dollars from $100, cents below that, so a small car still shows something. */
+  const carMoney = (v) => (v == null ? '–' : money(v, Math.abs(v) >= 100 ? 0 : 2));
+  const centsPerKm = (v) => (v == null || !Number.isFinite(v) ? '–' : v.toFixed(1));
+  /** "14 Nov 2024" for a YYYY-MM-DD date. */
+  const carDate = (d) => `${dayLabel(d)} ${d.slice(0, 4)}`;
+
+  function carChartOption(car, view) {
+    const th = baseTheme();
+    const months = car.months;
+    const saved = months.map((m) => m[`${view}_system`].saved);
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 16, top: 36, bottom: 8, containLabel: true },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        formatter: (params) => moneyTooltip([[params[0].marker, 'Saved', money(saved[params[0].dataIndex])]],
+          longMonth(months[params[0].dataIndex].month)),
+      },
+      xAxis: {
+        type: 'category',
+        data: months.map((m) => `${MONTHS[+m.month.slice(5) - 1]} ${m.month.slice(2, 4)}`),
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
+        axisLine: { lineStyle: { color: th.line } },
+      },
+      yAxis: {
+        type: 'value', name: 'Saved ($)', nameTextStyle: { color: th.muted, align: 'left' },
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series: [{
+        name: 'Saved', type: 'bar', barMaxWidth: 28, itemStyle: { color: css('--save-bar') },
+        data: saved.map((v) => (v == null ? null : +v.toFixed(2))),
+      }],
+    };
+  }
+
+  function renderCar(car, view, index) {
+    const t = car.total;
+    const s = t[`${view}_system`];
+    const section = el('div', 'car-section');
+    const head = el('div', 'car-head');
+    head.append(el('h3', 'car-name', car.label),
+      el('span', 'car-dates', `${carDate(car.first_day)} to ${carDate(car.last_day)}`));
+    const big = el('div', 'car-saved', carMoney(s.saved));
+    big.append(el('span', 'unit', 'saved'));
+
+    const petrolCents = t.petrol_cost != null && t.km > 0 ? (t.petrol_cost * 100) / t.km : null;
+    const stats = [
+      kpi('', 'Driven', kwhText(Math.round(t.km)), 'km'),
+      kpi('', 'Charging vs petrol', `${carMoney(s.charging_cost)} vs ${carMoney(t.petrol_cost)}`),
+      kpi('', 'Cents per km', `${centsPerKm(s.cents_per_km)} vs ${centsPerKm(petrolCents)}`, 'EV vs petrol'),
+    ];
+    if (view === 'with') {
+      stats.push(kpi('', 'The system added', carMoney(t.system_added)));
+      const energy = t.grid_kwh + t.self_kwh;
+      if (energy > 0) {
+        stats.push(kpi('', 'Solar and battery share', percent((t.self_kwh / energy) * 100), '', 'of costed home charging'));
+      }
+    }
+    const statRow = el('div', 'car-stats');
+    statRow.append(...stats);
+    section.append(head, big, statRow);
+
+    if (car.months.length >= 2) {
+      const id = `cars-chart-${index}`;
+      const chart = el('div', 'car-chart');
+      chart.id = id;
+      chart.setAttribute('role', 'img');
+      chart.setAttribute('aria-label', `${car.label}: saved each month, in dollars, ${car.months.length} months`);
+      section.append(chart);
+      // The chart needs its element in the page first.
+      requestAnimationFrame(() => {
+        const c = getChart(id);
+        if (c) { c.setOption(carChartOption(car, view), true); c.resize(); }
+      });
+    }
+
+    const notes = [];
+    if (t.pending_sessions > 0) {
+      notes.push(`${t.pending_sessions} ${t.pending_sessions === 1 ? 'session is' : 'sessions are'} still being costed.`);
+    }
+    if (t.away_uncosted_kwh > 0) {
+      notes.push(`${kwhText(t.away_uncosted_kwh)} kWh charged away from home has no price (set away_cents_per_kwh).`);
+    }
+    if (t.uncovered_kwh > 0) {
+      notes.push(`${kwhText(t.uncovered_kwh)} kWh had no house data and was counted as grid.`);
+    }
+    for (const n of notes) section.append(el('p', 'panel-note', n));
+    return section;
+  }
+
+  function renderCars() {
+    const data = carsData;
+    for (const b of document.querySelectorAll('[data-cars]')) {
+      b.setAttribute('aria-pressed', String(b.dataset.cars === carsView));
+    }
+    $('cars-explain').textContent = CARS_EXPLAIN[carsView];
+    // The charts live in the list being replaced.
+    for (const id of Object.keys(charts)) {
+      if (id.startsWith('cars-chart-')) { charts[id].dispose(); delete charts[id]; }
+    }
+    $('cars-list').replaceChildren(...data.cars.map((car, i) => renderCar(car, carsView, i)));
+  }
+
+  /** The Cars card. It stays hidden when there is no TeslaMate history (or the request fails). */
+  async function loadCarsCard(mode, when) {
+    const data = await quiet(api('/api/ev/cars'));
+    if (state.view !== 'money' || state.mode !== mode || state.when !== when) return;
+    $('cars-card').hidden = !data || !Array.isArray(data.cars) || data.cars.length === 0;
+    if ($('cars-card').hidden) return;
+    carsData = data;
+    $('cars-sub').textContent = data.configured
+      ? `Fuel saved against a petrol car using ${data.petrol_litres_per_100km} L/100 km` : '';
+    $('cars-sub').hidden = !data.configured;
+    $('cars-unconfigured').textContent = NOT_CONFIGURED_PETROL;
+    $('cars-unconfigured').hidden = data.configured;
+    $('cars-body').hidden = !data.configured;
+    if (data.configured) renderCars();
+  }
+
+  for (const b of document.querySelectorAll('[data-cars]')) {
+    b.onclick = () => {
+      carsView = b.dataset.cars;
+      try { localStorage.setItem(CARS_KEY, carsView); } catch (err) { /* private window or blocked storage */ }
+      if (carsData) renderCars();
+    };
+  }
+
   async function loadMoneyView(mode, when) {
     for (const b of document.querySelectorAll('[data-money]')) {
       b.setAttribute('aria-pressed', String(b.dataset.money === mode));
@@ -2860,6 +3000,7 @@
     await loadMoneyCar(mode, when, p);
     await loadBillCheck(mode, when, p);
     await loadBatteryCard(mode, when);
+    await loadCarsCard(mode, when);
   }
 
   // ---------- routing (hash) ----------
