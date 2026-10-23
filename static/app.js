@@ -951,6 +951,7 @@
       shoulderCents: t.default_import_cents,
       importWindows: windows(t.import, (w) => ({ free: 'Free', peak: 'Peak', shoulder: 'Shoulder' })[w.band]),
       exportDefaultCents: t.default_export_cents,
+      exportTier: t.export_tier || null,
       exportWindows: windows(t.export, (w) => (w.band === 'super' ? 'Super Export' : 'Feed-in')),
     };
   }
@@ -1013,6 +1014,10 @@
       });
       return `<div class="trow"><b>${name}</b><div class="ttrack">${cells.join('')}</div></div>`;
     });
+    // A kWh-based tier is not a time window, so it gets a note instead of a segment.
+    if (tf.exportTier) {
+      rows.push(`<div class="tnote">${esc(`first ${+tf.exportTier.first_kwh_per_day.toFixed(2)} kWh a day: ${cents(tf.exportTier.cents)}`)}</div>`);
+    }
     strip.innerHTML = rows.join('');
   }
 
@@ -1180,7 +1185,7 @@
   const CORE_KEYS = ['pv_kwh', 'load_kwh', 'import_kwh', 'export_kwh'];
   /** /api/daily's grid energy by tariff band (null without a tariff or interval data). */
   const BOUGHT_KEYS = ['import_free_kwh', 'import_shoulder_kwh', 'import_peak_kwh'];
-  const SOLD_KEYS = ['export_super_kwh', 'export_peak_kwh', 'export_other_kwh'];
+  const SOLD_KEYS = ['export_super_kwh', 'export_peak_kwh', 'export_other_kwh', 'export_tier_kwh'];
   const ENERGY_KEYS = [...CORE_KEYS, 'battery_charge_kwh', 'battery_discharge_kwh', ...BOUGHT_KEYS, ...SOLD_KEYS];
 
   const utcMs = (d) => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10));
@@ -1426,6 +1431,8 @@
         { key: 'export_super_kwh', name: withRate('Sold', r('export', 'super') || 'super'), colour: '--sold-super' },
         { key: 'export_peak_kwh', name: withRate('Sold', r('export', 'peak') || 'peak'), colour: '--sold-rest' },
         { key: 'export_other_kwh', name: withRate('Sold', r('export', 'other') || 'other'), colour: '--sold-rest' },
+        // The first kWh of each day on a tiered feed-in plan (all zero, so not drawn, without one).
+        { key: 'export_tier_kwh', name: t && t.export_tier ? `Sold first ${+t.export_tier.first_kwh_per_day.toFixed(2)} kWh a day ${cents(t.export_tier.cents)}` : 'Sold daily tier', colour: '--sold-tier' },
       ],
     };
   }
@@ -1501,7 +1508,7 @@
   }
 
   /** The key above the bars: Solar, Bought free/shoulder/peak, Sold by rate, Battery out/in, Home. */
-  function renderBarsLegend(t, unsplit) {
+  function renderBarsLegend(t, unsplit, hasTier) {
     const parts = gridParts(t);
     const sw = (colour) => { const e = el('span', 'lg-sw'); e.style.background = `var(${colour})`; e.setAttribute('aria-hidden', 'true'); return e; };
     const item = (...nodes) => { const e = el('span', 'lg'); e.append(...nodes); return e; };
@@ -1510,7 +1517,7 @@
     $('bars-legend').replaceChildren(
       item(sw('--c-pv'), 'Solar'),
       item('Bought ', sw('--band-free'), 'free ', sw('--band-shoulder'), 'shoulder ', sw('--band-peak'), 'peak'),
-      item('Sold ', sw('--sold-super'), `${t ? rate(parts.sold[0]) : 'super'} `, sw('--sold-rest'), soldRest),
+      item('Sold ', sw('--sold-super'), `${t ? rate(parts.sold[0]) : 'super'} `, sw('--sold-rest'), soldRest, ...(hasTier ? [' ', sw('--sold-tier'), t && t.export_tier ? `first ${+t.export_tier.first_kwh_per_day.toFixed(2)} kWh a day ${cents(t.export_tier.cents)}` : 'daily tier'] : [])),
       item(sw('--batt-out'), 'Battery out ', sw('--batt-in'), 'in'),
       item(sw('--c-load'), 'Home'),
       ...(unsplit ? [item(sw('--c-grid'), 'Grid, not split by tariff')] : []),
@@ -1542,7 +1549,7 @@
     const wide = narrow && rows.length > 8;
     $('bars-chart').style.width = wide ? `${rows.length * 30 + 40}px` : '';
     const option = energyOption(labels, rows, title, narrow && !wide, thin, histTariff);
-    renderBarsLegend(histTariff, unsplit);
+    renderBarsLegend(histTariff, unsplit, rows.some((d) => d.export_tier_kwh > 0.005));
     showChart('bars-chart', hasEnergy(rows), option,
       `${alt}: columns per period for solar, grid (bought above the axis, sold below), battery (out above, in below) and home, in kWh.`);
     $('bars-hint').textContent = wide ? `${hint} Scroll the chart sideways to see every bar.` : hint;
@@ -1676,6 +1683,8 @@
         cost: (kwh('import_peak_kwh') * buy.peak - kwh('export_peak_kwh') * sell.peak) / 100,
       },
       super: { bought: 0, sold: kwh('export_super_kwh'), cost: (-kwh('export_super_kwh') * sell.super) / 100 },
+      // The first kWh of each day, paid this plan's tier rate whatever the time.
+      tier: { bought: 0, sold: kwh('export_tier_kwh'), cost: (-kwh('export_tier_kwh') * (t.export_tier ? t.export_tier.cents : 0)) / 100 },
       supply: { days: tot.days || 0, cost: ((tot.days || 0) * t.supply_cents_per_day) / 100 },
     };
   }
@@ -1686,7 +1695,7 @@
   /** Fills the By tariff table. `segs` are the runs on one plan, `parts` their /api/daily totals, `costs` the /api/costs totals. */
   function drawTariffTable(segs, parts, costs) {
     const cur = segs[segs.length - 1].t; // labels come from the latest plan
-    const sum = { free: { bought: 0, sold: 0, cost: 0 }, shoulder: { bought: 0, sold: 0, cost: 0 }, peak: { bought: 0, sold: 0, cost: 0 }, super: { bought: 0, sold: 0, cost: 0 } };
+    const sum = { free: { bought: 0, sold: 0, cost: 0 }, shoulder: { bought: 0, sold: 0, cost: 0 }, peak: { bought: 0, sold: 0, cost: 0 }, super: { bought: 0, sold: 0, cost: 0 }, tier: { bought: 0, sold: 0, cost: 0 } };
     let supplyDays = 0;
     let supplyCost = 0;
     segs.forEach((sg, i) => {
@@ -1712,6 +1721,11 @@
     const superW = windows(cur.export, 'super');
     if (superW.length || sum.super.sold > 0.04) {
       add('super', 'Super Export', windowsText(superW), `sell ${rates('export', 'super')}`, sum.super);
+    }
+    const tierCfg = cur.export_tier;
+    if (tierCfg || sum.tier.sold > 0.04) {
+      add('tier', 'Daily feed-in tier', tierCfg ? `first ${+tierCfg.first_kwh_per_day.toFixed(2)} kWh a day` : 'an earlier plan',
+        tierCfg ? `sell ${cents(tierCfg.cents)}` : 'sell tier rate', sum.tier);
     }
     const credit = costs.totals.credit > 0 ? costs.totals.credit : 0;
     const body = rows.map((r) => {

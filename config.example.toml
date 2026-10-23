@@ -141,6 +141,13 @@ path = "data/solar.db"
 # to = "21:00"
 # max_kwh = 0.1
 # credit_cents = 100.0
+# # Optional: a daily tiered feed-in ("first 14 kWh 15c/kWh, thereafter 5c").
+# # The first `first_kwh_per_day` kWh exported in each local day, in time order
+# # from midnight, earn `cents` instead of the time-of-day rate; exports after
+# # that earn the window or default_export_cents rate as usual.
+# [tariff.export_tier]
+# first_kwh_per_day = 14.0
+# cents = 15.0
 
 # Optional: plans you were on before the [tariff] above, so older days are
 # priced on the plan that applied then. Add one [[previous_tariff]] per past
@@ -149,13 +156,18 @@ path = "data/solar.db"
 # applied. The next plan starts the day after, and [tariff] covers every day
 # after the last `until`. `until` must increase down the file; `name` is just
 # a label. A zero_import_credit goes in a [previous_tariff.zero_import_credit]
-# table straight after its entry.
+# table straight after its entry, and an export_tier in a
+# [previous_tariff.export_tier] table.
 # [[previous_tariff]]
 # name = "Old flat plan"
 # until = "2025-06-30"
 # supply_cents_per_day = 110.0
 # default_import_cents = 32.0
 # default_export_cents = 5.0
+# # First 14 kWh a day at 15c, then the default 5c:
+# [previous_tariff.export_tier]
+# first_kwh_per_day = 14.0
+# cents = 15.0
 
 # Optional: what the system cost, for the payback estimate (`/api/payback`).
 # It needs the [tariff] section above too. Add one [[system.purchase]] per

@@ -889,6 +889,9 @@ pub async fn tariff(
             "credit_cents": t.credit_cents(),
         })
     });
+    let export_tier = t.export_tier().map(|(first_kwh_per_day, cents)| {
+        json!({ "first_kwh_per_day": first_kwh_per_day, "cents": cents })
+    });
     Ok(Json(json!({
         "configured": true,
         "date": date.to_string(),
@@ -900,6 +903,7 @@ pub async fn tariff(
         "import": import,
         "export": export,
         "zero_import_credit": credit,
+        "export_tier": export_tier,
     })))
 }
 
@@ -1317,6 +1321,9 @@ mod tests {
             until = "2026-06-30"
             supply_cents_per_day = 100.0
             default_import_cents = 30.0
+            [previous_tariff.export_tier]
+            first_kwh_per_day = 14.0
+            cents = 15.0
             "#,
         )
         .unwrap();
@@ -1366,6 +1373,10 @@ mod tests {
         assert_eq!(old["default_import_cents"], 30.0);
         assert_eq!(old["import"].as_array().unwrap().len(), 0);
         assert!(old["zero_import_credit"].is_null());
+        // The tier is on the earlier plan only.
+        assert_eq!(old["export_tier"]["first_kwh_per_day"], 14.0);
+        assert_eq!(old["export_tier"]["cents"], 15.0);
+        assert!(now["export_tier"].is_null());
 
         // No date means today; a bad one is a 400; no tariff is "not configured".
         let Json(today_plan) = tariff(State(with.clone()), Query(ask(None))).await.unwrap();
