@@ -186,3 +186,10 @@ path = "data/solar.db"
 # name = "Battery 2"
 # date = "2025-06-01"
 # cost_dollars = 8000.00
+
+# Optional: real bills for past periods, for when the tariff above cannot
+# price them (say a spot-price retailer) or the meter data has gaps. Money and
+# Payback use each bill's real total for every day it covers. See "Past bills"
+# in docs/how-to-run.md for the CSV format.
+# [bills]
+# file = "/etc/solar-dash/bills.csv"

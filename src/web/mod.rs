@@ -32,6 +32,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
 
+use crate::bills::PastBill;
 use crate::config::Config;
 use crate::cost::TariffSchedule;
 use crate::ev_cost::EvPrices;
@@ -81,6 +82,8 @@ pub struct AppState {
     price_rise_percent: f64,
     /// Whether the config has a `[globird]` section.
     globird_configured: bool,
+    /// The past bills from `[bills]`, oldest first; empty when there are none.
+    bills: Arc<[PastBill]>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -115,6 +118,7 @@ impl AppState {
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
             globird_configured: false,
+            bills: Arc::from([]),
         })
     }
 
@@ -152,6 +156,12 @@ impl AppState {
     /// API reports as `configured`.
     pub fn with_globird_configured(mut self, configured: bool) -> Self {
         self.globird_configured = configured;
+        self
+    }
+
+    /// Sets the past bills (oldest first) whose totals replace our estimate.
+    pub fn with_bills(mut self, bills: Vec<PastBill>) -> Self {
+        self.bills = bills.into();
         self
     }
 
@@ -197,6 +207,11 @@ impl AppState {
             .map(|current| TariffSchedule::from_config(current, &config.previous_tariff))
             .transpose()?;
         let purchases = payback::purchases_from_config(&config.system.purchase)?;
+        // A bad bills file stops `serve` here, with the line in the message.
+        let bills = match &config.bills {
+            Some(section) => crate::bills::load(std::path::Path::new(&section.file))?,
+            None => Vec::new(),
+        };
         let ev_prices = config
             .teslamate
             .as_ref()
@@ -211,6 +226,7 @@ impl AppState {
             .with_tariff(tariff)
             .with_ev_prices(ev_prices)
             .with_purchases(purchases)
+            .with_bills(bills)
             .with_price_rise_percent(config.system.price_rise_percent)
             .with_globird_configured(config.globird.is_some()))
     }
@@ -1969,6 +1985,56 @@ mod tests {
         // Baseline 2.00 less GloBird's -0.36, not our 0.85.
         assert_eq!(json["saved"], 2.36);
         assert_eq!(json["net"], -7.64);
+    }
+
+    /// A router with the flat tariff, these purchases and the past bills in `csv`.
+    fn bills_router(pool: &SqlitePool, csv: &str, purchases: Vec<Purchase>) -> Router {
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+            .unwrap()
+            .with_tariff(Some(flat_tariff()))
+            .with_purchases(purchases)
+            .with_bills(crate::bills::parse(csv).unwrap());
+        router(state)
+    }
+
+    const BILLS_HEADER: &str = "from,to,bill_total,excluded,import_kwh,import_dollars,\
+        export_kwh,export_dollars,supply_dollars,note\n";
+
+    #[tokio::test]
+    async fn payback_counts_a_past_bill_day_with_no_data() {
+        let (_dir, _app, pool) = costs_app().await;
+        // Two days, no data at all. First pass per day: 100 c supply + 400 c
+        // import (10 kWh at 40 c) = 500 c; the bill says 6.00, so 300 c a day.
+        // The load falls back to the 10 kWh bought, so each day saves 200 c.
+        let csv = format!("{BILLS_HEADER}2026-10-01,2026-10-02,6.00,0,20,8.00,0,0,2.00,\n");
+        let app = bills_router(&pool, &csv, vec![solar_purchase("2026-10-01", 10.0)]);
+        let json = payback_json(&app).await;
+        assert_eq!(json["saved"], 4.0);
+        assert_eq!(json["net"], -6.0);
+    }
+
+    #[tokio::test]
+    async fn a_range_cutting_a_past_bill_gets_the_whole_periods_smoothing() {
+        let (_dir, _app, pool) = costs_app().await;
+        // Ten days: first pass 1200 + 4000 = 5200 c against 5000 c billed, so
+        // every day is 20 c cheaper: 120 + 400 - 20 = 500 c.
+        let csv = format!("{BILLS_HEADER}2026-10-01,2026-10-10,50.00,0,100,40.00,0,0,12.00,\n");
+        let app = bills_router(&pool, &csv, Vec::new());
+
+        let half = costs_json(&app, "from=2026-10-01&to=2026-10-05").await;
+        let days = half["days"].as_array().unwrap();
+        assert_eq!(days.len(), 5);
+        assert_eq!(days[0]["source"], "bill");
+        assert_eq!(days[0]["actual"], 5.0);
+        assert_eq!(half["totals"]["actual"], 25.0);
+        assert_eq!(half["totals"]["billed_days"], 5);
+
+        // The whole period adds up to the bill, and days outside it stay out.
+        let all = costs_json(&app, "from=2026-09-30&to=2026-10-11").await;
+        assert_eq!(all["days"].as_array().unwrap().len(), 10);
+        assert_eq!(all["totals"]["actual"], 50.0);
     }
 
     #[tokio::test]

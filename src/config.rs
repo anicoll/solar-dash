@@ -35,6 +35,15 @@ pub struct Config {
     /// What the system cost, for the payback estimate. Optional.
     #[serde(default)]
     pub system: System,
+    /// Past bills whose real totals replace our estimate. Optional.
+    pub bills: Option<Bills>,
+}
+
+/// The `[bills]` section.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Bills {
+    /// CSV of past bills; see docs/how-to-run.md.
+    pub file: String,
 }
 
 #[derive(Clone, Deserialize)]

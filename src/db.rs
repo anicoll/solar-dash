@@ -6,6 +6,7 @@
 //! keeps builds simple at the cost of checking SQL only when it runs (the
 //! tests below cover that).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -502,6 +503,23 @@ pub async fn daily_costs_in_range(
     .await
     .context("could not read stored day costs")?;
     Ok(rows.into_iter().map(CachedDayCost::from).collect())
+}
+
+/// The average daily load (kWh) per calendar month (1 to 12, any year) over
+/// the stored day costs. One small grouped query on the `daily_cost` table;
+/// load does not depend on the tariff, so every stored row counts. A month
+/// with no stored day is missing from the map.
+pub async fn average_load_by_month(pool: &SqlitePool) -> Result<HashMap<u32, f64>> {
+    let rows: Vec<(i64, f64)> = sqlx::query_as(
+        "SELECT CAST(substr(date, 6, 2) AS INTEGER), AVG(load_kwh) FROM daily_cost GROUP BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .context("could not read the average daily load")?;
+    Ok(rows
+        .into_iter()
+        .map(|(month, kwh)| (month as u32, kwh))
+        .collect())
 }
 
 /// Saves finished days' costs (replacing any row for the same date), all in

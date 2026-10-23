@@ -497,6 +497,57 @@ meter serial numbers, tokens and payment descriptions are replaced with
 `REDACTED`. The redaction goes by field name, so open the file and check it
 before sharing it.
 
+## Past bills (optional)
+
+For a past period you may have no usable tariff (a spot-price retailer, say) or
+gaps in the meter data (cloud sync was off for a while). If you still have the
+bills, list them in a CSV file and point `[bills]` at it:
+
+```toml
+[bills]
+file = "/etc/solar-dash/bills.csv"
+```
+
+Every day a bill covers then uses the bill's real total in Money and Payback,
+spread evenly over the bill's days. The Bill check still compares GloBird with
+our own estimate only. `serve` refuses to start if the file is bad, and the
+error names the line.
+
+The file has a header line, then one line per bill. Blank lines and lines
+starting with `#` are ignored. Periods must not overlap.
+
+```csv
+# Neutral example numbers.
+from,to,bill_total,excluded,import_kwh,import_dollars,export_kwh,export_dollars,supply_dollars,note
+2026-01-01,2026-01-31,152.40,0,610,190.00,280,22.40,48.50,summer bill
+2026-02-01,2026-02-28,98.00,25.00,540,170.00,310,25.00,44.00,includes a $25 rebate
+```
+
+| Column | Meaning |
+| --- | --- |
+| `from`, `to` | First and last local day of the bill (inclusive), `YYYY-MM-DD`. |
+| `bill_total` | Dollars billed. A credit is negative. |
+| `excluded` | Dollars of rebates (say government relief) on the bill. They are added back (`bill_total + excluded`) so they do not count as savings from your solar. Use `0` if none. |
+| `import_kwh`, `import_dollars` | Billed grid import and its usage charges. |
+| `export_kwh`, `export_dollars` | Billed export and its credits (a positive number). |
+| `supply_dollars` | All the daily fixed charges and fees of the period. |
+| `note` | Free text, may be empty. It is the last field and may contain commas. |
+
+How a bill becomes days:
+
+- Each day is priced at the bill's average rates (`import_dollars / import_kwh`
+  and `export_dollars / export_kwh`) and an equal share of `supply_dollars`.
+- A day we have data for uses its own import, export and load kWh. A day with
+  no data uses the bill's average daily import and export, and the average daily
+  load of the same calendar month from the days we do have (the bill's average
+  daily import if that month has none). The no-solar baseline is the supply
+  share plus that load at the average import rate.
+- The averages never add up to the bill exactly, so the leftover is shared
+  equally over all the days of the bill (even the ones we have no data for) and
+  added to the import cost, or taken off as extra export credit if negative.
+  The days then add up to exactly `bill_total + excluded`.
+- A bill wins over GloBird's daily figures for the same day.
+
 ## Backfill history
 
 `serve` downloads the 5-minute history by itself. Set the day your inverter
