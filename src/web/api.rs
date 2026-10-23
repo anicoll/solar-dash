@@ -516,7 +516,7 @@ fn car_label(car: &db::TmCar) -> String {
 
 /// A stored session as the savings summary adds it up, or `None` if it took
 /// no energy. Only a session at "Home" with all its cost columns is costed.
-fn car_charge(row: &db::TmChargeRow, tz: Tz) -> Option<ev_cost::CarCharge> {
+pub(super) fn car_charge(row: &db::TmChargeRow, tz: Tz) -> Option<ev_cost::CarCharge> {
     let kwh = row
         .energy_used_kwh
         .or(row.energy_added_kwh)

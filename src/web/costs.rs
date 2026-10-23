@@ -10,7 +10,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::{DateTime, NaiveDate};
+use chrono::{DateTime, Days, NaiveDate};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -24,7 +24,7 @@ use super::api::{
 use crate::bills::{self, Metered, PastBill};
 use crate::cost::{self, DayCost, GridSplit, Interval, Tariff, TariffSchedule};
 use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
-use crate::ev_cost;
+use crate::ev_cost::{self, CarDayTotals};
 use crate::globird::data::{self as globird_data, bucket_of, is_supply};
 use crate::modbus::Sample;
 
@@ -350,6 +350,9 @@ struct CostDay {
     import: f64,
     /// Dollars earned for feed-in (export).
     feed_in: f64,
+    /// The cars this day; left out when `cars_available` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cars: Option<Cars>,
 }
 
 /// How `/api/costs` groups its rows: one per day, or summed per month or year.
@@ -451,6 +454,7 @@ impl Sums {
             baseline: dollars(self.baseline_cents),
             savings: dollars(self.baseline_cents - self.actual_cents),
             not_bought: dollars(self.not_bought_cents()),
+            cars: None,
         }
     }
 }
@@ -480,6 +484,124 @@ struct Totals {
     savings: f64,
     /// Value of the power not bought from the grid.
     not_bought: f64,
+    /// The cars over the period; left out when `cars_available` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cars: Option<Cars>,
+}
+
+/// What the cars saved on fuel over a day, month, year or the whole range, in
+/// dollars. `fuel_saved` is `petrol` less `charging`: the saving of running
+/// on electricity instead of petrol, with the charging priced from the grid.
+///
+/// It is what to ADD to the house's `savings` for a view that includes the
+/// cars, and only that. The house's no-solar `baseline` already includes
+/// charging the cars at grid prices (the car is part of the house load), so
+/// the system's share of the car's savings is in `savings` already. Adding
+/// the "with the system" saving of `/api/ev/cars` as well would count it twice.
+#[derive(Debug, Serialize)]
+struct Cars {
+    km: f64,
+    /// What the km would have cost in petrol; days without a petrol price add nothing.
+    petrol: f64,
+    /// What the charging would have cost from the grid.
+    charging: f64,
+    /// Petrol less charging, over the days that have a petrol price.
+    fuel_saved: f64,
+    /// Home sessions in `charging` that are not costed yet and are priced
+    /// at the plan's average import price.
+    estimated_sessions: u32,
+}
+
+/// Car days added up, in unrounded cents.
+#[derive(Debug, Default)]
+struct CarSums {
+    km: f64,
+    petrol_cents: f64,
+    charging_cents: f64,
+    fuel_saved_cents: f64,
+    estimated_sessions: u32,
+}
+
+impl CarSums {
+    fn add(&mut self, day: &CarDayTotals) {
+        self.km += day.km;
+        self.petrol_cents += day.petrol_cents.unwrap_or(0.0);
+        self.charging_cents += day.charging_cents;
+        self.fuel_saved_cents += day.fuel_saved_cents().unwrap_or(0.0);
+        self.estimated_sessions += day.estimated_sessions;
+    }
+
+    fn cars(&self) -> Cars {
+        Cars {
+            km: round2(self.km),
+            petrol: dollars(self.petrol_cents),
+            charging: dollars(self.charging_cents),
+            fuel_saved: dollars(self.fuel_saved_cents),
+            estimated_sessions: self.estimated_sessions,
+        }
+    }
+}
+
+/// The cars' days (from [`car_days`]) added up for each period, keyed like
+/// [`Group::period_of`].
+fn cars_by_period(group: Group, days: &BTreeMap<String, CarDayTotals>) -> HashMap<String, CarSums> {
+    let mut periods: HashMap<String, CarSums> = HashMap::new();
+    for (date, day) in days {
+        if let Ok(date) = NaiveDate::from_str(date) {
+            periods.entry(group.period_of(date)).or_default().add(day);
+        }
+    }
+    periods
+}
+
+/// All the cars' days from `first` to `last`, or `None` when there are no
+/// TeslaMate cars or no petrol price (then there is nothing to compare with).
+/// See [`ev_cost::car_day_totals`]; home sessions not costed yet use the
+/// plan's average import price on their day.
+async fn car_days(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    first: NaiveDate,
+    last: NaiveDate,
+) -> Result<Option<BTreeMap<String, CarDayTotals>>> {
+    // Looks at the petrol prices file, so a hand edit shows on this request.
+    let petrol = state.petrol.current();
+    let cars = db::tm_cars(&state.pool).await?;
+    if cars.is_empty() || !petrol.is_configured() {
+        return Ok(None);
+    }
+    let (first, last) = (first.to_string(), last.to_string());
+    let in_range = |date: &str| date >= first.as_str() && date <= last.as_str();
+    let (mut days, mut charges) = (Vec::new(), Vec::new());
+    for car in cars {
+        days.extend(
+            db::tm_drive_days(&state.pool, car.id)
+                .await?
+                .into_iter()
+                .filter(|day| in_range(&day.date))
+                .map(|day| ev_cost::CarDay {
+                    date: day.date,
+                    km: day.km,
+                }),
+        );
+        charges.extend(
+            db::tm_charge_rows(&state.pool, car.id)
+                .await?
+                .iter()
+                .filter_map(|row| super::api::car_charge(row, state.tz))
+                .filter(|charge| in_range(&charge.date)),
+        );
+    }
+    let average = |date: &str| {
+        NaiveDate::from_str(date).map_or(0.0, |d| schedule.for_date(d).average_import_cents())
+    };
+    Ok(Some(ev_cost::car_day_totals(
+        &state.ev_prices,
+        &petrol,
+        average,
+        &days,
+        &charges,
+    )))
 }
 
 /// A month or year of days added up.
@@ -935,14 +1057,36 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
     for day in &costed {
         sums.add_day(day);
     }
-    let totals = sums.totals();
+    let mut totals = sums.totals();
+    let last = from + Days::new(count - 1);
+    let car_days = car_days(&state, tariff, from, last).await?;
+    // Every day in the range counts, even one with no house data.
+    totals.cars = car_days.as_ref().map(|days| {
+        let mut sums = CarSums::default();
+        days.values().for_each(|day| sums.add(day));
+        sums.cars()
+    });
+    let cars_available = car_days.is_some();
+    let by_period = car_days.as_ref().map(|days| cars_by_period(group, days));
+    let cars_in = |period: &str| {
+        by_period.as_ref().map(|periods| {
+            periods
+                .get(period)
+                .map_or_else(|| CarSums::default().cars(), CarSums::cars)
+        })
+    };
 
     if group != Group::Day {
+        let mut buckets = bucket_days(group, &costed);
+        for bucket in &mut buckets {
+            bucket.totals.cars = cars_in(&bucket.period);
+        }
         return Ok(Json(json!({
             "configured": true,
+            "cars_available": cars_available,
             "group": if group == Group::Month { "month" } else { "year" },
             "totals": totals,
-            "buckets": bucket_days(group, &costed),
+            "buckets": buckets,
         })));
     }
 
@@ -961,10 +1105,12 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
             supply: dollars(cost.supply_cents),
             import: dollars(cost.import_cents),
             feed_in: dollars(cost.export_cents),
+            cars: cars_in(&date.to_string()),
         })
         .collect();
     Ok(Json(json!({
         "configured": true,
+        "cars_available": cars_available,
         "group": "day",
         "totals": totals,
         "days": days,

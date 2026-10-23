@@ -2186,6 +2186,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn costs_show_the_cars_fuel_saving_per_bucket_and_in_total() {
+        let (_dir, plain, pool) = costs_app().await;
+        let tz = chrono_tz::Australia::Adelaide;
+        for date in ["2026-09-15", "2026-09-16"] {
+            let (day_start, _) = api::day_bounds_or_error(date.parse().unwrap(), tz).unwrap();
+            seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
+        }
+        let range = "from=2026-09-01&to=2026-09-30";
+
+        // No TeslaMate cars: nothing about cars, and the rest as before.
+        let before = costs_json(&plain, range).await;
+        assert_eq!(before["cars_available"], false);
+        assert!(before["totals"].get("cars").is_none());
+        assert!(before["days"][0].get("cars").is_none());
+        let before_month = costs_json(&plain, &format!("{range}&group=month")).await;
+        assert_eq!(before_month["cars_available"], false);
+        assert!(before_month["buckets"][0].get("cars").is_none());
+
+        let hash = hash_password(PASSWORD).unwrap();
+        let router_with = |petrol: PetrolPrices| {
+            let prices = EvPrices {
+                petrol_cents_per_litre: None,
+                petrol_litres_per_100km: 8.0,
+                away_cents_per_kwh: Some(60.0),
+            };
+            router(
+                AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+                    .unwrap()
+                    .with_tariff(Some(flat_tariff()))
+                    .with_ev_prices(prices)
+                    .with_petrol_prices(petrol),
+            )
+        };
+        // Cars but no petrol price is not enough either.
+        let car = db::TmCar {
+            id: 1,
+            name: Some("Daily".to_string()),
+            model: Some("3".to_string()),
+        };
+        db::upsert_tm_cars(&pool, &[car], 1).await.unwrap();
+        let app = router_with(PetrolPrices::fixed(None, vec![]));
+        let json = costs_json(&app, range).await;
+        assert_eq!(json["cars_available"], false);
+        assert!(json["totals"].get("cars").is_none());
+
+        // 100 km on the 15th and 50 km on the 17th (no house data that day).
+        // At 8 L/100 km and $2.00 that is $16.00 and $8.00 of petrol.
+        let drive = |date: &str, km: f64| db::TmDriveDay {
+            car_id: 1,
+            date: date.to_string(),
+            km,
+            drives: 1,
+        };
+        db::upsert_tm_drive_days(
+            &pool,
+            &[drive("2026-09-15", 100.0), drive("2026-09-17", 50.0)],
+        )
+        .await
+        .unwrap();
+        let start = SEP_15_START + 10 * 3600;
+        let charge = |id: i64, at: i64, geofence: &str, kwh: f64| db::TmCharge {
+            id,
+            car_id: 1,
+            started_at: at,
+            ended_at: Some(at + 3600),
+            energy_added_kwh: Some(kwh),
+            energy_used_kwh: Some(kwh),
+            start_soc_pct: None,
+            end_soc_pct: None,
+            geofence: Some(geofence.to_string()),
+            fast_charger: false,
+        };
+        // A costed home session (baseline $3.70) on the 15th; on the 16th a
+        // home session not costed yet (5 kWh at the plan's 25 c average) and
+        // 10 kWh away at 60 c.
+        db::save_tm_charges(
+            &pool,
+            &[
+                charge(1, start, "Home", 7.4),
+                charge(2, start + 86_400, "Home", 5.0),
+                charge(3, start + 86_400 + 7200, "Servo", 10.0),
+            ],
+        )
+        .await
+        .unwrap();
+        let cost = db::TmChargeCost {
+            cost_key: "k".to_string(),
+            grid_kwh: 7.4,
+            self_kwh: 0.0,
+            uncovered_kwh: 0.0,
+            cost_cents: 185.0,
+            baseline_cents: 370.0,
+            feed_in_forgone_cents: 0.0,
+        };
+        db::save_tm_charge_cost(&pool, 1, &cost).await.unwrap();
+
+        let app = router_with(PetrolPrices::fixed(Some(200.0), vec![]));
+        let json = costs_json(&app, range).await;
+        assert_eq!(json["cars_available"], true);
+        // Day by day, only the days with house data have rows.
+        assert_eq!(json["days"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            json["days"][0]["cars"],
+            serde_json::json!({
+                "km": 100.0, "petrol": 16.0, "charging": 3.7, "fuel_saved": 12.3,
+                "estimated_sessions": 0
+            })
+        );
+        // No driving on the 16th: the charging is a cost with nothing to offset it.
+        assert_eq!(
+            json["days"][1]["cars"],
+            serde_json::json!({
+                "km": 0.0, "petrol": 0.0, "charging": 7.25, "fuel_saved": -7.25,
+                "estimated_sessions": 1
+            })
+        );
+        // The total also has the 17th, which has no row of its own.
+        assert_eq!(
+            json["totals"]["cars"],
+            serde_json::json!({
+                "km": 150.0, "petrol": 24.0, "charging": 10.95, "fuel_saved": 13.05,
+                "estimated_sessions": 1
+            })
+        );
+        // The house's own figures are the same as without cars.
+        assert_eq!(json["totals"]["savings"], before["totals"]["savings"]);
+
+        let months = costs_json(&app, &format!("{range}&group=month")).await;
+        assert_eq!(months["cars_available"], true);
+        assert_eq!(months["buckets"][0]["cars"], months["totals"]["cars"]);
+        let years = costs_json(&app, "from=2026-01-01&to=2026-12-31&group=year").await;
+        assert_eq!(years["buckets"][0]["cars"]["fuel_saved"], 13.05);
+
+        // A period with house data but no car activity gets zeros.
+        let (day_start, _) = api::day_bounds_or_error("2026-08-01".parse().unwrap(), tz).unwrap();
+        seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
+        let august = costs_json(&app, "from=2026-08-01&to=2026-08-31&group=month").await;
+        assert_eq!(
+            august["buckets"][0]["cars"],
+            serde_json::json!({
+                "km": 0.0, "petrol": 0.0, "charging": 0.0, "fuel_saved": 0.0,
+                "estimated_sessions": 0
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn costs_can_be_grouped_by_month_and_year() {
         let (_dir, app, pool) = costs_app().await;
         // The same usage on 31 Dec 2025, then 15 Sep, 16 Sep and 1 Oct 2026.
