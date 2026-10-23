@@ -10,7 +10,7 @@ mod payback;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -26,6 +26,7 @@ use axum_extra::extract::cookie::Key;
 use base64::Engine;
 use chrono_tz::Tz;
 use rust_embed::RustEmbed;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -320,7 +321,53 @@ pub async fn serve(
 }
 
 async fn index(headers: HeaderMap) -> Response {
-    serve_asset("index.html", &headers)
+    let page = &*INDEX_PAGE;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::ETAG, HeaderValue::from_str(&page.etag).unwrap());
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if etag_matches(&headers, &page.etag) {
+        return (StatusCode::NOT_MODIFIED, response_headers).into_response();
+    }
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    (response_headers, page.html.clone()).into_response()
+}
+
+/// index.html with `?v=<hash>` added to each stylesheet and script link.
+struct IndexPage {
+    html: String,
+    etag: String,
+}
+
+/// Each build changes the links to app.js and style.css, so a browser or a
+/// proxy in front (such as Cloudflare) can never pair a new page with an old
+/// cached script, which would leave the page blank.
+static INDEX_PAGE: LazyLock<IndexPage> = LazyLock::new(|| {
+    let file = Assets::get("index.html").expect("index.html is embedded");
+    let mut html = String::from_utf8_lossy(&file.data).into_owned();
+    for name in ["app.js", "style.css"] {
+        if let Some(asset) = Assets::get(name) {
+            let version = &hex::encode(asset.metadata.sha256_hash())[..12];
+            let plain = format!("\"/static/{name}\"");
+            html = html.replace(&plain, &format!("\"/static/{name}?v={version}\""));
+        }
+    }
+    let etag = format!("\"{}\"", hex::encode(Sha256::digest(html.as_bytes())));
+    IndexPage { html, etag }
+});
+
+/// Whether an If-None-Match header names `etag` (weak or strong) or `*`.
+fn etag_matches(request_headers: &HeaderMap, etag: &str) -> bool {
+    request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_start_matches("W/"))
+                .any(|t| t == "*" || t == etag)
+        })
 }
 
 async fn static_file(Path(path): Path<String>, headers: HeaderMap) -> Response {
@@ -339,15 +386,7 @@ fn serve_asset(path: &str, request_headers: &HeaderMap) -> Response {
     response_headers.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
     response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
 
-    let matches = request_headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.split(',')
-                .map(|t| t.trim().trim_start_matches("W/"))
-                .any(|t| t == "*" || t == etag)
-        });
-    if matches {
+    if etag_matches(request_headers, &etag) {
         return (StatusCode::NOT_MODIFIED, response_headers).into_response();
     }
     response_headers.insert(
@@ -1234,6 +1273,35 @@ mod tests {
         let response = send(&app, request).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+    }
+
+    #[tokio::test]
+    async fn index_links_versioned_assets() {
+        let (_dir, app) = test_app().await;
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let etag = response.headers()[header::ETAG].clone();
+        let html = body_text(response).await;
+        for name in ["app.js", "style.css"] {
+            let version = &hex::encode(Assets::get(name).unwrap().metadata.sha256_hash())[..12];
+            assert!(
+                html.contains(&format!("\"/static/{name}?v={version}\"")),
+                "{name}"
+            );
+        }
+
+        // The versioned link still serves the file.
+        let response = send(&app, get_request("/static/app.js?v=abc", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = Request::get("/")
+            .header(header::COOKIE, &cookie)
+            .header(header::IF_NONE_MATCH, &etag)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, request).await.status(), StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]
