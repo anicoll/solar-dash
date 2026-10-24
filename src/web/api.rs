@@ -232,8 +232,10 @@ pub struct InverterHistoryParams {
     to: Option<String>,
 }
 
-/// `{"changes": [...]}`: the times the inverter's settings changed, newest
-/// first, each with the settings from then on and their labels. `from`
+/// `{"changes": [...], "previous": {...}}`: the times the inverter's settings
+/// changed, newest first, each with the settings from then on and their
+/// labels. `previous` is the newest row before `from` (the setting in force
+/// when the range starts), or null. `from`
 /// (inclusive) and `to` (exclusive) are unix seconds and default to the last
 /// 7 days.
 pub async fn inverter_history(
@@ -262,7 +264,11 @@ pub async fn inverter_history(
         .iter()
         .map(settings_json)
         .collect::<Result<Vec<Value>, ApiError>>()?;
-    Ok(Json(json!({ "changes": changes })))
+    let previous = match db::inverter_settings_before(&state.pool, from).await? {
+        Some(s) => settings_json(&s)?,
+        None => Value::Null,
+    };
+    Ok(Json(json!({ "changes": changes, "previous": previous })))
 }
 
 #[derive(Deserialize)]
@@ -1545,7 +1551,7 @@ mod tests {
         let Json(json) = inverter_history(State(state.clone()), Query(params(None, None)))
             .await
             .unwrap();
-        assert_eq!(json, json!({ "changes": [] }));
+        assert_eq!(json, json!({ "changes": [], "previous": null }));
 
         let now = db::now();
         let row = |ts, ems_mode, running_state| modbus::Settings {
@@ -1584,6 +1590,9 @@ mod tests {
         assert_eq!(changes[0]["running_state_label"], "Dispatch running");
         assert_eq!(changes[1]["ems_mode_label"], "Self-consumption");
         assert!(changes[1]["max_soc_pct"].is_null());
+        // The row from 8 days ago is the setting in force when the range starts.
+        assert_eq!(json["previous"]["ts"], now - 8 * 24 * 3600);
+        assert_eq!(json["previous"]["ems_mode_label"], "Self-consumption");
 
         // An explicit range: `to` is exclusive.
         let from = (now - 3600).to_string();
@@ -1592,6 +1601,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(json["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(json["previous"]["ts"], now - 8 * 24 * 3600);
     }
 
     #[tokio::test]
