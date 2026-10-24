@@ -3101,147 +3101,203 @@
     renderBatteryMissed(data.days);
   }
 
-  // ---------- Money: Cars ----------
+  // ---------- Money: EV vs petrol ----------
 
-  const CARS_KEY = 'solar-dash.cars-view';
-  const CARS_EXPLAIN = {
-    with: 'What charging really cost: grid power on your plan, solar and battery free.',
-    without: 'Every kWh bought from the grid on the plan of the day, as if there were no solar or battery.',
-  };
   let carsData = null;
-  let carsView = 'with';
-  try { if (localStorage.getItem(CARS_KEY) === 'without') carsView = 'without'; } catch (err) { /* private window or blocked storage */ }
 
   /** Whole dollars from $100, cents below that, so a small car still shows something. */
   const carMoney = (v) => (v == null ? '–' : money(v, Math.abs(v) >= 100 ? 0 : 2));
   const centsPerKm = (v) => (v == null || !Number.isFinite(v) ? '–' : v.toFixed(1));
   /** "14 Nov 2024" for a YYYY-MM-DD date. */
   const carDate = (d) => `${dayLabel(d)} ${d.slice(0, 4)}`;
+  const wholeText = (v) => Math.round(v).toLocaleString('en-AU');
+  const sessionsText = (n) => `${n} ${n === 1 ? 'session' : 'sessions'}`;
 
-  function carChartOption(car, view) {
-    const th = baseTheme();
-    const months = car.months;
-    const saved = months.map((m) => m[`${view}_system`].saved);
-    return {
-      animation: false,
-      textStyle: { fontFamily: css('--font') },
-      grid: { left: 8, right: 16, top: 36, bottom: 8, containLabel: true },
-      tooltip: {
-        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
-        formatter: (params) => moneyTooltip([[params[0].marker, 'Saved', money(saved[params[0].dataIndex])]],
-          longMonth(months[params[0].dataIndex].month)),
-      },
-      xAxis: {
-        type: 'category',
-        data: months.map((m) => `${MONTHS[+m.month.slice(5) - 1]} ${m.month.slice(2, 4)}`),
-        axisLabel: { color: th.muted, fontFamily: css('--mono'), hideOverlap: true },
-        axisLine: { lineStyle: { color: th.line } },
-      },
-      yAxis: {
-        type: 'value', name: 'Saved ($)', nameTextStyle: { color: th.muted, align: 'left' },
-        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `$${v.toLocaleString('en-AU')}` },
-        splitLine: { lineStyle: { color: th.line } },
-      },
-      series: [{
-        name: 'Saved', type: 'bar', barMaxWidth: 28, itemStyle: { color: css('--save-bar') },
-        data: saved.map((v) => (v == null ? null : +v.toFixed(2))),
-      }],
-    };
+  /** TeslaMate paint names as a colour for the strip on a car's card. */
+  const CAR_PAINT = {
+    PearlWhite: '#e8e8e4', MidnightSilver: '#6c7178', SolidBlack: '#1b1b1d', DeepBlue: '#1f3b73',
+    RedMulticoat: '#a3141b', Quicksilver: '#aeb4ba', StealthGrey: '#4b4f55', UltraRed: '#c4121f',
+    MidnightCherryRed: '#5a0f1b', Silver: '#b9bdc2',
+  };
+  /** "PearlWhite" as "Pearl White". */
+  const spaced = (s) => s.replace(/([a-z])([A-Z])/g, '$1 $2');
+
+  /** A "name and detail on the left, amount on the right" row. */
+  function carRow(label, amount, cls, detail) {
+    const row = el('div', `car-row ${cls || ''}`.trim());
+    const name = el('span', 'car-row-name', label);
+    if (detail) name.append(el('span', 'car-row-detail', detail));
+    row.append(name, el('span', 'car-row-amount', amount));
+    return row;
   }
 
-  function renderCar(car, view, index) {
+  /** Charging by plan, a total and the away line: shared by a car and the both-cars panel. */
+  function chargingRows(plans, away, total) {
+    const rows = plans.map((p) => {
+      const pending = p.pending_sessions > 0 ? ` (${p.pending_sessions} still being costed)` : '';
+      return carRow(`Home · ${p.plan}`, carMoney(p.cost), '', `${kwhText(p.kwh)} kWh${pending}`);
+    });
+    rows.push(carRow('Total charging cost', carMoney(total), 'total'));
+    if (away && away.sessions > 0) {
+      const kwhPart = `${kwhText(away.kwh)} kWh`;
+      rows.push(away.cost == null
+        ? carRow(`Away · ${sessionsText(away.sessions)}, no price`, '–', 'muted', kwhPart)
+        : carRow(`Away · ${sessionsText(away.sessions)}`, carMoney(away.cost), 'muted', kwhPart));
+    }
+    return rows;
+  }
+
+  /** The "Month by month" table, a block per year with the newest year first. */
+  function carMonths(car) {
+    const details = el('details', 'car-months');
+    details.append(el('summary', '', 'Month by month'));
+    const wrap = el('div', 'table-wrap');
+    const table = el('table', 'data car-table');
+    const head = el('tr');
+    for (const h of ['Month', 'km', 'Petrol', 'Home kWh', 'Home', 'Away kWh']) {
+      const th = el('th', '', h);
+      th.scope = 'col';
+      head.append(th);
+    }
+    const thead = el('thead');
+    thead.append(head);
+    table.append(thead);
+    const years = [...new Set(car.months.map((m) => m.month.slice(0, 4)))].sort().reverse();
+    for (const year of years) {
+      const ms = car.months.filter((m) => m.month.startsWith(year)).reverse();
+      const km = ms.reduce((a, m) => a + m.km, 0);
+      const petrol = ms.reduce((a, m) => a + (m.petrol_cost || 0), 0);
+      const body = el('tbody');
+      const yr = el('tr', 'car-year');
+      const yth = el('th', '', `${year} · ${wholeText(km)} km · ${carMoney(petrol)} petrol`);
+      yth.scope = 'rowgroup';
+      yth.colSpan = 6;
+      yr.append(yth);
+      body.append(yr);
+      for (const m of ms) {
+        // Charging cost has the priced away charging in it; the home part is what is left.
+        const home = m.with_system.charging_cost - (m.away_cost || 0);
+        const tr = el('tr');
+        tr.append(el('td', '', MONTHS[+m.month.slice(5) - 1]), el('td', '', wholeText(m.km)),
+          el('td', '', carMoney(m.petrol_cost)), el('td', '', kwhText(m.home_kwh)),
+          el('td', '', carMoney(home)), el('td', '', kwhText(m.away_kwh)));
+        body.append(tr);
+      }
+      table.append(body);
+    }
+    wrap.append(table);
+    details.append(wrap);
+    return details;
+  }
+
+  function renderCar(car, data) {
     const t = car.total;
-    const s = t[`${view}_system`];
-    const section = el('div', 'car-section');
+    const s = t.with_system;
+    const section = el('article', 'car-card');
+    const band = el('div', 'car-band');
+    band.style.background = CAR_PAINT[car.paint] || 'var(--track)';
+    section.append(band);
+
+    const body = el('div', 'car-body');
+    const kind = [car.trim || car.marketing_name, car.paint && spaced(car.paint)].filter(Boolean).join(' · ');
     const head = el('div', 'car-head');
-    head.append(el('h3', 'car-name', car.label),
-      el('span', 'car-dates', `${carDate(car.first_day)} to ${carDate(car.last_day)}`));
+    head.append(el('h3', 'car-name', car.label));
+    if (kind) head.append(el('div', 'car-kind', kind));
+    // A car that stopped driving a while ago gets its end date.
+    const ended = Date.parse(todayStr()) - Date.parse(car.last_day) > 30 * 86400000;
+    head.append(el('div', 'car-kind', ended
+      ? `${carDate(car.first_day)} to ${carDate(car.last_day)}` : `since ${carDate(car.first_day)}`));
+    body.append(head);
+
     const big = el('div', 'car-saved', carMoney(s.saved));
-    big.append(el('span', 'unit', 'saved'));
+    big.append(el('span', 'unit', `saved vs ${car.compare_with || 'a petrol car'} over ${wholeText(t.km)} km`));
+    body.append(big);
+
+    const lPer100 = data.petrol_litres_per_100km || (t.km > 0 ? (t.petrol_litres * 100) / t.km : null);
+    const compare = el('div', 'car-rows');
+    compare.append(
+      carRow(`${car.compare_with || 'Petrol car'} · ${lPer100 == null ? '–' : lPer100.toFixed(1)} L/100km · ${data.petrol_grade}`,
+        carMoney(t.petrol_cost)),
+      carRow(`${car.label} · home charging`, carMoney(s.charging_cost), 'ev'));
+    body.append(compare);
+
+    const charging = el('div', 'car-rows');
+    charging.append(...chargingRows(car.charging_by_plan, car.away, s.charging_cost));
+    body.append(charging);
 
     const petrolCents = t.petrol_cost != null && t.km > 0 ? (t.petrol_cost * 100) / t.km : null;
-    const stats = [
-      kpi('', 'Driven', kwhText(Math.round(t.km)), 'km'),
-      kpi('', 'Charging vs petrol', `${carMoney(s.charging_cost)} vs ${carMoney(t.petrol_cost)}`),
-      kpi('', 'Cents per km', `${centsPerKm(s.cents_per_km)} vs ${centsPerKm(petrolCents)}`, 'EV vs petrol'),
-    ];
-    if (view === 'with') {
-      stats.push(kpi('', 'Solar and battery saved on charging', carMoney(t.system_added), '', 'vs buying it all from the grid'));
-      const energy = t.grid_kwh + t.self_kwh;
-      if (energy > 0) {
-        stats.push(kpi('', 'Solar and battery share', percent((t.self_kwh / energy) * 100), '', 'of costed home charging'));
-      }
-    }
-    const statRow = el('div', 'car-stats');
-    statRow.append(...stats);
-    section.append(head, big, statRow);
-
-    if (car.months.length >= 2) {
-      const id = `cars-chart-${index}`;
-      const chart = el('div', 'car-chart');
-      chart.id = id;
-      chart.setAttribute('role', 'img');
-      chart.setAttribute('aria-label', `${car.label}: saved each month, in dollars, ${car.months.length} months`);
-      section.append(chart);
-      // The chart needs its element in the page first.
-      requestAnimationFrame(() => {
-        const c = getChart(id);
-        if (c) { c.setOption(carChartOption(car, view), true); c.resize(); }
-      });
-    }
-
-    const notes = [];
-    if (t.pending_sessions > 0) {
-      notes.push(`${t.pending_sessions} ${t.pending_sessions === 1 ? 'session is' : 'sessions are'} still being costed.`);
-    }
-    if (t.away_uncosted_kwh > 0) {
-      notes.push(`${kwhText(t.away_uncosted_kwh)} kWh charged away from home has no price (set away_cents_per_kwh).`);
-    }
+    const metrics = el('div', 'car-metrics');
+    metrics.append(kpi('', 'Petrol per km', centsPerKm(petrolCents), 'c'),
+      kpi('save', 'EV per km', centsPerKm(s.cents_per_km), 'c'),
+      kpi('', 'From solar and battery', percent(car.self_share_pct)));
+    body.append(metrics);
+    body.append(el('p', 'panel-note', `Solar and battery saved ${carMoney(t.system_added)} of charging vs buying it all from the grid.`));
     if (t.uncovered_kwh > 0) {
-      notes.push(`${kwhText(t.uncovered_kwh)} kWh had no house data and was counted as grid.`);
+      body.append(el('p', 'panel-note', `${kwhText(t.uncovered_kwh)} kWh had no house data and was counted as grid.`));
     }
-    for (const n of notes) section.append(el('p', 'panel-note', n));
+    if (car.months.length > 0) body.append(carMonths(car));
+    section.append(body);
     return section;
   }
 
   function renderCars() {
     const data = carsData;
-    for (const b of document.querySelectorAll('[data-cars]')) {
-      b.setAttribute('aria-pressed', String(b.dataset.cars === carsView));
-    }
-    $('cars-explain').textContent = CARS_EXPLAIN[carsView];
-    const saved = data.cars.reduce((a, c) => a + (c.total[`${carsView}_system`].saved || 0), 0);
+    const cars = data.cars;
+    const sum = (f) => cars.reduce((a, c) => a + (f(c) || 0), 0);
+    const saved = sum((c) => c.total.with_system.saved);
     setCardSummary('cars-card', `Saved ${carMoney(saved)}`);
-    // The charts live in the list being replaced.
-    for (const id of Object.keys(charts)) {
-      if (id.startsWith('cars-chart-')) { charts[id].dispose(); delete charts[id]; }
+    const away = data.away;
+    const homeCost = sum((c) => c.total.with_system.charging_cost - (c.total.away_cost || 0));
+    const awayNote = away && away.cost == null && away.kwh > 0 ? 'away not priced' : `away ${carMoney(away && away.cost)}`;
+    const since = cars.map((c) => c.first_day).sort()[0];
+    $('cars-sub').textContent = `What the cars have saved against petrol since ${carDate(since)}, counting every home charge at what it really cost.`;
+
+    const tiles = el('div', 'cards car-tiles');
+    tiles.append(
+      kpi('save', 'Saved vs petrol', carMoney(saved), '', cars.length > 1 ? 'both cars, after charging' : 'after charging'),
+      kpi('', 'Petrol would have cost', carMoney(sum((c) => c.total.petrol_cost)), '',
+        `${wholeText(sum((c) => c.total.petrol_litres))} L at pump prices`),
+      kpi('', 'Charging cost', carMoney(sum((c) => c.total.with_system.charging_cost)), '', `home ${carMoney(homeCost)} · ${awayNote}`),
+      kpi('', 'Driven', `${(sum((c) => c.total.km) / 1000).toFixed(1)}k`, 'km', cars.map((c) => c.label).join(' + ')));
+    const grid = el('div', 'car-grid');
+    grid.append(...cars.map((car) => renderCar(car, data)));
+    const out = [tiles, grid];
+
+    if (cars.length > 1) {
+      const panel = el('div', 'car-split');
+      panel.append(el('h3', 'car-name', 'Where the charging money went'));
+      const rows = el('div', 'car-rows');
+      rows.append(...chargingRows(data.charging_by_plan, away, sum((c) => c.total.with_system.charging_cost)));
+      panel.append(rows);
+      out.push(panel);
     }
-    $('cars-list').replaceChildren(...data.cars.map((car, i) => renderCar(car, carsView, i)));
+
+    const how = el('details', 'car-how');
+    how.append(el('summary', '', 'How we calculate'));
+    for (const [h, p] of [
+      ['Petrol side', "Each day's km times the L/100km, at that month's pump price from the petrol prices file."],
+      ['EV side', 'Each home charging session is costed from the house data: solar and battery are free, grid power is at the plan of the day. Charging away from home is left out unless it has a price.'],
+      ['Where the numbers come from', 'Driving and charging from TeslaMate, house energy from the inverter and iSolarCloud, prices from the Amber and GloBird bills.'],
+    ]) {
+      how.append(el('h4', '', h), el('p', '', p));
+    }
+    out.push(how);
+    $('cars-list').replaceChildren(...out);
   }
 
-  /** The Cars card. It stays hidden when there is no TeslaMate history (or the request fails). */
+  /** The EV vs petrol card. It stays hidden when there is no TeslaMate history (or the request fails). */
   async function loadCarsCard(mode, when) {
     const data = await quiet(api('/api/ev/cars'));
     if (state.view !== 'money' || state.mode !== mode || state.when !== when) return;
     $('cars-card').hidden = !data || !Array.isArray(data.cars) || data.cars.length === 0;
     if ($('cars-card').hidden) return;
     carsData = data;
-    $('cars-sub').textContent = data.configured
-      ? `Fuel saved against a petrol car using ${data.petrol_litres_per_100km} L/100 km` : '';
     $('cars-sub').hidden = !data.configured;
     $('cars-unconfigured').textContent = NOT_CONFIGURED_PETROL;
     $('cars-unconfigured').hidden = data.configured;
     $('cars-body').hidden = !data.configured;
     if (!data.configured) setCardSummary('cars-card', '');
     if (data.configured) renderCars();
-  }
-
-  for (const b of document.querySelectorAll('[data-cars]')) {
-    b.onclick = () => {
-      carsView = b.dataset.cars;
-      try { localStorage.setItem(CARS_KEY, carsView); } catch (err) { /* private window or blocked storage */ }
-      if (carsData) renderCars();
-    };
   }
 
   // ---------- Money: collapsible cards and jump links ----------

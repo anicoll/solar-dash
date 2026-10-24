@@ -862,6 +862,159 @@ pub fn summarise_car(
     }
 }
 
+/// A name for a plan in [`PlanCharging`]: the configured name, else its days
+/// ("Plan until 2026-05-24", "Plan from 2026-05-25"), else "Current plan" for
+/// a schedule of one plan.
+pub fn plan_label(name: Option<&str>, from: Option<NaiveDate>, until: Option<NaiveDate>) -> String {
+    if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        return name.to_string();
+    }
+    match (from, until) {
+        (Some(from), Some(until)) => format!("Plan {from} to {until}"),
+        (Some(from), None) => format!("Plan from {from}"),
+        (None, Some(until)) => format!("Plan until {until}"),
+        (None, None) => "Current plan".to_string(),
+    }
+}
+
+/// Home charging on one plan, for the "EV versus petrol" view. Money is in
+/// dollars, energy in kWh.
+///
+/// `first_day` and `last_day` span every home session on the plan; `sessions`,
+/// `kwh` and `cost` only the costed ones (what was actually paid with the
+/// system), so they add up with each other. Sessions not costed yet are in
+/// `pending_sessions` and never in the money.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlanCharging {
+    pub plan: String,
+    pub first_day: String,
+    pub last_day: String,
+    pub sessions: u32,
+    pub kwh: f64,
+    pub cost: f64,
+    pub pending_sessions: u32,
+}
+
+/// Charging away from home. `cost` is `None` when there were sessions and no
+/// `away_cents_per_kwh`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AwayCharging {
+    pub sessions: u32,
+    pub kwh: f64,
+    pub cost: Option<f64>,
+}
+
+/// A car's (or every car's) charging by plan, away from home, and how much of
+/// the costed home energy was solar or battery.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChargingSummary {
+    /// Plans with at least one home session, oldest plan first.
+    pub charging_by_plan: Vec<PlanCharging>,
+    pub away: AwayCharging,
+    /// Solar and battery kWh as a percentage of the costed home kWh (solar,
+    /// battery and grid, with the uncovered part counted as grid); one
+    /// decimal. `None` without costed home sessions.
+    pub self_share_pct: Option<f64>,
+}
+
+/// Share of `self_kwh` in `self_kwh + grid_kwh`, in percent to one decimal;
+/// `None` when both are 0.
+pub fn self_share_pct(self_kwh: f64, grid_kwh: f64) -> Option<f64> {
+    let total = self_kwh + grid_kwh;
+    (total > 0.0).then(|| (self_kwh / total * 1000.0).round() / 10.0)
+}
+
+/// Groups charging sessions by the plan of the day they started on.
+/// `plans` holds the plan names, oldest first, and `plan_of` says which of
+/// them a local day ("YYYY-MM-DD") falls on (an index past the end counts as
+/// the last plan). Pass every car's sessions together for the combined view.
+pub fn summarise_charging(
+    prices: &EvPrices,
+    plans: &[String],
+    plan_of: impl Fn(&str) -> usize,
+    charges: &[CarCharge],
+) -> ChargingSummary {
+    struct Sums {
+        first: String,
+        last: String,
+        sessions: u32,
+        kwh: f64,
+        cents: f64,
+        pending: u32,
+    }
+    let mut by_plan: BTreeMap<usize, Sums> = BTreeMap::new();
+    let (mut away_sessions, mut away_kwh) = (0, 0.0);
+    let (mut self_kwh, mut grid_kwh) = (0.0, 0.0);
+    for charge in charges {
+        if !charge.at_home {
+            away_sessions += 1;
+            away_kwh += charge.kwh;
+            continue;
+        }
+        let index = plan_of(&charge.date).min(plans.len().saturating_sub(1));
+        let sums = by_plan.entry(index).or_insert_with(|| Sums {
+            first: charge.date.clone(),
+            last: charge.date.clone(),
+            sessions: 0,
+            kwh: 0.0,
+            cents: 0.0,
+            pending: 0,
+        });
+        if charge.date < sums.first {
+            sums.first.clone_from(&charge.date);
+        }
+        if charge.date > sums.last {
+            sums.last.clone_from(&charge.date);
+        }
+        match &charge.cost {
+            Some(cost) => {
+                sums.sessions += 1;
+                sums.kwh += charge.kwh;
+                sums.cents += cost.cost_cents;
+                self_kwh += cost.self_kwh;
+                grid_kwh += cost.grid_kwh;
+            }
+            None => sums.pending += 1,
+        }
+    }
+    ChargingSummary {
+        charging_by_plan: by_plan
+            .into_iter()
+            .map(|(index, sums)| PlanCharging {
+                plan: plans.get(index).cloned().unwrap_or_default(),
+                first_day: sums.first,
+                last_day: sums.last,
+                sessions: sums.sessions,
+                kwh: round2(sums.kwh),
+                cost: round2(sums.cents / 100.0),
+                pending_sessions: sums.pending,
+            })
+            .collect(),
+        away: AwayCharging {
+            sessions: away_sessions,
+            kwh: round2(away_kwh),
+            cost: match prices.away_cents_per_kwh {
+                Some(cents) => Some(round2(cents * away_kwh / 100.0)),
+                None => (away_sessions == 0).then_some(0.0),
+            },
+        },
+        self_share_pct: self_share_pct(self_kwh, grid_kwh),
+    }
+}
+
+/// The comparison car for a TeslaMate model string, from `[teslamate]
+/// compare_cars`. Case and surrounding spaces do not matter ("y" finds "Y").
+pub fn compare_with(
+    compare_cars: &BTreeMap<String, String>,
+    model: Option<&str>,
+) -> Option<String> {
+    let model = model?.trim();
+    compare_cars
+        .iter()
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case(model))
+        .map(|(_, car)| car.clone())
+}
+
 /// What all the cars did on one local day, for adding to the house's savings.
 /// Money is in cents.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1693,6 +1846,124 @@ mod tests {
         let none = PetrolHistory::default();
         assert!(!none.is_configured());
         assert_eq!(none.on("2026-03-01"), None);
+    }
+
+    fn two_plans() -> Vec<String> {
+        vec!["Amber".to_string(), "ZeroHero".to_string()]
+    }
+
+    fn plan_on(day: &str) -> usize {
+        usize::from(day >= "2026-05-25")
+    }
+
+    #[test]
+    fn charging_is_grouped_by_the_plan_of_the_day() {
+        let prices = EvPrices {
+            away_cents_per_kwh: Some(50.0),
+            ..EvPrices::default()
+        };
+        let charges = [
+            home_charge("2026-05-24", 10.0, true),
+            home_charge("2026-05-01", 20.0, true),
+            home_charge("2026-05-26", 8.0, true),
+            home_charge("2026-06-01", 5.0, false),
+            away_charge("2026-06-02", 10.0),
+        ];
+        let summary = summarise_charging(&prices, &two_plans(), plan_on, &charges);
+        let rows = &summary.charging_by_plan;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].plan, "Amber");
+        assert_eq!(
+            (rows[0].first_day.as_str(), rows[0].last_day.as_str()),
+            ("2026-05-01", "2026-05-24")
+        );
+        assert_eq!(
+            (rows[0].sessions, rows[0].kwh, rows[0].cost),
+            (2, 30.0, 2.0)
+        );
+        assert_eq!(rows[0].pending_sessions, 0);
+        // The pending session widens the days but never the money.
+        assert_eq!(rows[1].plan, "ZeroHero");
+        assert_eq!(rows[1].last_day, "2026-06-01");
+        assert_eq!((rows[1].sessions, rows[1].kwh, rows[1].cost), (1, 8.0, 1.0));
+        assert_eq!(rows[1].pending_sessions, 1);
+        assert_eq!(
+            summary.away,
+            AwayCharging {
+                sessions: 1,
+                kwh: 10.0,
+                cost: Some(5.0)
+            }
+        );
+        // Each costed session is half solar or battery.
+        assert_eq!(summary.self_share_pct, Some(50.0));
+    }
+
+    #[test]
+    fn charging_without_sessions_or_prices() {
+        let none = summarise_charging(&EvPrices::default(), &two_plans(), plan_on, &[]);
+        assert!(none.charging_by_plan.is_empty());
+        assert_eq!(
+            none.away,
+            AwayCharging {
+                sessions: 0,
+                kwh: 0.0,
+                cost: Some(0.0)
+            }
+        );
+        assert_eq!(none.self_share_pct, None);
+
+        // Away sessions with no away price have no cost; a plan index past the
+        // end falls back to the last plan.
+        let charges = [
+            away_charge("2026-06-02", 10.0),
+            home_charge("2026-06-03", 4.0, true),
+        ];
+        let summary = summarise_charging(&EvPrices::default(), &two_plans(), |_| 9, &charges);
+        assert_eq!(summary.away.cost, None);
+        assert_eq!(summary.charging_by_plan[0].plan, "ZeroHero");
+    }
+
+    #[test]
+    fn self_share_is_a_percentage_of_the_costed_energy() {
+        assert_eq!(self_share_pct(1.0, 2.0), Some(33.3));
+        assert_eq!(self_share_pct(0.0, 5.0), Some(0.0));
+        assert_eq!(self_share_pct(3.0, 0.0), Some(100.0));
+        assert_eq!(self_share_pct(0.0, 0.0), None);
+    }
+
+    #[test]
+    fn plans_are_labelled_by_name_or_by_days() {
+        let (a, b) = (naive("2026-05-24"), naive("2026-05-25"));
+        assert_eq!(plan_label(Some("Amber"), None, Some(a)), "Amber");
+        assert_eq!(
+            plan_label(Some("  "), None, Some(a)),
+            "Plan until 2026-05-24"
+        );
+        assert_eq!(plan_label(None, Some(b), None), "Plan from 2026-05-25");
+        assert_eq!(
+            plan_label(None, Some(a), Some(b)),
+            "Plan 2026-05-24 to 2026-05-25"
+        );
+        assert_eq!(plan_label(None, None, None), "Current plan");
+    }
+
+    #[test]
+    fn the_comparison_car_is_found_by_model() {
+        let map = BTreeMap::from([
+            ("3".to_string(), "Hyundai i30 Sedan N".to_string()),
+            ("Y".to_string(), "Toyota RAV4 GX 2WD".to_string()),
+        ]);
+        assert_eq!(
+            compare_with(&map, Some("Y")).as_deref(),
+            Some("Toyota RAV4 GX 2WD")
+        );
+        assert_eq!(
+            compare_with(&map, Some(" y ")).as_deref(),
+            Some("Toyota RAV4 GX 2WD")
+        );
+        assert_eq!(compare_with(&map, Some("X")), None);
+        assert_eq!(compare_with(&map, None), None);
     }
 
     #[test]

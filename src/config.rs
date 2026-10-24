@@ -1,5 +1,6 @@
 //! Configuration loaded from a TOML file.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -237,6 +238,15 @@ pub struct Teslamate {
     /// `postgres://solar_dash:secret@192.168.10.84:5432/teslamate`. Without
     /// it the history sync is off. It holds a password, so it is never logged.
     pub database_url: Option<String>,
+    /// The petrol car each TeslaMate model is compared with, by TeslaMate's
+    /// model string (such as "3" or "Y"), for the "EV versus petrol" view of
+    /// `/api/ev/cars`. A model without an entry has no comparison car. Write it
+    /// before the `[[teslamate.petrol_price]]` tables, as TOML needs.
+    #[serde(default)]
+    pub compare_cars: BTreeMap<String, String>,
+    /// The grade of petrol the price and the comparison are for.
+    #[serde(default = "default_petrol_grade")]
+    pub petrol_grade: String,
 }
 
 impl Teslamate {
@@ -269,6 +279,16 @@ impl Teslamate {
                 self.petrol_price.is_empty(),
                 "[teslamate] sets both petrol_prices_file and [[teslamate.petrol_price]]; \
                  use one or the other (the file's entries replace the tables)"
+            );
+        }
+        anyhow::ensure!(
+            !self.petrol_grade.trim().is_empty(),
+            "petrol_grade in [teslamate] must not be empty"
+        );
+        for (model, car) in &self.compare_cars {
+            anyhow::ensure!(
+                !model.trim().is_empty() && !car.trim().is_empty(),
+                "compare_cars in [teslamate] needs a model and a car name in every entry"
             );
         }
         let mut last: Option<NaiveDate> = None;
@@ -354,8 +374,10 @@ impl fmt::Debug for Globird {
 /// turns it into something quick to look up.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tariff {
-    /// A label for the plan, shown on the payback timeline. Left out of the
-    /// stored key, so naming a plan does not make stored costs stale.
+    /// A label for the plan, shown on the payback timeline and in
+    /// `/api/ev/cars`. It is not part of the rates, so it is left out of the
+    /// stored key and naming a plan does not make stored costs stale. (In a
+    /// `[[previous_tariff]]` the table's own `name` is the one that counts.)
     #[serde(default, skip_serializing)]
     pub name: Option<String>,
     /// Fixed daily supply charge.
@@ -477,7 +499,8 @@ impl Tariff {
 pub struct PreviousTariff {
     /// Last local day ("YYYY-MM-DD", inclusive) this plan applied.
     pub until: String,
-    /// A label for the plan, shown on the payback timeline.
+    /// A label for the plan, shown on the payback timeline and in
+    /// `/api/ev/cars`; not used in any maths.
     pub name: Option<String>,
     #[serde(flatten)]
     pub tariff: Tariff,
@@ -600,6 +623,10 @@ fn default_teslamate_car_id() -> u32 {
 
 fn default_teslamate_topic_prefix() -> String {
     "teslamate".to_string()
+}
+
+fn default_petrol_grade() -> String {
+    "Unleaded 91".to_string()
 }
 
 fn default_petrol_litres_per_100km() -> f64 {
@@ -829,6 +856,29 @@ mod tests {
     fn teslamate_section_needs_a_host() {
         let text = format!("{MINIMAL}\n[teslamate]\nport = 1883\n");
         assert!(toml::from_str::<Config>(&text).is_err());
+    }
+
+    #[test]
+    fn teslamate_comparison_cars_and_petrol_grade() {
+        let parse = |extra: &str| -> Teslamate {
+            let text = format!("{MINIMAL}\n[teslamate]\nhost = \"h\"\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().teslamate.unwrap()
+        };
+        let plain = parse("");
+        assert!(plain.compare_cars.is_empty());
+        assert_eq!(plain.petrol_grade, "Unleaded 91");
+        assert!(plain.check().is_ok());
+
+        let set = parse(
+            "compare_cars = { \"3\" = \"Hyundai i30 Sedan N\", \"Y\" = \"Toyota RAV4 GX 2WD\" }\n\
+             petrol_grade = \"Premium 95\"\n",
+        );
+        assert_eq!(set.compare_cars["Y"], "Toyota RAV4 GX 2WD");
+        assert_eq!(set.petrol_grade, "Premium 95");
+        assert!(set.check().is_ok());
+
+        assert!(parse("petrol_grade = \" \"\n").check().is_err());
+        assert!(parse("compare_cars = { \"Y\" = \"\" }\n").check().is_err());
     }
 
     #[test]
