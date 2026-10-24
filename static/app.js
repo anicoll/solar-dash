@@ -2250,56 +2250,112 @@
   /** Month after `ym` ("YYYY-MM"). */
   const nextMonth = (ym) => shiftMonth(ym, 1);
 
+  /** "24 Oct 2026" for "2026-10-24". */
+  const dmyLabel = (d) => `${+d.slice(8, 10)} ${MONTHS[+d.slice(5, 7) - 1]} ${d.slice(0, 4)}`;
+
+  /** The projected payback as a month ("YYYY-MM") when it is one, else null. */
+  const projMonth = (proj) => (typeof proj === 'string' && /^\d{4}-\d{2}$/.test(proj) ? proj : null);
+
+  /**
+   * The dashed line from the last actual month to `proj`: `{ months, values }`
+   * for the months after `lastMonth` up to and including `proj`, or null when
+   * there is nothing to draw. The same growth curve as the server: savings so
+   * far follow (e^(gt) - 1), scaled so the line reaches zero in `proj`.
+   */
+  function projectNet(lastMonth, lastNet, proj, risePercent) {
+    if (!projMonth(proj) || proj <= lastMonth) return null;
+    const months = [];
+    for (let m = nextMonth(lastMonth); m <= proj; m = nextMonth(m)) months.push(m);
+    const g = Math.log(1 + (risePercent || 0) / 100);
+    const grown = (n) => (g > 0 ? Math.expm1(g * n / 12) : n);
+    const values = months.map((_, i) => +(lastNet * (1 - grown(i + 1) / grown(months.length))).toFixed(2));
+    return { months, values };
+  }
+
   /**
    * Chart option for net position: actual month-end points, a dashed line to the
-   * projected payback month, and the purchases as dots.
+   * projected payback month, the purchases as dots, and (when present) the same
+   * again for the house without the latest part.
    */
   function paybackOption(pb) {
     const th = baseTheme();
-    const months = pb.series.map((p) => p.month);
-    const actual = pb.series.map((p) => p.net);
+    const narrow = $('payback-chart').clientWidth < 520; // the legend wraps to more rows
+    const first = pb.series[0];
     const last = pb.series[pb.series.length - 1];
     const proj = pb.projected_payback;
-    let projected = null;
-    if (typeof proj === 'string' && /^\d{4}-\d{2}$/.test(proj) && last && proj > last.month) {
-      const extra = [];
-      for (let m = nextMonth(last.month); m <= proj; m = nextMonth(m)) extra.push(m);
-      months.push(...extra);
-      projected = months.map(() => null);
-      projected[pb.series.length - 1] = last.net;
-      // The same growth curve as the server: savings so far follow (e^(gt) - 1),
-      // scaled so the line reaches zero in the projected month.
-      const g = Math.log(1 + (pb.price_rise_percent || 0) / 100);
-      const grown = (months) => (g > 0 ? Math.expm1(g * months / 12) : months);
-      extra.forEach((_, i) => {
-        projected[pb.series.length + i] = +(last.net * (1 - grown(i + 1) / grown(extra.length))).toFixed(2);
-      });
-    }
-    const dots = pb.purchases
-      .map((p) => ({ name: p.name, i: months.indexOf(p.date.slice(0, 7)) }))
-      .filter((p) => p.i >= 0 && p.i < pb.series.length)
-      .map((p) => ({ name: p.name, value: [ymLabel(months[p.i]), actual[p.i]] }));
+    const wo = pb.without;
+    const woLast = wo && wo.series[wo.series.length - 1];
+    const main = last && projectNet(last.month, last.net, proj, pb.price_rise_percent);
+    const alt = woLast && projectNet(woLast.month, woLast.net, wo.projected_payback, pb.price_rise_percent);
+    // One month axis for every line, out to the later payback month.
+    let end = last ? last.month : '';
+    for (const p of [main, alt]) if (p && p.months[p.months.length - 1] > end) end = p.months[p.months.length - 1];
+    const months = [];
+    if (first) for (let m = first.month; m <= end; m = nextMonth(m)) months.push(m);
     const labels = months.map(ymLabel);
+    /** Values on `months`: the `points`, or the `tail` of a projection that starts at `from`. */
+    const align = (points, tail, from) => {
+      const out = months.map(() => null);
+      for (const p of points) if (months.indexOf(p.month) >= 0) out[months.indexOf(p.month)] = p.net;
+      if (tail) {
+        out[months.indexOf(from.month)] = from.net;
+        tail.months.forEach((m, i) => { out[months.indexOf(m)] = tail.values[i]; });
+      }
+      return out;
+    };
+    const actual = align(pb.series);
+    const dots = pb.purchases
+      .map((p) => ({ p, i: months.indexOf(p.date.slice(0, 7)) }))
+      .filter((d) => d.i >= 0 && actual[d.i] != null)
+      .map((d, n) => ({
+        name: `${d.p.name} · ${money(d.p.cost, 0)}`, value: [labels[d.i], actual[d.i]],
+        label: { position: n && !narrow ? 'bottom' : 'right', ...(narrow ? { width: 130, overflow: 'break' } : {}) },
+      }));
     const series = [
       {
         name: 'Actual', type: 'line', data: actual, showSymbol: false, smooth: 0.3,
         lineStyle: { width: 3, color: css('--save') }, itemStyle: { color: css('--save') }, z: 4,
         markLine: {
-          silent: true, symbol: 'none', label: { show: false },
-          lineStyle: { color: css('--muted'), width: 1.5, type: 'solid' }, data: [{ yAxis: 0 }],
+          silent: true, symbol: 'none',
+          lineStyle: { color: css('--muted'), width: 1.5, type: 'solid' },
+          data: [
+            { yAxis: 0, label: { show: false } },
+            // Today: a vertical line at the last actual month, labelled with the net now.
+            ...(last ? [{
+              xAxis: ymLabel(last.month), lineStyle: { width: 1, type: 'dotted' },
+              label: {
+                show: true, position: narrow ? 'insideEndTop' : 'end', color: th.muted, fontSize: 12, align: 'center', lineHeight: 15,
+                formatter: `Today · ${dmyLabel(todayStr())}\n${money(last.net, 0)}`,
+              },
+            }] : []),
+          ],
         },
       },
     ];
-    if (projected) {
+    if (main) {
       series.push({
-        name: 'Projected', type: 'line', data: projected, showSymbol: false, smooth: 0.3,
+        name: 'Projected', type: 'line', data: align([], main, last), showSymbol: false, smooth: 0.3,
         lineStyle: { width: 3, type: 'dashed', color: css('--save') }, itemStyle: { color: css('--save') },
         markPoint: {
-          symbol: 'circle', symbolSize: 12, label: { show: false },
+          symbol: 'circle', symbolSize: 12,
+          label: { show: true, position: 'top', offset: [-36, 0], color: th.fg, fontSize: 12, formatter: `Payback ~${ymLabel(proj)}` },
           itemStyle: { color: css('--bg'), borderColor: css('--save'), borderWidth: 2.5 },
           data: [{ name: 'Payback', coord: [ymLabel(proj), 0] }],
         },
       });
+    }
+    if (wo && wo.series.length) {
+      const grey = css('--muted');
+      series.push({
+        name: `Without ${wo.name} (rough estimate)`, type: 'line', data: align(wo.series), showSymbol: false, smooth: 0.3,
+        lineStyle: { width: 2, color: grey, opacity: 0.8 }, itemStyle: { color: grey }, z: 3,
+      });
+      if (alt) {
+        series.push({
+          name: `Without ${wo.name} (projected)`, type: 'line', data: align([], alt, woLast), showSymbol: false, smooth: 0.3,
+          lineStyle: { width: 2, type: 'dashed', color: grey, opacity: 0.8 }, itemStyle: { color: grey }, z: 3,
+        });
+      }
     }
     if (dots.length) {
       series.push({
@@ -2311,7 +2367,7 @@
     return {
       animation: false,
       textStyle: { fontFamily: css('--font') },
-      grid: { left: 8, right: 24, top: 56, bottom: 28, containLabel: true },
+      grid: { left: 8, right: 24, top: narrow ? 120 : 96, bottom: 28, containLabel: true },
       legend: { top: 0, left: 8, textStyle: { color: th.fg }, itemWidth: 16, itemHeight: 8 },
       tooltip: {
         trigger: 'axis', axisPointer: { type: 'line' }, ...tooltipStyle(),
@@ -2327,7 +2383,7 @@
         axisLine: { show: false }, axisTick: { show: false },
       },
       yAxis: {
-        type: 'value', name: 'Net position ($)', nameTextStyle: { color: th.muted, align: 'left' },
+        type: 'value', name: narrow ? '' : 'Net position ($)', nameTextStyle: { color: th.muted, align: 'left' },
         axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: (v) => `${v < 0 ? '-' : ''}$${Math.abs(v).toLocaleString('en-AU')}` },
         splitLine: { lineStyle: { color: th.line } },
       },
@@ -2335,60 +2391,176 @@
     };
   }
 
+  /** "$2.4k" for 2431, "$850" for 850. */
+  const shortMoney = (v) => (Math.abs(v) >= 1000 ? `$${(v / 1000).toFixed(1)}k` : money(v, 0));
+
+  /** Bar chart option for dollars saved each year, oldest on the left. */
+  function paybackYearsOption(years) {
+    const th = baseTheme();
+    const label = (y) => `'${String(y.year).slice(2)}${y.partial ? '*' : ''}`;
+    return {
+      animation: false,
+      textStyle: { fontFamily: css('--font') },
+      grid: { left: 8, right: 8, top: 28, bottom: 24, containLabel: true },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipStyle(),
+        formatter: (params) => {
+          const y = years[params[0].dataIndex];
+          return moneyTooltip([
+            [params[0].marker, 'Saved', money(y.saved, 0)], ['', 'Days with data', `${y.days}`],
+            ['', 'Average a day', y.days ? money(y.saved / y.days) : '–'],
+          ], `${y.year}${y.partial ? ' (part of a year)' : ''}`);
+        },
+      },
+      xAxis: {
+        type: 'category', data: years.map(label),
+        axisLabel: { color: th.muted, fontFamily: css('--mono') },
+        axisLine: { lineStyle: { color: th.line } }, axisTick: { show: false },
+      },
+      yAxis: {
+        type: 'value',
+        axisLabel: { color: th.muted, fontFamily: css('--mono'), formatter: shortMoney },
+        splitLine: { lineStyle: { color: th.line } },
+      },
+      series: [{
+        type: 'bar', barMaxWidth: 48,
+        data: years.map((y) => ({ value: y.saved, itemStyle: { color: css('--save'), opacity: y.partial ? 0.55 : 1, borderRadius: [4, 4, 0, 0] } })),
+        label: { show: true, position: 'top', color: th.fg, fontFamily: css('--mono'), fontSize: 12, formatter: (p) => shortMoney(p.value) },
+      }],
+    };
+  }
+
+  /** The sentence under the title. */
+  function paybackHeadline(pb) {
+    const says = (p) => (p === null ? 'has paid for itself' : p === 'never' ? "isn't on track to pay back at this rate"
+      : `pays for itself around ${ymLabel(p)}`);
+    const whole = pb.projected_payback;
+    const firstPart = pb.parts.length > 1 ? pb.parts[0] : null;
+    if (firstPart && firstPart.saved != null) {
+      const fp = firstPart.projected_payback;
+      const bothDated = projMonth(fp) && projMonth(whole);
+      return `The first system ${says(fp)}, and ${bothDated ? `the whole system around ${ymLabel(whole)}` : `the whole system ${says(whole)}`}.`;
+    }
+    return `The whole system ${says(whole)}.`;
+  }
+
+  /** Fills the full-width status card. */
+  function fillPaybackStatus(pb) {
+    const proj = pb.projected_payback;
+    const title = proj === null ? 'Paid back' : proj === 'never' ? 'Not on track at this rate'
+      : `On track to pay back around ${ymLabel(proj)}`;
+    const gap = pb.net < 0 ? `${money(-pb.net, 0)} to go` : `${money(pb.net, 0)} ahead`;
+    $('payback-status').replaceChildren(
+      el('div', 'pb-status-title', title),
+      el('div', 'pb-status-line', `${gap} as of ${dmyLabel(todayStr())} · saving about ${money(pb.last_12_months_saved, 0)} a year, rising ${pb.price_rise_percent}% a year`),
+      meter(pb.recovered_pct, '--save'),
+      el('div', 'pb-status-line', `${pb.recovered_pct.toFixed(1)}% of the cost recovered`));
+  }
+
+  /** One labelled figure in a part card. */
+  function partCell(label, text) {
+    const c = el('div');
+    c.append(el('span', 'label', label), el('span', 'num', text));
+    return c;
+  }
+
+  /** One "Each part" card. */
+  function partCard(p, firstPart) {
+    const card = el('div', 'part');
+    const head = el('div', 'part-head');
+    const title = el('div');
+    title.append(el('div', 'part-name', p.name), el('div', 'part-date', `installed ${ymLabel(p.date.slice(0, 7))}`));
+    head.appendChild(title);
+    const grid = el('div', 'part-grid');
+    grid.appendChild(partCell('Cost', money(p.cost, 0)));
+    // A part with no figure of its own is counted with the first one.
+    if (p.saved == null) {
+      card.append(head, grid, el('div', 'part-status', `Counted with ${firstPart.name}`));
+      return card;
+    }
+    head.appendChild(el('span', `part-net ${p.net < 0 ? 'cost' : 'positive'}`, money(p.net, 0)));
+    grid.append(partCell(p.estimated ? 'Added' : 'Saved', money(p.saved, 0)), partCell('Recovered', `${p.recovered_pct.toFixed(0)}%`));
+    const pr = p.projected_payback;
+    const status = pr === null ? 'Paid back' : pr === 'never' ? 'Not on track at this rate'
+      : `Pays back ~${ymLabel(pr)}${p.estimated ? ' at the current rate' : ''}`;
+    card.append(head, grid, meter(p.recovered_pct, '--save'), el('div', 'part-status', status));
+    return card;
+  }
+
+  /** Past events, today, and the paybacks still to come, oldest first. */
+  function fillPaybackTimeline(pb) {
+    const today = todayStr();
+    const items = [];
+    let plans = 0;
+    for (const t of pb.timeline) {
+      const text = t.kind === 'purchase' ? t.label : `${plans++ ? 'Moved to' : 'On'} ${t.label}`;
+      items.push({ key: t.date, date: dmyLabel(t.date), text, note: t.cost != null ? money(t.cost, 0) : '', future: t.date > today });
+    }
+    items.push({
+      key: today, date: dmyLabel(today), text: 'Today', today: true,
+      note: `${money(pb.saved, 0)} saved so far · ${pb.recovered_pct.toFixed(1)}% recovered`,
+    });
+    // A payback month that has already begun still sorts after today.
+    const milestone = (ym, text) => items.push({
+      key: `${ym}-31` > today ? `${ym}-31` : `${today}z`, date: `~${ymLabel(ym)}`, text, note: '', future: true,
+    });
+    if (pb.parts.length > 1) {
+      for (const p of pb.parts) if (p.saved != null && projMonth(p.projected_payback)) milestone(p.projected_payback, `${p.name} paid back`);
+    }
+    if (projMonth(pb.projected_payback)) milestone(pb.projected_payback, 'Whole system paid back');
+    items.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    $('payback-timeline').replaceChildren(...items.map((it) => {
+      const li = el('li', `tl${it.today ? ' today' : ''}${it.future ? ' future' : ''}`);
+      const body = el('div', 'tl-body');
+      body.append(el('span', 'tl-text', it.text));
+      if (it.note) body.append(el('span', 'tl-note', it.note));
+      li.append(el('span', 'tl-date', it.date), body);
+      return li;
+    }));
+  }
+
   async function loadPaybackView() {
-    const [pb, savings] = await Promise.all([
-      loadPayback(),
-      loadSavings().catch((err) => { if (err.message === 'Not logged in.') throw err; return null; }),
-    ]);
+    const pb = await loadPayback();
     if (state.view !== 'payback') return;
     setConfigured('payback', pb.configured, NOT_CONFIGURED_PAYBACK);
     if (!pb.configured) return;
 
-    const proj = pb.projected_payback;
-    const projText = proj === null ? 'Paid back' : proj === 'never' ? 'Not at this rate' : ymLabel(proj);
-    const projNote = proj === null ? 'savings now cover the cost'
-      : proj === 'never' ? 'savings are not keeping up'
-      : `at about ${money(pb.rate_per_day)} a day (last 12 months), rising ${pb.price_rise_percent}% a year`;
-    const recovered = el('div', 'kpi');
-    const rv = el('div', 'value', `${pb.recovered_pct.toFixed(1)}%`);
-    recovered.append(el('div', 'label', 'Cost recovered'), rv, meter(pb.recovered_pct, '--save'),
-      el('div', 'note', `${money(pb.saved, 0)} saved of ${money(pb.total_cost, 0)} spent`));
-    const net = kpi('', 'Net position today', money(pb.net, 0), '', 'savings minus what the system cost');
-    net.classList.add(pb.net < 0 ? 'cost' : 'positive');
+    $('payback-headline').textContent = paybackHeadline(pb);
+    fillPaybackStatus(pb);
+    const bought = pb.purchases.length === 1 ? pb.purchases[0].name : `${pb.purchases.length} purchases`;
+    const since = pb.purchases.length ? `since ${ymLabel(pb.purchases[0].date.slice(0, 7))}` : '';
     $('payback-cards').replaceChildren(
-      kpi('save', 'Projected payback', projText, '', projNote), recovered, net);
+      kpi('', 'System cost', money(pb.total_cost, 0), '', bought),
+      kpi('positive', 'Saved so far', money(pb.saved, 0), '', since),
+      kpi('', 'Last 12 months', money(pb.last_12_months_saved, 0), '', 'saved on power'),
+      kpi(pb.net < 0 ? 'cost' : 'positive', 'Net position now', money(pb.net, 0), '', 'savings minus what it cost'));
 
-    const hasSeries = pb.series.length > 0;
-    showChart('payback-chart', hasSeries, paybackOption(pb),
+    const proj = pb.projected_payback;
+    showChart('payback-chart', pb.series.length > 0, paybackOption(pb),
       `Net position over time, in dollars: starts at minus ${money(pb.total_cost, 0)} cost, now ${money(pb.net, 0)}`
-      + (typeof proj === 'string' && proj !== 'never' ? `, projected to reach zero in ${ymLabel(proj)}.` : '.'));
+      + (projMonth(proj) ? `, projected to reach zero in ${ymLabel(proj)}.` : '.'));
 
-    const days = savings && savings.configured ? savings.days : [];
-    $('payback-parts').replaceChildren(...pb.purchases.map((p) => {
-      const card = el('div', 'part');
-      const head = el('div', 'part-head');
-      head.append(el('span', 'part-name', p.name), el('span', 'part-date', ymLabel(p.date)));
-      const grid = el('div', 'part-grid');
-      const cell = (label, text) => {
-        const c = el('div');
-        c.append(el('span', 'label', label), el('span', 'num', text));
-        return c;
-      };
-      grid.appendChild(cell('Cost', money(p.cost, 0)));
-      if (days.length) {
-        const since = days.filter((d) => d.date >= p.date).reduce((a, d) => a + d.savings, 0);
-        grid.appendChild(cell('Saved since', money(since, 0)));
-      }
-      card.append(head, grid);
-      return card;
-    }));
+    $('payback-parts').replaceChildren(...pb.parts.map((p) => partCard(p, pb.parts[0])));
+    const estimated = pb.parts.find((p) => p.estimated);
+    const note = $('payback-parts-note');
+    note.hidden = !estimated;
+    if (estimated) {
+      note.textContent = `${estimated.name} shows a rough estimate of what it added on top of the earlier system: each day, the battery discharge beyond what the earlier batteries hold, at that day's peak price. The parts add up to the total.`;
+    }
 
-    fillTable('payback-years', pb.by_year.slice().reverse().map((y) => [
+    const years = pb.by_year;
+    showChart('payback-years-chart', years.length > 0, paybackYearsOption(years),
+      `Dollars saved each year: ${years.map((y) => `${y.year} ${money(y.saved, 0)}`).join(', ')}.`);
+    $('payback-years-note').hidden = !years.some((y) => y.partial);
+    fillTable('payback-years', years.slice().reverse().map((y) => [
       [String(y.year) + (y.partial ? ' (partial)' : '')],
       [money(y.saved, 0), 'save'],
       [`${y.days}`],
       [y.days ? money(y.saved / y.days) : '–'],
     ]));
+
+    fillPaybackTimeline(pb);
+    $('payback-rise').textContent = `${pb.price_rise_percent}%`;
   }
 
   // ---------- Money ----------

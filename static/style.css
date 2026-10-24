@@ -529,20 +529,49 @@ table.data td.save { color: var(--save); }
 .kpi.positive .value { color: var(--save); }
 .page-title { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
 @media (min-width: 760px) { .page-title { font-size: 34px; } }
-.cards.three { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .meter { height: 10px; border-radius: 5px; background: var(--track); overflow: hidden; margin: 4px 0; }
 .meter span { display: block; height: 100%; border-radius: 5px; }
 .parts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
 @media (min-width: 760px) { .parts { gap: 16px; } }
 .part { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 10px; }
-.part-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.part-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
 .part-name { font-weight: 600; }
 .part-date { font-size: 13px; color: var(--muted); }
-.part-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.part-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .part-grid > div { display: flex; flex-direction: column; }
 .part-grid .label { font-size: 12px; color: var(--muted); }
 .part-grid .num { font-weight: 600; }
+.part-net { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; white-space: nowrap; }
+.part-net.cost { color: var(--cost); }
+.part-net.positive { color: var(--save); }
+.part-status { font-size: 13px; color: var(--fg-soft); }
+.pb-headline { margin: 0; font-size: 17px; color: var(--fg-soft); }
+.pb-status {
+  background: var(--save-panel); border: 1px solid var(--save-border); border-radius: 16px;
+  padding: 18px; display: flex; flex-direction: column; gap: 8px;
+}
+.pb-status-title { font-size: 20px; font-weight: 600; color: var(--save); }
+.pb-status-line { font-size: 13px; color: var(--save-soft); }
+.tiles .kpi .value { font-size: 24px; overflow-wrap: anywhere; }
+@media (min-width: 760px) { .tiles .kpi .value { font-size: 30px; } .pb-status { padding: 24px; } .pb-status-title { font-size: 24px; } }
+.years-table summary { cursor: pointer; color: var(--fg-soft); font-weight: 600; min-height: 24px; }
+.years-table .table-wrap { margin-top: 8px; }
+.timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.tl { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 12px; padding: 0 0 14px 18px; position: relative; border-left: 2px solid var(--border-strong); margin-left: 4px; }
+.tl:last-child { padding-bottom: 0; }
+.tl::before { content: ''; position: absolute; left: -7px; top: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--c-pv); border: 2px solid var(--panel); }
+.tl.today::before { background: var(--save); }
+.tl.future { border-left-style: dashed; color: var(--muted); }
+.tl.future::before { background: var(--panel); border-color: var(--baseline); }
+.tl-date { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+.tl-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tl-text { font-weight: 600; overflow-wrap: anywhere; }
+.tl-note { font-size: 13px; color: var(--muted); }
+.tl.today .tl-text { color: var(--save); }
+@media (max-width: 480px) { .tl { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
 .how { display: block; padding: 16px 20px; }
+.how h3 { margin: 16px 0 4px; font-size: 14px; color: var(--muted); font-weight: 600; }
+.how ul { margin: 0; padding-left: 20px; color: var(--fg-soft); }
 .how summary { cursor: pointer; font-weight: 600; min-height: 24px; }
 .how p { margin: 12px 0 0; color: var(--fg-soft); }
 
@@ -671,3 +700,4 @@ table.car-table tr.car-year th { text-align: left; color: var(--fg); font-weight
 @media (min-width: 760px) { .cards.car-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 .car-tiles .kpi .value { font-size: 26px; }
 @media (min-width: 760px) { .car-tiles .kpi .value { font-size: 32px; } }
+@media (max-width: 520px) { #payback-chart { height: 460px; } }
