@@ -374,10 +374,10 @@ impl fmt::Debug for Globird {
 /// turns it into something quick to look up.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tariff {
-    /// A label for the plan, shown in `/api/ev/cars`. It is not part of the
-    /// rates, so it is left out of the stored key and renaming a plan does not
-    /// cost anything again. (In a `[[previous_tariff]]` the table's own `name`
-    /// is the one that counts.)
+    /// A label for the plan, shown on the payback timeline and in
+    /// `/api/ev/cars`. It is not part of the rates, so it is left out of the
+    /// stored key and naming a plan does not make stored costs stale. (In a
+    /// `[[previous_tariff]]` the table's own `name` is the one that counts.)
     #[serde(default, skip_serializing)]
     pub name: Option<String>,
     /// Fixed daily supply charge.
@@ -499,7 +499,8 @@ impl Tariff {
 pub struct PreviousTariff {
     /// Last local day ("YYYY-MM-DD", inclusive) this plan applied.
     pub until: String,
-    /// A label for the plan, shown in `/api/ev/cars`; not used in any maths.
+    /// A label for the plan, shown on the payback timeline and in
+    /// `/api/ev/cars`; not used in any maths.
     pub name: Option<String>,
     #[serde(flatten)]
     pub tariff: Tariff,
@@ -558,6 +559,10 @@ pub struct Purchase {
     /// Local date it was paid for, "YYYY-MM-DD".
     pub date: String,
     pub cost_dollars: f64,
+    /// Capacity of the battery this purchase added, in kWh. Optional; with it
+    /// `/api/payback` estimates the savings this battery added.
+    #[serde(default)]
+    pub battery_kwh: Option<f64>,
 }
 
 /// Parse a "YYYY-MM-DD" date. Strict, like [`parse_hhmm`].
@@ -585,6 +590,12 @@ impl System {
                 p.cost_dollars >= 0.0 && p.cost_dollars.is_finite(),
                 "purchase[{i}].cost_dollars in [system] must be zero or more"
             );
+            if let Some(kwh) = p.battery_kwh {
+                anyhow::ensure!(
+                    kwh.is_finite() && kwh > 0.0,
+                    "purchase[{i}].battery_kwh in [system] must be greater than 0"
+                );
+            }
         }
         Ok(())
     }
@@ -1143,6 +1154,18 @@ mod tests {
     }
 
     #[test]
+    fn plans_may_be_named() {
+        let text = format!("{CURRENT}name = \"Now\"\n{}", previous("2025-06-30"));
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{text}")).unwrap();
+        assert_eq!(cfg.tariff.unwrap().name.as_deref(), Some("Now"));
+        assert_eq!(cfg.previous_tariff[0].name.as_deref(), Some("Old"));
+        // The previous plan's name is its own, not the flattened tariff's.
+        assert_eq!(cfg.previous_tariff[0].tariff.name, None);
+        let unnamed: Config = toml::from_str(&format!("{MINIMAL}\n{CURRENT}")).unwrap();
+        assert_eq!(unnamed.tariff.unwrap().name, None);
+    }
+
+    #[test]
     fn export_tier_in_a_previous_tariff() {
         let text = format!(
             "{CURRENT}{}[previous_tariff.export_tier]\nfirst_kwh_per_day = 14.0\ncents = 15.0\n",
@@ -1268,6 +1291,18 @@ mod tests {
     }
 
     #[test]
+    fn battery_kwh_is_optional_and_checked() {
+        let with = format!(
+            "{PURCHASES}\n[[system.purchase]]\nname = \"c\"\ndate = \"2025-10-01\"\n\
+             cost_dollars = 7690.0\nbattery_kwh = 12.8\n"
+        );
+        check_system(&with).unwrap();
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{with}")).unwrap();
+        assert_eq!(cfg.system.purchase[0].battery_kwh, None);
+        assert_eq!(cfg.system.purchase[2].battery_kwh, Some(12.8));
+    }
+
+    #[test]
     fn price_rise_defaults_and_is_checked() {
         let cfg: Config = toml::from_str(MINIMAL).unwrap();
         assert_eq!(cfg.system.price_rise_percent, 3.0);
@@ -1306,6 +1341,18 @@ mod tests {
                     one("name = \"b\"\ndate = \"2024-01-01\"\ncost_dollars = nan")
                 ),
                 "purchase[1].cost_dollars",
+            ),
+            (
+                one("name = \"a\"\ndate = \"2024-01-01\"\ncost_dollars = 1.0\nbattery_kwh = 0"),
+                "purchase[0].battery_kwh",
+            ),
+            (
+                one("name = \"a\"\ndate = \"2024-01-01\"\ncost_dollars = 1.0\nbattery_kwh = -2.5"),
+                "purchase[0].battery_kwh",
+            ),
+            (
+                one("name = \"a\"\ndate = \"2024-01-01\"\ncost_dollars = 1.0\nbattery_kwh = nan"),
+                "purchase[0].battery_kwh",
             ),
         ];
         for (section, field) in cases {

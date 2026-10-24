@@ -2039,7 +2039,7 @@ mod tests {
             .await
             .unwrap();
         // Readings need their points to exist first.
-        for point_id in [83102, 83072, 83118] {
+        for point_id in [83102, 83072, 83118, 83323] {
             let point = Point {
                 point_id,
                 code: None,
@@ -2637,6 +2637,7 @@ mod tests {
             name: "Solar".to_string(),
             date: date.parse().unwrap(),
             cost_dollars,
+            battery_kwh: None,
         }
     }
 
@@ -2943,6 +2944,20 @@ mod tests {
         assert_eq!(json["net"], -14.15);
         assert_eq!(json["recovered_pct"], 5.67);
         assert_eq!(json["rate_per_day"], 0.85);
+        assert_eq!(json["last_12_months_saved"], 0.85);
+        // No battery_kwh anywhere: everything stays with the first purchase.
+        assert_eq!(json["without"], Value::Null);
+        assert_eq!(json["parts"][0]["saved"], 0.85);
+        assert_eq!(json["parts"][0]["estimated"], false);
+        assert_eq!(json["parts"][0]["net"], -9.15);
+        assert_eq!(json["parts"][0]["recovered_pct"], 8.5);
+        assert_eq!(json["parts"][1]["saved"], Value::Null);
+        assert_eq!(json["parts"][1]["net"], Value::Null);
+        // Purchases only: a flat plan with no name adds nothing.
+        assert_eq!(json["timeline"].as_array().unwrap().len(), 2);
+        assert_eq!(json["timeline"][1]["kind"], "purchase");
+        assert_eq!(json["timeline"][1]["label"], "Solar");
+        assert_eq!(json["timeline"][1]["cost"], 5.0);
         // 14.15 / 0.85 = 17 days from today: some "YYYY-MM" in the future.
         let projected = json["projected_payback"].as_str().unwrap();
         assert!(projected.len() == 7 && projected.as_bytes()[4] == b'-');
@@ -2967,6 +2982,48 @@ mod tests {
         let json = payback_json(&cheap).await;
         assert_eq!(json["net"], 0.35);
         assert_eq!(json["projected_payback"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn payback_estimates_what_a_later_battery_added() {
+        let (_dir, _app, pool) = costs_app().await;
+        // One finished day saving 85 c (see `costs_for_a_cloud_day`), with
+        // 11.5 kWh discharged.
+        seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
+        let discharge = [3600, LAST_READING].map(|offset| Reading {
+            point_id: 83323,
+            ts: SEP_15_START + offset,
+            value: Some(11_500.0),
+        });
+        db::upsert_readings(&pool, PLANT, &discharge).await.unwrap();
+        let with_battery = |date: &str, cost: f64, kwh: f64| Purchase {
+            battery_kwh: Some(kwh),
+            ..solar_purchase(date, cost)
+        };
+        let app = payback_router(
+            &pool,
+            vec![
+                with_battery("2026-09-01", 10.0, 10.0),
+                with_battery("2026-09-14", 5.0, 5.0),
+            ],
+        );
+        let json = payback_json(&app).await;
+        // (11.5 - 0.95 * 10) kWh at the flat 25 c is 50 c for the second battery.
+        assert_eq!(json["saved"], 0.85);
+        let (first, second) = (&json["parts"][0], &json["parts"][1]);
+        assert_eq!(first["saved"], 0.35);
+        assert_eq!(first["estimated"], false);
+        assert_eq!(second["saved"], 0.5);
+        assert_eq!(second["estimated"], true);
+        assert_eq!(second["net"], -4.5);
+        assert_eq!(second["recovered_pct"], 10.0);
+        // Without it: 10 spent, 0.35 saved.
+        let without = &json["without"];
+        assert_eq!(without["name"], "Solar");
+        assert_eq!(without["series"][0]["saved"], 0.35);
+        assert_eq!(without["series"][0]["net"], -9.65);
+        assert_eq!(without["rate_per_day"], 0.35);
+        assert!(without["projected_payback"].is_string());
     }
 
     /// The ZeroHero plan: free import 11:00-14:00, 10 c export and a $1
