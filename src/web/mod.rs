@@ -331,7 +331,16 @@ pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .route("/healthz", get(api::healthz))
         .route("/login", get(auth::login_page).post(auth::login))
-        .route("/logout", post(auth::logout));
+        .route("/logout", post(auth::logout))
+        .route("/favicon.svg", get(|h: HeaderMap| icon("favicon.svg", h)))
+        .route(
+            "/favicon.ico",
+            get(|h: HeaderMap| icon("favicon-32.png", h)),
+        )
+        .route(
+            "/apple-touch-icon.png",
+            get(|h: HeaderMap| icon("apple-touch-icon.png", h)),
+        );
 
     // Compression is outermost so it sees every response; the security
     // headers sit just inside it and cover every route, including 401s.
@@ -444,6 +453,18 @@ fn etag_matches(request_headers: &HeaderMap, etag: &str) -> bool {
 
 async fn static_file(Path(path): Path<String>, headers: HeaderMap) -> Response {
     serve_asset(&path, &headers)
+}
+
+/// Serves one of the icons without a session, since the login page and
+/// browsers' automatic `/favicon.ico` request carry no cookie. Icons rarely
+/// change, so unlike the other static files they may be cached for a day.
+async fn icon(name: &'static str, headers: HeaderMap) -> Response {
+    let mut response = serve_asset(name, &headers);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    response
 }
 
 /// Looks `path` up in the embedded files and sends it with the right content
@@ -933,6 +954,44 @@ mod tests {
         }
         let response = send(&app, get_request("/static/missing.js", Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn icons_are_public() {
+        let (_dir, app) = test_app().await;
+
+        for (uri, content_type) in [
+            ("/favicon.svg", "image/svg+xml"),
+            ("/favicon.ico", "image/png"),
+            ("/apple-touch-icon.png", "image/png"),
+        ] {
+            let response = send(&app, get_request(uri, None)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                content_type,
+                "{uri}"
+            );
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "public, max-age=86400",
+                "{uri}"
+            );
+        }
+
+        let response = send(&app, get_request("/login", None)).await;
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains(r#"<link rel="icon" href="/favicon.svg""#));
+        assert!(body.contains(r#"<link rel="apple-touch-icon" href="/apple-touch-icon.png">"#));
     }
 
     #[tokio::test]
