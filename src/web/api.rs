@@ -16,7 +16,7 @@ use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, round2};
 use crate::cost::GridSplit;
 use crate::db::{self, LatestReading};
 use crate::ev_cost;
-use crate::modbus::Sample;
+use crate::modbus::{self, Sample};
 
 const MAX_SERIES_POINTS: usize = 20;
 const MAX_SERIES_SECS: i64 = 31 * 24 * 3600;
@@ -196,6 +196,29 @@ pub async fn live(State(state): State<AppState>) -> ApiResult {
     };
     let fresh = sample.filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
     Ok(Json(json!({ "sample": fresh, "car": state.car.get() })))
+}
+
+/// `{"settings": ...}`: the inverter's control settings with their labels, or
+/// null if there are none yet or they are too old (for example when Modbus is
+/// off or the dongle has been unreachable). The raw register values are kept
+/// next to the decoded ones.
+pub async fn inverter(State(state): State<AppState>) -> ApiResult {
+    let fresh = state
+        .latest_settings
+        .get()
+        .filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
+    let settings = match fresh {
+        Some(s) => {
+            let mut json = serde_json::to_value(&s).map_err(anyhow::Error::from)?;
+            json["ems_mode_label"] = json!(s.ems_mode.map(modbus::ems_mode_label));
+            json["forced_command_label"] =
+                json!(s.forced_command.map(modbus::forced_command_label));
+            json["running_state_label"] = json!(s.running_state.map(modbus::running_state_label));
+            json
+        }
+        None => Value::Null,
+    };
+    Ok(Json(json!({ "settings": settings })))
 }
 
 #[derive(Deserialize)]
@@ -1417,6 +1440,48 @@ mod tests {
         });
         let Json(json) = live(State(state)).await.unwrap();
         assert!(json["sample"].is_null());
+    }
+
+    #[tokio::test]
+    async fn inverter_adds_labels_and_hides_old_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let settings = modbus::Settings {
+            ts: db::now() - 5,
+            ems_mode: Some(2),
+            forced_command: Some(0xAA),
+            forced_power_w: Some(5000),
+            max_soc_pct: Some(100.0),
+            min_soc_pct: Some(5.0),
+            export_limit_w: Some(5000),
+            export_limit_enabled: Some(true),
+            backup_reserve_pct: Some(10),
+            max_charge_w: None,
+            max_discharge_w: Some(8000),
+            running_state: Some(0),
+        };
+        state.latest_settings().set(settings.clone());
+        let Json(json) = inverter(State(state.clone())).await.unwrap();
+        assert_eq!(json["settings"]["ems_mode"], 2);
+        assert_eq!(
+            json["settings"]["ems_mode_label"],
+            "Forced (compulsory) mode"
+        );
+        assert_eq!(json["settings"]["forced_command_label"], "Forced charge");
+        assert_eq!(json["settings"]["running_state_label"], "Running");
+        assert_eq!(json["settings"]["forced_power_w"], 5000);
+        assert!(json["settings"]["max_charge_w"].is_null());
+
+        state.latest_settings().set(modbus::Settings {
+            ts: db::now() - 600,
+            ..settings
+        });
+        let Json(json) = inverter(State(state)).await.unwrap();
+        assert!(json["settings"].is_null());
     }
 
     #[tokio::test]

@@ -19,8 +19,8 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::net::lookup_host;
 use tokio::time::{sleep, timeout};
-use tokio_modbus::Slave;
 use tokio_modbus::client::{Context as ModbusContext, Reader as _, tcp};
+use tokio_modbus::{ExceptionCode, Slave};
 use tracing::{debug, info, warn};
 
 use crate::config::Modbus;
@@ -43,6 +43,32 @@ const BATTERY_POWER_REG: u16 = 5213;
 /// cheaper than three separate reads.
 const BLOCK_START: u16 = 13007;
 const BLOCK_LEN: u16 = 16;
+
+// Control settings. These are read with function 03 (read holding registers),
+// except the running state, which is an input register. Every one is read-only
+// here: nothing in this program ever writes to the inverter.
+/// EMS mode, forced command and forced power are three registers in a row.
+const EMS_START: u16 = 13049;
+const EMS_LEN: u16 = 3;
+/// Max SOC then min SOC, 0.1 % each.
+const SOC_LIMITS_START: u16 = 13057;
+const SOC_LIMITS_LEN: u16 = 2;
+/// Export power limit, W.
+const EXPORT_LIMIT_REG: u16 = 13073;
+/// Export limit mode: [`EXPORT_LIMIT_ON`] or [`EXPORT_LIMIT_OFF`].
+const EXPORT_MODE_REG: u16 = 13086;
+/// Reserved SOC for backup, whole %.
+const BACKUP_RESERVE_REG: u16 = 13099;
+/// Battery max charge power then max discharge power, units of 10 W.
+const BATTERY_LIMITS_START: u16 = 33046;
+const BATTERY_LIMITS_LEN: u16 = 2;
+/// Running state (input register).
+const RUNNING_STATE_REG: u16 = 12999;
+
+const EXPORT_LIMIT_ON: u16 = 0xAA;
+const EXPORT_LIMIT_OFF: u16 = 0x55;
+/// The battery power limit registers count in tens of watts.
+const BATTERY_LIMIT_UNIT_W: u32 = 10;
 
 /// The inverter sends this for a 32-bit value it cannot measure right now.
 const UNAVAILABLE: u32 = 0x7FFF_FFFF;
@@ -105,6 +131,47 @@ impl Latest {
 
     pub fn get(&self) -> Option<Sample> {
         *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The inverter's control settings, as last read. A field is `None` when the
+/// inverter said the value is unavailable or refused to answer for it. The
+/// `ems_mode`, `forced_command` and `running_state` fields are the raw register
+/// values; see the `*_label` functions for their names.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Settings {
+    /// Unix seconds, UTC, when the read finished.
+    pub ts: i64,
+    pub ems_mode: Option<u16>,
+    pub forced_command: Option<u16>,
+    /// Power used when the mode is forced, W.
+    pub forced_power_w: Option<u32>,
+    /// Battery charge ceiling, %.
+    pub max_soc_pct: Option<f64>,
+    /// Battery discharge floor, %.
+    pub min_soc_pct: Option<f64>,
+    pub export_limit_w: Option<u32>,
+    /// `None` if the mode register holds neither "on" nor "off".
+    pub export_limit_enabled: Option<bool>,
+    /// SOC kept back for backup power, %.
+    pub backup_reserve_pct: Option<u16>,
+    pub max_charge_w: Option<u32>,
+    pub max_discharge_w: Option<u32>,
+    pub running_state: Option<u16>,
+}
+
+/// The newest settings, shared between the poller and the web server like
+/// [`Latest`].
+#[derive(Clone, Default)]
+pub struct LatestSettings(Arc<Mutex<Option<Settings>>>);
+
+impl LatestSettings {
+    pub fn set(&self, settings: Settings) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(settings);
+    }
+
+    pub fn get(&self) -> Option<Settings> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -194,6 +261,195 @@ pub fn decode_sample(ts: i64, pv: &[u16], battery: &[u16], block: &[u16]) -> Sam
         battery_w: decode_battery(battery),
         soc_pct,
     }
+}
+
+/// Name of the EMS mode in register 13049.
+pub fn ems_mode_label(raw: u16) -> String {
+    match raw {
+        0 => "Self-consumption".to_string(),
+        2 => "Forced (compulsory) mode".to_string(),
+        3 => "External EMS".to_string(),
+        4 => "VPP".to_string(),
+        8 => "Microgrid".to_string(),
+        other => format!("Unknown ({other})"),
+    }
+}
+
+/// Name of the forced charge/discharge command in register 13050.
+pub fn forced_command_label(raw: u16) -> String {
+    match raw {
+        0xAA => "Forced charge".to_string(),
+        0xBB => "Forced discharge".to_string(),
+        0xCC => "Stop".to_string(),
+        other => format!("Unknown (0x{other:02X})"),
+    }
+}
+
+/// Name of the running state in register 12999.
+pub fn running_state_label(raw: u16) -> String {
+    let name = match raw {
+        0x0000 | 0x0040 => "Running",
+        0x0001 | 0x8000 => "Stop",
+        0x0002 | 0x1300 => "Key stop",
+        0x0004 | 0x1500 => "Emergency stop",
+        0x0008 | 0x1400 => "Standby",
+        0x0010 | 0x1200 => "Initial standby",
+        0x0020 | 0x1600 => "Starting",
+        0x0041 => "Off-grid charge",
+        0x0080 | 0x8100 => "Derating",
+        0x0100 | 0x5500 => "Fault",
+        0x0200 => "Update failed",
+        0x0400 => "Maintain mode",
+        0x0800 => "Forced mode",
+        0x1000 => "Off-grid",
+        0x1111 => "Uninitialized",
+        0x2500 => "Communication fault",
+        0x2501 => "Restarting",
+        0x4000 => "External EMS mode",
+        0x4001 => "Emergency charging",
+        0x8200 => "Dispatch running",
+        0x9100 => "Warning running",
+        other => return format!("Unknown (0x{other:04X})"),
+    };
+    name.to_string()
+}
+
+/// Keeps a register value unless it is the "unavailable" all-ones.
+fn available(raw: u16) -> Option<u16> {
+    Some(raw).filter(|&v| v != UNAVAILABLE_U16)
+}
+
+/// Splits registers 13049..=13051 into `(ems_mode, forced_command,
+/// forced_power_w)`.
+pub fn decode_ems(words: &[u16]) -> (Option<u16>, Option<u16>, Option<u32>) {
+    (
+        available(words[0]),
+        available(words[1]),
+        available(words[2]).map(u32::from),
+    )
+}
+
+/// Splits registers 13057..=13058 into `(max_soc_pct, min_soc_pct)`.
+pub fn decode_soc_limits(words: &[u16]) -> (Option<f64>, Option<f64>) {
+    (decode_soc(words[0]), decode_soc(words[1]))
+}
+
+/// Export limit mode: on, off, or `None` for anything else.
+pub fn decode_export_enabled(raw: u16) -> Option<bool> {
+    match raw {
+        EXPORT_LIMIT_ON => Some(true),
+        EXPORT_LIMIT_OFF => Some(false),
+        _ => None,
+    }
+}
+
+/// Backup reserve in % from register 13099. A value over 100 gives `None`.
+pub fn decode_backup_reserve(raw: u16) -> Option<u16> {
+    available(raw).filter(|&v| v <= 100)
+}
+
+/// Splits registers 33046..=33047 into `(max_charge_w, max_discharge_w)`.
+pub fn decode_battery_limits(words: &[u16]) -> (Option<u32>, Option<u32>) {
+    let watts = |raw: u16| available(raw).map(|v| u32::from(v) * BATTERY_LIMIT_UNIT_W);
+    (watts(words[0]), watts(words[1]))
+}
+
+/// What one settings read got from the inverter. A group is `None` when the
+/// inverter refused it, so only its own fields end up missing.
+#[derive(Debug, Default)]
+struct RawSettings {
+    ems: Option<Vec<u16>>,
+    soc_limits: Option<Vec<u16>>,
+    export_limit: Option<Vec<u16>>,
+    export_mode: Option<Vec<u16>>,
+    backup_reserve: Option<Vec<u16>>,
+    battery_limits: Option<Vec<u16>>,
+    running_state: Option<Vec<u16>>,
+}
+
+impl RawSettings {
+    fn decode(&self, ts: i64) -> Settings {
+        let (ems_mode, forced_command, forced_power_w) = match &self.ems {
+            Some(w) => decode_ems(w),
+            None => (None, None, None),
+        };
+        let (max_soc_pct, min_soc_pct) = match &self.soc_limits {
+            Some(w) => decode_soc_limits(w),
+            None => (None, None),
+        };
+        let (max_charge_w, max_discharge_w) = match &self.battery_limits {
+            Some(w) => decode_battery_limits(w),
+            None => (None, None),
+        };
+        // A group of one register: its first word.
+        let first = |group: &Option<Vec<u16>>| group.as_ref().map(|w| w[0]);
+        Settings {
+            ts,
+            ems_mode,
+            forced_command,
+            forced_power_w,
+            max_soc_pct,
+            min_soc_pct,
+            export_limit_w: first(&self.export_limit).and_then(available).map(u32::from),
+            export_limit_enabled: first(&self.export_mode).and_then(decode_export_enabled),
+            backup_reserve_pct: first(&self.backup_reserve).and_then(decode_backup_reserve),
+            max_charge_w,
+            max_discharge_w,
+            running_state: first(&self.running_state).and_then(available),
+        }
+    }
+}
+
+/// A log line if the EMS mode or forced command changed between two reads,
+/// e.g. `inverter mode Self-consumption -> Forced (compulsory) mode`. A value
+/// that is missing in either read is not a change.
+pub fn describe_change(old: &Settings, new: &Settings) -> Option<String> {
+    let mut parts = Vec::new();
+    if let (Some(a), Some(b)) = (old.ems_mode, new.ems_mode)
+        && a != b
+    {
+        parts.push(format!(
+            "inverter mode {} -> {}",
+            ems_mode_label(a),
+            ems_mode_label(b)
+        ));
+    }
+    if let (Some(a), Some(b)) = (old.forced_command, new.forced_command)
+        && a != b
+    {
+        parts.push(format!(
+            "forced command {} -> {}",
+            forced_command_label(a),
+            forced_command_label(b)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Two short lines for people, e.g.
+/// `Inverter: Running, mode Self-consumption, forced command Stop at 0 W`.
+pub fn describe_settings(s: &Settings) -> String {
+    let text = |v: Option<String>| v.unwrap_or_else(|| "n/a".to_string());
+    let kw = |w: Option<u32>| text(w.map(|w| format!("{:.1} kW", f64::from(w) / 1000.0)));
+    let pct = |p: Option<f64>| text(p.map(|p| format!("{p:.1}%")));
+    let export = match (s.export_limit_enabled, s.export_limit_w) {
+        (Some(true), w) => format!("limit {}", kw(w)),
+        (Some(false), _) => "no limit".to_string(),
+        (None, _) => "n/a".to_string(),
+    };
+    format!(
+        "Inverter: {}, mode {}, forced command {} at {}\n\
+         Battery: SOC {} to {}, backup reserve {}, charge/discharge limit {} / {}, export {export}",
+        text(s.running_state.map(running_state_label)),
+        text(s.ems_mode.map(ems_mode_label)),
+        text(s.forced_command.map(forced_command_label)),
+        kw(s.forced_power_w),
+        pct(s.min_soc_pct),
+        pct(s.max_soc_pct),
+        text(s.backup_reserve_pct.map(|p| format!("{p}%"))),
+        kw(s.max_charge_w),
+        kw(s.max_discharge_w),
+    )
 }
 
 /// One line for people, e.g.
@@ -290,6 +546,68 @@ impl Reader {
 
         Ok(decode_sample(db::now(), &pv, &battery, &block))
     }
+
+    /// Reads the control settings, one small request per group. An answer
+    /// with an error code from the inverter only blanks that group's fields;
+    /// a transport error or timeout fails the read and drops the connection,
+    /// like [`Reader::read_sample`].
+    pub async fn read_settings(&mut self) -> Result<Settings> {
+        let result = self.try_read_settings().await;
+        if result.is_err() {
+            self.connection = None;
+        }
+        result
+    }
+
+    async fn try_read_settings(&mut self) -> Result<Settings> {
+        let ctx = match &mut self.connection {
+            Some(ctx) => ctx,
+            None => self.connection.insert(connect(&self.config).await?),
+        };
+
+        let ems = refusable(read_holding(ctx, EMS_START, EMS_LEN).await?, EMS_START);
+        sleep(REQUEST_PAUSE).await;
+        let soc_limits = refusable(
+            read_holding(ctx, SOC_LIMITS_START, SOC_LIMITS_LEN).await?,
+            SOC_LIMITS_START,
+        );
+        sleep(REQUEST_PAUSE).await;
+        let export_limit = refusable(
+            read_holding(ctx, EXPORT_LIMIT_REG, 1).await?,
+            EXPORT_LIMIT_REG,
+        );
+        sleep(REQUEST_PAUSE).await;
+        let export_mode = refusable(
+            read_holding(ctx, EXPORT_MODE_REG, 1).await?,
+            EXPORT_MODE_REG,
+        );
+        sleep(REQUEST_PAUSE).await;
+        let backup_reserve = refusable(
+            read_holding(ctx, BACKUP_RESERVE_REG, 1).await?,
+            BACKUP_RESERVE_REG,
+        );
+        sleep(REQUEST_PAUSE).await;
+        let battery_limits = refusable(
+            read_holding(ctx, BATTERY_LIMITS_START, BATTERY_LIMITS_LEN).await?,
+            BATTERY_LIMITS_START,
+        );
+        sleep(REQUEST_PAUSE).await;
+        let running_state = refusable(
+            read_input(ctx, RUNNING_STATE_REG, 1).await?,
+            RUNNING_STATE_REG,
+        );
+
+        let raw = RawSettings {
+            ems,
+            soc_limits,
+            export_limit,
+            export_mode,
+            backup_reserve,
+            battery_limits,
+            running_state,
+        };
+        Ok(raw.decode(db::now()))
+    }
 }
 
 /// While Modbus keeps failing, the first failure is logged and then one in
@@ -321,13 +639,20 @@ impl FailureLog {
     }
 }
 
+/// The control settings change rarely, so they are read on every this many
+/// ticks (the first tick included): about once a minute at the default interval.
+const SETTINGS_EVERY_N_TICKS: u32 = 4;
+
 /// Reads a sample every `interval_secs`, keeps it in `latest` and saves it,
-/// until `shutdown` completes. Failures are logged (throttled) and never end the loop: the
-/// dongle is flaky, and the rest of `serve` must keep going without it.
+/// until `shutdown` completes. Every few ticks it also reads the control
+/// settings into `latest_settings`. Failures are logged (throttled) and never
+/// end the loop: the dongle is flaky, and the rest of `serve` must keep going
+/// without it.
 pub async fn run_poll(
     config: Modbus,
     pool: &SqlitePool,
     latest: Latest,
+    latest_settings: LatestSettings,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(config.interval_secs));
@@ -335,6 +660,9 @@ pub async fn run_poll(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut reader = Reader::new(config);
     let mut failures = FailureLog::default();
+    let mut settings_failures = FailureLog::default();
+    let mut ticks: u32 = 0;
+    let mut previous_settings: Option<Settings> = None;
 
     tokio::pin!(shutdown);
     info!("Modbus polling started");
@@ -364,6 +692,35 @@ pub async fn run_poll(
                 }
             }
         }
+
+        let read_settings_now = ticks.is_multiple_of(SETTINGS_EVERY_N_TICKS);
+        ticks = ticks.wrapping_add(1);
+        if !read_settings_now {
+            continue;
+        }
+        let result = tokio::select! {
+            _ = &mut shutdown => break,
+            result = reader.read_settings() => result,
+        };
+        match result {
+            Ok(settings) => {
+                if let Some(count) = settings_failures.succeeded() {
+                    info!(failed_reads = count, "Modbus settings back");
+                }
+                if let Some(old) = &previous_settings
+                    && let Some(change) = describe_change(old, &settings)
+                {
+                    info!("{change}");
+                }
+                previous_settings = Some(settings.clone());
+                latest_settings.set(settings);
+            }
+            Err(err) => {
+                if settings_failures.failed() {
+                    warn!("Modbus settings read failed: {err:#}");
+                }
+            }
+        }
     }
     info!("Modbus polling stopped");
     Ok(())
@@ -387,24 +744,65 @@ async fn connect(config: &Modbus) -> Result<ModbusContext> {
     }
 }
 
-/// Reads `count` input registers (function 04) starting at `address`.
-async fn read_registers(ctx: &mut ModbusContext, address: u16, count: u16) -> Result<Vec<u16>> {
+/// What a register read gives: the words, or the error code the inverter
+/// answered with instead.
+type Answer = Result<Vec<u16>, ExceptionCode>;
+
+/// Checks a reply to a read of `count` registers at `address`. The error code
+/// from the device is passed on inside the `Ok`; transport errors, timeouts
+/// and a wrong number of words are errors.
+fn check_reply(
+    reply: Result<Result<Answer, tokio_modbus::Error>, tokio::time::error::Elapsed>,
+    address: u16,
+    count: u16,
+) -> Result<Answer> {
     // tokio-modbus has two layers of result: the outer one is for transport
     // errors, the inner one for an error answer from the device.
-    let reply = match timeout(REQUEST_TIMEOUT, ctx.read_input_registers(address, count)).await {
+    let reply = match reply {
         Ok(reply) => reply,
         Err(_) => bail!("reading registers at {address} timed out"),
     };
-    let words = reply
-        .with_context(|| format!("reading registers at {address} failed"))?
-        .map_err(|code| anyhow!("inverter refused registers at {address}: {code}"))?;
-    if words.len() != usize::from(count) {
+    let answer = reply.with_context(|| format!("reading registers at {address} failed"))?;
+    if let Ok(words) = &answer
+        && words.len() != usize::from(count)
+    {
         bail!(
             "asked for {count} registers at {address}, got {}",
             words.len()
         );
     }
-    Ok(words)
+    Ok(answer)
+}
+
+/// Reads `count` input registers (function 04) starting at `address`.
+async fn read_input(ctx: &mut ModbusContext, address: u16, count: u16) -> Result<Answer> {
+    let reply = timeout(REQUEST_TIMEOUT, ctx.read_input_registers(address, count)).await;
+    check_reply(reply, address, count)
+}
+
+/// Reads `count` holding registers (function 03) starting at `address`.
+async fn read_holding(ctx: &mut ModbusContext, address: u16, count: u16) -> Result<Answer> {
+    let reply = timeout(REQUEST_TIMEOUT, ctx.read_holding_registers(address, count)).await;
+    check_reply(reply, address, count)
+}
+
+/// Like [`read_input`], but an error code from the inverter is an error too.
+async fn read_registers(ctx: &mut ModbusContext, address: u16, count: u16) -> Result<Vec<u16>> {
+    read_input(ctx, address, count)
+        .await?
+        .map_err(|code| anyhow!("inverter refused registers at {address}: {code}"))
+}
+
+/// For the settings: a refused group gives `None` (and a debug line, as the
+/// dongle refuses some registers on some firmware) instead of failing the read.
+fn refusable(answer: Answer, address: u16) -> Option<Vec<u16>> {
+    match answer {
+        Ok(words) => Some(words),
+        Err(code) => {
+            debug!("inverter refused registers at {address}: {code}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -570,12 +968,38 @@ mod tests {
         fn call(&self, req: Self::Request) -> Self::Future {
             let answer = match req.request {
                 _ if req.slave != self.unit => Err(ExceptionCode::GatewayTargetDevice),
-                Request::ReadInputRegisters(5016, 2) => Ok(PV.to_vec()),
-                Request::ReadInputRegisters(5213, 2) => Ok(BATTERY.to_vec()),
-                Request::ReadInputRegisters(13007, 16) => Ok(BLOCK.to_vec()),
+                Request::ReadInputRegisters(5016, 2) => {
+                    Ok(Response::ReadInputRegisters(PV.to_vec()))
+                }
+                Request::ReadInputRegisters(5213, 2) => {
+                    Ok(Response::ReadInputRegisters(BATTERY.to_vec()))
+                }
+                Request::ReadInputRegisters(13007, 16) => {
+                    Ok(Response::ReadInputRegisters(BLOCK.to_vec()))
+                }
+                Request::ReadInputRegisters(12999, 1) => {
+                    Ok(Response::ReadInputRegisters(vec![0x0000]))
+                }
+                // Forced charge at 5 kW.
+                Request::ReadHoldingRegisters(13049, 3) => {
+                    Ok(Response::ReadHoldingRegisters(vec![2, 0xAA, 5000]))
+                }
+                Request::ReadHoldingRegisters(13057, 2) => {
+                    Ok(Response::ReadHoldingRegisters(vec![1000, 50]))
+                }
+                Request::ReadHoldingRegisters(13073, 1) => {
+                    Ok(Response::ReadHoldingRegisters(vec![5000]))
+                }
+                Request::ReadHoldingRegisters(13086, 1) => {
+                    Ok(Response::ReadHoldingRegisters(vec![0xAA]))
+                }
+                Request::ReadHoldingRegisters(13099, 1) => {
+                    Ok(Response::ReadHoldingRegisters(vec![10]))
+                }
+                // 33046 is refused on purpose, like some dongle firmware does.
                 _ => Err(ExceptionCode::IllegalDataAddress),
             };
-            ready(answer.map(Response::ReadInputRegisters))
+            ready(answer)
         }
     }
 
@@ -661,5 +1085,155 @@ mod tests {
         let mut reader = Reader::new(config_for(addr));
         let err = reader.read_sample().await.unwrap_err();
         assert!(format!("{err:#}").contains("could not connect"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn reader_keeps_going_when_one_settings_group_is_refused() {
+        let (listener, addr) = local_listener().await;
+        let server = start_fake(listener, 1);
+        let mut reader = Reader::new(config_for(addr));
+
+        let settings = reader.read_settings().await.unwrap();
+        assert!(settings.ts > 1_700_000_000);
+        assert_eq!(settings.ems_mode, Some(2));
+        assert_eq!(settings.forced_command, Some(0xAA));
+        assert_eq!(settings.forced_power_w, Some(5000));
+        assert_eq!(settings.max_soc_pct, Some(100.0));
+        assert_eq!(settings.min_soc_pct, Some(5.0));
+        assert_eq!(settings.export_limit_w, Some(5000));
+        assert_eq!(settings.export_limit_enabled, Some(true));
+        assert_eq!(settings.backup_reserve_pct, Some(10));
+        assert_eq!(settings.running_state, Some(0));
+        // The refused group is missing, nothing else.
+        assert_eq!(settings.max_charge_w, None);
+        assert_eq!(settings.max_discharge_w, None);
+
+        // The connection was kept and still works.
+        assert!(reader.connection.is_some());
+        reader.read_sample().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn settings_read_fails_when_the_connection_is_lost() {
+        let (listener, addr) = local_listener().await;
+        let server = start_fake(listener, 1);
+        let mut reader = Reader::new(config_for(addr));
+        reader.read_settings().await.unwrap();
+        server.abort();
+        let _ = server.await;
+        assert!(reader.read_settings().await.is_err());
+        assert!(reader.connection.is_none());
+    }
+
+    #[test]
+    fn labels_name_the_modes() {
+        assert_eq!(ems_mode_label(0), "Self-consumption");
+        assert_eq!(ems_mode_label(2), "Forced (compulsory) mode");
+        assert_eq!(ems_mode_label(3), "External EMS");
+        assert_eq!(ems_mode_label(4), "VPP");
+        assert_eq!(ems_mode_label(8), "Microgrid");
+        assert_eq!(ems_mode_label(5), "Unknown (5)");
+        assert_eq!(forced_command_label(0xAA), "Forced charge");
+        assert_eq!(forced_command_label(0xBB), "Forced discharge");
+        assert_eq!(forced_command_label(0xCC), "Stop");
+        assert_eq!(forced_command_label(0x01), "Unknown (0x01)");
+        assert_eq!(running_state_label(0x0000), "Running");
+        assert_eq!(running_state_label(0x0040), "Running");
+        assert_eq!(running_state_label(0x0041), "Off-grid charge");
+        assert_eq!(running_state_label(0x1400), "Standby");
+        assert_eq!(running_state_label(0x4000), "External EMS mode");
+        assert_eq!(running_state_label(0x9100), "Warning running");
+        assert_eq!(running_state_label(0x1234), "Unknown (0x1234)");
+    }
+
+    #[test]
+    fn decodes_setting_groups() {
+        assert_eq!(decode_ems(&[0, 0xCC, 0]), (Some(0), Some(0xCC), Some(0)));
+        assert_eq!(
+            decode_ems(&[0xFFFF, 0xBB, 3000]),
+            (None, Some(0xBB), Some(3000))
+        );
+        assert_eq!(decode_soc_limits(&[1000, 50]), (Some(100.0), Some(5.0)));
+        assert_eq!(decode_soc_limits(&[0xFFFF, 100]), (None, Some(10.0)));
+        assert_eq!(decode_export_enabled(0xAA), Some(true));
+        assert_eq!(decode_export_enabled(0x55), Some(false));
+        assert_eq!(decode_export_enabled(0), None);
+        assert_eq!(decode_backup_reserve(10), Some(10));
+        assert_eq!(decode_backup_reserve(0xFFFF), None);
+        assert_eq!(decode_backup_reserve(101), None);
+        // Units of 10 W: 800 is 8 kW.
+        assert_eq!(decode_battery_limits(&[800, 800]), (Some(8000), Some(8000)));
+        assert_eq!(decode_battery_limits(&[0xFFFF, 500]), (None, Some(5000)));
+    }
+
+    #[test]
+    fn refused_groups_only_blank_their_own_fields() {
+        let raw = RawSettings {
+            ems: Some(vec![0, 0xCC, 0]),
+            soc_limits: None,
+            export_limit: Some(vec![0xFFFF]),
+            export_mode: Some(vec![0x55]),
+            backup_reserve: Some(vec![10]),
+            battery_limits: Some(vec![800, 800]),
+            running_state: None,
+        };
+        let s = raw.decode(42);
+        assert_eq!(s.ts, 42);
+        assert_eq!(s.ems_mode, Some(0));
+        assert_eq!(s.max_soc_pct, None);
+        assert_eq!(s.min_soc_pct, None);
+        assert_eq!(s.export_limit_w, None);
+        assert_eq!(s.export_limit_enabled, Some(false));
+        assert_eq!(s.backup_reserve_pct, Some(10));
+        assert_eq!(s.max_charge_w, Some(8000));
+        assert_eq!(s.running_state, None);
+        // Everything refused: all fields are missing.
+        let none = RawSettings::default().decode(1);
+        assert_eq!(none.ems_mode, None);
+        assert_eq!(none.max_discharge_w, None);
+    }
+
+    #[test]
+    fn describes_a_mode_change() {
+        let before = RawSettings {
+            ems: Some(vec![0, 0xCC, 0]),
+            ..RawSettings::default()
+        }
+        .decode(1);
+        let after = RawSettings {
+            ems: Some(vec![2, 0xAA, 5000]),
+            ..RawSettings::default()
+        }
+        .decode(2);
+        assert_eq!(
+            describe_change(&before, &after).unwrap(),
+            "inverter mode Self-consumption -> Forced (compulsory) mode, \
+             forced command Stop -> Forced charge"
+        );
+        assert_eq!(describe_change(&after, &after), None);
+        // A refused group is not a change.
+        let blank = RawSettings::default().decode(3);
+        assert_eq!(describe_change(&after, &blank), None);
+    }
+
+    #[test]
+    fn describes_settings_for_people() {
+        let s = RawSettings {
+            ems: Some(vec![0, 0xCC, 0]),
+            soc_limits: Some(vec![1000, 50]),
+            export_limit: Some(vec![5000]),
+            export_mode: Some(vec![0xAA]),
+            backup_reserve: Some(vec![10]),
+            battery_limits: None,
+            running_state: Some(vec![0]),
+        }
+        .decode(0);
+        let text = describe_settings(&s);
+        assert!(text.starts_with(
+            "Inverter: Running, mode Self-consumption, forced command Stop at 0.0 kW\n"
+        ));
+        assert!(text.contains("SOC 5.0% to 100.0%, backup reserve 10%"));
+        assert!(text.contains("limit n/a / n/a, export limit 5.0 kW"));
     }
 }
