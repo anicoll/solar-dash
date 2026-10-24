@@ -23,6 +23,9 @@ const MAX_SERIES_SECS: i64 = 31 * 24 * 3600;
 /// `/api/live` ignores a sample older than this: it would show stale data as current.
 const LIVE_MAX_AGE_SECS: i64 = 5 * 60;
 const MAX_LIVE_SERIES_SECS: i64 = 2 * 24 * 3600;
+const DEFAULT_INVERTER_HISTORY_SECS: i64 = 7 * 24 * 3600;
+const MAX_INVERTER_HISTORY_SECS: i64 = 400 * 24 * 3600;
+const MAX_INVERTER_HISTORY_ROWS: i64 = 500;
 const MAX_DAILY_DAYS: u64 = 400;
 const MAX_EV_SESSIONS_SECS: i64 = MAX_DAILY_DAYS as i64 * 24 * 3600;
 /// Without `from`, `/api/daily` returns this many days.
@@ -208,17 +211,58 @@ pub async fn inverter(State(state): State<AppState>) -> ApiResult {
         .get()
         .filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
     let settings = match fresh {
-        Some(s) => {
-            let mut json = serde_json::to_value(&s).map_err(anyhow::Error::from)?;
-            json["ems_mode_label"] = json!(s.ems_mode.map(modbus::ems_mode_label));
-            json["forced_command_label"] =
-                json!(s.forced_command.map(modbus::forced_command_label));
-            json["running_state_label"] = json!(s.running_state.map(modbus::running_state_label));
-            json
-        }
+        Some(s) => settings_json(&s)?,
         None => Value::Null,
     };
     Ok(Json(json!({ "settings": settings })))
+}
+
+/// The settings with the labels for their raw register values added.
+fn settings_json(s: &modbus::Settings) -> Result<Value, ApiError> {
+    let mut json = serde_json::to_value(s).map_err(anyhow::Error::from)?;
+    json["ems_mode_label"] = json!(s.ems_mode.map(modbus::ems_mode_label));
+    json["forced_command_label"] = json!(s.forced_command.map(modbus::forced_command_label));
+    json["running_state_label"] = json!(s.running_state.map(modbus::running_state_label));
+    Ok(json)
+}
+
+#[derive(Deserialize)]
+pub struct InverterHistoryParams {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// `{"changes": [...]}`: the times the inverter's settings changed, newest
+/// first, each with the settings from then on and their labels. `from`
+/// (inclusive) and `to` (exclusive) are unix seconds and default to the last
+/// 7 days.
+pub async fn inverter_history(
+    State(state): State<AppState>,
+    Query(params): Query<InverterHistoryParams>,
+) -> ApiResult {
+    let now = db::now();
+    let to = match params.to.as_deref() {
+        Some(t) => parse_unix("to", Some(t))?,
+        None => now + 1,
+    };
+    let from = match params.from.as_deref() {
+        Some(t) => parse_unix("from", Some(t))?,
+        None => to - DEFAULT_INVERTER_HISTORY_SECS,
+    };
+    if to < from {
+        return Err(ApiError::bad_request("to must not be before from"));
+    }
+    if to - from > MAX_INVERTER_HISTORY_SECS {
+        return Err(ApiError::bad_request("the range can be at most 400 days"));
+    }
+
+    let rows =
+        db::inverter_settings_in_range(&state.pool, from, to, MAX_INVERTER_HISTORY_ROWS).await?;
+    let changes = rows
+        .iter()
+        .map(settings_json)
+        .collect::<Result<Vec<Value>, ApiError>>()?;
+    Ok(Json(json!({ "changes": changes })))
 }
 
 #[derive(Deserialize)]
@@ -1523,6 +1567,97 @@ mod tests {
         });
         let Json(json) = inverter(State(state)).await.unwrap();
         assert!(json["settings"].is_null());
+    }
+
+    #[tokio::test]
+    async fn inverter_history_lists_changes_newest_first_with_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool.clone(), 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let params = |from: Option<&str>, to: Option<&str>| InverterHistoryParams {
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+        };
+
+        // Nothing saved yet.
+        let Json(json) = inverter_history(State(state.clone()), Query(params(None, None)))
+            .await
+            .unwrap();
+        assert_eq!(json, json!({ "changes": [] }));
+
+        let now = db::now();
+        let row = |ts, ems_mode, running_state| modbus::Settings {
+            ts,
+            ems_mode: Some(ems_mode),
+            forced_command: Some(0xAA),
+            forced_power_w: Some(5000),
+            max_soc_pct: None,
+            min_soc_pct: None,
+            export_limit_w: None,
+            export_limit_enabled: None,
+            backup_reserve_pct: Some(10),
+            max_charge_w: None,
+            max_discharge_w: None,
+            running_state: Some(running_state),
+        };
+        db::insert_inverter_settings(&pool, &row(now - 3600, 0, 0))
+            .await
+            .unwrap();
+        db::insert_inverter_settings(&pool, &row(now - 60, 2, 0x8200))
+            .await
+            .unwrap();
+        // Older than the default 7 days.
+        db::insert_inverter_settings(&pool, &row(now - 8 * 24 * 3600, 0, 0))
+            .await
+            .unwrap();
+
+        let Json(json) = inverter_history(State(state.clone()), Query(params(None, None)))
+            .await
+            .unwrap();
+        let changes = json["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0]["ts"], now - 60);
+        assert_eq!(changes[0]["ems_mode_label"], "Forced (compulsory) mode");
+        assert_eq!(changes[0]["forced_command_label"], "Forced charge");
+        assert_eq!(changes[0]["running_state_label"], "Dispatch running");
+        assert_eq!(changes[1]["ems_mode_label"], "Self-consumption");
+        assert!(changes[1]["max_soc_pct"].is_null());
+
+        // An explicit range: `to` is exclusive.
+        let from = (now - 3600).to_string();
+        let to = (now - 60).to_string();
+        let Json(json) = inverter_history(State(state), Query(params(Some(&from), Some(&to))))
+            .await
+            .unwrap();
+        assert_eq!(json["changes"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inverter_history_rejects_bad_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let call = |from: &str, to: &str| {
+            inverter_history(
+                State(state.clone()),
+                Query(InverterHistoryParams {
+                    from: Some(from.to_string()),
+                    to: Some(to.to_string()),
+                }),
+            )
+        };
+        assert!(call("abc", "100").await.is_err());
+        assert!(call("200", "100").await.is_err());
+        let too_long = (401 * 24 * 3600).to_string();
+        assert!(call("0", &too_long).await.is_err());
+        let ok = (400 * 24 * 3600).to_string();
+        assert!(call("0", &ok).await.is_ok());
     }
 
     #[tokio::test]

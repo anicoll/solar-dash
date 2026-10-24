@@ -26,7 +26,7 @@ One binary does everything. A background sync task fetches data from iSolarCloud
 
 ### Inverter settings
 
-With a `[modbus]` section, the poller also reads the inverter's control settings (EMS mode, forced charge/discharge command, battery SOC limits, export limit, backup reserve, charge/discharge power limits and running state) about once a minute. They show in the "Inverter" panel on the home page and at `GET /api/inverter`, which returns `{"settings": {...}}` with raw values and labels, or `{"settings": null}` when there is no recent reading. This is read-only: the program never writes to the inverter. Some WiNet-S firmware refuses a few of these registers; then only those values show as n/a. `modbus-test` prints the settings too.
+With a `[modbus]` section, the poller also reads the inverter's control settings (EMS mode, forced charge/discharge command, battery SOC limits, export limit, backup reserve, charge/discharge power limits and running state) about once a minute. They show in the "Inverter" panel on the home page and at `GET /api/inverter`, which returns `{"settings": {...}}` with raw values and labels, or `{"settings": null}` when there is no recent reading. This is read-only: the program never writes to the inverter. Some WiNet-S firmware refuses a few of these registers; then only those values show as n/a. `modbus-test` prints the settings too. Whenever a setting changes (for example when the retailer's service switches the battery's mode), the new settings are saved with the time, and the "Recent changes" list in the panel shows the latest ones; `GET /api/inverter/history?from=<unix>&to=<unix>` returns them as `{"changes": [...]}`, newest first, for the last 7 days by default (at most 400 days and 500 rows).
 
 ## Running it
 
