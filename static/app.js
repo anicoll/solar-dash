@@ -296,6 +296,51 @@
     }
   }
 
+  /** The inverter's control settings; null if there are none (or the request failed). */
+  async function fetchInverter() {
+    const data = await quiet(api('/api/inverter'));
+    return (data && data.settings) || null;
+  }
+
+  /** Fills the Inverter panel; the panel is hidden when there are no settings. */
+  function renderInverter(s) {
+    $('inverter').hidden = !s;
+    if (!s) return;
+    const na = 'n/a';
+    const kwText = (w) => (w == null ? null : `${(w / 1000).toFixed(1)} kW`);
+    let mode = na;
+    if (s.ems_mode != null) {
+      mode = s.ems_mode_label;
+      // 2 is the inverter's forced (compulsory) mode.
+      if (s.ems_mode === 2 && s.forced_command != null) {
+        const power = kwText(s.forced_power_w);
+        const at = power ? ` at ${power}` : '';
+        mode = s.forced_command === 0xAA ? `Forced: charging${at}`
+          : s.forced_command === 0xBB ? `Forced: discharging${at}`
+          : s.forced_command === 0xCC ? 'Forced: stopped'
+          : `Forced: ${s.forced_command_label}`;
+      }
+    }
+    const pct = (v) => (v == null ? null : `${Math.round(v)}%`);
+    const [lo, hi, reserve] = [pct(s.min_soc_pct), pct(s.max_soc_pct), pct(s.backup_reserve_pct)];
+    const battery = lo || hi || reserve
+      ? [lo || hi ? `min ${lo || na} to max ${hi || na}` : null, reserve ? `backup reserve ${reserve}` : null]
+        .filter(Boolean).join(', ')
+      : na;
+    const power = s.max_charge_w == null && s.max_discharge_w == null ? na
+      : `${kwText(s.max_charge_w) || na} / ${kwText(s.max_discharge_w) || na}`;
+    const exportText = s.export_limit_enabled === false ? 'Off'
+      : s.export_limit_enabled === true ? (kwText(s.export_limit_w) || na) : na;
+    const rows = [
+      ['Mode', mode],
+      ['Inverter state', s.running_state == null ? na : s.running_state_label],
+      ['Battery limits', battery],
+      ['Charge / discharge limits', power],
+      ['Export limit', exportText],
+    ];
+    $('inverter-rows').replaceChildren(...rows.flatMap(([k, v]) => [el('dt', null, k), el('dd', null, v)]));
+  }
+
   /** A power tile: coloured label, big value, optional extra node underneath. */
   function powerTile(label, valueText, unit, colourVar, extra) {
     const t = el('div', 'ptile');
@@ -710,13 +755,15 @@
   /** Loads the Now part of the home page. Returns the delay before the next refresh. */
   async function loadNow() {
     const today = todayStr();
-    const [{ sample, car }, daily, savings] = await Promise.all([
+    const [{ sample, car }, inverter, daily, savings] = await Promise.all([
       fetchLive(),
+      fetchInverter(),
       api(`/api/daily?from=${today}&to=${today}`),
       loadSavings().catch((err) => { if (err.message === 'Not logged in.') throw err; return null; }),
     ]);
     if (state.view !== 'home') return LIVE_REFRESH_MS;
     renderHero(savings);
+    renderInverter(inverter);
     const todayTotals = daily.days[0] || {};
     renderToday(todayTotals,
       savings && savings.configured ? savings.days.find((d) => d.date === today) : null);
