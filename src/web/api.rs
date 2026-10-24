@@ -919,6 +919,25 @@ async fn day_max_kwh(
     Ok(max.map(|wh| wh / 1000.0))
 }
 
+/// The battery's discharge in kWh on each of `dates` that has a figure, the
+/// same one `/api/daily` reports (the live samples when they cover the day,
+/// else the cloud counter). Days without a figure are left out.
+pub(super) async fn battery_discharge_by_date(
+    state: &AppState,
+    dates: &[NaiveDate],
+) -> Result<std::collections::BTreeMap<NaiveDate, f64>, ApiError> {
+    let live_range = db::live_ts_range(&state.pool).await?;
+    let now = db::now();
+    let mut found = std::collections::BTreeMap::new();
+    for &date in dates {
+        let (totals, _) = day_totals_with_live(state, date, live_range, now).await?;
+        if let Some(kwh) = totals.battery_discharge_kwh {
+            found.insert(date, kwh);
+        }
+    }
+    Ok(found)
+}
+
 /// `live_range` is the oldest and newest live sample time (see
 /// `db::live_ts_range`), so days without any live data skip the extra query.
 #[cfg(test)]

@@ -5,6 +5,12 @@
 //! own figures put in for the days it has billed. The
 //! maths below is pure and works on plain `(date, dollars)` pairs, so it is
 //! tested with plain numbers.
+//!
+//! A later purchase with a `battery_kwh` also gets a rough estimate of what
+//! its battery added, from the battery's daily discharge (as `/api/daily`
+//! reports it) priced at that day's peak import rate. It splits the savings
+//! into a part per purchase, and shows the net position without the latest
+//! battery.
 
 use std::collections::BTreeMap;
 
@@ -16,7 +22,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::AppState;
-use super::api::{ApiResult, today};
+use super::api::{ApiResult, battery_discharge_by_date, today};
 use super::costs::{billed_days, round2};
 use crate::config;
 
@@ -29,6 +35,10 @@ const MAX_PAYBACK_DAYS: u64 = 4000;
 const MAX_PROJECTED_DAYS: f64 = 36_500.0;
 /// Mean length of a year, for turning the yearly price rise into days.
 const DAYS_PER_YEAR: f64 = 365.25;
+/// The share of a battery's capacity assumed to be used each day. The
+/// discharge up to this much from the batteries already owned is not credited
+/// to a new one.
+const BATTERY_USABLE: f64 = 0.95;
 
 /// One thing bought for the system, with its date already parsed.
 #[derive(Debug, Clone)]
@@ -36,6 +46,8 @@ pub struct Purchase {
     pub name: String,
     pub date: NaiveDate,
     pub cost_dollars: f64,
+    /// Capacity of the battery it added, in kWh, if any.
+    pub battery_kwh: Option<f64>,
 }
 
 /// Convert the config's purchases, oldest first. `Config::load` already
@@ -48,6 +60,7 @@ pub fn purchases_from_config(list: &[config::Purchase]) -> Result<Vec<Purchase>>
                 name: p.name.clone(),
                 date: config::parse_date(&p.date)?,
                 cost_dollars: p.cost_dollars,
+                battery_kwh: p.battery_kwh,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -134,10 +147,21 @@ fn monthly_series(
     points
 }
 
+/// The last [`RATE_DAYS`] days that have data (all of them if there are
+/// fewer). `days` must be oldest first.
+fn recent(days: &[DaySavings]) -> &[DaySavings] {
+    &days[days.len().saturating_sub(RATE_DAYS)..]
+}
+
+/// Savings over the days [`rate_per_day`] averages.
+fn last_12_months_saved(days: &[DaySavings]) -> f64 {
+    recent(days).iter().map(|d| d.1).sum()
+}
+
 /// Mean savings per day over the last [`RATE_DAYS`] days that have data (all
 /// of them if there are fewer). 0 with no data. `days` must be oldest first.
 fn rate_per_day(days: &[DaySavings]) -> f64 {
-    let recent = &days[days.len().saturating_sub(RATE_DAYS)..];
+    let recent = recent(days);
     if recent.is_empty() {
         return 0.0;
     }
@@ -170,6 +194,165 @@ fn projected_payback(net: f64, rate: f64, price_rise_percent: f64, today: NaiveD
     match today.checked_add_days(Days::new(days as u64)) {
         Some(date) => Projection::On(date),
         None => Projection::Never,
+    }
+}
+
+/// Dollars a battery adds on one day: the discharge beyond what the batteries
+/// owned before it could supply (`BATTERY_USABLE` of their capacity), priced
+/// at the day's peak import rate in cents. Never negative.
+fn added_savings(discharge_kwh: f64, owned_kwh: f64, peak_cents: f64) -> f64 {
+    (discharge_kwh - BATTERY_USABLE * owned_kwh).max(0.0) * peak_cents / 100.0
+}
+
+/// What a battery added on each day from `from` that has a discharge figure,
+/// in dollars. `peak_cents` gives a day's peak import rate. Days without a
+/// figure are left out, so they add nothing.
+fn estimated_added(
+    discharge: &BTreeMap<NaiveDate, f64>,
+    from: NaiveDate,
+    owned_kwh: f64,
+    peak_cents: impl Fn(NaiveDate) -> f64,
+) -> BTreeMap<NaiveDate, f64> {
+    discharge
+        .range(from..)
+        .map(|(&date, &kwh)| (date, added_savings(kwh, owned_kwh, peak_cents(date))))
+        .collect()
+}
+
+/// `days` with each map's added savings taken off its days. Same days, same order.
+fn minus_added(days: &[DaySavings], added: &[&BTreeMap<NaiveDate, f64>]) -> Vec<DaySavings> {
+    days.iter()
+        .map(|&(date, saved)| {
+            let taken: f64 = added.iter().filter_map(|a| a.get(&date)).sum();
+            (date, saved - taken)
+        })
+        .collect()
+}
+
+/// What `added` gives on the days of `days` from `from` (0 where it has none),
+/// so a rate over it covers every day since the purchase.
+fn added_on_days(
+    days: &[DaySavings],
+    added: &BTreeMap<NaiveDate, f64>,
+    from: NaiveDate,
+) -> Vec<DaySavings> {
+    days.iter()
+        .filter(|d| d.0 >= from)
+        .map(|&(date, _)| (date, added.get(&date).copied().unwrap_or(0.0)))
+        .collect()
+}
+
+/// The kWh of battery owned before purchase `index`: the `battery_kwh` of
+/// every earlier purchase. `purchases` must be oldest first.
+fn battery_owned_before(purchases: &[Purchase], index: usize) -> f64 {
+    purchases[..index]
+        .iter()
+        .filter_map(|p| p.battery_kwh)
+        .sum()
+}
+
+/// One purchase with its share of the savings.
+#[derive(Debug, PartialEq)]
+struct Part {
+    /// `None` for a later purchase with no `battery_kwh`: its savings stay
+    /// with the first purchase.
+    saved: Option<f64>,
+    /// `saved` is the battery estimate, not a measured total.
+    estimated: bool,
+    /// When this part alone pays for itself, at its own recent rate.
+    projection: Option<Projection>,
+}
+
+/// A part per purchase, oldest first. `added` has one entry per purchase: the
+/// estimated daily savings of a later purchase with a `battery_kwh`, `None`
+/// for the rest. The first purchase gets the savings less every estimate, so
+/// the parts add up to the total.
+fn build_parts(
+    purchases: &[Purchase],
+    added: &[Option<BTreeMap<NaiveDate, f64>>],
+    days: &[DaySavings],
+    price_rise_percent: f64,
+    today: NaiveDate,
+) -> Vec<Part> {
+    let estimates: Vec<&BTreeMap<NaiveDate, f64>> = added.iter().flatten().collect();
+    let first_days = minus_added(days, &estimates);
+    let estimated_total: f64 = estimates.iter().flat_map(|a| a.values()).sum();
+    let total: f64 = days.iter().map(|d| d.1).sum();
+    purchases
+        .iter()
+        .zip(added)
+        .enumerate()
+        .map(|(i, (purchase, added))| {
+            let (saved, rate, estimated) = match (i, added) {
+                (_, Some(added)) => {
+                    let own = added_on_days(days, added, purchase.date);
+                    (Some(added.values().sum()), rate_per_day(&own), true)
+                }
+                (0, None) => (
+                    Some(total - estimated_total),
+                    rate_per_day(&first_days),
+                    false,
+                ),
+                _ => (None, 0.0, false),
+            };
+            let projection = saved.map(|saved| {
+                projected_payback(
+                    saved - purchase.cost_dollars,
+                    rate,
+                    price_rise_percent,
+                    today,
+                )
+            });
+            Part {
+                saved,
+                estimated,
+                projection,
+            }
+        })
+        .collect()
+}
+
+/// A date on the ownership timeline.
+#[derive(Debug, PartialEq, Serialize)]
+struct TimelineEntry {
+    /// "YYYY-MM-DD".
+    date: String,
+    /// "purchase" or "plan".
+    kind: &'static str,
+    label: String,
+    /// Dollars, for a purchase.
+    cost: Option<f64>,
+}
+
+/// Every purchase and every named plan start, oldest first (a purchase before
+/// a plan on the same day).
+fn build_timeline(purchases: &[Purchase], plans: &[(NaiveDate, String)]) -> Vec<TimelineEntry> {
+    let mut entries: Vec<TimelineEntry> = purchases
+        .iter()
+        .map(|p| TimelineEntry {
+            date: p.date.to_string(),
+            kind: "purchase",
+            label: p.name.clone(),
+            cost: Some(round2(p.cost_dollars)),
+        })
+        .chain(plans.iter().map(|(date, name)| TimelineEntry {
+            date: date.to_string(),
+            kind: "plan",
+            label: name.clone(),
+            cost: None,
+        }))
+        .collect();
+    // Stable, so a purchase stays ahead of a plan on the same day.
+    entries.sort_by(|a, b| a.date.cmp(&b.date));
+    entries
+}
+
+/// The projection as the API reports it: `null` once paid back, "never", or "YYYY-MM".
+fn projection_json(projection: &Projection) -> Value {
+    match projection {
+        Projection::PaidBack => Value::Null,
+        Projection::Never => json!("never"),
+        Projection::On(date) => json!(date.format("%Y-%m").to_string()),
     }
 }
 
@@ -218,15 +401,103 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
     let saved: f64 = days.iter().map(|d| d.1).sum();
     let net = saved - total_cost;
     let rate = rate_per_day(&days);
-    let projected: Value = match projected_payback(net, rate, state.price_rise_percent, today) {
-        Projection::PaidBack => Value::Null,
-        Projection::Never => json!("never"),
-        Projection::On(date) => json!(date.format("%Y-%m").to_string()),
-    };
+    let projected = projection_json(&projected_payback(
+        net,
+        rate,
+        state.price_rise_percent,
+        today,
+    ));
     let purchases: Vec<Value> = state
         .purchases
         .iter()
         .map(|p| json!({ "name": p.name, "date": p.date.to_string(), "cost": round2(p.cost_dollars) }))
+        .collect();
+
+    // What each later battery added, from the days it has a discharge figure for.
+    let battery_from = state
+        .purchases
+        .iter()
+        .skip(1)
+        .filter(|p| p.battery_kwh.is_some())
+        .map(|p| p.date.max(start))
+        .min();
+    let discharge = match battery_from {
+        Some(from) => {
+            let dates: Vec<NaiveDate> = from.iter_days().take_while(|d| *d <= today).collect();
+            battery_discharge_by_date(&state, &dates).await?
+        }
+        None => BTreeMap::new(),
+    };
+    let added: Vec<Option<BTreeMap<NaiveDate, f64>>> = state
+        .purchases
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i == 0 || p.battery_kwh.is_none() {
+                return None;
+            }
+            let owned = battery_owned_before(&state.purchases, i);
+            Some(estimated_added(&discharge, p.date, owned, |date| {
+                tariff.for_date(date).peak_import_cents()
+            }))
+        })
+        .collect();
+    let parts = build_parts(
+        &state.purchases,
+        &added,
+        &days,
+        state.price_rise_percent,
+        today,
+    );
+    let parts: Vec<Value> = state
+        .purchases
+        .iter()
+        .zip(&parts)
+        .map(|(p, part)| {
+            let net = part.saved.map(|saved| saved - p.cost_dollars);
+            json!({
+                "name": p.name,
+                "date": p.date.to_string(),
+                "cost": round2(p.cost_dollars),
+                "saved": part.saved.map(round2),
+                "estimated": part.estimated,
+                "recovered_pct": part.saved.map(|saved| if p.cost_dollars > 0.0 {
+                    round2(saved / p.cost_dollars * 100.0)
+                } else {
+                    0.0
+                }),
+                "net": net.map(round2),
+                "projected_payback": part.projection.as_ref().map_or(Value::Null, projection_json),
+            })
+        })
+        .collect();
+
+    // Without the latest battery: only when its savings were estimated.
+    let without = match (state.purchases.split_last(), added.last()) {
+        (Some((last, earlier)), Some(Some(added))) if !earlier.is_empty() => {
+            let days = minus_added(&days, &[added]);
+            let saved: f64 = days.iter().map(|d| d.1).sum();
+            let cost: f64 = earlier.iter().map(|p| p.cost_dollars).sum();
+            let rate = rate_per_day(&days);
+            let projection = projected_payback(saved - cost, rate, state.price_rise_percent, today);
+            json!({
+                "name": last.name,
+                "series": monthly_series(&days, earlier, start, today),
+                "rate_per_day": round2(rate),
+                "projected_payback": projection_json(&projection),
+            })
+        }
+        _ => Value::Null,
+    };
+
+    let first_day = first.date;
+    let plans: Vec<(NaiveDate, String)> = tariff
+        .plans()
+        .into_iter()
+        .filter_map(|(date, name)| {
+            let name = name?.trim();
+            (!name.is_empty()).then(|| (date.unwrap_or(first_day), name.to_string()))
+        })
         .collect();
 
     Ok(Json(json!({
@@ -237,8 +508,12 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
         "recovered_pct": if total_cost > 0.0 { round2(saved / total_cost * 100.0) } else { 0.0 },
         "projected_payback": projected,
         "rate_per_day": round2(rate),
+        "last_12_months_saved": round2(last_12_months_saved(&days)),
         "price_rise_percent": state.price_rise_percent,
         "purchases": purchases,
+        "parts": parts,
+        "without": without,
+        "timeline": build_timeline(&state.purchases, &plans),
         "series": monthly_series(&days, &state.purchases, start, today),
         "by_year": by_year(&days),
     })))
@@ -257,6 +532,7 @@ mod tests {
             name: "x".to_string(),
             date: date(on),
             cost_dollars,
+            battery_kwh: None,
         }
     }
 
@@ -395,12 +671,189 @@ mod tests {
         assert!(by_year(&[]).is_empty());
     }
 
+    fn battery(on: &str, cost_dollars: f64, kwh: f64) -> Purchase {
+        Purchase {
+            battery_kwh: Some(kwh),
+            ..purchase(on, cost_dollars)
+        }
+    }
+
+    #[test]
+    fn a_battery_adds_only_the_discharge_beyond_what_was_owned() {
+        // 10 kWh owned supplies 9.5; 12 kWh discharged leaves 2.5 at 50 c.
+        assert!((added_savings(12.0, 10.0, 50.0) - 1.25).abs() < 1e-9);
+        // Less than the old battery could supply: nothing, never negative.
+        assert_eq!(added_savings(9.0, 10.0, 50.0), 0.0);
+        // With no battery before, all of it counts.
+        assert!((added_savings(4.0, 0.0, 25.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_estimate_starts_on_the_purchase_day_and_skips_days_without_data() {
+        let discharge: BTreeMap<NaiveDate, f64> = [
+            (date("2025-09-30"), 20.0),
+            (date("2025-10-01"), 20.0),
+            // 2025-10-02 has no figure.
+            (date("2025-10-03"), 10.0),
+        ]
+        .into();
+        // Peak 40 c before the 3rd, 80 c from then on.
+        let peak = |d: NaiveDate| if d < date("2025-10-03") { 40.0 } else { 80.0 };
+        let added = estimated_added(&discharge, date("2025-10-01"), 10.0, peak);
+        let got: Vec<(NaiveDate, f64)> = added.into_iter().collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, date("2025-10-01"));
+        // (20 - 9.5) * 0.40 and (10 - 9.5) * 0.80.
+        assert!((got[0].1 - 4.2).abs() < 1e-9);
+        assert_eq!(got[1].0, date("2025-10-03"));
+        assert!((got[1].1 - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn owned_battery_adds_up_the_earlier_purchases() {
+        let list = [
+            battery("2023-02-01", 1.0, 13.0),
+            purchase("2024-01-01", 1.0),
+            battery("2025-10-01", 1.0, 12.8),
+        ];
+        assert_eq!(battery_owned_before(&list, 0), 0.0);
+        assert_eq!(battery_owned_before(&list, 1), 13.0);
+        assert_eq!(battery_owned_before(&list, 2), 13.0);
+    }
+
+    #[test]
+    fn minusing_the_added_savings_keeps_the_days() {
+        let days = [
+            (date("2025-01-01"), 10.0),
+            (date("2025-01-02"), 10.0),
+            (date("2025-01-03"), 10.0),
+        ];
+        let one: BTreeMap<NaiveDate, f64> = [(date("2025-01-02"), 3.0)].into();
+        let two: BTreeMap<NaiveDate, f64> =
+            [(date("2025-01-02"), 1.0), (date("2025-01-03"), 2.0)].into();
+        assert_eq!(
+            minus_added(&days, &[&one, &two]),
+            vec![
+                (date("2025-01-01"), 10.0),
+                (date("2025-01-02"), 6.0),
+                (date("2025-01-03"), 8.0),
+            ]
+        );
+        // The part's own days run from the purchase, with 0 where nothing was added.
+        assert_eq!(
+            added_on_days(&days, &one, date("2025-01-02")),
+            vec![(date("2025-01-02"), 3.0), (date("2025-01-03"), 0.0)]
+        );
+    }
+
+    #[test]
+    fn last_12_months_use_the_rate_window() {
+        let first = date("2020-01-01");
+        let days: Vec<DaySavings> = (0..400)
+            .map(|i| (first + Days::new(i), if i < 35 { 100.0 } else { 1.0 }))
+            .collect();
+        assert_eq!(last_12_months_saved(&days), 365.0);
+        assert_eq!(last_12_months_saved(&[]), 0.0);
+    }
+
+    #[test]
+    fn parts_add_up_to_the_total() {
+        let today = date("2026-10-21");
+        let purchases = [
+            battery("2025-01-01", 1000.0, 10.0),
+            purchase("2025-02-01", 50.0),
+            battery("2025-03-01", 100.0, 5.0),
+        ];
+        let days: Vec<DaySavings> = (0..100)
+            .map(|i| (date("2025-01-01") + Days::new(i), 10.0))
+            .collect();
+        // The third purchase added 4 a day from 2025-03-01 (day 59) to day 99.
+        let added: BTreeMap<NaiveDate, f64> = (59..100)
+            .map(|i| (date("2025-01-01") + Days::new(i), 4.0))
+            .collect();
+        let parts = build_parts(&purchases, &[None, None, Some(added)], &days, 0.0, today);
+        assert_eq!(parts.len(), 3);
+        // 1000 total less 41 days * 4.
+        assert_eq!(parts[0].saved, Some(836.0));
+        assert!(!parts[0].estimated);
+        // Not estimated, so nothing of its own.
+        assert_eq!(parts[1].saved, None);
+        assert_eq!(parts[1].projection, None);
+        assert_eq!(parts[2].saved, Some(164.0));
+        assert!(parts[2].estimated);
+        // The first part still needs 164 at its own rate: (59 * 10 + 41 * 6) / 100 = 8.36.
+        let Some(Projection::On(first)) = parts[0].projection else {
+            panic!("expected a date");
+        };
+        assert_eq!(first, today + Days::new(20));
+        // 164 saved against 100: already paid back.
+        assert_eq!(parts[2].projection, Some(Projection::PaidBack));
+    }
+
+    #[test]
+    fn a_part_with_no_savings_never_pays_back() {
+        let today = date("2026-10-21");
+        let purchases = [
+            purchase("2025-01-01", 100.0),
+            battery("2025-02-01", 50.0, 5.0),
+        ];
+        let days = [(date("2025-01-01"), 0.0), (date("2025-02-01"), 0.0)];
+        let parts = build_parts(
+            &purchases,
+            &[None, Some(BTreeMap::new())],
+            &days,
+            3.0,
+            today,
+        );
+        assert_eq!(parts[0].projection, Some(Projection::Never));
+        assert_eq!(parts[1].saved, Some(0.0));
+        assert_eq!(parts[1].projection, Some(Projection::Never));
+    }
+
+    #[test]
+    fn timeline_is_sorted_with_purchases_and_plans() {
+        let purchases = [
+            purchase("2023-02-01", 19_490.0),
+            battery("2025-10-01", 7_690.0, 12.8),
+        ];
+        let plans = [
+            (date("2023-02-01"), "First plan".to_string()),
+            (date("2025-07-01"), "Current plan".to_string()),
+        ];
+        let got: Vec<(String, &str, String, Option<f64>)> = build_timeline(&purchases, &plans)
+            .into_iter()
+            .map(|e| (e.date, e.kind, e.label, e.cost))
+            .collect();
+        let expected =
+            |date: &str, kind, label: &str, cost| (date.to_string(), kind, label.to_string(), cost);
+        assert_eq!(
+            got,
+            vec![
+                expected("2023-02-01", "purchase", "x", Some(19_490.0)),
+                expected("2023-02-01", "plan", "First plan", None),
+                expected("2025-07-01", "plan", "Current plan", None),
+                expected("2025-10-01", "purchase", "x", Some(7_690.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_json_matches_the_top_level_format() {
+        assert_eq!(projection_json(&Projection::PaidBack), Value::Null);
+        assert_eq!(projection_json(&Projection::Never), json!("never"));
+        assert_eq!(
+            projection_json(&Projection::On(date("2027-03-09"))),
+            json!("2027-03")
+        );
+    }
+
     #[test]
     fn purchases_are_sorted_by_date() {
         let list = |name: &str, date: &str| config::Purchase {
             name: name.to_string(),
             date: date.to_string(),
             cost_dollars: 1.0,
+            battery_kwh: None,
         };
         let sorted =
             purchases_from_config(&[list("late", "2025-10-01"), list("early", "2024-01-01")])
