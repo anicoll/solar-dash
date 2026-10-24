@@ -11,6 +11,7 @@ mod petrol;
 
 pub(crate) use costs::house_intervals;
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -88,6 +89,10 @@ pub struct AppState {
     /// What petrol cost on each day: `petrol_cents_per_litre` and either the
     /// `[[teslamate.petrol_price]]` entries or the `petrol_prices_file`.
     petrol: PetrolPrices,
+    /// `compare_cars` from `[teslamate]`: the petrol car for each model.
+    compare_cars: Arc<BTreeMap<String, String>>,
+    /// `petrol_grade` from `[teslamate]`.
+    petrol_grade: Arc<str>,
     /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
     purchases: Arc<[Purchase]>,
     /// Assumed yearly electricity price rise (percent) in the payback projection.
@@ -130,6 +135,8 @@ impl AppState {
             tariff: None,
             ev_prices: EvPrices::default(),
             petrol: PetrolPrices::default(),
+            compare_cars: Arc::new(BTreeMap::new()),
+            petrol_grade: Arc::from("Unleaded 91"),
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
             globird_configured: false,
@@ -164,6 +171,18 @@ impl AppState {
     /// Sets the petrol prices by day that the per-car history uses.
     pub fn with_petrol_prices(mut self, petrol: PetrolPrices) -> Self {
         self.petrol = petrol;
+        self
+    }
+
+    /// Sets the petrol car each model is compared with and the petrol grade,
+    /// both shown by `/api/ev/cars`.
+    pub fn with_petrol_comparison(
+        mut self,
+        compare_cars: BTreeMap<String, String>,
+        petrol_grade: &str,
+    ) -> Self {
+        self.compare_cars = Arc::new(compare_cars);
+        self.petrol_grade = petrol_grade.into();
         self
     }
 
@@ -280,7 +299,15 @@ impl AppState {
             },
             None => PetrolPrices::default(),
         };
-        Ok(Self::new(pool, plant_id, tz, password_hash, key)?
+        let (compare_cars, petrol_grade) = match &config.teslamate {
+            Some(t) => (t.compare_cars.clone(), t.petrol_grade.clone()),
+            None => Default::default(),
+        };
+        let mut state = Self::new(pool, plant_id, tz, password_hash, key)?;
+        if config.teslamate.is_some() {
+            state = state.with_petrol_comparison(compare_cars, &petrol_grade);
+        }
+        Ok(state
             .with_cookie_secure(config.server.cookie_secure)
             .with_api_token(config.server.api_token.as_deref())
             .with_tariff(tariff)
@@ -1610,7 +1637,11 @@ mod tests {
                 AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
                     .unwrap()
                     .with_ev_prices(prices)
-                    .with_petrol_prices(petrol),
+                    .with_petrol_prices(petrol)
+                    .with_petrol_comparison(
+                        BTreeMap::from([("Y".to_string(), "Toyota RAV4".to_string())]),
+                        "Unleaded 95",
+                    ),
             )
         };
         let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
@@ -1631,6 +1662,9 @@ mod tests {
             id,
             name: Some(name.to_string()),
             model: model.map(str::to_string),
+            trim_badging: (id == 1).then(|| "Long Range".to_string()),
+            exterior_color: (id == 1).then(|| "PearlWhite".to_string()),
+            ..db::TmCar::default()
         };
         db::upsert_tm_cars(
             &pool,
@@ -1728,6 +1762,37 @@ mod tests {
         assert_eq!(total["without_system"]["saved"], 13.5);
         assert_eq!(total["system_added"], 1.85);
         assert_eq!(total["grid_kwh"], 7.4);
+
+        // Car details and the comparison car (only the Model Y has one).
+        assert_eq!(cars[2]["trim"], "Long Range");
+        assert_eq!(cars[2]["paint"], "PearlWhite");
+        assert!(cars[2]["wheels"].is_null());
+        assert!(cars[2]["marketing_name"].is_null());
+        assert!(cars[2]["compare_with"].is_null());
+        assert_eq!(cars[1]["compare_with"], "Toyota RAV4");
+        assert!(cars[1]["trim"].is_null());
+        assert_eq!(json["petrol_grade"], "Unleaded 95");
+
+        // Without a [tariff] there is one plan. Car 1's costed session is in
+        // the money, its other home session is only pending; the away session
+        // is costed at 60 c/kWh. Nothing was solar, so the share is 0.
+        let plans = cars[2]["charging_by_plan"].as_array().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["plan"], "Home charging");
+        assert_eq!(plans[0]["sessions"], 1);
+        assert_eq!(plans[0]["kwh"], 7.4);
+        assert_eq!(plans[0]["cost"], 1.85);
+        assert_eq!(plans[0]["pending_sessions"], 1);
+        assert_eq!(cars[2]["away"]["sessions"], 1);
+        assert_eq!(cars[2]["away"]["kwh"], 10.0);
+        assert_eq!(cars[2]["away"]["cost"], 6.0);
+        assert_eq!(cars[2]["self_share_pct"], 0.0);
+        assert!(cars[0]["self_share_pct"].is_null());
+        // The combined figures cover every car: car 4's away session too.
+        assert_eq!(json["away"]["sessions"], 2);
+        assert_eq!(json["away"]["kwh"], 14.0);
+        assert_eq!(json["charging_by_plan"][0]["cost"], 1.85);
+        assert_eq!(json["self_share_pct"], 0.0);
         let months = cars[2]["months"].as_array().unwrap();
         assert_eq!(months.len(), 1);
         assert_eq!(months[0]["month"], "2026-09");
@@ -2307,6 +2372,7 @@ mod tests {
             id: 1,
             name: Some("Daily".to_string()),
             model: Some("3".to_string()),
+            ..db::TmCar::default()
         };
         db::upsert_tm_cars(&pool, &[car], 1).await.unwrap();
         let app = router_with(PetrolPrices::fixed(None, vec![]));

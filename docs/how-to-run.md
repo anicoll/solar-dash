@@ -213,7 +213,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
 | `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`. A session still charging has `ended_at` `null` and counts as running until now. `energy_used_kwh` is taken from the wall, `energy_added_kwh` reaches the battery. The last six fields (kWh by source, dollars, and the share 0 to 1 of the session the inverter samples cover) are `null` without a `[tariff]`, away from home (geofence not "Home") or with no energy. At most 400 days. Empty without a `[teslamate]` section |
 | `GET /api/ev/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` | The car against petrol, by month and in total: `{"configured":true,"months":[{month,km,home_kwh,home_cost,away_kwh,away_cost,charging_cost,petrol_litres,petrol_cost,saved,ev_cents_per_km,petrol_cents_per_km},...],"total":{...},"petrol_cents_per_litre":...,"petrol_litres_per_100km":...}`. Local dates, both included, at most 400 days; without `from` it covers the last 365 days. Money is in dollars. `away_cost` is `null` when there were away sessions and no `away_cents_per_kwh`, and the `*_cents_per_km` fields are `null` for 0 km. `configured` is `false`, and the money fields `null`, without a `petrol_cents_per_litre`. See [TeslaMate](#teslamate-optional) |
-| `GET /api/ev/cars` | Each TeslaMate car's fuel savings over its whole synced history, newest car first: `{"configured":true,"petrol_litres_per_100km":...,"cars":[{car_id,name,model,label,first_day,last_day,total,months:[{month,...}]}]}`. Each period has `km`, `petrol_litres`, `petrol_cost`, `home_kwh`, `away_kwh`, `away_cost`, `away_uncosted_kwh`, `with_system` and `without_system` (`charging_cost`, `saved`, `cents_per_km`), `system_added`, `grid_kwh`, `self_kwh`, `uncovered_kwh`, `feed_in_forgone` and `pending_sessions`. Dollars. Empty until the history sync has run. See [Car versus petrol](#car-versus-petrol) |
+| `GET /api/ev/cars` | Each TeslaMate car's fuel savings over its whole synced history, newest car first: `{"configured":true,"petrol_litres_per_100km":...,"petrol_grade":"Unleaded 91","charging_by_plan":[...],"away":{...},"self_share_pct":...,"cars":[{car_id,name,model,label,trim,paint,wheels,marketing_name,compare_with,first_day,last_day,total,months:[{month,...}],charging_by_plan,away,self_share_pct}]}`. `charging_by_plan` is `[{plan,first_day,last_day,sessions,kwh,cost,pending_sessions}]`, `away` is `{sessions,kwh,cost}` (`cost` `null` without `away_cents_per_kwh`) and `self_share_pct` is solar and battery kWh over costed home kWh; the top-level ones add up all cars. See [Comparison cars and charging by plan](#comparison-cars-and-charging-by-plan). Each period has `km`, `petrol_litres`, `petrol_cost`, `home_kwh`, `away_kwh`, `away_cost`, `away_uncosted_kwh`, `with_system` and `without_system` (`charging_cost`, `saved`, `cents_per_km`), `system_added`, `grid_kwh`, `self_kwh`, `uncovered_kwh`, `feed_in_forgone` and `pending_sessions`. Dollars. Empty until the history sync has run. See [Car versus petrol](#car-versus-petrol) |
 | `GET /api/petrol-prices` | The petrol prices: `{"file":true,"fallback_cents_per_litre":...,"prices":[{"from":"YYYY-MM-DD","cents_per_litre":...},...]}`, oldest first. `file` is `false` when they come from `[[teslamate.petrol_price]]`. See [Petrol prices file](#petrol-prices-file) |
 | `PUT /api/petrol-prices` | Adds or replaces the price starting on a date. JSON body `{"from":"YYYY-MM-DD","cents_per_litre":189.9}`; answers like the `GET`. 400 for a bad date or price, 415 unless the body is `application/json`, 409 without `petrol_prices_file` |
 | `DELETE /api/petrol-prices/YYYY-MM-DD` | Removes the price starting on that date and answers like the `GET`. 404 if there is none, 409 without `petrol_prices_file` |
@@ -410,6 +410,31 @@ price. `GET /api/ev/summary` gives the same numbers.
   Saved is petrol cost minus charging cost. The cents per km are those
   costs over the km.
 - A session counts in the month it started.
+
+#### Comparison cars and charging by plan
+
+Two more `[teslamate]` keys feed the "EV versus petrol" view of
+`GET /api/ev/cars`:
+
+```toml
+compare_cars = { "3" = "Hyundai i30 Sedan N", "Y" = "Toyota RAV4 GX 2WD" }
+petrol_grade = "Unleaded 91"     # the default
+```
+
+`compare_cars` maps TeslaMate's model string to the name of the petrol car it
+is compared with (the key is matched ignoring case); a model with no entry has
+`compare_with` `null`. `petrol_litres_per_100km` stays one setting shared by all
+cars. `petrol_grade` is returned as is.
+
+Home charging is also split by the plan that applied on the day each session
+started: `charging_by_plan` has one row per plan with home sessions, oldest
+first, with the plan's `name` from `[tariff]` or `[[previous_tariff]]` (without
+one it is "Plan until <date>", "Plan from <date>" or "Plan <date> to <date>").
+`sessions`, `kwh` and `cost` (dollars paid with the system) count costed
+sessions only; sessions not costed yet are in `pending_sessions` and never in
+the money. Days where Amber was billed use the bill's average price, as above.
+The car's details (`trim`, `paint`, `wheels`, `marketing_name`) come from
+TeslaMate's `cars` table and are `null` where TeslaMate has nothing.
 
 #### Petrol prices file
 

@@ -322,6 +322,19 @@ pub struct TariffSchedule {
     /// Oldest first, with strictly increasing `until` days (inclusive).
     previous: Vec<(NaiveDate, Tariff)>,
     current: Tariff,
+    /// The configured plan names: one per previous plan, then the current one.
+    names: Vec<Option<String>>,
+}
+
+/// One plan of a [`TariffSchedule`], for labelling.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanSpan {
+    /// The `name` from the config, if it has one.
+    pub name: Option<String>,
+    /// The first local day it applied; `None` for the first plan.
+    pub from: Option<NaiveDate>,
+    /// The last local day it applied; `None` for the current plan.
+    pub until: Option<NaiveDate>,
 }
 
 impl TariffSchedule {
@@ -330,6 +343,7 @@ impl TariffSchedule {
         Self {
             previous: Vec::new(),
             current,
+            names: vec![None],
         }
     }
 
@@ -339,6 +353,11 @@ impl TariffSchedule {
         current: &config::Tariff,
         previous: &[config::PreviousTariff],
     ) -> Result<Self> {
+        let names = previous
+            .iter()
+            .map(|p| p.name.clone())
+            .chain([current.name.clone()])
+            .collect();
         let previous = previous
             .iter()
             .enumerate()
@@ -357,7 +376,34 @@ impl TariffSchedule {
         Ok(Self {
             previous,
             current: Tariff::from_config(current)?,
+            names,
         })
+    }
+
+    /// Which plan applies on this local day: 0 for the oldest, up to the
+    /// number of previous plans for the current one. The same choice as
+    /// [`TariffSchedule::for_date`].
+    pub fn plan_index(&self, date: NaiveDate) -> usize {
+        self.previous
+            .iter()
+            .position(|(until, _)| *until >= date)
+            .unwrap_or(self.previous.len())
+    }
+
+    /// Every plan, oldest first, with the days it applied.
+    pub fn plans(&self) -> Vec<PlanSpan> {
+        let mut from = None;
+        let mut spans = Vec::new();
+        for (i, name) in self.names.iter().enumerate() {
+            let until = self.previous.get(i).map(|(until, _)| *until);
+            spans.push(PlanSpan {
+                name: name.clone(),
+                from,
+                until,
+            });
+            from = until.and_then(|u| u.succ_opt());
+        }
+        spans
     }
 
     /// The plan in effect on this local day: the first previous plan whose
@@ -843,6 +889,39 @@ mod tests {
                 .import_cents_at(0),
             5.0
         );
+    }
+
+    #[test]
+    fn plans_are_listed_with_their_days() {
+        let schedule = schedule();
+        let day = |text: &str| -> NaiveDate { text.parse().unwrap() };
+        let plans = schedule.plans();
+        assert_eq!(plans.len(), 3);
+        assert_eq!(
+            (plans[0].from, plans[0].until),
+            (None, Some(day("2025-06-30")))
+        );
+        assert_eq!(
+            (plans[1].from, plans[1].until),
+            (Some(day("2025-07-01")), Some(day("2026-01-31")))
+        );
+        assert_eq!(
+            (plans[2].from, plans[2].until),
+            (Some(day("2026-02-01")), None)
+        );
+        // The index is the same choice as `for_date`.
+        assert_eq!(schedule.plan_index(day("2025-06-30")), 0);
+        assert_eq!(schedule.plan_index(day("2025-07-01")), 1);
+        assert_eq!(schedule.plan_index(day("2026-02-01")), 2);
+    }
+
+    #[test]
+    fn a_plan_name_does_not_change_the_stored_key() {
+        let plain = tariff("[tariff]\nsupply_cents_per_day = 1.0\ndefault_import_cents = 5.0\n");
+        let named = tariff(
+            "[tariff]\nname = \"Flat\"\nsupply_cents_per_day = 1.0\ndefault_import_cents = 5.0\n",
+        );
+        assert_eq!(plain.key(), named.key());
     }
 
     /// The GloBird plan from config.example.toml.

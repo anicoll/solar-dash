@@ -940,11 +940,17 @@ pub async fn globird_kwh_in_range(
 }
 
 /// One car from TeslaMate, as stored in `tm_car`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TmCar {
     pub id: i64,
     pub name: Option<String>,
     pub model: Option<String>,
+    /// TeslaMate's `trim_badging`, such as "Long Range".
+    pub trim_badging: Option<String>,
+    /// TeslaMate's `exterior_color`, the paint.
+    pub exterior_color: Option<String>,
+    pub wheel_type: Option<String>,
+    pub marketing_name: Option<String>,
 }
 
 /// One car's driving on one local day, as stored in `tm_drive_daily`.
@@ -978,13 +984,21 @@ pub async fn upsert_tm_cars(pool: &SqlitePool, cars: &[TmCar], now: i64) -> Resu
     let mut tx = pool.begin().await?;
     for car in cars {
         sqlx::query(
-            "INSERT INTO tm_car (id, name, model, updated_at) VALUES (?, ?, ?, ?)
+            "INSERT INTO tm_car (id, name, model, trim_badging, exterior_color, wheel_type,
+                                 marketing_name, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET name = excluded.name, model = excluded.model,
-                                            updated_at = excluded.updated_at",
+               trim_badging = excluded.trim_badging, exterior_color = excluded.exterior_color,
+               wheel_type = excluded.wheel_type, marketing_name = excluded.marketing_name,
+               updated_at = excluded.updated_at",
         )
         .bind(car.id)
         .bind(&car.name)
         .bind(&car.model)
+        .bind(&car.trim_badging)
+        .bind(&car.exterior_color)
+        .bind(&car.wheel_type)
+        .bind(&car.marketing_name)
         .bind(now)
         .execute(&mut *tx)
         .await
@@ -1132,14 +1146,35 @@ pub async fn save_tm_charge_cost(pool: &SqlitePool, id: i64, cost: &TmChargeCost
 
 /// Every car in `tm_car`, by id.
 pub async fn tm_cars(pool: &SqlitePool) -> Result<Vec<TmCar>> {
-    let rows: Vec<(i64, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT id, name, model FROM tm_car ORDER BY id")
-            .fetch_all(pool)
-            .await
-            .context("could not read the TeslaMate cars")?;
+    type Row = (
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, name, model, trim_badging, exterior_color, wheel_type, marketing_name
+         FROM tm_car ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("could not read the TeslaMate cars")?;
     Ok(rows
         .into_iter()
-        .map(|(id, name, model)| TmCar { id, name, model })
+        .map(
+            |(id, name, model, trim_badging, exterior_color, wheel_type, marketing_name)| TmCar {
+                id,
+                name,
+                model,
+                trim_badging,
+                exterior_color,
+                wheel_type,
+                marketing_name,
+            },
+        )
         .collect())
 }
 
@@ -1864,6 +1899,8 @@ mod tests {
             id: 10001,
             name: Some(name.to_string()),
             model: Some("3".to_string()),
+            trim_badging: Some("Long Range".to_string()),
+            ..TmCar::default()
         };
         upsert_tm_cars(&pool, &[car("Old")], 5).await.unwrap();
         upsert_tm_cars(&pool, &[car("Renamed")], 9).await.unwrap();
@@ -1873,6 +1910,9 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rows, vec![(10001, Some("Renamed".to_string()), 9)]);
+        let read = tm_cars(&pool).await.unwrap();
+        assert_eq!(read[0].trim_badging.as_deref(), Some("Long Range"));
+        assert_eq!(read[0].wheel_type, None);
     }
 
     #[tokio::test]
@@ -2012,7 +2052,7 @@ mod tests {
         let car = |id: i64, name: &str| TmCar {
             id,
             name: Some(name.to_string()),
-            model: None,
+            ..TmCar::default()
         };
         upsert_tm_cars(&pool, &[car(10001, "B"), car(1, "A")], 5)
             .await

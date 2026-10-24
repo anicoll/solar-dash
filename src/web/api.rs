@@ -13,7 +13,7 @@ use tracing::error;
 
 use super::AppState;
 use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, round2};
-use crate::cost::GridSplit;
+use crate::cost::{GridSplit, TariffSchedule};
 use crate::db::{self, LatestReading};
 use crate::ev_cost;
 use crate::modbus::{self, Sample};
@@ -489,7 +489,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
             .collect();
         let history = ev_cost::summarise_car(&prices, &petrol, &days, &charges);
         if history.first_day.is_some() {
-            cars.push((car, history));
+            cars.push((car, history, charges));
         }
     }
     // Newest car first.
@@ -498,16 +498,26 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
             .cmp(&a.1.first_day)
             .then_with(|| a.0.id.cmp(&b.0.id))
     });
-    let labels: Vec<String> = cars.iter().map(|(car, _)| car_label(car)).collect();
+    let labels: Vec<String> = cars.iter().map(|(car, _, _)| car_label(car)).collect();
+    let (plans, plan_of) = charging_plans(state.tariff.as_deref());
+    let summarise = |charges: &[ev_cost::CarCharge]| {
+        ev_cost::summarise_charging(&prices, &plans, &plan_of, charges)
+    };
+    let all_charges: Vec<ev_cost::CarCharge> = cars
+        .iter()
+        .flat_map(|(_, _, charges)| charges.iter().cloned())
+        .collect();
+    let combined = summarise(&all_charges);
     let cars: Vec<Value> = cars
         .iter()
         .zip(&labels)
-        .map(|((car, history), label)| {
+        .map(|((car, history, charges), label)| {
             let shared = labels.iter().filter(|other| *other == label).count() > 1;
             let label = match (&car.name, shared) {
                 (Some(name), true) => format!("{label} ({name})"),
                 _ => label.clone(),
             };
+            let summary = summarise(charges);
             json!({
                 "car_id": car.id,
                 "name": car.name,
@@ -517,14 +527,45 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
                 "last_day": history.last_day,
                 "total": history.total,
                 "months": history.months,
+                "trim": car.trim_badging,
+                "paint": car.exterior_color,
+                "wheels": car.wheel_type,
+                "marketing_name": car.marketing_name,
+                "compare_with": ev_cost::compare_with(&state.compare_cars, car.model.as_deref()),
+                "charging_by_plan": summary.charging_by_plan,
+                "away": summary.away,
+                "self_share_pct": summary.self_share_pct,
             })
         })
         .collect();
     Ok(Json(json!({
         "configured": petrol.is_configured(),
         "petrol_litres_per_100km": prices.petrol_litres_per_100km,
+        "petrol_grade": &*state.petrol_grade,
+        "charging_by_plan": combined.charging_by_plan,
+        "away": combined.away,
+        "self_share_pct": combined.self_share_pct,
         "cars": cars,
     })))
+}
+
+/// The plan names for `charging_by_plan`, oldest first, and which of them a
+/// local day ("YYYY-MM-DD") falls on. Without a `[tariff]` there is one plan,
+/// "Home charging" (nothing is costed then anyway).
+fn charging_plans(schedule: Option<&TariffSchedule>) -> (Vec<String>, impl Fn(&str) -> usize + '_) {
+    let plans = match schedule {
+        Some(schedule) => schedule
+            .plans()
+            .iter()
+            .map(|p| ev_cost::plan_label(p.name.as_deref(), p.from, p.until))
+            .collect(),
+        None => vec!["Home charging".to_string()],
+    };
+    let plan_of = move |day: &str| match (schedule, NaiveDate::parse_from_str(day, "%Y-%m-%d")) {
+        (Some(schedule), Ok(date)) => schedule.plan_index(date),
+        _ => 0,
+    };
+    (plans, plan_of)
 }
 
 /// "Model 3" for a car with a model, else its name, else "Car 1".

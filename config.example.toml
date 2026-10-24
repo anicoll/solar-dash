@@ -99,6 +99,14 @@ path = "data/solar.db"
 # petrol_cents_per_litre = 195.0
 # How much petrol a comparable petrol car uses per 100 km.
 # petrol_litres_per_100km = 6.9
+# Optional: the petrol car each TeslaMate model is compared with in the "EV
+# versus petrol" view (/api/ev/cars `compare_with`). The key is TeslaMate's
+# model string ("3", "Y", ...), the value any name you like. A model without
+# an entry has no comparison car. The one petrol_litres_per_100km above is
+# shared by all cars. Keep this before any [[teslamate.petrol_price]] table.
+# compare_cars = { "3" = "Hyundai i30 Sedan N", "Y" = "Toyota RAV4 GX 2WD" }
+# The grade of petrol the price is for; shown as `petrol_grade` by /api/ev/cars.
+# petrol_grade = "Unleaded 91"
 # A flat price per kWh for charging away from home (a public charger, say).
 # Without it, away sessions are listed as uncosted. Home is the geofence
 # "Home" (or no geofence at all).
@@ -155,6 +163,9 @@ path = "data/solar.db"
 # wrap past midnight (for example from = "21:00", to = "06:00"). If windows
 # overlap, the first one listed wins.
 # [tariff]
+# # Optional label for the plan, shown by /api/ev/cars (a [[previous_tariff]]
+# # has its own `name`). Without one the plan is called "Plan from <date>".
+# name = "GloBird ZeroHero"
 # supply_cents_per_day = 150.0
 # # Import price for any time not covered by an `import` window (shoulder).
 # default_import_cents = 40.0

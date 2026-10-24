@@ -15,6 +15,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Local Modbus reader (`modbus-test`) for live power from the inverter
 - [x] `serve` polls Modbus when configured and stores live samples (`/api/live`, `/api/live/series`)
 - [x] `serve` follows the Tesla's charge state from TeslaMate over MQTT when configured (`/api/live`)
+- [x] `/api/ev/cars` gives each TeslaMate car's details (trim, paint, wheels), home charging per plan, and a petrol comparison car; set `compare_cars` and `petrol_grade` in `[teslamate]`, for example `compare_cars = { "3" = "Hyundai i30 Sedan N", "Y" = "Toyota RAV4 GX 2WD" }` and `petrol_grade = "Unleaded 91"` (see `config.example.toml`)
 - [x] GloBird portal probe (`globird-probe`) to learn the response shapes (unofficial API)
 - [x] `serve` keeps GloBird's daily cost and usage in SQLite when configured (no API or UI yet)
 - [x] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
