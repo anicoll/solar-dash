@@ -364,6 +364,9 @@ fn login_html(error: Option<&str>) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>solar-dash login</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
   :root {{ color-scheme: light dark; --bg: #f5f6f8; --fg: #1b1f24; --muted: #5d6671;
           --card: #fff; --line: #d8dce2; --accent: #e8890c; --danger: #c0392b; }}
