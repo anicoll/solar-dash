@@ -632,25 +632,42 @@ table.data td.save { color: var(--save); }
 }
 .battery-stats .kpi .unit { font-family: var(--font); }
 
-/* ---------- Money: Cars ---------- */
-.car-section { display: flex; flex-direction: column; gap: 12px; padding-top: 16px; border-top: 1px solid var(--border); }
-.car-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 12px; }
+/* ---------- Money: EV vs petrol ---------- */
+.car-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+@media (min-width: 760px) { .car-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.car-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; min-width: 0; }
+.car-band { height: 6px; }
+.car-body { display: flex; flex-direction: column; gap: 14px; padding: 16px; }
+.car-body .panel-note, .car-split .panel-note { margin: 0; }
+.car-head { display: flex; flex-direction: column; gap: 2px; }
 .car-name { margin: 0; font-size: 17px; font-weight: 600; color: var(--fg); }
-.car-dates { font-size: 13px; color: var(--muted); }
-.car-saved { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 32px; font-weight: 600; line-height: 1.1; color: var(--save); }
-.car-saved .unit { font-family: var(--font); font-size: 15px; font-weight: 400; color: var(--muted); margin-left: 6px; }
-.car-stats { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; }
-@media (min-width: 760px) { .car-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; } }
-.car-stats .kpi { border-radius: 0; border-width: 0 0 1px; background: none; padding: 10px 0; flex-direction: row; flex-wrap: wrap; justify-content: space-between; align-items: baseline; }
-.car-stats .kpi:last-child { border-bottom: 0; }
-.car-stats .kpi .label { font-size: 15px; color: var(--fg-soft); }
-.car-stats .kpi .value { font-size: 18px; }
-.car-stats .kpi .unit { font-family: var(--font); }
-@media (min-width: 760px) {
-  .car-stats .kpi { border-width: 1px; border-radius: 12px; background: var(--panel-2); flex-direction: column; flex-wrap: nowrap; align-items: stretch; justify-content: flex-start; padding: 14px 16px; }
-  .car-stats .kpi:last-child { border-bottom-width: 1px; }
-  .car-stats .kpi .label { font-size: 13px; color: var(--muted); }
-  .car-stats .kpi .value { font-size: 22px; }
-}
-.car-chart { width: 100%; height: 200px; }
-.car-section .panel-note { margin: 0; }
+.car-kind { font-size: 13px; color: var(--muted); }
+.car-saved { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 34px; font-weight: 600; line-height: 1.1; color: var(--save); }
+.car-saved .unit { display: block; font-family: var(--font); font-size: 13px; font-weight: 400; color: var(--muted); margin: 4px 0 0; }
+.car-rows { display: flex; flex-direction: column; font-size: 14px; }
+.car-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 7px 0; border-top: 1px solid var(--border); }
+.car-row:first-child { border-top: 0; }
+.car-row-name { min-width: 0; overflow-wrap: anywhere; color: var(--fg-soft); }
+.car-row-detail { display: block; font-size: 12px; color: var(--muted); }
+.car-row-amount { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.car-row.ev .car-row-amount { color: var(--save); }
+.car-row.total { font-weight: 700; border-top: 1px solid var(--border-strong); }
+.car-row.total .car-row-name { color: var(--fg); }
+.car-row.muted .car-row-name, .car-row.muted .car-row-amount { color: var(--muted); }
+.car-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.car-metrics .kpi { padding: 10px; border-radius: 12px; background: var(--panel); }
+.car-metrics .kpi .label { font-size: 12px; }
+.car-metrics .kpi .value { font-size: 20px; }
+.car-metrics .kpi .unit { font-family: var(--font); font-size: 12px; margin-left: 2px; }
+.car-months summary, .car-how summary { cursor: pointer; font-weight: 600; min-height: 24px; }
+.car-months .table-wrap { margin-top: 8px; }
+table.car-table { min-width: 460px; font-size: 13px; }
+table.car-table th, table.car-table td { padding: 6px; }
+table.car-table tr.car-year th { text-align: left; color: var(--fg); font-weight: 600; padding-top: 12px; border-top: 1px solid var(--border); }
+.car-split, .car-how { background: var(--panel-2); border: 1px solid var(--border); border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.car-how h4 { margin: 10px 0 0; font-size: 14px; }
+.car-how p { margin: 0; color: var(--fg-soft); font-size: 14px; }
+.cards.car-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (min-width: 760px) { .cards.car-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+.car-tiles .kpi .value { font-size: 26px; }
+@media (min-width: 760px) { .car-tiles .kpi .value { font-size: 32px; } }

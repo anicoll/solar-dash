@@ -153,9 +153,44 @@ fn should_wait(coverage: f64, ended_at: i64, now: i64) -> bool {
 // One run
 // ---------------------------------------------------------------------------
 
-/// Reads TeslaMate's cars.
+/// The `cars` columns that describe how a car is specified. Some TeslaMate
+/// versions lack some of them.
+const CAR_DETAIL_COLUMNS: [&str; 4] = [
+    "trim_badging",
+    "exterior_color",
+    "wheel_type",
+    "marketing_name",
+];
+
+/// The query for TeslaMate's cars: the columns in [`CAR_DETAIL_COLUMNS`] that
+/// `existing` lists are selected, the others come back as NULL.
+fn cars_query(existing: &[String]) -> String {
+    let details: Vec<String> = CAR_DETAIL_COLUMNS
+        .iter()
+        .map(|col| {
+            if existing.iter().any(|e| e == col) {
+                format!("{col}::text AS {col}")
+            } else {
+                format!("NULL::text AS {col}")
+            }
+        })
+        .collect();
+    format!(
+        "SELECT id::bigint AS id, name, model, {} FROM cars ORDER BY id",
+        details.join(", ")
+    )
+}
+
+/// Reads TeslaMate's cars. The query is built from fixed column names only.
 async fn fetch_cars(pg: &PgPool) -> Result<Vec<TmCar>> {
-    let rows = sqlx::query("SELECT id::bigint AS id, name, model FROM cars ORDER BY id")
+    let existing: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+         WHERE table_name = 'cars' AND table_schema = ANY(current_schemas(false))",
+    )
+    .fetch_all(pg)
+    .await
+    .context("could not read the columns of TeslaMate's cars")?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(cars_query(&existing)))
         .fetch_all(pg)
         .await
         .context("could not read TeslaMate's cars")?;
@@ -165,6 +200,10 @@ async fn fetch_cars(pg: &PgPool) -> Result<Vec<TmCar>> {
                 id: row.try_get("id")?,
                 name: row.try_get("name")?,
                 model: row.try_get("model")?,
+                trim_badging: row.try_get("trim_badging")?,
+                exterior_color: row.try_get("exterior_color")?,
+                wheel_type: row.try_get("wheel_type")?,
+                marketing_name: row.try_get("marketing_name")?,
             })
         })
         .collect::<Result<_, sqlx::Error>>()
@@ -597,6 +636,20 @@ mod tests {
         assert!(!should_wait(1.0, recent, now));
         // After 3 days it is costed with what there is.
         assert!(!should_wait(0.0, old, now));
+    }
+
+    #[test]
+    fn cars_query_selects_only_the_columns_that_exist() {
+        let existing: Vec<String> = ["id", "name", "trim_badging", "wheel_type"]
+            .map(String::from)
+            .to_vec();
+        let query = cars_query(&existing);
+        assert!(query.contains("trim_badging::text AS trim_badging"));
+        assert!(query.contains("wheel_type::text AS wheel_type"));
+        // The ones this version lacks come back empty instead of failing.
+        assert!(query.contains("NULL::text AS exterior_color"));
+        assert!(query.contains("NULL::text AS marketing_name"));
+        assert!(cars_query(&[]).contains("NULL::text AS wheel_type"));
     }
 
     #[test]
