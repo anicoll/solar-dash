@@ -423,6 +423,20 @@ pub async fn inverter_settings_in_range(
     .context("could not read inverter settings")
 }
 
+/// The newest saved inverter settings with `ts < before`, or `None`.
+pub async fn inverter_settings_before(pool: &SqlitePool, before: i64) -> Result<Option<Settings>> {
+    sqlx::query_as(
+        "SELECT ts, ems_mode, forced_command, forced_power_w, max_soc_pct,
+                min_soc_pct, export_limit_w, export_limit_enabled, backup_reserve_pct,
+                max_charge_w, max_discharge_w, running_state
+         FROM inverter_settings WHERE ts < ? ORDER BY ts DESC LIMIT 1",
+    )
+    .bind(before)
+    .fetch_optional(pool)
+    .await
+    .context("could not read inverter settings")
+}
+
 /// Live samples with `from <= ts < to`, averaged into 1-minute buckets,
 /// oldest first. Each returned `ts` is the start of its minute. A column
 /// that is NULL for the whole minute stays `None`.
@@ -1718,6 +1732,23 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn inverter_settings_before_is_strictly_earlier() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(inverter_settings_before(&pool, 1000).await.unwrap(), None);
+        for ts in [100, 200, 300] {
+            insert_inverter_settings(&pool, &settings(ts, 0))
+                .await
+                .unwrap();
+        }
+        // A row at exactly `before` does not count.
+        let row = inverter_settings_before(&pool, 300).await.unwrap();
+        assert_eq!(row.map(|r| r.ts), Some(200));
+        let row = inverter_settings_before(&pool, 301).await.unwrap();
+        assert_eq!(row.map(|r| r.ts), Some(300));
+        assert_eq!(inverter_settings_before(&pool, 100).await.unwrap(), None);
     }
 
     #[tokio::test]

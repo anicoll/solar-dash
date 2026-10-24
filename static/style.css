@@ -490,7 +490,13 @@ table.tariff-table tfoot td { font-weight: 700; border-top: 1px solid var(--bord
 .ts-peak { background: #4a2228; color: #ffb3ba; }
 .ts-feed { background: #2b2440; color: #c9a0ff; }
 .ts-super { background: #4b3a78; color: #efe3ff; }
-.trow:last-child .ts-base { background: var(--panel-2); color: var(--muted); }
+.trow.sell .ts-base { background: var(--panel-2); color: var(--muted); }
+/* Battery row: forced control shows in the battery colours; self-consumption stays blank. */
+.tbat { background: var(--panel-2); }
+.tb-charge { background: var(--batt-in); color: var(--bg); }
+.tb-discharge { background: var(--batt-out); color: var(--bg); }
+.tb-stop, .tb-other { background: repeating-linear-gradient(45deg, var(--track) 0 4px, var(--panel-2) 4px 8px); color: var(--fg-soft); }
+.tlegend { display: flex; flex-wrap: wrap; gap: 4px 16px; }
 @media (min-width: 760px) { .chart.tall { height: 420px; } }
 .source { margin: 4px 4px 2px; color: var(--muted); font-size: 13px; }
 .empty {

@@ -1353,7 +1353,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             body_json(response).await,
-            serde_json::json!({ "changes": [] })
+            serde_json::json!({ "changes": [], "previous": null })
         );
         let response = send(
             &app,

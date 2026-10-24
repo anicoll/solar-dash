@@ -978,9 +978,17 @@
     const tf = dayTariff(tariff);
     if (!current()) return;
     const merged = mergeDay(day.series, live);
+    // The battery control history arrives later and must not hold the chart up.
+    let history = null;
     // Kept so the Smooth toggle can redraw without refetching.
-    dayDraws[chartId] = () => drawDayChart(chartId, noteId, date, day, merged, charging, tf);
-    drawDayChart(chartId, noteId, date, day, merged, charging, tf);
+    const draw = () => drawDayChart(chartId, noteId, date, day, merged, charging, tf, history);
+    dayDraws[chartId] = draw;
+    draw();
+    const found = await quiet(api(`/api/inverter/history?from=${day.start}&to=${day.end}`));
+    if (found && current() && dayDraws[chartId] === draw) {
+      history = found;
+      draw();
+    }
   }
 
   /**
@@ -1088,16 +1096,54 @@
     return { text: `Shoulder ${cents(imp ? imp.cents : tf.shoulderCents)} · ${sell}`, kind: 'shoulder' };
   }
 
+  /**
+   * The battery's control state across [start, end] ms, from /api/inverter/history
+   * (`previous` is the setting in force at the start; `changes` are newest first).
+   * Returns [{from, to, kind, label}] oldest first, kind being charge, discharge,
+   * stop, self, other, or none (mode unknown). Time before the first known
+   * setting is left out.
+   */
+  function batterySegments(history, start, end) {
+    if (!history) return [];
+    const entries = [...(history.changes || [])].reverse()
+      .map((s) => ({ s, at: s.ts * 1000 }));
+    if (history.previous) entries.unshift({ s: history.previous, at: start });
+    const out = [];
+    entries.forEach(({ s, at }, i) => {
+      const from = Math.max(at, start);
+      const to = Math.min(i + 1 < entries.length ? entries[i + 1].at : end, end);
+      if (to <= from) return;
+      const power = kwText(s.forced_power_w);
+      const atPower = power ? ` at ${power}` : '';
+      let seg;
+      if (s.ems_mode == null) seg = { kind: 'none', label: '' };
+      else if (s.ems_mode === 0) seg = { kind: 'self', label: 'Self-consumption' };
+      // 2 is the inverter's forced (compulsory) mode.
+      else if (s.ems_mode !== 2 || s.forced_command == null) seg = { kind: 'other', label: s.ems_mode_label };
+      else if (s.forced_command === 0xAA) seg = { kind: 'charge', label: `Forced charge${atPower}` };
+      else if (s.forced_command === 0xBB) seg = { kind: 'discharge', label: `Forced discharge${atPower}` };
+      else seg = { kind: 'stop', label: 'Forced stop' };
+      const last = out[out.length - 1];
+      if (last && last.to === from && last.label === seg.label) last.to = to;
+      else out.push({ from, to, ...seg });
+    });
+    return out;
+  }
+
   const STRIP_LEFT = 52;  // px between the chart's left edge and the plot: the kW labels, and "Buy"/"Sell" below
   const STRIP_RIGHT = 44; // and on the right, for the SOC labels
 
-  /** Fills the two-row tariff strip under the chart, covering [start, max] ms of `date`. */
-  function drawTariffStrip(strip, date, start, max, gl, gr, tf) {
+  /**
+   * Fills the strip under the chart, covering [start, max] ms of `date`: the Buy and Sell
+   * rows (when `tf` is set) and a Battery row of forced-control times (when `battery`,
+   * from batterySegments, has any).
+   */
+  function drawTariffStrip(strip, date, start, max, gl, gr, tf, battery) {
     strip.style.setProperty('--gl', `${gl}px`);
     strip.style.setProperty('--gr', `${gr}px`);
     const plotW = $('day-chart').clientWidth - gl - gr;
-    const { buy, sell } = tariffSegments(tf);
-    const rows = [['Buy', buy], ['Sell', sell]].map(([name, segs]) => {
+    const { buy, sell } = tf ? tariffSegments(tf) : { buy: [], sell: [] };
+    const rows = (tf ? [['Buy', buy], ['Sell', sell]] : []).map(([name, segs]) => {
       const cells = segs.map((s) => {
         const a = Math.max(adelaideMs(date, s.from), start);
         const b = Math.min(adelaideMs(date, s.to), max);
@@ -1107,17 +1153,38 @@
         const kind = s.name === 'Free' ? 'free' : s.name === 'Peak' ? 'peak' : s.name === 'Super Export' ? 'super' : s.name === 'Feed-in' ? 'feed' : 'base';
         return `<span class="ts-${kind}" style="width:${frac * 100}%" title="${esc(s.text)}">${fits ? esc(s.text) : ''}</span>`;
       });
-      return `<div class="trow"><b>${name}</b><div class="ttrack">${cells.join('')}</div></div>`;
+      return `<div class="trow${name === 'Sell' ? ' sell' : ''}"><b>${name}</b><div class="ttrack">${cells.join('')}</div></div>`;
     });
     // A kWh-based tier is not a time window, so it gets a note instead of a segment.
-    if (tf.exportTier) {
+    if (tf && tf.exportTier) {
       rows.push(`<div class="tnote">${esc(`first ${+tf.exportTier.first_kwh_per_day.toFixed(2)} kWh a day: ${cents(tf.exportTier.cents)}`)}</div>`);
+    }
+    // Normal days are all self-consumption, so the Battery row only appears for anything else.
+    if (battery.some((g) => g.kind !== 'self' && g.kind !== 'none')) {
+      const span = max - start;
+      const track = [];
+      let at = start;
+      for (const g of battery) {
+        // Time before the first known setting stays empty.
+        if (g.from > at) track.push(`<span style="width:${(g.from - at) / span * 100}%"></span>`);
+        at = g.to;
+        const frac = (g.to - g.from) / span;
+        const tip = g.kind === 'none' || g.kind === 'self' ? g.label
+          : `${g.label}, ${clock(g.from)}\u2013${clock(g.to)}`;
+        const fits = g.kind !== 'self' && frac * plotW >= g.label.length * 6.5 + 10;
+        track.push(`<span class="tb-${g.kind}" style="width:${frac * 100}%" title="${esc(tip)}">${fits ? esc(g.label) : ''}</span>`);
+      }
+      rows.push(`<div class="trow"><b>Battery</b><div class="ttrack tbat">${track.join('')}</div></div>`);
+      const kinds = [['charge', 'Forced charge'], ['discharge', 'Forced discharge'], ['stop', 'Forced stop'], ['other', 'Other mode']];
+      const keys = kinds.filter(([k]) => battery.some((g) => g.kind === k))
+        .map(([k, name]) => `<span class="lg"><span class="lg-sw tb-${k}" aria-hidden="true"></span>${name}</span>`);
+      rows.push(`<div class="tnote tlegend">${keys.join('')}</div>`);
     }
     strip.innerHTML = rows.join('');
   }
 
   /** Draws the power chart from fetched data, smoothed when the toggle is on. */
-  function drawDayChart(chartId, noteId, date, day, { byKey, source }, charging, tf) {
+  function drawDayChart(chartId, noteId, date, day, { byKey, source }, charging, tf, history) {
     const start = day.start * 1000;
     const isToday = date === todayStr();
     // Today stops at now (at least 15 minutes in, so the first minutes still draw).
@@ -1265,8 +1332,10 @@
         ? `Power chart for ${date}: peak solar ${kw(peakKw)} kW; solar, home, battery (supplying or charging) and grid (buying or selling) in kW, battery state of charge in percent.`
         : `Power chart for ${date}: no data`);
     const strip = $('day-strip');
-    strip.hidden = !hasData || !tf;
-    if (hasData && tf) drawTariffStrip(strip, date, start, end, gl, gr, tf);
+    const battery = hasData ? batterySegments(history, start, end) : [];
+    const showBattery = battery.some((g) => g.kind !== 'self' && g.kind !== 'none');
+    strip.hidden = !hasData || !(tf || showBattery);
+    if (!strip.hidden) drawTariffStrip(strip, date, start, end, gl, gr, tf, battery);
   }
 
   // ---------- History: periods, date pill, cards ----------
