@@ -20,6 +20,7 @@
     <nav class="tabs" aria-label="Views">
       <a class="tab" href="#money" data-view="money">Money</a>
       <a class="tab" href="#payback" data-view="payback">Payback</a>
+      <a class="tab" href="#cars" data-view="cars">Cars</a>
     </nav>
     <form method="post" action="/logout" class="logout">
       <button type="submit" class="btn">Log out</button>
@@ -230,6 +231,16 @@
       </details>
     </div>
   </section>
+
+  <section id="view-cars" class="view" aria-labelledby="h-cars" hidden>
+    <h2 id="h-cars" class="page-title">EV vs petrol</h2>
+    <p id="cars-empty" class="panel notice" hidden>No TeslaMate history yet, so there is nothing to compare with petrol.</p>
+    <p id="cars-unconfigured" class="panel notice" hidden></p>
+    <div id="cars-body" class="view-body" hidden>
+      <p id="cars-sub" class="pb-headline"></p>
+      <div id="cars-list" class="view-body"></div>
+    </div>
+  </section>
   <section id="view-money" class="view" aria-labelledby="h-money" hidden>
     <h2 id="h-money" class="sr-only">Money</h2>
     <div class="picker seg" role="group" aria-label="Period">
@@ -357,14 +368,6 @@
             <button type="button" class="btn" id="battery-more" aria-expanded="false" aria-controls="battery-table" hidden></button>
           </div>
           <p class="panel-note">Credits are from GloBird's bill where it has posted the day, otherwise our estimate. The reason is our best guess.</p>
-        </div>
-      </section>
-      <section class="panel" id="cars-card" aria-labelledby="h-cars" hidden>
-        <h2 id="h-cars" class="panel-title">EV vs petrol</h2>
-        <p id="cars-sub" class="panel-note"></p>
-        <p id="cars-unconfigured" class="panel-note" hidden></p>
-        <div id="cars-body" class="view-body">
-          <div id="cars-list" class="view-body"></div>
         </div>
       </section>
       <details class="panel how">
