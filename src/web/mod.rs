@@ -39,7 +39,7 @@ use crate::bills::PastBill;
 use crate::config::Config;
 use crate::cost::TariffSchedule;
 use crate::ev_cost::{CostSetup, EvPrices};
-use crate::modbus::Latest;
+use crate::modbus::{Latest, LatestSettings};
 use crate::petrol_prices::PetrolPrices;
 use crate::teslamate::Car;
 use auth::LockoutMap;
@@ -77,6 +77,8 @@ pub struct AppState {
     api_token: Option<Arc<str>>,
     /// The newest Modbus sample, kept by the poller.
     latest: Latest,
+    /// The inverter's control settings, kept by the poller.
+    latest_settings: LatestSettings,
     /// The car's charge state from TeslaMate, kept by the MQTT task.
     car: Car,
     /// The parsed `[tariff]` and `[[previous_tariff]]` sections; `None` turns the cost API off.
@@ -123,6 +125,7 @@ impl AppState {
             cookie_secure: true,
             api_token: None,
             latest: Latest::default(),
+            latest_settings: LatestSettings::default(),
             car: Car::default(),
             tariff: None,
             ev_prices: EvPrices::default(),
@@ -192,6 +195,11 @@ impl AppState {
     /// The slot the Modbus poller writes its newest sample to.
     pub fn latest(&self) -> Latest {
         self.latest.clone()
+    }
+
+    /// The slot the Modbus poller writes the inverter's settings to.
+    pub fn latest_settings(&self) -> LatestSettings {
+        self.latest_settings.clone()
     }
 
     /// The slot the TeslaMate task writes the car's state to.
@@ -310,6 +318,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/latest", get(api::latest))
         .route("/api/live", get(api::live))
         .route("/api/live/series", get(api::live_series))
+        .route("/api/inverter", get(api::inverter))
         .route("/api/ev/sessions", get(api::ev_sessions))
         .route("/api/ev/summary", get(api::ev_summary))
         .route("/api/ev/cars", get(api::ev_cars))
@@ -1287,6 +1296,21 @@ mod tests {
         assert_eq!(
             body_json(response).await,
             serde_json::json!({ "sample": null, "car": null })
+        );
+    }
+
+    #[tokio::test]
+    async fn inverter_needs_a_session_and_is_null_without_data() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/inverter", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/inverter", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "settings": null })
         );
     }
 

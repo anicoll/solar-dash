@@ -23,6 +23,10 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 
 One binary does everything. A background sync task fetches data from iSolarCloud and writes it to SQLite. If a `[modbus]` section is configured, a second task also reads live power from the inverter over the local network. An axum web server reads only from SQLite and serves an embedded static dashboard (plain HTML/CSS/JS, no build step); the web side never calls iSolarCloud directly. This keeps us well inside the API limits of 2,000 calls per hour and 100,000 per month.
 
+### Inverter settings
+
+With a `[modbus]` section, the poller also reads the inverter's control settings (EMS mode, forced charge/discharge command, battery SOC limits, export limit, backup reserve, charge/discharge power limits and running state) about once a minute. They show in the "Inverter" panel on the home page and at `GET /api/inverter`, which returns `{"settings": {...}}` with raw values and labels, or `{"settings": null}` when there is no recent reading. This is read-only: the program never writes to the inverter. Some WiNet-S firmware refuses a few of these registers; then only those values show as n/a. `modbus-test` prints the settings too.
+
 ## Running it
 
 See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC, systemd, Cloudflare Tunnel), see [docs/deploy.md](docs/deploy.md).

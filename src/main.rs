@@ -180,9 +180,12 @@ async fn run_serve(config: Config) -> Result<()> {
     // The Modbus poller only runs if there is a [modbus] section. Otherwise
     // this future finishes at once, which `try_join!` is happy with.
     let latest = state.latest();
+    let latest_settings = state.latest_settings();
     let poll_modbus = async {
         match config.modbus.clone() {
-            Some(modbus) => modbus::run_poll(modbus, &pool, latest, shutdown_signal()).await,
+            Some(modbus) => {
+                modbus::run_poll(modbus, &pool, latest, latest_settings, shutdown_signal()).await
+            }
             None => Ok(()),
         }
     };
@@ -343,6 +346,7 @@ async fn modbus_test(config: Config, watch: bool) -> Result<()> {
     if !watch {
         let sample = reader.read_sample().await?;
         println!("{}", modbus::describe(&sample));
+        print_settings(&mut reader).await;
         return Ok(());
     }
 
@@ -354,6 +358,8 @@ async fn modbus_test(config: Config, watch: bool) -> Result<()> {
         "Reading every {}s. Press Ctrl+C to stop.",
         interval.as_secs()
     );
+    // The settings change rarely, so they are only shown once, at the start.
+    print_settings(&mut reader).await;
     // Pinning lets `select!` poll the same future in every round.
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -382,6 +388,15 @@ async fn modbus_test(config: Config, watch: bool) -> Result<()> {
     }
     println!("{tally}");
     Ok(())
+}
+
+/// Prints the inverter's control settings, or why they could not be read.
+/// Settings are a bonus here, so a failure does not fail the test.
+async fn print_settings(reader: &mut modbus::Reader) {
+    match reader.read_settings().await {
+        Ok(settings) => println!("{}", modbus::describe_settings(&settings)),
+        Err(err) => println!("Settings read failed: {err:#}"),
+    }
 }
 
 /// Logs in, lists the plants and prints a short summary.
