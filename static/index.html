@@ -176,30 +176,57 @@
     <h2 id="h-payback" class="page-title">Has it paid for itself?</h2>
     <p id="payback-unconfigured" class="panel notice" hidden></p>
     <div id="payback-body" class="view-body" hidden>
-      <div class="cards three" id="payback-cards"></div>
+      <p id="payback-headline" class="pb-headline"></p>
+      <section class="pb-status" id="payback-status" aria-label="Payback status"></section>
+      <div class="cards tiles" id="payback-cards"></div>
       <section class="panel" aria-labelledby="h-net">
         <h2 id="h-net" class="panel-title">Net position over time</h2>
         <div class="card flat">
-          <div id="payback-chart" class="chart" role="img" aria-label="Net position over time"></div>
+          <div id="payback-chart" class="chart tall" role="img" aria-label="Net position over time"></div>
           <p id="payback-empty" class="empty" hidden>No data yet</p>
         </div>
       </section>
-      <section class="stack" aria-labelledby="h-bought">
-        <h2 id="h-bought" class="panel-title">What you bought</h2>
+      <section class="stack" aria-labelledby="h-parts">
+        <h2 id="h-parts" class="panel-title">Each part</h2>
         <div class="parts" id="payback-parts"></div>
+        <p id="payback-parts-note" class="panel-note" hidden></p>
       </section>
-      <section class="panel" aria-labelledby="h-years">
-        <h2 id="h-years" class="panel-title">Savings by year</h2>
-        <div class="table-wrap">
-          <table class="data" id="payback-years">
-            <thead><tr><th scope="col">Year</th><th scope="col">Saved</th><th scope="col">Days with data</th><th scope="col">Average a day</th></tr></thead>
-            <tbody></tbody>
-          </table>
+      <section class="panel stack" aria-labelledby="h-years">
+        <h2 id="h-years" class="panel-title">Saved each year</h2>
+        <div class="card flat">
+          <div id="payback-years-chart" class="chart" role="img" aria-label="Dollars saved each year"></div>
+          <p id="payback-years-empty" class="empty" hidden>No data yet</p>
         </div>
+        <p id="payback-years-note" class="panel-note" hidden>* Part of a year.</p>
+        <details class="years-table">
+          <summary>Table</summary>
+          <div class="table-wrap">
+            <table class="data" id="payback-years">
+              <thead><tr><th scope="col">Year</th><th scope="col">Saved</th><th scope="col">Days with data</th><th scope="col">Average a day</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
+      <section class="panel stack" aria-labelledby="h-timeline">
+        <h2 id="h-timeline" class="panel-title">Timeline</h2>
+        <ol class="timeline" id="payback-timeline"></ol>
       </section>
       <details class="panel how">
         <summary>How this is calculated</summary>
-        <p>Each day's saving is what that day's usage would have cost on your tariff with no solar or battery, minus what you actually paid, including credits and feed-in. Purchases are entered in the config file. The projection extends the last 12 months of savings, assuming electricity prices (and so the savings) rise by a set percentage each year: <code>price_rise_percent</code> in the <code>[system]</code> section of the config file, 3 by default.</p>
+        <h3>Assumptions</h3>
+        <ul>
+          <li>Power only. Car fuel savings are on the Money tab.</li>
+          <li>Without the system, the house would have bought every kWh on the plan of the day.</li>
+          <li>The projection uses the last 12 months of savings, rising <span id="payback-rise">3%</span> a year (<code>price_rise_percent</code> in the <code>[system]</code> section of the config file).</li>
+          <li>Dollars include GST.</li>
+        </ul>
+        <h3>Data notes</h3>
+        <ul>
+          <li>Bill days use the bills file totals.</li>
+          <li>GloBird days use GloBird's billed figures.</li>
+          <li>Other days are our estimate from iSolarCloud and the inverter.</li>
+        </ul>
       </details>
     </div>
   </section>
