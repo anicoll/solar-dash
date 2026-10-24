@@ -3314,7 +3314,6 @@
     const cars = data.cars;
     const sum = (f) => cars.reduce((a, c) => a + (f(c) || 0), 0);
     const saved = sum((c) => c.total.with_system.saved);
-    setCardSummary('cars-card', `Saved ${carMoney(saved)}`);
     const away = data.away;
     const homeCost = sum((c) => c.total.with_system.charging_cost - (c.total.away_cost || 0));
     const awayNote = away && away.cost == null && away.kwh > 0 ? 'away not priced' : `away ${carMoney(away && away.cost)}`;
@@ -3354,18 +3353,19 @@
     $('cars-list').replaceChildren(...out);
   }
 
-  /** The EV vs petrol card. It stays hidden when there is no TeslaMate history (or the request fails). */
-  async function loadCarsCard(mode, when) {
+  /** The Cars tab: the EV vs petrol card, or a short notice when there is no TeslaMate history (or the request fails). */
+  async function loadCarsView() {
     const data = await quiet(api('/api/ev/cars'));
-    if (state.view !== 'money' || state.mode !== mode || state.when !== when) return;
-    $('cars-card').hidden = !data || !Array.isArray(data.cars) || data.cars.length === 0;
-    if ($('cars-card').hidden) return;
+    if (state.view !== 'cars') return;
+    const has = !!data && Array.isArray(data.cars) && data.cars.length > 0;
+    $('cars-empty').hidden = has;
+    if (!has) {
+      $('cars-unconfigured').hidden = true;
+      $('cars-body').hidden = true;
+      return;
+    }
     carsData = data;
-    $('cars-sub').hidden = !data.configured;
-    $('cars-unconfigured').textContent = NOT_CONFIGURED_PETROL;
-    $('cars-unconfigured').hidden = data.configured;
-    $('cars-body').hidden = !data.configured;
-    if (!data.configured) setCardSummary('cars-card', '');
+    setConfigured('cars', data.configured, NOT_CONFIGURED_PETROL);
     if (data.configured) renderCars();
   }
 
@@ -3376,7 +3376,7 @@
   const FOLD_CARDS = [
     ['money-bill-card', 'h-bill'], ['money-sources-card', 'h-sources'], ['money-chart-card', 'money-chart-title'],
     ['money-car', 'money-car-title'], ['money-sessions', 'h-moneyev'], ['bill-check', 'h-billcheck'],
-    ['battery-card', 'h-battery'], ['cars-card', 'h-cars'],
+    ['battery-card', 'h-battery'],
   ];
   /** The jump chips: [card id, title element id, fixed label (when the title is long or changes)]. */
   const JUMP_LINKS = [['money-hero', 'h-moneysaved'], ...FOLD_CARDS.map((c) => (c[0] === 'money-car' ? [...c, 'Car'] : c))];
@@ -3533,13 +3533,12 @@
     await loadMoneyCar(mode, when, p);
     await loadBillCheck(mode, when, p);
     await loadBatteryCard(mode, when);
-    await loadCarsCard(mode, when);
   }
 
   // ---------- routing (hash) ----------
 
   // Home is the Now content with History below it; Day, Month and Year are History's periods.
-  const VIEWS = ['home', 'money', 'payback'];
+  const VIEWS = ['home', 'money', 'payback', 'cars'];
   const PERIODS = ['day', 'week', 'month', 'year', 'lifetime', 'custom'];
   let period = 'day'; // the period History opens on: the last one shown
   // Money's `mode` is month, year or all; `when` is its month (2026-09) or year (2025).
@@ -3631,6 +3630,7 @@
     document.getElementById('view-home').hidden = !home;
     document.getElementById('view-money').hidden = state.view !== 'money';
     document.getElementById('view-payback').hidden = state.view !== 'payback';
+    document.getElementById('view-cars').hidden = state.view !== 'cars';
     closePop(false);
     const brand = document.querySelector('.brand');
     if (home) brand.setAttribute('aria-current', 'page');
@@ -3660,6 +3660,7 @@
     if (home) {
       guarded(() => loadHistory());
     } else if (state.view === 'money') guarded(() => loadMoneyView(state.mode, state.when));
+    else if (state.view === 'cars') guarded(() => loadCarsView());
     else guarded(() => loadPaybackView());
   }
 

@@ -133,7 +133,7 @@ it on the server too.
 ### Dashboard views
 
 The home page (the solar-dash name at the top left) shows Now, with History
-below it; the tabs are Money and Payback. History has Day, Week
+below it; the tabs are Money, Payback and Cars (EV vs petrol). History has Day, Week
 (Monday to Sunday), Month, Year, Lifetime and Custom tabs, a date pill with a
 picker, and four total cards above the chart. The address keeps the period
 (`#day=2026-10-20`, `#week=2026-10-19`, `#month=2026-10`, `#year=2026`,
