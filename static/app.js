@@ -302,25 +302,27 @@
     return (data && data.settings) || null;
   }
 
+  const kwText = (w) => (w == null ? null : `${(w / 1000).toFixed(1)} kW`);
+
+  /** The inverter's mode as text, e.g. "Self-consumption" or "Forced: charging at 8.0 kW"; null if unknown. */
+  function inverterModeText(s) {
+    if (s.ems_mode == null) return null;
+    // 2 is the inverter's forced (compulsory) mode.
+    if (s.ems_mode !== 2 || s.forced_command == null) return s.ems_mode_label;
+    const power = kwText(s.forced_power_w);
+    const at = power ? ` at ${power}` : '';
+    return s.forced_command === 0xAA ? `Forced: charging${at}`
+      : s.forced_command === 0xBB ? `Forced: discharging${at}`
+      : s.forced_command === 0xCC ? 'Forced: stopped'
+      : `Forced: ${s.forced_command_label}`;
+  }
+
   /** Fills the Inverter panel; the panel is hidden when there are no settings. */
   function renderInverter(s) {
     $('inverter').hidden = !s;
     if (!s) return;
     const na = 'n/a';
-    const kwText = (w) => (w == null ? null : `${(w / 1000).toFixed(1)} kW`);
-    let mode = na;
-    if (s.ems_mode != null) {
-      mode = s.ems_mode_label;
-      // 2 is the inverter's forced (compulsory) mode.
-      if (s.ems_mode === 2 && s.forced_command != null) {
-        const power = kwText(s.forced_power_w);
-        const at = power ? ` at ${power}` : '';
-        mode = s.forced_command === 0xAA ? `Forced: charging${at}`
-          : s.forced_command === 0xBB ? `Forced: discharging${at}`
-          : s.forced_command === 0xCC ? 'Forced: stopped'
-          : `Forced: ${s.forced_command_label}`;
-      }
-    }
+    const mode = inverterModeText(s) || na;
     const pct = (v) => (v == null ? null : `${Math.round(v)}%`);
     const [lo, hi, reserve] = [pct(s.min_soc_pct), pct(s.max_soc_pct), pct(s.backup_reserve_pct)];
     const battery = lo || hi || reserve
@@ -339,6 +341,51 @@
       ['Export limit', exportText],
     ];
     $('inverter-rows').replaceChildren(...rows.flatMap(([k, v]) => [el('dt', null, k), el('dd', null, v)]));
+  }
+
+  const INVERTER_CHANGES_SHOWN = 10;
+  const INVERTER_CHANGES_EVERY_MS = 5 * 60 * 1000; // the list changes rarely
+  let inverterChangesAt = 0; // when the list was last fetched
+
+  /** What changed from `old` (the previous entry) to `s`, as short phrases. */
+  function inverterChangeParts(s, old) {
+    const parts = [];
+    const pair = (name, a, b) => { if (a != null && b != null && a !== b) parts.push(`${name} ${a} \u2192 ${b}`); };
+    pair('Mode', inverterModeText(old), inverterModeText(s));
+    pair('Inverter state', old.running_state_label, s.running_state_label);
+    const pct = (v) => (v == null ? null : `${Math.round(v)}%`);
+    pair('Backup reserve', pct(old.backup_reserve_pct), pct(s.backup_reserve_pct));
+    pair('Min SOC', pct(old.min_soc_pct), pct(s.min_soc_pct));
+    pair('Max SOC', pct(old.max_soc_pct), pct(s.max_soc_pct));
+    pair('Charge limit', kwText(old.max_charge_w), kwText(s.max_charge_w));
+    pair('Discharge limit', kwText(old.max_discharge_w), kwText(s.max_discharge_w));
+    pair('Export limit', kwText(old.export_limit_w), kwText(s.export_limit_w));
+    if (old.export_limit_enabled != null && s.export_limit_enabled != null
+      && old.export_limit_enabled !== s.export_limit_enabled) {
+      parts.push(`Export limit ${s.export_limit_enabled ? 'on' : 'off'}`);
+    }
+    return parts;
+  }
+
+  /** Fills the "Recent changes" list from /api/inverter/history, at most every 5 minutes. */
+  async function refreshInverterChanges() {
+    if (Date.now() - inverterChangesAt < INVERTER_CHANGES_EVERY_MS) return;
+    inverterChangesAt = Date.now();
+    const data = await quiet(api('/api/inverter/history'));
+    // Newest first; the entry after the last one shown is what it is compared with.
+    const list = (data && data.changes) || [];
+    const shown = list.slice(0, INVERTER_CHANGES_SHOWN);
+    $('inverter-changes').hidden = shown.length === 0;
+    const items = shown.map((s, i) => {
+      const old = list[i + 1];
+      const parts = old ? inverterChangeParts(s, old)
+        : [`Mode ${inverterModeText(s) || 'n/a'}`, `Inverter state ${s.running_state == null ? 'n/a' : s.running_state_label}`];
+      const li = el('li');
+      li.append(el('span', 'inv-change-time', fmtLong.format(new Date(s.ts * 1000))),
+        el('span', null, parts.join(', ') || 'Other settings changed'));
+      return li;
+    });
+    $('inverter-changes-list').replaceChildren(...items);
   }
 
   /** A power tile: coloured label, big value, optional extra node underneath. */
@@ -764,6 +811,7 @@
     if (state.view !== 'home') return LIVE_REFRESH_MS;
     renderHero(savings);
     renderInverter(inverter);
+    refreshInverterChanges().catch(() => {}); // not awaited: it must not slow the live refresh
     const todayTotals = daily.days[0] || {};
     renderToday(todayTotals,
       savings && savings.configured ? savings.days.find((d) => d.date === today) : null);

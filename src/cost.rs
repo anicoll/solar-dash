@@ -237,6 +237,13 @@ impl Tariff {
         (0..24 * 60).map(|m| self.import_cents_at(m)).sum::<f64>() / (24.0 * 60.0)
     }
 
+    /// The highest import price at any time of day, in cents per kWh.
+    pub fn peak_import_cents(&self) -> f64 {
+        (0..24 * 60)
+            .map(|m| self.import_cents_at(m))
+            .fold(f64::MIN, f64::max)
+    }
+
     /// Cents per kWh paid to import at this local time (minutes since midnight).
     pub fn import_cents_at(&self, minute_of_day: u32) -> f64 {
         price_at(&self.import, self.default_import_cents, minute_of_day)
@@ -351,14 +358,9 @@ impl TariffSchedule {
     /// so an error here means the config was built some other way.
     pub fn from_config(
         current: &config::Tariff,
-        previous: &[config::PreviousTariff],
+        previous_cfg: &[config::PreviousTariff],
     ) -> Result<Self> {
-        let names = previous
-            .iter()
-            .map(|p| p.name.clone())
-            .chain([current.name.clone()])
-            .collect();
-        let previous = previous
+        let previous = previous_cfg
             .iter()
             .enumerate()
             .map(|(i, p)| {
@@ -373,6 +375,11 @@ impl TariffSchedule {
             previous.windows(2).all(|pair| pair[0].0 < pair[1].0),
             "[[previous_tariff]] `until` days must increase"
         );
+        let names = previous_cfg
+            .iter()
+            .map(|p| p.name.clone())
+            .chain([current.name.clone()])
+            .collect();
         Ok(Self {
             previous,
             current: Tariff::from_config(current)?,
@@ -391,7 +398,7 @@ impl TariffSchedule {
     }
 
     /// Every plan, oldest first, with the days it applied.
-    pub fn plans(&self) -> Vec<PlanSpan> {
+    pub fn plan_spans(&self) -> Vec<PlanSpan> {
         let mut from = None;
         let mut spans = Vec::new();
         for (i, name) in self.names.iter().enumerate() {
@@ -404,6 +411,19 @@ impl TariffSchedule {
             from = until.and_then(|u| u.succ_opt());
         }
         spans
+    }
+
+    /// Each plan, oldest first, as the first local day it applied and its
+    /// name. The first plan has no known start (`None`); every later one
+    /// starts the day after the one before ended.
+    pub fn plans(&self) -> Vec<(Option<NaiveDate>, Option<&str>)> {
+        let starts = std::iter::once(None)
+            .chain(self.previous.iter().map(|(until, _)| until.succ_opt()))
+            .take(self.names.len());
+        starts
+            .zip(&self.names)
+            .map(|(start, name)| (start, name.as_deref()))
+            .collect()
     }
 
     /// The plan in effect on this local day: the first previous plan whose
@@ -690,6 +710,63 @@ mod tests {
     }
 
     #[test]
+    fn peak_import_is_the_dearest_price_of_the_day() {
+        assert_eq!(zerohero().peak_import_cents(), 60.0);
+        // A window shadowed by an earlier one does not count.
+        let t = tariff(
+            r#"
+            [tariff]
+            supply_cents_per_day = 0.0
+            default_import_cents = 30.0
+            import = [
+              { from = "09:00", to = "13:00", cents = 1.0 },
+              { from = "10:00", to = "12:00", cents = 99.0 },
+            ]
+            "#,
+        );
+        assert_eq!(t.peak_import_cents(), 30.0);
+    }
+
+    #[test]
+    fn plans_list_their_start_days_and_names() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: config::Tariff,
+            previous_tariff: Vec<config::PreviousTariff>,
+        }
+        let w: Wrapper = toml::from_str(
+            r#"
+            [tariff]
+            name = "Now"
+            supply_cents_per_day = 100.0
+            default_import_cents = 30.0
+            [[previous_tariff]]
+            name = "Old"
+            until = "2024-06-30"
+            supply_cents_per_day = 100.0
+            default_import_cents = 20.0
+            [[previous_tariff]]
+            until = "2025-06-30"
+            supply_cents_per_day = 100.0
+            default_import_cents = 25.0
+            "#,
+        )
+        .unwrap();
+        let schedule = TariffSchedule::from_config(&w.tariff, &w.previous_tariff).unwrap();
+        let day = |text: &str| text.parse::<NaiveDate>().ok();
+        assert_eq!(
+            schedule.plans(),
+            vec![
+                (None, Some("Old")),
+                (day("2024-07-01"), None),
+                (day("2025-07-01"), Some("Now")),
+            ]
+        );
+        let single = TariffSchedule::single(Tariff::from_config(&w.tariff).unwrap());
+        assert_eq!(single.plans(), vec![(None, None)]);
+    }
+
+    #[test]
     fn first_matching_window_wins() {
         let t = tariff(
             r#"
@@ -895,7 +972,7 @@ mod tests {
     fn plans_are_listed_with_their_days() {
         let schedule = schedule();
         let day = |text: &str| -> NaiveDate { text.parse().unwrap() };
-        let plans = schedule.plans();
+        let plans = schedule.plan_spans();
         assert_eq!(plans.len(), 3);
         assert_eq!(
             (plans[0].from, plans[0].until),

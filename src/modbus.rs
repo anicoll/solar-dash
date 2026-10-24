@@ -138,7 +138,7 @@ impl Latest {
 /// inverter said the value is unavailable or refused to answer for it. The
 /// `ems_mode`, `forced_command` and `running_state` fields are the raw register
 /// values; see the `*_label` functions for their names.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct Settings {
     /// Unix seconds, UTC, when the read finished.
     pub ts: i64,
@@ -426,6 +426,35 @@ pub fn describe_change(old: &Settings, new: &Settings) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
+/// What to save after a settings read: `new` with any missing value filled in
+/// from the last saved row (a register the inverter refused is not a change),
+/// or `None` when nothing but the time differs from `saved`.
+pub fn settings_to_save(saved: Option<&Settings>, new: &Settings) -> Option<Settings> {
+    let Some(old) = saved else {
+        return Some(new.clone());
+    };
+    let merged = Settings {
+        ts: new.ts,
+        ems_mode: new.ems_mode.or(old.ems_mode),
+        forced_command: new.forced_command.or(old.forced_command),
+        forced_power_w: new.forced_power_w.or(old.forced_power_w),
+        max_soc_pct: new.max_soc_pct.or(old.max_soc_pct),
+        min_soc_pct: new.min_soc_pct.or(old.min_soc_pct),
+        export_limit_w: new.export_limit_w.or(old.export_limit_w),
+        export_limit_enabled: new.export_limit_enabled.or(old.export_limit_enabled),
+        backup_reserve_pct: new.backup_reserve_pct.or(old.backup_reserve_pct),
+        max_charge_w: new.max_charge_w.or(old.max_charge_w),
+        max_discharge_w: new.max_discharge_w.or(old.max_discharge_w),
+        running_state: new.running_state.or(old.running_state),
+    };
+    // Compare with the time made equal.
+    let same = Settings {
+        ts: old.ts,
+        ..merged.clone()
+    } == *old;
+    (!same).then_some(merged)
+}
+
 /// Two short lines for people, e.g.
 /// `Inverter: Running, mode Self-consumption, forced command Stop at 0 W`.
 pub fn describe_settings(s: &Settings) -> String {
@@ -663,6 +692,14 @@ pub async fn run_poll(
     let mut settings_failures = FailureLog::default();
     let mut ticks: u32 = 0;
     let mut previous_settings: Option<Settings> = None;
+    // The newest saved row, so a restart does not save the same settings again.
+    let mut saved_settings = match db::latest_inverter_settings(pool).await {
+        Ok(saved) => saved,
+        Err(err) => {
+            warn!("could not read saved inverter settings: {err:#}");
+            None
+        }
+    };
 
     tokio::pin!(shutdown);
     info!("Modbus polling started");
@@ -713,6 +750,12 @@ pub async fn run_poll(
                     info!("{change}");
                 }
                 previous_settings = Some(settings.clone());
+                if let Some(row) = settings_to_save(saved_settings.as_ref(), &settings) {
+                    match db::insert_inverter_settings(pool, &row).await {
+                        Ok(()) => saved_settings = Some(row),
+                        Err(err) => warn!("could not save inverter settings: {err:#}"),
+                    }
+                }
                 latest_settings.set(settings);
             }
             Err(err) => {
@@ -1235,5 +1278,46 @@ mod tests {
         ));
         assert!(text.contains("SOC 5.0% to 100.0%, backup reserve 10%"));
         assert!(text.contains("limit n/a / n/a, export limit 5.0 kW"));
+    }
+
+    #[test]
+    fn saves_settings_only_when_they_change() {
+        let first = RawSettings {
+            ems: Some(vec![0, 0xCC, 0]),
+            backup_reserve: Some(vec![10]),
+            running_state: Some(vec![0]),
+            ..RawSettings::default()
+        }
+        .decode(100);
+        // The first read is always saved.
+        assert_eq!(settings_to_save(None, &first), Some(first.clone()));
+
+        // Same values at a later time: nothing to save.
+        let later = Settings {
+            ts: 160,
+            ..first.clone()
+        };
+        assert_eq!(settings_to_save(Some(&first), &later), None);
+
+        // A refused register keeps the old value and is no change.
+        let refused = Settings {
+            ts: 160,
+            backup_reserve_pct: None,
+            running_state: None,
+            ..first.clone()
+        };
+        assert_eq!(settings_to_save(Some(&first), &refused), None);
+
+        // A real change is saved, and a refused field carries the old value.
+        let changed = Settings {
+            ts: 220,
+            running_state: Some(0x8200),
+            backup_reserve_pct: None,
+            ..first.clone()
+        };
+        let row = settings_to_save(Some(&first), &changed).unwrap();
+        assert_eq!(row.ts, 220);
+        assert_eq!(row.running_state, Some(0x8200));
+        assert_eq!(row.backup_reserve_pct, Some(10));
     }
 }
