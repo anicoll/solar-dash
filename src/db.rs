@@ -17,7 +17,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 
 use crate::cost::DayCost;
 use crate::globird::data::DayRecord;
-use crate::modbus::Sample;
+use crate::modbus::{Sample, Settings};
 
 /// A measuring point (a kind of value, such as "battery power").
 #[derive(Debug, Clone, PartialEq)]
@@ -359,6 +359,68 @@ pub async fn latest_live_sample(pool: &SqlitePool) -> Result<Option<Sample>> {
     .fetch_optional(pool)
     .await
     .context("could not read latest live sample")
+}
+
+/// Saves one row of inverter settings. A second row with the same second
+/// replaces the first.
+pub async fn insert_inverter_settings(pool: &SqlitePool, s: &Settings) -> Result<()> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO inverter_settings (ts, ems_mode, forced_command, forced_power_w,
+                max_soc_pct, min_soc_pct, export_limit_w, export_limit_enabled,
+                backup_reserve_pct, max_charge_w, max_discharge_w, running_state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(s.ts)
+    .bind(s.ems_mode)
+    .bind(s.forced_command)
+    .bind(s.forced_power_w)
+    .bind(s.max_soc_pct)
+    .bind(s.min_soc_pct)
+    .bind(s.export_limit_w)
+    .bind(s.export_limit_enabled)
+    .bind(s.backup_reserve_pct)
+    .bind(s.max_charge_w)
+    .bind(s.max_discharge_w)
+    .bind(s.running_state)
+    .execute(pool)
+    .await
+    .context("could not save inverter settings")?;
+    Ok(())
+}
+
+/// The newest saved inverter settings, or `None` if there are none.
+pub async fn latest_inverter_settings(pool: &SqlitePool) -> Result<Option<Settings>> {
+    sqlx::query_as(
+        "SELECT ts, ems_mode, forced_command, forced_power_w, max_soc_pct,
+                min_soc_pct, export_limit_w, export_limit_enabled, backup_reserve_pct,
+                max_charge_w, max_discharge_w, running_state
+         FROM inverter_settings ORDER BY ts DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("could not read latest inverter settings")
+}
+
+/// Saved inverter settings with `from <= ts < to`, newest first, at most `limit`.
+pub async fn inverter_settings_in_range(
+    pool: &SqlitePool,
+    from: i64,
+    to: i64,
+    limit: i64,
+) -> Result<Vec<Settings>> {
+    sqlx::query_as(
+        "SELECT ts, ems_mode, forced_command, forced_power_w, max_soc_pct,
+                min_soc_pct, export_limit_w, export_limit_enabled, backup_reserve_pct,
+                max_charge_w, max_discharge_w, running_state
+         FROM inverter_settings
+         WHERE ts >= ? AND ts < ? ORDER BY ts DESC LIMIT ?",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("could not read inverter settings")
 }
 
 /// Live samples with `from <= ts < to`, averaged into 1-minute buckets,
@@ -1556,6 +1618,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    fn settings(ts: i64, ems_mode: u16) -> Settings {
+        Settings {
+            ts,
+            ems_mode: Some(ems_mode),
+            forced_command: Some(0xAA),
+            forced_power_w: Some(8000),
+            max_soc_pct: Some(100.0),
+            min_soc_pct: Some(5.5),
+            export_limit_w: None,
+            export_limit_enabled: Some(true),
+            backup_reserve_pct: Some(10),
+            max_charge_w: Some(8000),
+            max_discharge_w: None,
+            running_state: Some(0x8200),
+        }
+    }
+
+    #[tokio::test]
+    async fn inverter_settings_round_trip() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(latest_inverter_settings(&pool).await.unwrap(), None);
+
+        insert_inverter_settings(&pool, &settings(100, 0))
+            .await
+            .unwrap();
+        insert_inverter_settings(&pool, &settings(200, 2))
+            .await
+            .unwrap();
+        // NULLs and false are kept as they are.
+        let blank = Settings {
+            ems_mode: None,
+            export_limit_enabled: Some(false),
+            ..settings(300, 0)
+        };
+        insert_inverter_settings(&pool, &blank).await.unwrap();
+
+        assert_eq!(latest_inverter_settings(&pool).await.unwrap(), Some(blank));
+    }
+
+    #[tokio::test]
+    async fn inverter_settings_in_range_are_newest_first() {
+        let (_dir, pool) = test_db().await;
+        for ts in [100, 200, 300, 400] {
+            insert_inverter_settings(&pool, &settings(ts, 0))
+                .await
+                .unwrap();
+        }
+        // `to` is exclusive.
+        let rows = inverter_settings_in_range(&pool, 200, 400, 10)
+            .await
+            .unwrap();
+        let times: Vec<i64> = rows.iter().map(|r| r.ts).collect();
+        assert_eq!(times, [300, 200]);
+        // The limit keeps the newest rows.
+        let rows = inverter_settings_in_range(&pool, 0, 1000, 3).await.unwrap();
+        let times: Vec<i64> = rows.iter().map(|r| r.ts).collect();
+        assert_eq!(times, [400, 300, 200]);
+        assert!(
+            inverter_settings_in_range(&pool, 500, 600, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

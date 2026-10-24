@@ -319,6 +319,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/live", get(api::live))
         .route("/api/live/series", get(api::live_series))
         .route("/api/inverter", get(api::inverter))
+        .route("/api/inverter/history", get(api::inverter_history))
         .route("/api/ev/sessions", get(api::ev_sessions))
         .route("/api/ev/summary", get(api::ev_summary))
         .route("/api/ev/cars", get(api::ev_cars))
@@ -1312,6 +1313,27 @@ mod tests {
             body_json(response).await,
             serde_json::json!({ "settings": null })
         );
+    }
+
+    #[tokio::test]
+    async fn inverter_history_needs_a_session_and_is_empty_without_data() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/inverter/history", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/inverter/history", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "changes": [] })
+        );
+        let response = send(
+            &app,
+            get_request("/api/inverter/history?from=200&to=100", Some(&cookie)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
