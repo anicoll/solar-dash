@@ -347,12 +347,19 @@
   const INVERTER_CHANGES_EVERY_MS = 5 * 60 * 1000; // the list changes rarely
   let inverterChangesAt = 0; // when the list was last fetched
 
-  /** What changed from `old` (the previous entry) to `s`, as short phrases. */
+  /** Running states the inverter flips between every minute or so; a change between them is not shown. */
+  const RUNNING_ALIKE = new Set([0x0000, 0x0040, 0x8200]);
+
+  /**
+   * What changed from `old` (the previous entry) to `s`, as short phrases.
+   * Null when the only change is a Running / Dispatch running flip (older rows saved those).
+   */
   function inverterChangeParts(s, old) {
     const parts = [];
     const pair = (name, a, b) => { if (a != null && b != null && a !== b) parts.push(`${name} ${a} \u2192 ${b}`); };
     pair('Mode', inverterModeText(old), inverterModeText(s));
-    pair('Inverter state', old.running_state_label, s.running_state_label);
+    const flip = RUNNING_ALIKE.has(old.running_state) && RUNNING_ALIKE.has(s.running_state);
+    if (!flip) pair('Inverter state', old.running_state_label, s.running_state_label);
     const pct = (v) => (v == null ? null : `${Math.round(v)}%`);
     pair('Backup reserve', pct(old.backup_reserve_pct), pct(s.backup_reserve_pct));
     pair('Min SOC', pct(old.min_soc_pct), pct(s.min_soc_pct));
@@ -364,6 +371,7 @@
       && old.export_limit_enabled !== s.export_limit_enabled) {
       parts.push(`Export limit ${s.export_limit_enabled ? 'on' : 'off'}`);
     }
+    if (parts.length === 0 && flip && old.running_state !== s.running_state) return null;
     return parts;
   }
 
@@ -374,12 +382,14 @@
     const data = await quiet(api('/api/inverter/history'));
     // Newest first; the entry after the last one shown is what it is compared with.
     const list = (data && data.changes) || [];
-    const shown = list.slice(0, INVERTER_CHANGES_SHOWN);
-    $('inverter-changes').hidden = shown.length === 0;
-    const items = shown.map((s, i) => {
+    const entries = list.map((s, i) => {
       const old = list[i + 1];
       const parts = old ? inverterChangeParts(s, old)
         : [`Mode ${inverterModeText(s) || 'n/a'}`, `Inverter state ${s.running_state == null ? 'n/a' : s.running_state_label}`];
+      return { s, parts };
+    }).filter((e) => e.parts !== null).slice(0, INVERTER_CHANGES_SHOWN);
+    $('inverter-changes').hidden = entries.length === 0;
+    const items = entries.map(({ s, parts }) => {
       const li = el('li');
       li.append(el('span', 'inv-change-time', fmtLong.format(new Date(s.ts * 1000))),
         el('span', null, parts.join(', ') || 'Other settings changed'));
