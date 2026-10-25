@@ -426,6 +426,13 @@ pub fn describe_change(old: &Settings, new: &Settings) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
+/// Whether the running state is plain "Running" or "Dispatch running" (taking
+/// orders from outside). The inverter flips between these often, so a change
+/// from one to the other is not worth saving.
+fn running_alike(raw: u16) -> bool {
+    matches!(raw, 0x0000 | 0x0040 | 0x8200)
+}
+
 /// What to save after a settings read: `new` with any missing value filled in
 /// from the last saved row (a register the inverter refused is not a change),
 /// or `None` when nothing but the time differs from `saved`.
@@ -447,9 +454,16 @@ pub fn settings_to_save(saved: Option<&Settings>, new: &Settings) -> Option<Sett
         max_discharge_w: new.max_discharge_w.or(old.max_discharge_w),
         running_state: new.running_state.or(old.running_state),
     };
-    // Compare with the time made equal.
+    // Compare with the time made equal, and with a flip between "Running" and
+    // "Dispatch running" ignored: the inverter goes back and forth between the
+    // two every minute or so while the retailer's service is connected.
+    let running_state = match (old.running_state, merged.running_state) {
+        (Some(a), Some(b)) if running_alike(a) && running_alike(b) => old.running_state,
+        _ => merged.running_state,
+    };
     let same = Settings {
         ts: old.ts,
+        running_state,
         ..merged.clone()
     } == *old;
     (!same).then_some(merged)
@@ -1308,9 +1322,26 @@ mod tests {
         };
         assert_eq!(settings_to_save(Some(&first), &refused), None);
 
-        // A real change is saved, and a refused field carries the old value.
+        // Running <-> Dispatch running alone is not a change.
+        let dispatch = Settings {
+            ts: 280,
+            running_state: Some(0x8200),
+            ..first.clone()
+        };
+        assert_eq!(settings_to_save(Some(&first), &dispatch), None);
+        // Running -> Fault is.
+        let fault = Settings {
+            ts: 280,
+            running_state: Some(0x5500),
+            ..first.clone()
+        };
+        assert!(settings_to_save(Some(&first), &fault).is_some());
+
+        // A real change is saved with the new running state, and a refused
+        // field carries the old value.
         let changed = Settings {
             ts: 220,
+            ems_mode: Some(4),
             running_state: Some(0x8200),
             backup_reserve_pct: None,
             ..first.clone()
