@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{NaiveDate, NaiveTime};
@@ -161,12 +161,33 @@ impl fmt::Debug for Server {
 pub struct Database {
     #[serde(default = "default_db_path")]
     pub path: String,
+    /// Where the nightly backups go. Default: a `backups` directory next to
+    /// the database file.
+    pub backup_dir: Option<String>,
+    /// How many daily backups to keep; 0 turns backups off.
+    #[serde(default = "default_backup_keep")]
+    pub backup_keep: usize,
 }
 
 impl Default for Database {
     fn default() -> Self {
         Self {
             path: default_db_path(),
+            backup_dir: None,
+            backup_keep: default_backup_keep(),
+        }
+    }
+}
+
+impl Database {
+    /// The backup directory: `backup_dir`, or `backups` next to the database.
+    pub fn backup_dir(&self) -> PathBuf {
+        match &self.backup_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => Path::new(&self.path)
+                .parent()
+                .unwrap_or(Path::new(""))
+                .join("backups"),
         }
     }
 }
@@ -667,6 +688,10 @@ fn default_db_path() -> String {
     "data/solar.db".to_string()
 }
 
+fn default_backup_keep() -> usize {
+    14
+}
+
 impl Config {
     /// Read and parse the config file at `path`.
     pub fn load(path: &Path) -> Result<Self> {
@@ -738,9 +763,30 @@ mod tests {
         assert!(cfg.isolarcloud.encrypt);
         assert_eq!(cfg.server.bind, "127.0.0.1:8080");
         assert_eq!(cfg.database.path, "data/solar.db");
+        assert_eq!(cfg.database.backup_dir(), PathBuf::from("data/backups"));
+        assert_eq!(cfg.database.backup_keep, 14);
         assert_eq!(cfg.isolarcloud.timezone, "Australia/Adelaide");
         assert_eq!(cfg.isolarcloud.points.len(), 13);
         assert!(cfg.isolarcloud.points.contains(&83252));
+    }
+
+    #[test]
+    fn backup_settings_can_be_changed() {
+        let cfg: Config = toml::from_str(&format!(
+            "{MINIMAL}\n[database]\npath = \"/var/lib/x/solar.db\"\nbackup_keep = 0\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.database.backup_keep, 0);
+        // Next to the database unless `backup_dir` says otherwise.
+        assert_eq!(
+            cfg.database.backup_dir(),
+            PathBuf::from("/var/lib/x/backups")
+        );
+        let cfg: Config = toml::from_str(&format!(
+            "{MINIMAL}\n[database]\nbackup_dir = \"/mnt/usb\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.database.backup_dir(), PathBuf::from("/mnt/usb"));
     }
 
     #[test]

@@ -114,7 +114,7 @@ fn local_at(tz: Tz, date: NaiveDate, time: NaiveTime) -> DateTime<Tz> {
 }
 
 /// The first `sync_time` strictly after `now`.
-fn next_daily(now: DateTime<Tz>, sync_time: NaiveTime) -> DateTime<Tz> {
+pub(crate) fn next_daily(now: DateTime<Tz>, sync_time: NaiveTime) -> DateTime<Tz> {
     let tz = now.timezone();
     let today = local_at(tz, now.date_naive(), sync_time);
     if today > now {

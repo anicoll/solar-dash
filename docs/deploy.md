@@ -157,7 +157,8 @@ Fill in:
   start without it. Leave `cookie_secure` at its default (`true`): visitors
   reach the site over https through the tunnel.
 - `[database]`: `path = "/var/lib/solar-dash/solar.db"` (install.sh already
-  sets this in a new config).
+  sets this in a new config). `serve` also backs up the database by itself,
+  see section 8; the defaults need no settings.
 
 The file holds secrets, which is why it is readable only by root and the
 `solar-dash` group (mode 640).
@@ -342,6 +343,17 @@ If you built inside the LXC (option B), update with `git pull`,
 instead.
 
 ## 8. Backups and restore
+
+There are two nightly backups. `serve` makes its own: at startup (if today's is
+missing) and then every day at 03:30 in the `[isolarcloud]` timezone, it writes
+`/var/lib/solar-dash/backups/solar-YYYY-MM-DD.db` (a `backups` folder next to
+the database; change it with `backup_dir` in `[database]`) and keeps the newest
+14 (`backup_keep`; `0` turns it off). The folder is inside `/var/lib/solar-dash`,
+which the service user already owns and may write to, so the systemd unit needs
+no change. Look for `database backup written` in `journalctl -u solar-dash`.
+Restoring is the same as below, using a file from that folder.
+
+The second one is the systemd timer, described next.
 
 The timer runs every night at 03:30 and writes
 `/var/backups/solar-dash/solar-YYYY-MM-DD.db`. It uses SQLite's online
