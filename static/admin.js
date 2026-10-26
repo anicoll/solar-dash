@@ -27,11 +27,11 @@
    * message for a failed one, so forms can show it next to the button. A 401
    * sends the browser to the login page.
    */
-  async function call(method, url, payload) {
+  async function call(method, url, payload, contentType) {
     const init = { method, credentials: 'same-origin', headers: { Accept: 'application/json' } };
     if (payload !== undefined) {
-      init.headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(payload);
+      init.headers['Content-Type'] = contentType || 'application/json';
+      init.body = contentType ? payload : JSON.stringify(payload);
     }
     let res;
     try {
@@ -62,6 +62,7 @@
     }
     drawPetrol();
     drawPurchases();
+    drawBills();
     drawSettings();
     drawChanges();
   }
@@ -149,7 +150,7 @@
     return p;
   }
 
-  const dollars = (v) => '$' + Number(v).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const dollars = (v) => (v < 0 ? '-$' : '$') + Math.abs(Number(v)).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   /** The number in a text box, or null when it is empty. */
   const numOrNull = (text) => (text.trim() === '' ? null : Number(text));
 
@@ -249,6 +250,94 @@
         await load();
       },
       editing ? () => { purchaseEditing = null; drawPurchases(); } : null));
+  }
+
+  // ---------- Past bills ----------
+
+  /** The same header as bills.rs expects. */
+  const BILLS_HEADER = 'from,to,bill_total,excluded,import_kwh,import_dollars,export_kwh,export_dollars,supply_dollars,note';
+  const BILL_COLUMNS = BILLS_HEADER.split(',');
+
+  /** The current bills as CSV text. A note cannot hold a line break in this format. */
+  function billsToCsv(bills) {
+    const lines = [BILLS_HEADER];
+    for (const b of bills) {
+      lines.push(BILL_COLUMNS.map((c) => (c === 'note' ? String(b.note).replace(/[\r\n]+/g, ' ') : b[c])).join(','));
+    }
+    return lines.join('\n') + '\n';
+  }
+
+  /** How many bill lines a CSV text holds: not blank, not a comment, minus the header. */
+  function countBillLines(text) {
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+    return Math.max(0, lines.length - 1);
+  }
+
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+  function drawBills() {
+    const box = body('admin-bills');
+    box.replaceChildren();
+    const bills = data.bills.slice().sort((a, b) => b.from.localeCompare(a.from));
+
+    box.append(el('p', 'panel-note',
+      'Real bills for periods the plan cannot price. Each bill is spread evenly over its days. Upload a CSV to replace the whole list.'));
+    const list = el('ul', 'alist');
+    if (!bills.length) list.append(el('li', 'alist-empty', 'No bills yet.'));
+    for (const b of bills) {
+      const li = el('li', 'arow');
+      const text = el('div', 'arow-text');
+      text.append(el('strong', 'num', `${b.from} to ${b.to}`),
+        el('span', 'num', `${dollars(b.bill_total)} billed`
+          + (b.excluded ? `, ${dollars(b.excluded)} excluded` : '')
+          + ` · ${b.import_kwh} kWh in, ${b.export_kwh} kWh out`));
+      if (b.note) text.append(el('span', 'muted', b.note));
+      const actions = el('div', 'arow-actions');
+      actions.append(rowButton('Delete', `Delete the bill from ${b.from}`, () => confirmDelete(
+        `Delete the bill from ${b.from} to ${b.to}?`,
+        () => call('DELETE', `/api/admin/bills/${b.from}`), 'admin-bills'), 'danger'));
+      li.append(text, actions);
+      list.append(li);
+    }
+    box.append(list, listError());
+
+    // Upload: pick a file, confirm the replacement, send it as text/csv.
+    const file = input('file', { accept: '.csv,text/csv,text/plain' });
+    const msg = el('p', 'aform-error');
+    msg.setAttribute('role', 'alert');
+    msg.hidden = true;
+    file.onchange = async () => {
+      msg.hidden = true;
+      const chosen = file.files[0];
+      if (!chosen) return;
+      try {
+        const text = await chosen.text();
+        const question = `Replace your ${plural(bills.length, 'bill')} with the ${plural(countBillLines(text), 'bill')} in ${chosen.name}?`;
+        if (!window.confirm(question)) return;
+        await call('PUT', '/api/admin/bills', text, 'text/csv');
+        await load();
+      } catch (err) {
+        msg.textContent = err.message;
+        msg.hidden = false;
+      } finally {
+        file.value = '';
+      }
+    };
+    const actions = el('div', 'aform-actions');
+    const download = el('button', 'btn', 'Download as CSV');
+    download.type = 'button';
+    download.disabled = !bills.length;
+    download.onclick = () => {
+      const url = URL.createObjectURL(new Blob([billsToCsv(data.bills)], { type: 'text/csv' }));
+      const a = el('a');
+      a.href = url;
+      a.download = 'bills.csv';
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+    actions.append(download);
+    box.append(el('h3', 'sub-title', 'Replace all from a CSV file'),
+      field('CSV file', file, `Columns: ${BILLS_HEADER}`), msg, actions);
   }
 
   // ---------- Settings ----------

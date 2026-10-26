@@ -743,3 +743,5 @@ table.car-table tr.car-year th { text-align: left; color: var(--fg); font-weight
 .admin-card-body { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .admin-card-body .sub-title { margin: 8px 0 0; }
 #view-admin > .panel-note { margin: 0; }
+.afield input[type="file"] { padding: 8px 12px; min-height: 44px; }
+.afield-hint { overflow-wrap: anywhere; }
