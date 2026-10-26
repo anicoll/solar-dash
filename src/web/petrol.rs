@@ -3,12 +3,14 @@
 //!
 //! The write routes sit behind `auth::require_session` like the rest of
 //! `/api/`. What keeps another website from using a visitor's login to change
-//! prices: the session cookie is `SameSite=Lax`, so browsers do not send it on
-//! cross-site PUT or DELETE requests (or on cross-site form POSTs); a page
-//! cannot make a cross-site PUT with a JSON body without a CORS preflight,
-//! which we never approve; and `PUT` requires `Content-Type: application/json`
-//! (axum's `Json` answers 415 otherwise), which a plain HTML form cannot send.
-//! The Bearer token (`api_token`) is not sent by browsers on their own.
+//! prices: writes need the session cookie (the `api_token` Bearer only works
+//! for GET and HEAD, see `auth.rs`); the cookie is `SameSite=Lax`, so browsers
+//! do not send it on cross-site PUT or DELETE requests (or on cross-site form
+//! POSTs); a request whose `Origin` header names another host is refused with
+//! 403 (see `same_origin` in `mod.rs`); a page cannot make a cross-site PUT
+//! with a JSON body without a CORS preflight, which we never approve; and
+//! `PUT` requires `Content-Type: application/json` (axum's `Json` answers 415
+//! otherwise), which a plain HTML form cannot send.
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -127,7 +129,7 @@ fn date(text: &str) -> Result<NaiveDate, ApiError> {
     parse_date(text).map_err(|err| ApiError::bad_request(format!("from: {err}")))
 }
 
-fn view_json(petrol: &PetrolHistory) -> Value {
+pub(super) fn view_json(petrol: &PetrolHistory) -> Value {
     let prices: Vec<Value> = petrol
         .changes()
         .iter()

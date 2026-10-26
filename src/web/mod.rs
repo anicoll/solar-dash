@@ -1,6 +1,7 @@
 //! The web server: password login, a JSON API over the readings, and the
 //! embedded static files. It only reads from SQLite and never calls iSolarCloud.
 
+mod admin;
 mod api;
 mod auth;
 mod battery;
@@ -21,11 +22,11 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::extract::{FromRef, Path};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum_extra::extract::cookie::Key;
 use base64::Engine;
 use chrono_tz::Tz;
@@ -301,6 +302,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ev/cars", get(api::ev_cars))
         .route("/api/petrol-prices", get(petrol::list).put(petrol::put))
         .route("/api/petrol-prices/{from}", delete(petrol::remove))
+        .route("/api/admin", get(admin::read))
+        .route("/api/admin/tariffs", post(admin::tariff_create))
+        .route(
+            "/api/admin/tariffs/{id}",
+            put(admin::tariff_update).delete(admin::tariff_delete),
+        )
+        .route("/api/admin/purchases", post(admin::purchase_create))
+        .route(
+            "/api/admin/purchases/{id}",
+            put(admin::purchase_update).delete(admin::purchase_delete),
+        )
+        .route("/api/admin/bills", put(admin::bills_replace))
+        .route("/api/admin/bills/{from}", delete(admin::bill_delete))
+        .route("/api/admin/settings", put(admin::settings_update))
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
@@ -333,8 +348,37 @@ pub fn router(state: AppState) -> Router {
     protected
         .merge(public)
         .with_state(state)
+        .layer(middleware::from_fn(same_origin))
         .layer(middleware::from_fn(security_headers))
         .layer(CompressionLayer::new())
+}
+
+/// Refuses a request that changes something (anything but GET or HEAD) when
+/// its `Origin` header names a different host than the `Host` header, so a
+/// page on another site cannot drive the API with a visitor's login. Requests
+/// without an `Origin` (curl, scripts) pass; browsers always send one on
+/// cross-site writes.
+async fn same_origin(request: Request, next: Next) -> Response {
+    let safe = matches!(*request.method(), Method::GET | Method::HEAD);
+    if !safe && let Some(origin) = request.headers().get(header::ORIGIN) {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| request.uri().authority().map(|a| a.as_str()));
+        // "https://solar.example.com" -> "solar.example.com"; "null" has no "://".
+        let origin_host = origin
+            .to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .map(|(_, host)| host);
+        let same = matches!((origin_host, host), (Some(o), Some(h)) if o.eq_ignore_ascii_case(h));
+        if !same {
+            return api::ApiError::new(StatusCode::FORBIDDEN, "cross-origin request refused")
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// Content-Security-Policy: everything comes from this origin, except ECharts
@@ -826,7 +870,8 @@ mod tests {
                 r#"{"from":"2026-03-01","cents_per_litre":199.0}"#,
             ))
             .unwrap();
-        assert_eq!(send(&app, put).await.status(), StatusCode::OK);
+        // The token is for reading: a write needs the session cookie.
+        assert_eq!(send(&app, put).await.status(), StatusCode::UNAUTHORIZED);
 
         for value in [
             "Bearer wrong",
@@ -3097,5 +3142,525 @@ mod tests {
         assert_eq!(day["reason"], Value::Null);
         assert_eq!(json["summary"]["earned"], 1);
         assert_eq!(json["summary"]["missed"], 0);
+    }
+
+    // ---- the admin API ----
+
+    /// A request with a JSON body, the login cookie and any extra headers.
+    fn admin_request(
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    /// Sends a JSON write as the logged-in user and gives back status and body.
+    async fn admin_send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        body: &str,
+    ) -> (StatusCode, Value) {
+        let response = send(app, admin_request(method, uri, cookie, body, &[])).await;
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    async fn count(pool: &SqlitePool, table: &str) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        n
+    }
+
+    const PLAN: &str = r#"{"valid_from":null,"tariff":{"name":"Old plan","supply_cents_per_day":100.0,
+        "default_import_cents":30.0,"default_export_cents":5.0,
+        "import":[{"from":"11:00","to":"14:00","cents":0.0}]}}"#;
+
+    #[tokio::test]
+    async fn admin_routes_need_the_session_cookie_and_the_token_only_reads() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let (_dir, app, pool) = petrol_app(Some(token)).await;
+        let bearer = format!("Bearer {token}");
+
+        // Nobody logged in.
+        for (method, uri) in [
+            ("GET", "/api/admin"),
+            ("POST", "/api/admin/tariffs"),
+            ("PUT", "/api/admin/tariffs/1"),
+            ("DELETE", "/api/admin/tariffs/1"),
+            ("POST", "/api/admin/purchases"),
+            ("PUT", "/api/admin/purchases/1"),
+            ("DELETE", "/api/admin/purchases/1"),
+            ("PUT", "/api/admin/bills"),
+            ("DELETE", "/api/admin/bills/2026-01-01"),
+            ("PUT", "/api/admin/settings"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(PLAN))
+                .unwrap();
+            let response = send(&app, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+
+        // The token reads, but cannot write.
+        let read = Request::get("/api/admin")
+            .header(header::AUTHORIZATION, &bearer)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, read).await.status(), StatusCode::OK);
+        for (method, uri) in [
+            ("POST", "/api/admin/tariffs"),
+            ("PUT", "/api/admin/settings"),
+            ("PUT", "/api/petrol-prices"),
+            ("DELETE", "/api/petrol-prices/2026-03-01"),
+        ] {
+            let request = admin_request(method, uri, "", PLAN, &[("authorization", &bearer)]);
+            let response = send(&app, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+        assert_eq!(count(&pool, "tariff_plan").await, 0);
+    }
+
+    #[tokio::test]
+    async fn writes_from_another_origin_are_refused() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+        let put = |headers: &[(&str, &str)]| {
+            admin_request(
+                "PUT",
+                "/api/admin/settings",
+                &cookie,
+                r#"{"petrol_grade":"Premium 98"}"#,
+                headers,
+            )
+        };
+        // Another site, "null" (sandboxed pages) and a different port are refused.
+        for origin in [
+            "https://evil.example",
+            "null",
+            "https://solar.example:8443",
+            "http://solar.example.evil.example",
+        ] {
+            let response = send(&app, put(&[("host", "solar.example"), ("origin", origin)])).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin}");
+            assert_eq!(
+                body_json(response).await["error"],
+                "cross-origin request refused"
+            );
+        }
+        assert_eq!(count(&pool, "setting").await, 1);
+
+        // The same host (any scheme, any case), or no Origin at all, is fine.
+        for headers in [
+            vec![
+                ("host", "solar.example"),
+                ("origin", "https://solar.example"),
+            ],
+            vec![
+                ("host", "Solar.Example:8080"),
+                ("origin", "http://solar.example:8080"),
+            ],
+            vec![("host", "solar.example")],
+            vec![],
+        ] {
+            let response = send(&app, put(&headers)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{headers:?}");
+        }
+
+        // Reads are never refused for their Origin.
+        let read = Request::get("/api/admin")
+            .header(header::COOKIE, &cookie)
+            .header("host", "solar.example")
+            .header("origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, read).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_read_lists_everything_and_can_be_downloaded() {
+        let (_dir, app, _pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+        admin_send(&app, "POST", "/api/admin/tariffs", &cookie, PLAN).await;
+        admin_send(
+            &app,
+            "POST",
+            "/api/admin/purchases",
+            &cookie,
+            r#"{"name":"Panels","date":"2024-01-02","cost_dollars":9000.0}"#,
+        )
+        .await;
+        admin_send(
+            &app,
+            "PUT",
+            "/api/petrol-prices",
+            &cookie,
+            r#"{"from":"2026-03-01","cents_per_litre":199.0}"#,
+        )
+        .await;
+
+        let response = send(&app, get_request("/api/admin", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .is_none()
+        );
+        let json = body_json(response).await;
+        assert_eq!(json["tariffs"][0]["valid_from"], Value::Null);
+        assert_eq!(json["tariffs"][0]["tariff"]["name"], "Old plan");
+        assert_eq!(json["tariffs"][0]["tariff"]["import"][0]["to"], "14:00");
+        assert_eq!(json["petrol"]["fallback_cents_per_litre"], 190.0);
+        assert_eq!(json["petrol"]["prices"][0]["cents_per_litre"], 199.0);
+        assert_eq!(json["purchases"][0]["name"], "Panels");
+        assert_eq!(json["purchases"][0]["battery_kwh"], Value::Null);
+        assert_eq!(json["bills"], serde_json::json!([]));
+        assert_eq!(json["settings"]["petrol_cents_per_litre"], 190.0);
+        assert_eq!(json["setting_defaults"]["petrol_litres_per_100km"], 7.5);
+        // Newest change first, with the row key and no before/after.
+        let changes = json["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0]["what"], "petrol");
+        assert_eq!(changes[0]["action"], "create");
+        assert_eq!(changes[0]["key"], "2026-03-01");
+        assert!(changes[0]["at"].as_i64().unwrap() > 0);
+        assert!(changes[0].get("before").is_none());
+
+        let response = send(&app, get_request("/api/admin?download=1", Some(&cookie))).await;
+        let disposition = response.headers()[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            disposition.starts_with("attachment; filename=\"solar-dash-admin-20")
+                && disposition.ends_with(".json\""),
+            "{disposition}"
+        );
+        assert_eq!(body_json(response).await["purchases"][0]["name"], "Panels");
+    }
+
+    #[tokio::test]
+    async fn tariff_plans_can_be_added_changed_and_deleted_and_show_at_once() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+
+        // No plan: the cost features are off.
+        let response = send(&app, get_request("/api/tariff", Some(&cookie))).await;
+        assert_eq!(body_json(response).await["configured"], false);
+
+        let (status, plan) = admin_send(&app, "POST", "/api/admin/tariffs", &cookie, PLAN).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let first = plan["id"].as_i64().unwrap();
+        assert_eq!(plan["tariff"]["name"], "Old plan");
+        // No restart needed: the new plan is in force.
+        let response = send(&app, get_request("/api/tariff", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["default_import_cents"], 30.0);
+
+        // A newer plan from a date. The older one now ends the day before.
+        let newer = r#"{"valid_from":"2026-05-26","tariff":{"supply_cents_per_day":120.0,
+            "default_import_cents":40.0}}"#;
+        let (status, plan) = admin_send(&app, "POST", "/api/admin/tariffs", &cookie, newer).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let second = plan["id"].as_i64().unwrap();
+        for (date, cents) in [("2026-05-25", 30.0), ("2026-05-26", 40.0)] {
+            let uri = format!("/api/tariff?date={date}");
+            let response = send(&app, get_request(&uri, Some(&cookie))).await;
+            assert_eq!(body_json(response).await["default_import_cents"], cents);
+        }
+
+        // Bad plans are refused and nothing changes (not even the change log).
+        let changes = count(&pool, "admin_change").await;
+        for bad in [
+            // The same start day.
+            r#"{"valid_from":"2026-05-26","tariff":{"supply_cents_per_day":1.0,"default_import_cents":1.0}}"#,
+            // A second plan with no start.
+            r#"{"valid_from":null,"tariff":{"supply_cents_per_day":1.0,"default_import_cents":1.0}}"#,
+            r#"{"valid_from":"26/05/2026","tariff":{"supply_cents_per_day":1.0,"default_import_cents":1.0}}"#,
+            r#"{"valid_from":"2026-06-01","tariff":{"supply_cents_per_day":-1.0,"default_import_cents":1.0}}"#,
+            r#"{"valid_from":"2026-06-01","tariff":{"supply_cents_per_day":1.0,"default_import_cents":1.0,
+                "import":[{"from":"9:5","to":"10:00","cents":1.0}]}}"#,
+            r#"{"valid_from":"2026-06-01"}"#,
+            "not json",
+        ] {
+            let (status, json) = admin_send(&app, "POST", "/api/admin/tariffs", &cookie, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(json["error"].is_string(), "{bad}");
+        }
+        assert_eq!(count(&pool, "tariff_plan").await, 2);
+        assert_eq!(count(&pool, "admin_change").await, changes);
+        // The older plan cannot be moved onto the newer one's day either.
+        let clash = r#"{"valid_from":"2026-05-26","tariff":{"supply_cents_per_day":1.0,"default_import_cents":1.0}}"#;
+        let uri = format!("/api/admin/tariffs/{first}");
+        let (status, _) = admin_send(&app, "PUT", &uri, &cookie, clash).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Update the newer plan's rate: it shows at once.
+        let changed = r#"{"valid_from":"2026-05-26","tariff":{"supply_cents_per_day":120.0,
+            "default_import_cents":45.0}}"#;
+        let uri = format!("/api/admin/tariffs/{second}");
+        let (status, plan) = admin_send(&app, "PUT", &uri, &cookie, changed).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(plan["tariff"]["default_import_cents"], 45.0);
+        let response = send(
+            &app,
+            get_request("/api/tariff?date=2026-06-01", Some(&cookie)),
+        )
+        .await;
+        assert_eq!(body_json(response).await["default_import_cents"], 45.0);
+        let (status, _) = admin_send(&app, "PUT", "/api/admin/tariffs/999", &cookie, changed).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The change log keeps the rows before and after.
+        let (before, after): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT before, after FROM admin_change WHERE action = 'update' AND what = 'tariffs'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(before.unwrap().contains("40.0"));
+        assert!(after.unwrap().contains("45.0"));
+
+        // Delete both: cost features go off again.
+        for id in [second, first] {
+            let uri = format!("/api/admin/tariffs/{id}");
+            let (status, json) = admin_send(&app, "DELETE", &uri, &cookie, "").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["deleted"]["id"], id);
+        }
+        let (status, _) = admin_send(&app, "DELETE", "/api/admin/tariffs/1", &cookie, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let response = send(&app, get_request("/api/tariff", Some(&cookie))).await;
+        assert_eq!(body_json(response).await["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn purchases_can_be_added_changed_and_deleted() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+        let (_, _) = admin_send(&app, "POST", "/api/admin/tariffs", &cookie, PLAN).await;
+        let response = send(&app, get_request("/api/payback", Some(&cookie))).await;
+        assert_eq!(body_json(response).await["configured"], false);
+
+        let panels = r#"{"name":" Panels ","date":"2024-01-02","cost_dollars":9000.0}"#;
+        let (status, json) =
+            admin_send(&app, "POST", "/api/admin/purchases", &cookie, panels).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json["name"], "Panels");
+        let id = json["id"].as_i64().unwrap();
+        // The payback API sees it without a restart.
+        let response = send(&app, get_request("/api/payback", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["total_cost"], 9000.0);
+
+        let battery =
+            r#"{"name":"Battery","date":"2025-03-04","cost_dollars":5000.0,"battery_kwh":10.0}"#;
+        let (status, second) =
+            admin_send(&app, "POST", "/api/admin/purchases", &cookie, battery).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(second["battery_kwh"], 10.0);
+
+        let changes = count(&pool, "admin_change").await;
+        for bad in [
+            r#"{"name":"  ","date":"2024-01-02","cost_dollars":1.0}"#,
+            r#"{"name":"x","date":"yesterday","cost_dollars":1.0}"#,
+            r#"{"name":"x","date":"2024-01-02","cost_dollars":-1.0}"#,
+            r#"{"name":"x","date":"2024-01-02","cost_dollars":1.0,"battery_kwh":0}"#,
+            r#"{"name":"x","date":"2024-01-02"}"#,
+        ] {
+            let (status, _) = admin_send(&app, "POST", "/api/admin/purchases", &cookie, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert_eq!(count(&pool, "purchase").await, 2);
+        assert_eq!(count(&pool, "admin_change").await, changes);
+
+        let uri = format!("/api/admin/purchases/{id}");
+        let cheaper = r#"{"name":"Panels","date":"2024-01-02","cost_dollars":8500.0}"#;
+        let (status, json) = admin_send(&app, "PUT", &uri, &cookie, cheaper).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["cost_dollars"], 8500.0);
+        let response = send(&app, get_request("/api/payback", Some(&cookie))).await;
+        assert_eq!(body_json(response).await["total_cost"], 13500.0);
+        let (status, _) =
+            admin_send(&app, "PUT", "/api/admin/purchases/999", &cookie, cheaper).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, json) = admin_send(&app, "DELETE", &uri, &cookie, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["deleted"]["cost_dollars"], 8500.0);
+        let (status, _) = admin_send(&app, "DELETE", &uri, &cookie, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(count(&pool, "purchase").await, 1);
+        let actions: Vec<(String,)> =
+            sqlx::query_as("SELECT action FROM admin_change WHERE what = 'purchases' ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let actions: Vec<&str> = actions.iter().map(|a| a.0.as_str()).collect();
+        assert_eq!(actions, ["create", "create", "update", "delete"]);
+    }
+
+    fn csv_request(
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        content_type: &str,
+        body: String,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bills_are_replaced_from_csv_and_deleted_one_at_a_time() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+        let csv = format!(
+            "{BILLS_HEADER}2026-01-01,2026-01-31,152.40,0,610,190.00,280,22.40,48.50,summer, bill\n\
+             2026-02-01,2026-02-28,98.00,25.00,540,170.00,310,25.00,44.00,\n"
+        );
+        let put = |content_type: &str, body: String| {
+            csv_request("PUT", "/api/admin/bills", &cookie, content_type, body)
+        };
+
+        // Only CSV is accepted.
+        let response = send(&app, put("application/json", csv.clone())).await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let response = send(&app, put("text/csv; charset=utf-8", csv.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["rows"], 2);
+        let response = send(&app, get_request("/api/admin", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["bills"].as_array().unwrap().len(), 2);
+        assert_eq!(json["bills"][0]["note"], "summer, bill");
+        assert_eq!(json["bills"][1]["excluded"], 25.0);
+
+        // A bad file (a bad line, or overlapping periods) changes nothing.
+        let overlap = format!(
+            "{BILLS_HEADER}2026-01-01,2026-01-31,1,0,1,1,1,1,1,\n2026-01-31,2026-02-28,1,0,1,1,1,1,1,\n"
+        );
+        for bad in [format!("{BILLS_HEADER}oops\n"), overlap, String::new()] {
+            let response = send(&app, put("text/csv", bad)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(body_json(response).await["error"].is_string());
+        }
+        assert_eq!(count(&pool, "bill").await, 2);
+
+        // A replacement logs the row counts.
+        let one = format!("{BILLS_HEADER}2026-03-01,2026-03-31,10,0,1,1,1,1,1,\n");
+        let response = send(&app, put("text/csv", one)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (before, after): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT before, after FROM admin_change WHERE what = 'bills' AND action = 'replace' \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before.as_deref(), Some(r#"{"rows":2}"#));
+        assert_eq!(after.as_deref(), Some(r#"{"rows":1}"#));
+
+        let (status, json) =
+            admin_send(&app, "DELETE", "/api/admin/bills/2026-03-01", &cookie, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["deleted"]["bill_total"], 10.0);
+        let (status, _) =
+            admin_send(&app, "DELETE", "/api/admin/bills/2026-03-01", &cookie, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = admin_send(&app, "DELETE", "/api/admin/bills/March", &cookie, "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(count(&pool, "bill").await, 0);
+    }
+
+    #[tokio::test]
+    async fn settings_are_set_reset_and_checked() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+        let put = |body: &'static str| {
+            let (app, cookie) = (app.clone(), cookie.clone());
+            async move { admin_send(&app, "PUT", "/api/admin/settings", &cookie, body).await }
+        };
+
+        let (status, json) = put(
+            r#"{"petrol_grade":"Premium 98","compare_cars":{"Y":"Toyota RAV4"},
+                "price_rise_percent":5.5,"away_cents_per_kwh":65.0}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["petrol_grade"], "Premium 98");
+        assert_eq!(json["petrol_cents_per_litre"], 190.0);
+        // The cars API uses it without a restart.
+        let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
+        assert_eq!(body_json(response).await["petrol_grade"], "Premium 98");
+
+        // Bad requests change nothing, even the valid keys next to a bad one.
+        let changes = count(&pool, "admin_change").await;
+        for bad in [
+            r#"{"petrol_grade":"Diesel","colour":"red"}"#,
+            r#"{"petrol_grade":"  "}"#,
+            r#"{"petrol_grade":5}"#,
+            r#"{"price_rise_percent":21}"#,
+            r#"{"price_rise_percent":-1}"#,
+            r#"{"petrol_litres_per_100km":0}"#,
+            r#"{"petrol_cents_per_litre":"lots"}"#,
+            r#"{"away_cents_per_kwh":-4}"#,
+            r#"{"compare_cars":{"Y":""}}"#,
+            r#"{"compare_cars":["Y"]}"#,
+        ] {
+            let (status, json) = put(bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(json["error"].is_string(), "{bad}");
+        }
+        assert_eq!(count(&pool, "admin_change").await, changes);
+        let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
+        assert_eq!(body_json(response).await["petrol_grade"], "Premium 98");
+
+        // null puts a key back to its default (and removes its row).
+        let (status, json) = put(r#"{"petrol_grade":null,"petrol_cents_per_litre":null}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json.get("petrol_grade").is_none());
+        assert!(json.get("petrol_cents_per_litre").is_none());
+        let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["petrol_grade"], "Unleaded 91");
+        assert_eq!(json["configured"], false);
+        // Resetting what is already default, or setting the same value, logs nothing.
+        let changes = count(&pool, "admin_change").await;
+        put(r#"{"petrol_grade":null,"price_rise_percent":5.5}"#).await;
+        assert_eq!(count(&pool, "admin_change").await, changes);
     }
 }

@@ -112,8 +112,9 @@ openssl rand -hex 32
 ```
 
 Scripts then send `Authorization: Bearer <token>` on `/api/` requests. It is
-accepted on `/api/` routes only, never gives a cookie, and is ignored when
-`api_token` is not set. Keep `config.toml` private; the token is never logged.
+accepted on `/api/` routes only, only for `GET` and `HEAD` (anything that
+changes data needs the login cookie, see [Admin API](#admin-api)), never gives
+a cookie, and is ignored when `api_token` is not set. Keep `config.toml` private; the token is never logged.
 
 When you open the dashboard at `http://127.0.0.1:8080` (plain http), also set
 this in `[server]`, or the browser will drop the login cookie:
@@ -214,6 +215,7 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`. A session still charging has `ended_at` `null` and counts as running until now. `energy_used_kwh` is taken from the wall, `energy_added_kwh` reaches the battery. The last six fields (kWh by source, dollars, and the share 0 to 1 of the session the inverter samples cover) are `null` without a `[tariff]`, away from home (geofence not "Home") or with no energy. At most 400 days. Empty without a `[teslamate]` section |
 | `GET /api/ev/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` | The car against petrol, by month and in total: `{"configured":true,"months":[{month,km,home_kwh,home_cost,away_kwh,away_cost,charging_cost,petrol_litres,petrol_cost,saved,ev_cents_per_km,petrol_cents_per_km},...],"total":{...},"petrol_cents_per_litre":...,"petrol_litres_per_100km":...}`. Local dates, both included, at most 400 days; without `from` it covers the last 365 days. Money is in dollars. `away_cost` is `null` when there were away sessions and no `away_cents_per_kwh`, and the `*_cents_per_km` fields are `null` for 0 km. `configured` is `false`, and the money fields `null`, without a `petrol_cents_per_litre`. See [TeslaMate](#teslamate-optional) |
 | `GET /api/ev/cars` | Each TeslaMate car's fuel savings over its whole synced history, newest car first: `{"configured":true,"petrol_litres_per_100km":...,"petrol_grade":"Unleaded 91","charging_by_plan":[...],"away":{...},"self_share_pct":...,"cars":[{car_id,name,model,label,trim,paint,wheels,marketing_name,compare_with,first_day,last_day,total,months:[{month,...}],charging_by_plan,away,self_share_pct}]}`. `charging_by_plan` is `[{plan,first_day,last_day,sessions,kwh,cost,pending_sessions}]`, `away` is `{sessions,kwh,cost}` (`cost` `null` without `away_cents_per_kwh`) and `self_share_pct` is solar and battery kWh over costed home kWh; the top-level ones add up all cars. See [Comparison cars and charging by plan](#comparison-cars-and-charging-by-plan). Each period has `km`, `petrol_litres`, `petrol_cost`, `home_kwh`, `away_kwh`, `away_cost`, `away_uncosted_kwh`, `with_system` and `without_system` (`charging_cost`, `saved`, `cents_per_km`), `system_added`, `grid_kwh`, `self_kwh`, `uncovered_kwh`, `feed_in_forgone` and `pending_sessions`. Dollars. Empty until the history sync has run. See [Car versus petrol](#car-versus-petrol) |
+| `GET /api/admin`, `POST/PUT/DELETE /api/admin/...` | Read and edit the tariff plans, purchases, bills and settings. See [Admin API](#admin-api) |
 | `GET /api/petrol-prices` | The petrol prices: `{"fallback_cents_per_litre":...,"prices":[{"from":"YYYY-MM-DD","cents_per_litre":...},...]}`, oldest first. See [Petrol prices](#petrol-prices) |
 | `PUT /api/petrol-prices` | Adds or replaces the price starting on a date. JSON body `{"from":"YYYY-MM-DD","cents_per_litre":189.9}`; answers like the `GET`. 400 for a bad date or price, 415 unless the body is `application/json` |
 | `DELETE /api/petrol-prices/YYYY-MM-DD` | Removes the price starting on that date and answers like the `GET`. 404 if there is none |
@@ -427,26 +429,20 @@ The petrol price changes over time are rows in the database (table
 `petrol_price`), listed and changed through the API:
 
 ```sh
-TOKEN=...   # the api_token from config.toml
+TOKEN=...   # the api_token from config.toml (reads only)
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/petrol-prices
-curl -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"from":"2026-10-23","cents_per_litre":189.9}' http://127.0.0.1:8080/api/petrol-prices
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/petrol-prices/2026-10-23
-```
-
-Or with the login cookie instead of a token:
-
-```sh
+# Changes need the login cookie:
 curl -c cookies.txt -d 'password=YOUR_PASSWORD' http://127.0.0.1:8080/login
 curl -b cookies.txt -X PUT -H 'Content-Type: application/json' \
   -d '{"from":"2026-10-23","cents_per_litre":189.9}' http://127.0.0.1:8080/api/petrol-prices
+curl -b cookies.txt -X DELETE http://127.0.0.1:8080/api/petrol-prices/2026-10-23
 ```
 
 A change applies at once, without a restart, and is written to the change log
-(`admin_change`). The write routes need a login (or token) like the rest of
-`/api/`. The PUT must send `Content-Type: application/json`, and the login
-cookie is `SameSite=Lax`, so another website cannot change prices through a
-visitor's browser.
+(`admin_change`). The write routes need the login cookie, not the token. The
+PUT must send `Content-Type: application/json`, the cookie is `SameSite=Lax`,
+and a write whose `Origin` header names another host is refused with 403, so
+another website cannot change prices through a visitor's browser.
 
 An older config's `petrol_prices_file` (a `from,cents_per_litre` CSV) or
 `[[teslamate.petrol_price]]` tables are imported into the table once; see
@@ -714,6 +710,53 @@ How a bill becomes days:
   added to the import cost, or taken off as extra export credit if negative.
   The days then add up to exactly `bill_total + excluded`.
 - A bill wins over GloBird's daily figures for the same day.
+
+## Admin API
+
+The data in [Where the settings live](#where-the-settings-live) is edited
+through these routes. They are under `/api/`, so they need a login; the
+write routes need the login cookie (the `api_token` Bearer only works for
+`GET` and `HEAD`), and a write whose `Origin` header names a different host
+than the `Host` header is refused with 403 (requests without an `Origin`, such
+as curl, are fine). Bodies and answers are JSON, errors are `{"error":"..."}`.
+Each write runs in one transaction: the whole data set is checked after the
+change, and if it does not work (say two plans start on the same day) nothing
+is saved and the answer is a 400 with the reason. A change shows in the rest of
+the API at once, and is added to `admin_change` with the row before and after.
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/admin` | Everything: `{"tariffs":[Plan..],"petrol":{"fallback_cents_per_litre":..,"prices":[{from,cents_per_litre}..]},"purchases":[{id,name,date,cost_dollars,battery_kwh}..],"bills":[{from,to,bill_total,excluded,import_kwh,import_dollars,export_kwh,export_dollars,supply_dollars,note}..],"settings":{key:value..},"setting_defaults":{key:value..},"changes":[{id,at,what,action,key}..]}`. `settings` holds the keys that are set, `setting_defaults` what the others are. `changes` is the last 50, newest first (`at` is unix seconds). With `?download=1` the answer is sent as `solar-dash-admin-YYYY-MM-DD.json` to save (the Export) |
+| `POST /api/admin/tariffs` | Adds a plan and answers with it (201). Body: a Plan without `id` |
+| `PUT /api/admin/tariffs/{id}` | Replaces a plan and answers with it. 404 if there is none |
+| `DELETE /api/admin/tariffs/{id}` | Answers `{"deleted": Plan}`. Deleting the last plan turns the cost features off |
+| `POST /api/admin/purchases` | Adds `{"name","date":"YYYY-MM-DD","cost_dollars","battery_kwh"?}` and answers with it, with its `id` (201) |
+| `PUT /api/admin/purchases/{id}` | Replaces a purchase and answers with it. 404 if there is none |
+| `DELETE /api/admin/purchases/{id}` | Answers `{"deleted": Purchase}` |
+| `PUT /api/admin/bills` | Body: a whole bills CSV (see [Past bills](#past-bills-optional)) with `Content-Type: text/csv`. Replaces every bill and answers `{"rows":n}`. 415 for another content type, 400 naming the line for a bad file |
+| `DELETE /api/admin/bills/YYYY-MM-DD` | Removes the bill starting that day and answers `{"deleted": Bill}`. 404 if there is none |
+| `PUT /api/admin/settings` | A partial object of setting keys (`petrol_cents_per_litre`, `petrol_litres_per_100km`, `away_cents_per_kwh`, `compare_cars`, `petrol_grade`, `price_rise_percent`). `null` puts a key back to its default. An unknown key or a bad value is a 400 and nothing changes. Answers with the settings that are set |
+| `GET`, `PUT`, `DELETE /api/petrol-prices` | The petrol prices; see [Petrol prices](#petrol-prices) |
+
+A Plan is `{"id":1,"valid_from":"2026-05-26"|null,"tariff":{..}}`. It applies
+from `valid_from` (a local day, inclusive) until the day before the next plan
+starts. Only the earliest plan may have `valid_from` `null` (no known start),
+and no two plans may start on the same day. `tariff` has the fields of the old
+`[tariff]` section as JSON: `name`, `supply_cents_per_day`,
+`default_import_cents`, `default_export_cents`, `import` and `export` (lists of
+`{"from":"HH:MM","to":"HH:MM","cents":..}`), `zero_import_credit`
+(`{"from","to","max_kwh","credit_cents"}` or `null`) and `export_tier`
+(`{"first_kwh_per_day","cents"}` or `null`), with the same checks.
+
+```sh
+curl -c cookies.txt -d 'password=YOUR_PASSWORD' http://127.0.0.1:8080/login
+curl -b cookies.txt -o backup.json 'http://127.0.0.1:8080/api/admin?download=1'
+curl -b cookies.txt -X PUT -H 'Content-Type: application/json' \
+  -d '{"petrol_grade":"Premium 98","price_rise_percent":null}' \
+  http://127.0.0.1:8080/api/admin/settings
+curl -b cookies.txt -X PUT -H 'Content-Type: text/csv' --data-binary @bills.csv \
+  http://127.0.0.1:8080/api/admin/bills
+```
 
 ## Where the settings live
 

@@ -57,6 +57,16 @@ impl Default for AdminData {
     }
 }
 
+/// The keys of the `setting` table. A missing key means its default.
+pub const SETTING_KEYS: [&str; 6] = [
+    "petrol_cents_per_litre",
+    "petrol_litres_per_100km",
+    "away_cents_per_kwh",
+    "compare_cars",
+    "petrol_grade",
+    "price_rise_percent",
+];
+
 /// The JSON kept in `tariff_plan.body`: the plan as in the config file, plus
 /// its `name`. (`config::Tariff` leaves the name out when serialised, because
 /// it is not part of the rates and must stay out of the cost cache key.)
@@ -162,7 +172,7 @@ async fn load_plans(
 }
 
 /// The rows of the `setting` table as JSON values, by key.
-async fn load_settings(conn: &mut SqliteConnection) -> Result<BTreeMap<String, Value>> {
+pub(crate) async fn load_settings(conn: &mut SqliteConnection) -> Result<BTreeMap<String, Value>> {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM setting")
         .fetch_all(&mut *conn)
         .await
@@ -177,7 +187,7 @@ async fn load_settings(conn: &mut SqliteConnection) -> Result<BTreeMap<String, V
 }
 
 /// The bills in the `bill` table, oldest first, checked like the CSV file.
-async fn load_bills(conn: &mut SqliteConnection) -> Result<Vec<PastBill>> {
+pub(crate) async fn load_bills(conn: &mut SqliteConnection) -> Result<Vec<PastBill>> {
     type Row = (String, String, f64, f64, f64, f64, f64, f64, f64, String);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT from_date, to_date, bill_total, excluded, import_kwh, import_dollars, \

@@ -43,7 +43,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/modbus.rs` - Modbus TCP reader for live inverter data, and its poll loop
 - `src/teslamate.rs` - TeslaMate MQTT reader for the car's charge state
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
-- `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
+- `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the admin API (`admin.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
 - `static/` - the dashboard (`index.html`, `app.js`, `style.css`), compiled into the binary
 - `src/globird/` - GloBird portal client (`client.rs`), the `globird-probe` command (`probe.rs`), the daily sync (`sync.rs`) and the row types it saves (`data.rs`)
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
