@@ -60,6 +60,7 @@
       failure.hidden = false;
       return;
     }
+    drawPlans();
     drawPetrol();
     drawPurchases();
     drawBills();
@@ -250,6 +251,329 @@
         await load();
       },
       editing ? () => { purchaseEditing = null; drawPurchases(); } : null));
+  }
+
+  // ---------- Electricity plans ----------
+
+  const PLAN_NUMBERS = 'Numbers are in cents, as on the bill. Windows are local times; the first window that matches wins, and a window that ends before it starts runs past midnight.';
+
+  /** The plan being edited or added, as the text of its inputs, or null when none is. */
+  let draft = null;
+  /** True while the preview on screen matches the form; Save needs it. */
+  let previewOk = false;
+
+  const str = (v) => (v == null ? '' : String(v));
+  const windowDraft = (w) => ({ from: str(w.from), to: str(w.to), cents: str(w.cents) });
+
+  /** A draft (all text) from a plan row of GET /api/admin. */
+  function draftFrom(plan) {
+    const t = plan.tariff;
+    return {
+      id: plan.id,
+      valid_from: str(plan.valid_from),
+      name: str(t.name),
+      supply: str(t.supply_cents_per_day),
+      imp: str(t.default_import_cents),
+      exp: str(t.default_export_cents),
+      imports: (t.import || []).map(windowDraft),
+      exports: (t.export || []).map(windowDraft),
+      credit: t.zero_import_credit
+        ? { from: str(t.zero_import_credit.from), to: str(t.zero_import_credit.to), max_kwh: str(t.zero_import_credit.max_kwh), credit_cents: str(t.zero_import_credit.credit_cents) }
+        : null,
+      tier: t.export_tier ? { first_kwh_per_day: str(t.export_tier.first_kwh_per_day), cents: str(t.export_tier.cents) } : null,
+    };
+  }
+
+  /** The number in a text box; throws a message naming the field when it is empty or not a number. */
+  function needNumber(text, label) {
+    const n = text.trim() === '' ? NaN : Number(text);
+    if (!Number.isFinite(n)) throw new Error(`${label} needs a number.`);
+    return n;
+  }
+
+  function windowsToJson(list, label) {
+    return list.map((w, i) => {
+      if (!w.from || !w.to) throw new Error(`${label} ${i + 1} needs a from and a to time.`);
+      return { from: w.from, to: w.to, cents: needNumber(w.cents, `${label} ${i + 1} price`) };
+    });
+  }
+
+  /** The body for the plan API from a draft. Throws a message for a missing or bad number. */
+  function planFromDraft(d) {
+    const tariff = {
+      name: d.name.trim() || null,
+      supply_cents_per_day: needNumber(d.supply, 'Supply charge'),
+      default_import_cents: needNumber(d.imp, 'Default import price'),
+      default_export_cents: needNumber(d.exp, 'Default export price'),
+      import: windowsToJson(d.imports, 'Import window'),
+      export: windowsToJson(d.exports, 'Export window'),
+      zero_import_credit: null,
+    };
+    if (d.credit) {
+      if (!d.credit.from || !d.credit.to) throw new Error('The zero-import credit needs a from and a to time.');
+      tariff.zero_import_credit = {
+        from: d.credit.from, to: d.credit.to,
+        max_kwh: needNumber(d.credit.max_kwh, 'Credit maximum kWh'),
+        credit_cents: needNumber(d.credit.credit_cents, 'Credit amount'),
+      };
+    }
+    if (d.tier) {
+      tariff.export_tier = {
+        first_kwh_per_day: needNumber(d.tier.first_kwh_per_day, 'Export tier kWh'),
+        cents: needNumber(d.tier.cents, 'Export tier price'),
+      };
+    }
+    const plan = { valid_from: d.valid_from || null, tariff };
+    if (d.id != null) plan.id = d.id;
+    return plan;
+  }
+
+  /** Newest plan first, as the list shows them. */
+  const plansNewestFirst = () => data.tariffs.slice().sort((a, b) => (b.valid_from || '').localeCompare(a.valid_from || ''));
+
+  function drawPlans() {
+    const box = body('admin-plans');
+    box.replaceChildren();
+    const plans = plansNewestFirst();
+
+    box.append(el('p', 'panel-note',
+      'A plan applies from its start date until the next plan starts. Only the earliest plan can have no start date. Costs and savings use the plan in force on each day.'));
+    const list = el('ul', 'alist');
+    if (!plans.length) list.append(el('li', 'alist-empty', 'No plans yet. Without one, costs and savings are off.'));
+    for (const p of plans) {
+      const li = el('li', 'arow');
+      const text = el('div', 'arow-text');
+      text.append(el('strong', null, p.tariff.name || 'Unnamed plan'),
+        el('span', 'num', (p.valid_from ? `From ${p.valid_from}` : 'From the start')
+          + ` · ${p.tariff.supply_cents_per_day} c/day supply · ${p.tariff.default_import_cents} c/kWh import`));
+      const actions = el('div', 'arow-actions');
+      actions.append(
+        rowButton('Edit', `Edit plan ${p.tariff.name || p.valid_from || ''}`, () => { startDraft(draftFrom(p)); }),
+        rowButton('Delete', `Delete plan ${p.tariff.name || p.valid_from || ''}`, () => confirmDelete(
+          `Delete the plan "${p.tariff.name || p.valid_from || 'from the start'}"?`
+          + (plans.length === 1 ? ' It is the only plan, so costs and savings will switch off.' : ''),
+          () => call('DELETE', `/api/admin/tariffs/${p.id}`), 'admin-plans'), 'danger'));
+      li.append(text, actions);
+      list.append(li);
+    }
+    box.append(list, listError());
+
+    const add = el('button', 'btn', 'Add plan');
+    add.type = 'button';
+    add.onclick = () => {
+      // A copy of the newest plan is the starting point; the new one needs its own start date.
+      const newest = plans[0];
+      const d = newest ? draftFrom(newest) : draftFrom({ tariff: { supply_cents_per_day: '', default_import_cents: '', default_export_cents: 0 } });
+      d.id = null;
+      d.valid_from = '';
+      startDraft(d);
+    };
+    box.append(add);
+
+    const editorBox = el('div', 'plan-editor');
+    editorBox.id = 'plan-editor';
+    box.append(editorBox);
+    if (draft) drawEditor();
+  }
+
+  function startDraft(d) {
+    draft = d;
+    previewOk = false;
+    drawPlans();
+    const editor = $('plan-editor');
+    if (editor) editor.scrollIntoView({ block: 'nearest' });
+  }
+
+  /** A text or number or time input kept in step with `obj[key]`. */
+  function bound(type, obj, key, attrs) {
+    const i = input(type, attrs || {});
+    i.value = obj[key];
+    i.addEventListener('input', () => { obj[key] = i.value; stale(); });
+    return i;
+  }
+
+  /** The draft changed: the preview on screen no longer describes it. */
+  function stale() {
+    previewOk = false;
+    const save = $('plan-save');
+    if (save) save.disabled = true;
+    const out = $('plan-preview');
+    if (out) { out.hidden = true; out.replaceChildren(); }
+  }
+
+  /** Rows of from, to, price for one list of windows, with add and remove. */
+  function windowRows(title, list, label) {
+    const wrap = el('div', 'wlist');
+    wrap.append(el('h4', 'sub-title', title));
+    list.forEach((w, i) => {
+      const row = el('div', 'wrow');
+      const from = bound('time', w, 'from', { required: true });
+      const to = bound('time', w, 'to', { required: true });
+      const cents = bound('number', w, 'cents', { step: '0.01', inputMode: 'decimal' });
+      row.append(field('From', from), field('To', to), field('Cents per kWh', cents),
+        rowButton('Remove', `Remove ${label} ${i + 1}`, () => { list.splice(i, 1); stale(); drawEditor(); }, 'danger'));
+      wrap.append(row);
+    });
+    const add = el('button', 'btn small', `Add ${label}`);
+    add.type = 'button';
+    add.onclick = () => { list.push({ from: '', to: '', cents: '' }); stale(); drawEditor(); };
+    wrap.append(add);
+    return wrap;
+  }
+
+  /** A checkbox that turns an optional group on (with `make()` as its starting values) or off. */
+  function optionalGroup(title, on, toggle, fieldsFn) {
+    const wrap = el('div', 'wlist');
+    const label = el('label', 'check');
+    const box = input('checkbox', { checked: on });
+    box.onchange = () => { toggle(box.checked); stale(); drawEditor(); };
+    label.append(box, el('span', null, title));
+    wrap.append(label);
+    if (on) wrap.append(fieldsFn());
+    return wrap;
+  }
+
+  function drawEditor() {
+    const box = $('plan-editor');
+    box.replaceChildren();
+    if (!draft) return;
+    previewOk = false; // a redraw starts without a preview on screen
+    const d = draft;
+    const plans = data.tariffs;
+    const editing = d.id != null;
+    box.append(el('h3', 'sub-title', editing ? 'Edit plan' : 'Add a plan'));
+    box.append(el('p', 'panel-note', PLAN_NUMBERS));
+
+    const basics = [
+      field('Name', bound('text', d, 'name', { autocomplete: 'off' })),
+      field('Starts on', bound('date', d, 'valid_from'),
+        plans.length === 0 || (editing && plans.length === 1) ? 'Can stay empty for the only plan.' : 'Leave empty only for the earliest plan.'),
+      field('Supply charge (c per day)', bound('number', d, 'supply', { step: '0.01', inputMode: 'decimal' })),
+      field('Default import price (c/kWh)', bound('number', d, 'imp', { step: '0.01', inputMode: 'decimal' })),
+      field('Default export price (c/kWh)', bound('number', d, 'exp', { step: '0.01', inputMode: 'decimal' }), 'Paid for power sent to the grid outside any export window.'),
+    ];
+
+    const credit = optionalGroup('Credit for (almost) no grid import', !!d.credit,
+      (on) => { d.credit = on ? { from: '', to: '', max_kwh: '', credit_cents: '' } : null; },
+      () => {
+        const g = el('div', 'afields');
+        g.append(field('From', bound('time', d.credit, 'from', { required: true })),
+          field('To', bound('time', d.credit, 'to', { required: true })),
+          field('Import at most (kWh)', bound('number', d.credit, 'max_kwh', { step: '0.01', inputMode: 'decimal' })),
+          field('Credit (cents a day)', bound('number', d.credit, 'credit_cents', { step: '0.01', inputMode: 'decimal' })));
+        return g;
+      });
+    const tier = optionalGroup('Different price for the first kWh exported each day', !!d.tier,
+      (on) => { d.tier = on ? { first_kwh_per_day: '', cents: '' } : null; },
+      () => {
+        const g = el('div', 'afields');
+        g.append(field('First kWh a day', bound('number', d.tier, 'first_kwh_per_day', { step: '0.01', inputMode: 'decimal' })),
+          field('Price for them (c/kWh)', bound('number', d.tier, 'cents', { step: '0.01', inputMode: 'decimal' })));
+        return g;
+      });
+
+    const msg = el('p', 'aform-error');
+    msg.setAttribute('role', 'alert');
+    msg.hidden = true;
+    const showError = (err) => { msg.textContent = err.message; msg.hidden = false; };
+    const out = el('div', 'apreview');
+    out.id = 'plan-preview';
+    out.hidden = true;
+
+    const preview = el('button', 'btn', 'Preview');
+    preview.type = 'button';
+    const save = el('button', 'btn primary', 'Save plan');
+    save.type = 'button';
+    save.id = 'plan-save';
+    save.disabled = true;
+    const cancel = el('button', 'btn', 'Cancel');
+    cancel.type = 'button';
+    cancel.onclick = () => { draft = null; previewOk = false; drawPlans(); };
+
+    preview.onclick = async () => {
+      msg.hidden = true;
+      preview.disabled = true;
+      try {
+        const result = await call('POST', '/api/admin/tariffs/preview', planFromDraft(d));
+        drawPreview(out, result);
+        previewOk = true;
+        save.disabled = false;
+      } catch (err) {
+        previewOk = false;
+        save.disabled = true;
+        out.hidden = true;
+        showError(err);
+      } finally {
+        preview.disabled = false;
+      }
+    };
+    save.onclick = async () => {
+      msg.hidden = true;
+      save.disabled = true;
+      try {
+        const plan = planFromDraft(d);
+        if (editing) await call('PUT', `/api/admin/tariffs/${d.id}`, plan);
+        else await call('POST', '/api/admin/tariffs', plan);
+        draft = null;
+        previewOk = false;
+        await load();
+      } catch (err) {
+        save.disabled = !previewOk;
+        showError(err);
+      }
+    };
+
+    const actions = el('div', 'aform-actions');
+    actions.append(preview, save, cancel);
+    const grid = el('div', 'afields');
+    grid.append(...basics);
+    box.append(grid, windowRows('Import windows', d.imports, 'import window'),
+      windowRows('Export windows', d.exports, 'export window'), credit, tier,
+      msg, actions, out,
+      el('p', 'panel-note', 'Preview prices your last 30 complete days on the plans as they are now and with this change. Save turns on after a preview with no error.'));
+  }
+
+  /** Shows the answer of the preview endpoint: totals, then a day-by-day table. */
+  function drawPreview(out, result) {
+    out.replaceChildren();
+    out.hidden = false;
+    const n = result.days.length;
+    const total = result.total;
+    if (!n) {
+      out.append(el('p', 'panel-note', 'No days with data in the last 30 days, so there is nothing to compare. The plan itself is valid.'));
+      return;
+    }
+    const money = (c) => (c == null ? 'n/a' : dollars(c / 100));
+    const diff = total.current_cents == null ? null : total.new_cents - total.current_cents;
+    const head = el('p', 'preview-head');
+    head.append(document.createTextNode(`Over ${plural(n, 'day')} with data: `),
+      el('strong', null, `${money(total.current_cents)} now`),
+      document.createTextNode(', '),
+      el('strong', null, `${money(total.new_cents)} with this plan`));
+    if (diff != null) {
+      const word = diff > 0 ? 'more' : 'less';
+      head.append(document.createTextNode(diff === 0 ? ', no difference.' : `, ${money(Math.abs(diff))} ${word}.`));
+    }
+    const details = el('details', 'how-days');
+    details.append(el('summary', null, 'Day by day'));
+    const table = el('table', 'data');
+    const thead = el('thead');
+    const hr = el('tr');
+    for (const h of ['Day', 'Now', 'New', 'Change']) hr.append(el('th', null, h));
+    thead.append(hr);
+    const tbody = el('tbody');
+    for (const day of result.days) {
+      const tr = el('tr');
+      const change = day.current_cents == null ? null : day.new_cents - day.current_cents;
+      tr.append(el('td', null, day.date), el('td', null, money(day.current_cents)), el('td', null, money(day.new_cents)),
+        el('td', null, change == null ? 'n/a' : (change > 0 ? '+' : change < 0 ? '-' : '') + money(Math.abs(change))));
+      tbody.append(tr);
+    }
+    table.append(thead, tbody);
+    const wrap = el('div', 'table-wrap');
+    wrap.append(table);
+    details.append(wrap);
+    out.append(head, details);
   }
 
   // ---------- Past bills ----------

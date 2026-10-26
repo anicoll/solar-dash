@@ -304,6 +304,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/petrol-prices/{from}", delete(petrol::remove))
         .route("/api/admin", get(admin::read))
         .route("/api/admin/tariffs", post(admin::tariff_create))
+        .route("/api/admin/tariffs/preview", post(admin::tariff_preview))
         .route(
             "/api/admin/tariffs/{id}",
             put(admin::tariff_update).delete(admin::tariff_delete),
@@ -3462,6 +3463,82 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let response = send(&app, get_request("/api/tariff", Some(&cookie))).await;
         assert_eq!(body_json(response).await["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn tariff_preview_compares_the_current_plans_with_the_change() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+        let preview = "/api/admin/tariffs/preview?from=2026-09-15&to=2026-09-15";
+
+        // No plan yet: only the new cost is known. Import 1 kWh and export
+        // 2 kWh on 15 September (100 + 30 - 10 = 120 c).
+        for point_id in [83102, 83072, 83118] {
+            let point = Point {
+                point_id,
+                code: None,
+                name: None,
+                unit: Some("Wh".to_string()),
+            };
+            db::upsert_point(&pool, &point).await.unwrap();
+        }
+        seed_counters(&pool, SEP_15_START, &[3600, 3900], 1000.0).await;
+        let (status, json) = admin_send(&app, "POST", preview, &cookie, PLAN).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["days"][0]["date"], "2026-09-15");
+        assert_eq!(json["days"][0]["current_cents"], Value::Null);
+        assert_eq!(json["days"][0]["new_cents"], 120.0);
+        assert_eq!(json["total"]["current_cents"], Value::Null);
+
+        let (_, plan) = admin_send(&app, "POST", "/api/admin/tariffs", &cookie, PLAN).await;
+        let id = plan["id"].as_i64().unwrap();
+
+        // Replacing the plan: the import rate goes from 30 to 40 c.
+        let dearer = format!(
+            r#"{{"id":{id},"valid_from":null,"tariff":{{"supply_cents_per_day":100.0,
+            "default_import_cents":40.0,"default_export_cents":5.0}}}}"#
+        );
+        let (status, json) = admin_send(&app, "POST", preview, &cookie, &dearer).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["days"].as_array().unwrap().len(), 1);
+        assert_eq!(json["days"][0]["current_cents"], 120.0);
+        assert_eq!(json["days"][0]["new_cents"], 130.0);
+        assert_eq!(json["total"]["current_cents"], 120.0);
+        assert_eq!(json["total"]["new_cents"], 130.0);
+
+        // Adding a plan that starts on 1 September: a dearer supply charge.
+        let added = r#"{"valid_from":"2026-09-01","tariff":{"supply_cents_per_day":200.0,
+            "default_import_cents":30.0,"default_export_cents":5.0}}"#;
+        let (_, json) = admin_send(&app, "POST", preview, &cookie, added).await;
+        assert_eq!(json["days"][0]["current_cents"], 120.0);
+        assert_eq!(json["days"][0]["new_cents"], 220.0);
+
+        // Nothing was saved or stored: the plan is as it was and no day is cached.
+        assert_eq!(count(&pool, "tariff_plan").await, 1);
+        assert_eq!(count(&pool, "daily_cost").await, 0);
+        let response = send(&app, get_request("/api/tariff", Some(&cookie))).await;
+        assert_eq!(body_json(response).await["default_import_cents"], 30.0);
+
+        // Mistakes are refused like a save would.
+        let bad_rate = r#"{"valid_from":null,"tariff":{"supply_cents_per_day":-1.0,
+            "default_import_cents":40.0}}"#;
+        let (status, _) = admin_send(&app, "POST", preview, &cookie, bad_rate).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let same_day = r#"{"valid_from":null,"tariff":{"supply_cents_per_day":1.0,
+            "default_import_cents":40.0}}"#;
+        let (status, json) = admin_send(&app, "POST", preview, &cookie, same_day).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        let unknown = dearer.replace(&format!("\"id\":{id}"), "\"id\":999");
+        let (status, _) = admin_send(&app, "POST", preview, &cookie, &unknown).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let long = "/api/admin/tariffs/preview?from=2026-01-01&to=2026-05-01";
+        let (status, _) = admin_send(&app, "POST", long, &cookie, &dearer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // The default range is the last 30 days: this data is older, so no days.
+        let (status, json) =
+            admin_send(&app, "POST", "/api/admin/tariffs/preview", &cookie, &dearer).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["days"].as_array().unwrap().len() <= 1);
     }
 
     #[tokio::test]

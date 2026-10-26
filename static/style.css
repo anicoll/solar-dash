@@ -745,3 +745,19 @@ table.car-table tr.car-year th { text-align: left; color: var(--fg); font-weight
 #view-admin > .panel-note { margin: 0; }
 .afield input[type="file"] { padding: 8px 12px; min-height: 44px; }
 .afield-hint { overflow-wrap: anywhere; }
+.plan-editor { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.plan-editor:empty { display: none; }
+.wlist { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; min-width: 0; width: 100%; }
+.wlist .afields { width: 100%; }
+.wlist .sub-title { margin: 8px 0 0; }
+.wrow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 8px; align-items: end; width: 100%; }
+@media (max-width: 480px) { .wrow { grid-template-columns: repeat(2, minmax(0, 1fr)); } .wrow .btn { justify-self: start; } }
+.wrow .afield input[type="time"] { padding: 0 8px; font-family: var(--mono); }
+.check { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; }
+.check input { width: 20px; height: 20px; accent-color: var(--save); }
+.apreview { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--save-border); background: var(--save-panel); border-radius: 12px; }
+.apreview[hidden] { display: none; }
+.apreview .preview-head { margin: 0; }
+.apreview table.data { min-width: 0; }
+.how-days summary { cursor: pointer; color: var(--fg-soft); min-height: 24px; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }

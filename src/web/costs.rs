@@ -829,6 +829,24 @@ async fn costed_days_on(
         .collect())
 }
 
+/// The cost of every day in `dates` (sorted, consecutive) that has data, each
+/// priced on the plan `schedule` has for that day, for a "what if" preview.
+/// Unlike [`costed_days`] it never reads or writes the `daily_cost` table (a
+/// plan that is not saved has no stored costs), and it leaves out real bills.
+pub(super) async fn preview_days(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    dates: &[NaiveDate],
+) -> Result<Vec<CostedDay>, ApiError> {
+    let today = today(state.tz);
+    let mut costed = Vec::new();
+    for run in dates.chunk_by(|a, b| std::ptr::eq(schedule.for_date(*a), schedule.for_date(*b))) {
+        let days = compute_days(state, schedule.for_date(run[0]), run, today).await?;
+        costed.extend(days.into_iter().map(|(day, _)| day));
+    }
+    Ok(costed)
+}
+
 /// The kWh GloBird metered on one day. `None` means it has no figure.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct DayKwh {

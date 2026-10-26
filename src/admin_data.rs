@@ -153,6 +153,17 @@ impl AdminData {
 async fn load_plans(
     conn: &mut SqliteConnection,
 ) -> Result<Vec<(Option<NaiveDate>, config::Tariff)>> {
+    let rows = load_plan_rows(conn).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(_, valid_from, tariff)| (valid_from, tariff))
+        .collect())
+}
+
+/// Like [`load_plans`], with each plan's `id` as the first part.
+pub(crate) async fn load_plan_rows(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<(i64, Option<NaiveDate>, config::Tariff)>> {
     let rows: Vec<(i64, Option<String>, String)> =
         sqlx::query_as("SELECT id, valid_from, body FROM tariff_plan ORDER BY valid_from, id")
             .fetch_all(&mut *conn)
@@ -166,7 +177,7 @@ async fn load_plans(
             .with_context(|| format!("valid_from of tariff plan #{id}"))?;
         let tariff = tariff_from_body(&body).with_context(|| format!("tariff plan #{id}"))?;
         tariff.check(&format!("tariff plan #{id}"))?;
-        plans.push((valid_from, tariff));
+        plans.push((id, valid_from, tariff));
     }
     Ok(plans)
 }

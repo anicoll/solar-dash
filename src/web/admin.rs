@@ -13,12 +13,14 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use chrono::{Days, NaiveDate};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sqlx::SqliteConnection;
 
 use super::AppState;
-use super::api::{ApiError, ApiResult, today};
+use super::api::{ApiError, ApiResult, date_range, today};
+use super::costs;
 use super::petrol::view_json;
 use crate::admin_data::{
     self, AdminData, SETTING_KEYS, apply_setting, load_bills, load_settings, log_change,
@@ -26,6 +28,7 @@ use crate::admin_data::{
 };
 use crate::bills::{self, PastBill};
 use crate::config::{self, parse_date};
+use crate::cost::TariffSchedule;
 
 /// How many entries of the change log `GET /api/admin` lists.
 const CHANGES_SHOWN: i64 = 50;
@@ -159,9 +162,11 @@ async fn plan_row(conn: &mut SqliteConnection, id: i64) -> Result<Option<Value>,
         .transpose()
 }
 
-/// The body of `POST` and `PUT` on a plan.
+/// The body of `POST`, `PUT` and the preview on a plan.
 #[derive(Deserialize)]
 pub struct PlanBody {
+    /// Only the preview looks at this: the plan it replaces.
+    id: Option<i64>,
     valid_from: Option<String>,
     tariff: config::Tariff,
 }
@@ -311,6 +316,107 @@ pub async fn tariff_delete(State(state): State<AppState>, Path(id): Path<i64>) -
     })
     .await?;
     Ok(Json(json!({ "deleted": deleted })))
+}
+
+#[derive(Deserialize)]
+pub struct PreviewParams {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// The longest range a preview prices.
+const MAX_PREVIEW_DAYS: u64 = 92;
+/// The preview covers this many days ending yesterday unless asked otherwise.
+const PREVIEW_DAYS: u64 = 30;
+
+/// `POST /api/admin/tariffs/preview`: what the days so far would have cost
+/// with this plan, next to what they cost on the current plans. The body is a
+/// plan; with an `id` it replaces that plan, without one it is added. Nothing
+/// is saved, and no cost is stored.
+///
+/// Answers `{"days":[{"date","current_cents","new_cents"}..],"total":{..}}`
+/// for the last 30 complete days, or `?from=&to=` (at most 92 days). Days with
+/// no data are left out. With no plan saved yet, `current_cents` is null.
+pub async fn tariff_preview(
+    State(state): State<AppState>,
+    Query(params): Query<PreviewParams>,
+    plan: Result<Json<PlanBody>, JsonRejection>,
+) -> ApiResult {
+    let plan = body(plan)?;
+    checked_plan(&plan)?;
+    let valid_from = plan
+        .valid_from
+        .as_deref()
+        .map(parse_date)
+        .transpose()
+        .map_err(|err| ApiError::bad_request(format!("valid_from: {err:#}")))?;
+
+    let mut conn = state.pool().acquire().await.map_err(db_error)?;
+    let rows = admin_data::load_plan_rows(&mut conn).await?;
+    let current: Vec<_> = rows
+        .iter()
+        .map(|(_, from, tariff)| (*from, tariff.clone()))
+        .collect();
+    let mut changed = current.clone();
+    match plan.id {
+        Some(id) => {
+            let Some(i) = rows.iter().position(|(row_id, _, _)| *row_id == id) else {
+                return Err(not_found("tariff plan", id));
+            };
+            changed[i] = (valid_from, plan.tariff);
+        }
+        None => changed.push((valid_from, plan.tariff)),
+    }
+    let changed = TariffSchedule::from_plans(&changed)
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    let current = if current.is_empty() {
+        None
+    } else {
+        Some(TariffSchedule::from_plans(&current)?)
+    };
+
+    // The default range ends yesterday: today is not finished yet.
+    let to = params.to.clone().or_else(|| {
+        params
+            .from
+            .is_none()
+            .then(|| (today(state.tz) - Days::new(1)).to_string())
+    });
+    let (from, count) = date_range(
+        params.from.as_deref(),
+        to.as_deref(),
+        state.tz,
+        MAX_PREVIEW_DAYS,
+        PREVIEW_DAYS,
+    )?;
+    let dates: Vec<NaiveDate> = from.iter_days().take(count as usize).collect();
+
+    let new_days = costs::preview_days(&state, &changed, &dates).await?;
+    let current_days = match &current {
+        Some(schedule) => Some(costs::preview_days(&state, schedule, &dates).await?),
+        None => None,
+    };
+    let mut total_new = 0.0;
+    let mut total_current = 0.0;
+    let mut days = Vec::new();
+    for (i, day) in new_days.iter().enumerate() {
+        // Both lists come from the same intervals, so they have the same days.
+        let was = current_days.as_ref().map(|list| list[i].cost.actual_cents);
+        total_new += day.cost.actual_cents;
+        total_current += was.unwrap_or(0.0);
+        days.push(json!({
+            "date": day.date.to_string(),
+            "current_cents": was.map(costs::round2),
+            "new_cents": costs::round2(day.cost.actual_cents),
+        }));
+    }
+    Ok(Json(json!({
+        "days": days,
+        "total": {
+            "current_cents": current_days.as_ref().map(|_| costs::round2(total_current)),
+            "new_cents": costs::round2(total_new),
+        },
+    })))
 }
 
 // ---------------------------------------------------------------------------
