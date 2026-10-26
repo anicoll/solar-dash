@@ -401,9 +401,11 @@ async fn security_headers(request: Request, next: Next) -> Response {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    // Not "no-referrer": with that, browsers send `Origin: null` on our own
+    // form posts (login, logout), which `same_origin` would refuse.
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert(
         HeaderName::from_static("x-frame-options"),
@@ -1889,7 +1891,7 @@ mod tests {
                     .contains("frame-ancestors 'none'")
             );
             assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
-            assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+            assert_eq!(h[header::REFERRER_POLICY], "same-origin");
             assert_eq!(h["x-frame-options"], "DENY");
             assert_eq!(
                 h.get(header::CACHE_CONTROL)
