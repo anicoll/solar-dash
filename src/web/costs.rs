@@ -567,9 +567,8 @@ async fn car_days(
     first: NaiveDate,
     last: NaiveDate,
 ) -> Result<Option<BTreeMap<String, CarDayTotals>>> {
-    // Looks at the petrol prices file, so a hand edit shows on this request.
     let data = state.admin.get();
-    let petrol = data.petrol.current();
+    let petrol = &data.petrol;
     let cars = db::tm_cars(&state.pool).await?;
     if cars.is_empty() || !petrol.is_configured() {
         return Ok(None);
@@ -601,7 +600,7 @@ async fn car_days(
     };
     Ok(Some(ev_cost::car_day_totals(
         &data.ev_prices,
-        &petrol,
+        petrol,
         average,
         &days,
         &charges,

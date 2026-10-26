@@ -15,7 +15,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Local Modbus reader (`modbus-test`) for live power from the inverter
 - [x] `serve` polls Modbus when configured and stores live samples (`/api/live`, `/api/live/series`)
 - [x] `serve` follows the Tesla's charge state from TeslaMate over MQTT when configured (`/api/live`)
-- [x] `/api/ev/cars` gives each TeslaMate car's details (trim, paint, wheels), home charging per plan, and a petrol comparison car; set `compare_cars` and `petrol_grade` in `[teslamate]`, for example `compare_cars = { "3" = "Hyundai i30 Sedan N", "Y" = "Toyota RAV4 GX 2WD" }` and `petrol_grade = "Unleaded 91"` (see `config.example.toml`)
+- [x] `/api/ev/cars` gives each TeslaMate car's details (trim, paint, wheels), home charging per plan, and a petrol comparison car; set the `compare_cars` and `petrol_grade` settings, for example `{"3": "Hyundai i30 Sedan N", "Y": "Toyota RAV4 GX 2WD"}` and `Unleaded 91` (kept in the database; see "Where the settings live" in `docs/how-to-run.md`)
 - [x] GloBird portal probe (`globird-probe`) to learn the response shapes (unofficial API)
 - [x] `serve` keeps GloBird's daily cost and usage in SQLite when configured (no API or UI yet)
 - [x] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
@@ -37,6 +37,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/main.rs` - CLI and program entry point
 - `src/config.rs` - config file loading
 - `src/cost.rs` - electricity tariff lookup and the pure daily cost calculation
+- `src/admin_data.rs`, `src/admin_import.rs` - tariffs, petrol prices, purchases, bills and settings kept in tables, the swappable snapshot of them, and the one-time import from an older `config.toml`
 - `src/db.rs` - SQLite storage: opening, migrations and typed queries
 - `migrations/` - SQL schema, applied automatically on startup
 - `src/modbus.rs` - Modbus TCP reader for live inverter data, and its poll loop

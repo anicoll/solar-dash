@@ -89,14 +89,14 @@ impl ApiError {
         }
     }
 
-    pub(super) fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
         }
     }
 
-    pub(super) fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
@@ -522,8 +522,7 @@ pub async fn ev_summary(
 pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
     let data = state.admin.get();
     let prices = data.ev_prices;
-    // Looks at the petrol prices file, so a hand edit shows on this request.
-    let petrol = data.petrol.current();
+    let petrol = &data.petrol;
     let mut cars = Vec::new();
     for car in db::tm_cars(&state.pool).await? {
         let days: Vec<ev_cost::CarDay> = db::tm_drive_days(&state.pool, car.id)
@@ -539,7 +538,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
             .into_iter()
             .filter_map(|row| car_charge(&row, state.tz))
             .collect();
-        let history = ev_cost::summarise_car(&prices, &petrol, &days, &charges);
+        let history = ev_cost::summarise_car(&prices, petrol, &days, &charges);
         if history.first_day.is_some() {
             cars.push((car, history, charges));
         }

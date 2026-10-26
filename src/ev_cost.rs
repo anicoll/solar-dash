@@ -622,6 +622,17 @@ impl PetrolHistory {
         }
     }
 
+    /// The price that applies before the first change, if there is one.
+    pub fn fallback(&self) -> Option<f64> {
+        self.base
+    }
+
+    /// The changes, oldest first: the local day ("YYYY-MM-DD") a price
+    /// started on and the price in cents per litre.
+    pub fn changes(&self) -> &[(String, f64)] {
+        &self.changes
+    }
+
     /// Whether any petrol price is known at all.
     pub fn is_configured(&self) -> bool {
         self.base.is_some() || !self.changes.is_empty()

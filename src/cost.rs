@@ -387,6 +387,44 @@ impl TariffSchedule {
         })
     }
 
+    /// Builds the schedule from plans kept as data: each plan with the first
+    /// local day it applies (`None` for a plan with no known start, allowed
+    /// only for the earliest). A plan lasts until the day before the next
+    /// one starts. Gives the same schedule as [`TariffSchedule::from_config`]
+    /// for the same plans, including each plan's `key`.
+    pub fn from_plans(plans: &[(Option<NaiveDate>, config::Tariff)]) -> Result<Self> {
+        anyhow::ensure!(!plans.is_empty(), "there are no tariff plans");
+        let mut sorted: Vec<&(Option<NaiveDate>, config::Tariff)> = plans.iter().collect();
+        // `None` sorts before every date, so a plan with no start comes first.
+        sorted.sort_by_key(|(from, _)| *from);
+        anyhow::ensure!(
+            sorted.iter().skip(1).all(|(from, _)| from.is_some()),
+            "only the earliest plan may have no start date"
+        );
+        anyhow::ensure!(
+            sorted.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "two plans start on the same day"
+        );
+        let (last, earlier) = sorted.split_last().expect("checked not empty");
+        let mut previous = Vec::new();
+        for (i, (_, tariff)) in earlier.iter().enumerate() {
+            // The next plan has a start date: only the first can lack one.
+            let next_start = sorted[i + 1].0.context("a later plan has no start date")?;
+            let until = next_start
+                .pred_opt()
+                .context("plan start date is too early")?;
+            let tariff = Tariff::from_config(tariff)
+                .with_context(|| format!("invalid tariff plan #{}", i + 1))?;
+            previous.push((until, tariff));
+        }
+        let names = sorted.iter().map(|(_, t)| t.name.clone()).collect();
+        Ok(Self {
+            previous,
+            current: Tariff::from_config(&last.1)?,
+            names,
+        })
+    }
+
     /// Which plan applies on this local day: 0 for the oldest, up to the
     /// number of previous plans for the current one. The same choice as
     /// [`TariffSchedule::for_date`].
@@ -764,6 +802,83 @@ mod tests {
         );
         let single = TariffSchedule::single(Tariff::from_config(&w.tariff).unwrap());
         assert_eq!(single.plans(), vec![(None, None)]);
+    }
+
+    /// Three plans written as config, to compare `from_plans` with `from_config`.
+    fn three_plan_config() -> (config::Tariff, Vec<config::PreviousTariff>) {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: config::Tariff,
+            previous_tariff: Vec<config::PreviousTariff>,
+        }
+        let w: Wrapper = toml::from_str(
+            r#"
+            [tariff]
+            name = "Now"
+            supply_cents_per_day = 100.0
+            default_import_cents = 30.0
+            [[previous_tariff]]
+            name = "Old"
+            until = "2024-06-30"
+            supply_cents_per_day = 100.0
+            default_import_cents = 20.0
+            [[previous_tariff]]
+            until = "2025-06-30"
+            supply_cents_per_day = 100.0
+            default_import_cents = 25.0
+            "#,
+        )
+        .unwrap();
+        (w.tariff, w.previous_tariff)
+    }
+
+    #[test]
+    fn from_plans_builds_the_same_schedule_as_from_config() {
+        let (current, previous) = three_plan_config();
+        let day = |text: &str| text.parse::<NaiveDate>().unwrap();
+        let named = |plan: &config::PreviousTariff| config::Tariff {
+            name: plan.name.clone(),
+            ..plan.tariff.clone()
+        };
+        // Given out of order on purpose.
+        let plans = [
+            (Some(day("2025-07-01")), current.clone()),
+            (None, named(&previous[0])),
+            (Some(day("2024-07-01")), named(&previous[1])),
+        ];
+        let built = TariffSchedule::from_plans(&plans).unwrap();
+        let expected = TariffSchedule::from_config(&current, &previous).unwrap();
+        assert_eq!(built.plan_spans(), expected.plan_spans());
+        for date in [
+            "2020-01-01",
+            "2024-06-30",
+            "2024-07-01",
+            "2025-06-30",
+            "2025-07-01",
+        ] {
+            assert_eq!(
+                built.for_date(day(date)).key(),
+                expected.for_date(day(date)).key()
+            );
+        }
+    }
+
+    #[test]
+    fn from_plans_rejects_bad_sets() {
+        let (current, _) = three_plan_config();
+        let day = |text: &str| text.parse::<NaiveDate>().unwrap();
+        assert!(TariffSchedule::from_plans(&[]).is_err());
+        // Only the earliest plan may have no start.
+        let two_open = [(None, current.clone()), (None, current.clone())];
+        assert!(TariffSchedule::from_plans(&two_open).is_err());
+        let same_day = [
+            (Some(day("2025-01-01")), current.clone()),
+            (Some(day("2025-01-01")), current.clone()),
+        ];
+        assert!(TariffSchedule::from_plans(&same_day).is_err());
+        let one = [(Some(day("2025-01-01")), current)];
+        let schedule = TariffSchedule::from_plans(&one).unwrap();
+        assert_eq!(schedule.plans().len(), 1);
     }
 
     #[test]
