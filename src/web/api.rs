@@ -324,7 +324,8 @@ async fn home_session_cost(
     session: &db::ChargeSession,
     now: i64,
 ) -> Result<Option<ev_cost::SessionCost>, ApiError> {
-    let Some(schedule) = &state.tariff else {
+    let data = state.admin.get();
+    let Some(schedule) = &data.tariff else {
         return Ok(None);
     };
     // `to` is exclusive in the query, so add a second to include the end.
@@ -457,7 +458,7 @@ pub async fn ev_summary(
     let odometer = db::odometer_in_range(&state.pool, &from.to_string(), &to.to_string()).await?;
     let km_by_month = ev_cost::monthly_km(&odometer, &from.to_string());
 
-    let prices = state.ev_prices;
+    let prices = state.admin.get().ev_prices;
     let now = db::now();
     let mut sessions = Vec::new();
     // The query includes sessions that began before the range and are still
@@ -519,9 +520,10 @@ pub async fn ev_summary(
 /// name added when two cars would share a label. Cars with no drives and no
 /// charges are left out.
 pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
-    let prices = state.ev_prices;
+    let data = state.admin.get();
+    let prices = data.ev_prices;
     // Looks at the petrol prices file, so a hand edit shows on this request.
-    let petrol = state.petrol.current();
+    let petrol = data.petrol.current();
     let mut cars = Vec::new();
     for car in db::tm_cars(&state.pool).await? {
         let days: Vec<ev_cost::CarDay> = db::tm_drive_days(&state.pool, car.id)
@@ -549,7 +551,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
             .then_with(|| a.0.id.cmp(&b.0.id))
     });
     let labels: Vec<String> = cars.iter().map(|(car, _, _)| car_label(car)).collect();
-    let (plans, plan_of) = charging_plans(state.tariff.as_deref());
+    let (plans, plan_of) = charging_plans(data.tariff.as_deref());
     let summarise = |charges: &[ev_cost::CarCharge]| {
         ev_cost::summarise_charging(&prices, &plans, &plan_of, charges)
     };
@@ -581,7 +583,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
                 "paint": car.exterior_color,
                 "wheels": car.wheel_type,
                 "marketing_name": car.marketing_name,
-                "compare_with": ev_cost::compare_with(&state.compare_cars, car.model.as_deref()),
+                "compare_with": ev_cost::compare_with(&data.compare_cars, car.model.as_deref()),
                 "charging_by_plan": summary.charging_by_plan,
                 "away": summary.away,
                 "self_share_pct": summary.self_share_pct,
@@ -591,7 +593,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
     Ok(Json(json!({
         "configured": petrol.is_configured(),
         "petrol_litres_per_100km": prices.petrol_litres_per_100km,
-        "petrol_grade": &*state.petrol_grade,
+        "petrol_grade": data.petrol_grade,
         "charging_by_plan": combined.charging_by_plan,
         "away": combined.away,
         "self_share_pct": combined.self_share_pct,
@@ -1263,10 +1265,11 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
             _ => {}
         }
     }
+    let data = state.admin.get();
     let mut days = Vec::new();
     for date in from.iter_days().take(count as usize) {
         let (mut totals, live) = day_totals_with_live(&state, date, live_range, now).await?;
-        if let Some(schedule) = &state.tariff
+        if let Some(schedule) = &data.tariff
             && let Some(split) = day_grid_split(&state, schedule, date, &live, now).await?
         {
             totals.split.add(&split);

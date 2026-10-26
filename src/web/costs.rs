@@ -568,7 +568,8 @@ async fn car_days(
     last: NaiveDate,
 ) -> Result<Option<BTreeMap<String, CarDayTotals>>> {
     // Looks at the petrol prices file, so a hand edit shows on this request.
-    let petrol = state.petrol.current();
+    let data = state.admin.get();
+    let petrol = data.petrol.current();
     let cars = db::tm_cars(&state.pool).await?;
     if cars.is_empty() || !petrol.is_configured() {
         return Ok(None);
@@ -599,7 +600,7 @@ async fn car_days(
         NaiveDate::from_str(date).map_or(0.0, |d| schedule.for_date(d).average_import_cents())
     };
     Ok(Some(ev_cost::car_day_totals(
-        &state.ev_prices,
+        &data.ev_prices,
         &petrol,
         average,
         &days,
@@ -945,7 +946,8 @@ pub(super) async fn billed_days(
         return Ok(Vec::new());
     };
     // The bills that touch the request, and the span that covers them all.
-    let touched: Vec<&PastBill> = state
+    let data = state.admin.get();
+    let touched: Vec<&PastBill> = data
         .bills
         .iter()
         .filter(|bill| bill.from <= last && bill.to >= first)
@@ -1049,7 +1051,8 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
         max_days,
         DEFAULT_DAILY_DAYS,
     )?;
-    let Some(tariff) = &state.tariff else {
+    let data = state.admin.get();
+    let Some(tariff) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
 
@@ -1154,7 +1157,8 @@ pub async fn tariff(
             .map_err(|_| ApiError::bad_request("date must look like 2026-10-20"))?,
         None => today(state.tz),
     };
-    let Some(schedule) = &state.tariff else {
+    let data = state.admin.get();
+    let Some(schedule) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
     let t = schedule.for_date(date);

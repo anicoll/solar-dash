@@ -36,6 +36,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
 
+use crate::admin_data::{AdminData, SharedAdminData};
 use crate::bills::PastBill;
 use crate::config::Config;
 use crate::cost::TariffSchedule;
@@ -45,7 +46,7 @@ use crate::petrol_prices::PetrolPrices;
 use crate::teslamate::Car;
 use auth::LockoutMap;
 pub use auth::hash_password;
-use payback::Purchase;
+pub(crate) use payback::{Purchase, purchases_from_config};
 
 /// The files in `static/`, compiled into the binary.
 // (In debug builds rust-embed reads them from disk instead, so edits show up
@@ -82,25 +83,11 @@ pub struct AppState {
     latest_settings: LatestSettings,
     /// The car's charge state from TeslaMate, kept by the MQTT task.
     car: Car,
-    /// The parsed `[tariff]` and `[[previous_tariff]]` sections; `None` turns the cost API off.
-    tariff: Option<Arc<TariffSchedule>>,
-    /// The petrol and away-from-home prices from `[teslamate]`.
-    ev_prices: EvPrices,
-    /// What petrol cost on each day: `petrol_cents_per_litre` and either the
-    /// `[[teslamate.petrol_price]]` entries or the `petrol_prices_file`.
-    petrol: PetrolPrices,
-    /// `compare_cars` from `[teslamate]`: the petrol car for each model.
-    compare_cars: Arc<BTreeMap<String, String>>,
-    /// `petrol_grade` from `[teslamate]`.
-    petrol_grade: Arc<str>,
-    /// The `[[system.purchase]]` entries, oldest first; empty turns the payback API off.
-    purchases: Arc<[Purchase]>,
-    /// Assumed yearly electricity price rise (percent) in the payback projection.
-    price_rise_percent: f64,
+    /// The tariffs, petrol prices, purchases, bills and preferences. The
+    /// admin page swaps the whole snapshot; handlers call `admin.get()` once.
+    admin: SharedAdminData,
     /// Whether the config has a `[globird]` section.
     globird_configured: bool,
-    /// The past bills from `[bills]`, oldest first; empty when there are none.
-    bills: Arc<[PastBill]>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -132,15 +119,8 @@ impl AppState {
             latest: Latest::default(),
             latest_settings: LatestSettings::default(),
             car: Car::default(),
-            tariff: None,
-            ev_prices: EvPrices::default(),
-            petrol: PetrolPrices::default(),
-            compare_cars: Arc::new(BTreeMap::new()),
-            petrol_grade: Arc::from("Unleaded 91"),
-            purchases: Arc::from([]),
-            price_rise_percent: 3.0,
+            admin: SharedAdminData::new(AdminData::default()),
             globird_configured: false,
-            bills: Arc::from([]),
         })
     }
 
@@ -156,46 +136,56 @@ impl AppState {
         self
     }
 
-    /// Turns on the cost API with these plans.
-    pub fn with_tariff(mut self, tariff: Option<TariffSchedule>) -> Self {
-        self.tariff = tariff.map(Arc::new);
+    /// Changes the admin data. The state gets its own slot, so a clone made
+    /// before the call is not affected (tests rely on this).
+    fn edit_admin(mut self, change: impl FnOnce(&mut AdminData)) -> Self {
+        let mut data = (*self.admin.get()).clone();
+        change(&mut data);
+        self.admin = SharedAdminData::new(data);
         self
+    }
+
+    /// Puts in the admin data as a whole, e.g. one built from the config.
+    pub fn with_admin_data(self, data: AdminData) -> Self {
+        self.edit_admin(|d| *d = data)
+    }
+
+    /// Turns on the cost API with these plans.
+    pub fn with_tariff(self, tariff: Option<TariffSchedule>) -> Self {
+        self.edit_admin(|d| d.tariff = tariff.map(Arc::new))
     }
 
     /// Sets the prices the car-versus-petrol summary uses.
-    pub fn with_ev_prices(mut self, prices: EvPrices) -> Self {
-        self.ev_prices = prices;
-        self
+    pub fn with_ev_prices(self, prices: EvPrices) -> Self {
+        self.edit_admin(|d| d.ev_prices = prices)
     }
 
     /// Sets the petrol prices by day that the per-car history uses.
-    pub fn with_petrol_prices(mut self, petrol: PetrolPrices) -> Self {
-        self.petrol = petrol;
-        self
+    pub fn with_petrol_prices(self, petrol: PetrolPrices) -> Self {
+        self.edit_admin(|d| d.petrol = petrol)
     }
 
     /// Sets the petrol car each model is compared with and the petrol grade,
     /// both shown by `/api/ev/cars`.
     pub fn with_petrol_comparison(
-        mut self,
+        self,
         compare_cars: BTreeMap<String, String>,
         petrol_grade: &str,
     ) -> Self {
-        self.compare_cars = Arc::new(compare_cars);
-        self.petrol_grade = petrol_grade.into();
-        self
+        self.edit_admin(|d| {
+            d.compare_cars = compare_cars;
+            d.petrol_grade = petrol_grade.to_string();
+        })
     }
 
     /// Turns on the payback API with these purchases (oldest first).
-    pub fn with_purchases(mut self, purchases: Vec<Purchase>) -> Self {
-        self.purchases = purchases.into();
-        self
+    pub fn with_purchases(self, purchases: Vec<Purchase>) -> Self {
+        self.edit_admin(|d| d.purchases = purchases.into())
     }
 
     /// Sets the yearly price rise (percent) the payback projection assumes.
-    pub fn with_price_rise_percent(mut self, percent: f64) -> Self {
-        self.price_rise_percent = percent;
-        self
+    pub fn with_price_rise_percent(self, percent: f64) -> Self {
+        self.edit_admin(|d| d.price_rise_percent = percent)
     }
 
     /// Records whether a `[globird]` section is configured, which the compare
@@ -206,9 +196,8 @@ impl AppState {
     }
 
     /// Sets the past bills (oldest first) whose totals replace our estimate.
-    pub fn with_bills(mut self, bills: Vec<PastBill>) -> Self {
-        self.bills = bills.into();
-        self
+    pub fn with_bills(self, bills: Vec<PastBill>) -> Self {
+        self.edit_admin(|d| d.bills = bills.into())
     }
 
     /// The slot the Modbus poller writes its newest sample to.
@@ -226,14 +215,13 @@ impl AppState {
         self.car.clone()
     }
 
-    /// What the TeslaMate history sync needs to cost past sessions, or `None`
-    /// without a `[tariff]`.
-    pub fn cost_setup(&self) -> Option<CostSetup> {
-        Some(CostSetup {
-            schedule: self.tariff.clone()?,
-            bills: self.bills.clone(),
+    /// What the TeslaMate history sync needs to cost past sessions. It reads
+    /// the admin data again on every round, so edits apply without a restart.
+    pub fn cost_setup(&self) -> CostSetup {
+        CostSetup {
+            admin: self.admin.clone(),
             plant_id: self.plant_id,
-        })
+        }
     }
 
     /// The plant's time zone, which decides where a day ends.
@@ -262,60 +250,11 @@ impl AppState {
              (make one with `openssl rand -base64 64 | tr -d '\\n'; echo`)",
         )?;
         let key = key_from_secret(secret)?;
-        let tariff = config
-            .tariff
-            .as_ref()
-            .map(|current| TariffSchedule::from_config(current, &config.previous_tariff))
-            .transpose()?;
-        let purchases = payback::purchases_from_config(&config.system.purchase)?;
-        // A bad bills file stops `serve` here, with the line in the message.
-        let bills = match &config.bills {
-            Some(section) => crate::bills::load(std::path::Path::new(&section.file))?,
-            None => Vec::new(),
-        };
-        let ev_prices = config
-            .teslamate
-            .as_ref()
-            .map(|t| EvPrices {
-                petrol_cents_per_litre: t.petrol_cents_per_litre,
-                petrol_litres_per_100km: t.petrol_litres_per_100km,
-                away_cents_per_kwh: t.away_cents_per_kwh,
-            })
-            .unwrap_or_default();
-        // A bad petrol prices file stops `serve` here, with the line in the message.
-        let petrol = match &config.teslamate {
-            Some(t) => match &t.petrol_prices_file {
-                Some(file) => {
-                    PetrolPrices::open(t.petrol_cents_per_litre, std::path::Path::new(file))?
-                }
-                None => {
-                    let changes = t
-                        .petrol_price
-                        .iter()
-                        .map(|p| Ok((crate::config::parse_date(&p.from)?, p.cents_per_litre)))
-                        .collect::<Result<Vec<_>>>()?;
-                    PetrolPrices::fixed(t.petrol_cents_per_litre, changes)
-                }
-            },
-            None => PetrolPrices::default(),
-        };
-        let (compare_cars, petrol_grade) = match &config.teslamate {
-            Some(t) => (t.compare_cars.clone(), t.petrol_grade.clone()),
-            None => Default::default(),
-        };
-        let mut state = Self::new(pool, plant_id, tz, password_hash, key)?;
-        if config.teslamate.is_some() {
-            state = state.with_petrol_comparison(compare_cars, &petrol_grade);
-        }
+        let state = Self::new(pool, plant_id, tz, password_hash, key)?;
         Ok(state
             .with_cookie_secure(config.server.cookie_secure)
             .with_api_token(config.server.api_token.as_deref())
-            .with_tariff(tariff)
-            .with_ev_prices(ev_prices)
-            .with_petrol_prices(petrol)
-            .with_purchases(purchases)
-            .with_bills(bills)
-            .with_price_rise_percent(config.system.price_rise_percent)
+            .with_admin_data(AdminData::from_config(config)?)
             .with_globird_configured(config.globird.is_some()))
     }
 }

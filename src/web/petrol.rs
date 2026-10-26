@@ -27,7 +27,7 @@ use crate::petrol_prices::{StoreError, View};
 /// `file` is false when the prices come from `[[teslamate.petrol_price]]`,
 /// which cannot be changed here. `prices` are oldest first.
 pub async fn list(State(state): State<AppState>) -> ApiResult {
-    Ok(Json(view_json(&state.petrol.view())))
+    Ok(Json(view_json(&state.admin.get().petrol.view())))
 }
 
 #[derive(Deserialize)]
@@ -58,7 +58,7 @@ pub async fn put(
         )
     })?;
     let from = date(&body.from)?;
-    let view = state.petrol.put(from, body.cents_per_litre)?;
+    let view = state.admin.get().petrol.put(from, body.cents_per_litre)?;
     Ok(Json(view_json(&view)))
 }
 
@@ -66,7 +66,7 @@ pub async fn put(
 /// 409 without a `petrol_prices_file`. Answers like the list.
 pub async fn remove(State(state): State<AppState>, Path(from): Path<String>) -> ApiResult {
     let from = date(&from)?;
-    let view = state.petrol.remove(from)?;
+    let view = state.admin.get().petrol.remove(from)?;
     Ok(Json(view_json(&view)))
 }
 
