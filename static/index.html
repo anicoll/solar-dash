@@ -21,6 +21,7 @@
       <a class="tab" href="#money" data-view="money">Money</a>
       <a class="tab" href="#payback" data-view="payback">Payback</a>
       <a class="tab" href="#cars" data-view="cars">Cars</a>
+      <a class="tab" href="#admin" data-view="admin">Admin</a>
     </nav>
     <form method="post" action="/logout" class="logout">
       <button type="submit" class="btn">Log out</button>
@@ -377,10 +378,37 @@
       </details>
     </div>
   </section>
+  <section id="view-admin" class="view" aria-labelledby="h-admin" hidden>
+    <div class="admin-head">
+      <h2 id="h-admin" class="page-title">Admin</h2>
+      <a class="btn" id="admin-export" href="/api/admin?download=1" download>Export all data</a>
+    </div>
+    <p class="panel-note">The data that used to live in the config file. Changes apply straight away; no restart.</p>
+    <p id="admin-error" class="panel notice" hidden></p>
+    <div id="admin-body" class="view-body">
+      <section class="panel" id="admin-petrol" aria-labelledby="h-admin-petrol">
+        <h2 id="h-admin-petrol" class="panel-title">Petrol prices</h2>
+        <div class="admin-card-body"></div>
+      </section>
+      <section class="panel" id="admin-purchases" aria-labelledby="h-admin-purchases">
+        <h2 id="h-admin-purchases" class="panel-title">Purchases</h2>
+        <div class="admin-card-body"></div>
+      </section>
+      <section class="panel" id="admin-settings" aria-labelledby="h-admin-settings">
+        <h2 id="h-admin-settings" class="panel-title">Settings</h2>
+        <div class="admin-card-body"></div>
+      </section>
+      <section class="panel" id="admin-changes" aria-labelledby="h-admin-changes">
+        <h2 id="h-admin-changes" class="panel-title">Recent changes</h2>
+        <div class="admin-card-body"></div>
+      </section>
+    </div>
+  </section>
 </main>
 
 <!-- ECharts 5.6.0 (Apache-2.0) from cdnjs. To use a local copy instead, change only this tag. -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.6.0/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="/static/admin.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -707,3 +707,39 @@ table.car-table tr.car-year th { text-align: left; color: var(--fg); font-weight
 .car-tiles .kpi .value { font-size: 26px; }
 @media (min-width: 760px) { .car-tiles .kpi .value { font-size: 32px; } }
 @media (max-width: 520px) { #payback-chart { height: 460px; } }
+
+/* ---------- Admin ---------- */
+.admin-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.admin-head .btn { display: inline-flex; align-items: center; text-decoration: none; }
+.alist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.arow {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;
+  padding: 10px 0; border-top: 1px solid var(--border);
+}
+.arow:first-child { border-top: 0; }
+.arow-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.arow-text .num { font-size: 14px; color: var(--fg-soft); }
+.arow-actions { display: flex; gap: 8px; }
+.alist-empty { color: var(--muted); padding: 4px 0; }
+.btn.small { min-height: 36px; padding: 0 12px; }
+.btn.primary { border-color: var(--save); background: var(--save-panel); font-weight: 600; }
+.btn.danger { color: var(--danger-fg); }
+.aform { display: flex; flex-direction: column; gap: 12px; }
+.afields { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+@media (min-width: 760px) { .afields { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); } }
+.afield { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.afield-label { font-size: 13px; color: var(--fg-soft); }
+.afield-hint { font-size: 12px; color: var(--muted); }
+.afield input, .afield textarea, .afield select {
+  width: 100%; min-width: 0; font: inherit; font-size: 14px; color: var(--fg); background: transparent;
+  border: 1px solid var(--border-strong); border-radius: 8px; padding: 0 12px; min-height: 44px; color-scheme: dark;
+}
+.afield input[type="number"], .afield input[type="date"] { font-family: var(--mono); }
+.afield textarea { padding: 10px 12px; resize: vertical; }
+.aform-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.aform-error { margin: 0; padding: 8px 12px; border-radius: 8px; background: var(--danger-bg); color: var(--danger-fg); font-size: 14px; }
+.aform-error[hidden] { display: none; }
+.saved-note { margin: 0; color: var(--save); font-size: 14px; }
+.admin-card-body { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.admin-card-body .sub-title { margin: 8px 0 0; }
+#view-admin > .panel-note { margin: 0; }
