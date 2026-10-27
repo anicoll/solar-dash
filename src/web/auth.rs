@@ -226,10 +226,14 @@ fn bearer_matches(headers: &HeaderMap, token: Option<&str>) -> bool {
     })
 }
 
+/// The database download, which the Bearer token may not use.
+const BACKUP_DOWNLOAD_PATH: &str = "/api/admin/backup/download";
+
 /// Middleware: lets the request through only with a valid session, or, on
 /// `/api/` routes, the configured `api_token` as a Bearer token (no cookie is
 /// issued for those). The token only works for GET and HEAD: anything that
-/// changes data needs the session cookie.
+/// changes data needs the session cookie. The database backup download is the
+/// one read that also needs the cookie, since it hands out everything.
 pub async fn require_session(
     State(state): State<AppState>,
     jar: SignedCookieJar,
@@ -239,6 +243,7 @@ pub async fn require_session(
     let reads_only = matches!(*request.method(), Method::GET | Method::HEAD);
     if reads_only
         && request.uri().path().starts_with("/api/")
+        && request.uri().path() != BACKUP_DOWNLOAD_PATH
         && bearer_matches(request.headers(), state.api_token.as_deref())
     {
         return next.run(request).await;

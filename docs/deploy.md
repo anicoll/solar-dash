@@ -359,7 +359,9 @@ the database; change it with `backup_dir` in `[database]`) and keeps the newest
 14 (`backup_keep`; `0` turns it off). The folder is inside `/var/lib/solar-dash`,
 which the service user already owns and may write to, so the systemd unit needs
 no change. Look for `database backup written` in `journalctl -u solar-dash`.
-Restoring is the same as below, using a file from that folder.
+Restoring is the same as below, using a file from that folder. The newest one
+can also be downloaded from the "Database backup" card on the Admin page (handy
+for opening it with `sqlite3` elsewhere).
 
 The second one is the systemd timer, described next.
 

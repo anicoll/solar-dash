@@ -174,7 +174,9 @@ async fn run_serve(config: Config) -> Result<()> {
     admin_import::import_from_config(&pool, &config).await?;
     admin_import::warn_ignored(&config);
     let admin_data = admin_data::AdminData::load(&mut *pool.acquire().await?).await?;
-    let state = state.with_admin_data(admin_data);
+    let state = state
+        .with_admin_data(admin_data)
+        .with_backup_dir(config.database.backup_dir());
     let listener = TcpListener::bind(&config.server.bind)
         .await
         .with_context(|| format!("could not listen on {}", config.server.bind))?;

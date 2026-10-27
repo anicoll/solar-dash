@@ -62,6 +62,30 @@ pub async fn backup_now(pool: &SqlitePool, dir: &Path, date: NaiveDate) -> Resul
     Ok(done)
 }
 
+/// The newest backup in `dir` (by the date in its name) and its path, or
+/// `None` when there is none or the directory does not exist yet. Only files
+/// named `solar-YYYY-MM-DD.db` count, like in [`prune`].
+pub fn latest(dir: &Path) -> Result<Option<(NaiveDate, PathBuf)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("could not read backup directory {}", dir.display()));
+        }
+    };
+    let mut newest: Option<(NaiveDate, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry?;
+        if let Some(date) = entry.file_name().to_str().and_then(date_of)
+            && newest.as_ref().is_none_or(|(best, _)| date > *best)
+        {
+            newest = Some((date, entry.path()));
+        }
+    }
+    Ok(newest)
+}
+
 /// Deletes the oldest backups in `dir` so that only `keep` remain, and returns
 /// the paths it deleted. Only files named `solar-YYYY-MM-DD.db` count.
 pub fn prune(dir: &Path, keep: usize) -> Result<Vec<PathBuf>> {
@@ -167,6 +191,26 @@ mod tests {
         assert_eq!(date_of("solar-2026-1-6.db"), None);
         assert_eq!(date_of("pre-update-20261006-010203.db"), None);
         assert_eq!(date_of("solar.db"), None);
+    }
+
+    #[test]
+    fn latest_finds_the_newest_valid_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(latest(&dir.path().join("missing")).unwrap(), None);
+        assert_eq!(latest(dir.path()).unwrap(), None);
+        for name in [
+            "solar-2026-10-03.db",
+            "solar-2026-10-05.db",
+            "solar-2026-10-04.db",
+            "solar-2026-10-09.db.tmp",
+            "pre-update-20261020-000000.db",
+        ] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        assert_eq!(
+            latest(dir.path()).unwrap(),
+            Some((date(2026, 10, 5), dir.path().join("solar-2026-10-05.db")))
+        );
     }
 
     #[test]

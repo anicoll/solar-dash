@@ -15,6 +15,7 @@ pub(crate) use costs::house_intervals;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -90,6 +91,8 @@ pub struct AppState {
     admin: SharedAdminData,
     /// Whether the config has a `[globird]` section.
     globird_configured: bool,
+    /// Where the nightly backups are, for the admin page's download.
+    backup_dir: Option<PathBuf>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -123,7 +126,19 @@ impl AppState {
             car: Car::default(),
             admin: SharedAdminData::new(AdminData::default()),
             globird_configured: false,
+            backup_dir: None,
         })
+    }
+
+    /// Sets the folder the admin page downloads the latest backup from.
+    pub fn with_backup_dir(mut self, dir: PathBuf) -> Self {
+        self.backup_dir = Some(dir);
+        self
+    }
+
+    /// The backup folder, if one was set.
+    pub(crate) fn backup_dir(&self) -> Option<&std::path::Path> {
+        self.backup_dir.as_deref()
     }
 
     /// Sets the cookie `Secure` flag (on by default).
@@ -317,6 +332,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/bills", put(admin::bills_replace))
         .route("/api/admin/bills/{from}", delete(admin::bill_delete))
         .route("/api/admin/settings", put(admin::settings_update))
+        .route("/api/admin/backup", get(admin::backup_info))
+        .route("/api/admin/backup/download", get(admin::backup_download))
         .route("/api/series", get(api::series))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
@@ -3212,6 +3229,8 @@ mod tests {
             ("PUT", "/api/admin/bills"),
             ("DELETE", "/api/admin/bills/2026-01-01"),
             ("PUT", "/api/admin/settings"),
+            ("GET", "/api/admin/backup"),
+            ("GET", "/api/admin/backup/download"),
         ] {
             let request = Request::builder()
                 .method(method)
@@ -3248,6 +3267,83 @@ mod tests {
             );
         }
         assert_eq!(count(&pool, "tariff_plan").await, 0);
+    }
+
+    #[tokio::test]
+    async fn backup_download_is_session_only_and_serves_the_newest_file() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = hash_password(PASSWORD).unwrap();
+        let state = AppState::new(
+            pool,
+            PLANT,
+            chrono_tz::Australia::Adelaide,
+            &hash,
+            Key::generate(),
+        )
+        .unwrap()
+        .with_api_token(Some(token))
+        .with_backup_dir(backups.clone());
+        let app = router(state);
+        let cookie = log_in(&app).await;
+        let bearer = format!("Bearer {token}");
+
+        // No folder yet: nothing to show or download.
+        let info = send(&app, get_request("/api/admin/backup", Some(&cookie))).await;
+        assert_eq!(info.status(), StatusCode::OK);
+        assert_eq!(body_json(info).await, serde_json::json!({ "latest": null }));
+        let download = send(
+            &app,
+            get_request("/api/admin/backup/download", Some(&cookie)),
+        )
+        .await;
+        assert_eq!(download.status(), StatusCode::NOT_FOUND);
+
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(backups.join("solar-2026-10-25.db"), b"old").unwrap();
+        std::fs::write(backups.join("solar-2026-10-26.db"), b"SQLite newest").unwrap();
+        std::fs::write(backups.join("solar-2026-10-27.db.tmp"), b"partial").unwrap();
+
+        let info = send(&app, get_request("/api/admin/backup", Some(&cookie))).await;
+        assert_eq!(
+            body_json(info).await,
+            serde_json::json!({ "latest": { "date": "2026-10-26", "bytes": 13 } })
+        );
+        let response = send(
+            &app,
+            get_request("/api/admin/backup/download", Some(&cookie)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/vnd.sqlite3"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"solar-2026-10-26.db\""
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"SQLite newest");
+
+        // The Bearer token and anonymous requests cannot download it.
+        let by_token = Request::get("/api/admin/backup/download")
+            .header(header::AUTHORIZATION, &bearer)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            send(&app, by_token).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let anonymous = get_request("/api/admin/backup/download", None);
+        assert_eq!(
+            send(&app, anonymous).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
