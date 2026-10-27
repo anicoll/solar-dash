@@ -60,13 +60,30 @@
       failure.hidden = false;
       return;
     }
-    drawPlans();
-    drawPetrol();
-    drawPurchases();
-    drawBills();
-    drawSettings();
-    drawChanges();
-    drawBackup();
+    // Each card draws on its own, so a fault in one card shows in that card
+    // instead of leaving every card after it blank.
+    const cards = [
+      ['admin-plans', drawPlans],
+      ['admin-petrol', drawPetrol],
+      ['admin-purchases', drawPurchases],
+      ['admin-bills', drawBills],
+      ['admin-settings', drawSettings],
+      ['admin-changes', drawChanges],
+      ['admin-backup', drawBackup],
+    ];
+    const failed = (id) => (err) => {
+      console.error(`Admin card ${id} failed`, err);
+      body(id).replaceChildren(el('p', 'aform-error', `This card could not be shown: ${err.message}`));
+    };
+    for (const [id, draw] of cards) {
+      try {
+        // drawBackup is async; the others draw at once.
+        const done = draw();
+        if (done && done.catch) done.catch(failed(id));
+      } catch (err) {
+        failed(id)(err);
+      }
+    }
   }
 
   // ---------- small form pieces ----------
