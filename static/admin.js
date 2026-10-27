@@ -66,6 +66,7 @@
     drawBills();
     drawSettings();
     drawChanges();
+    drawBackup();
   }
 
   // ---------- small form pieces ----------
@@ -722,6 +723,35 @@
         saved.setAttribute('role', 'status');
         body('admin-settings').append(saved);
       }));
+  }
+
+  // ---------- Database backup ----------
+
+  const fmtDay = new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', day: 'numeric', month: 'short', year: 'numeric' });
+
+  async function drawBackup() {
+    const box = body('admin-backup');
+    let latest = null;
+    try {
+      latest = (await call('GET', '/api/admin/backup')).latest;
+    } catch (err) {
+      box.replaceChildren(el('p', 'aform-error', err.message));
+      return;
+    }
+    if (!latest) {
+      box.replaceChildren(el('p', 'panel-note', 'No backups yet. A backup is made every night at 03:30.'));
+      return;
+    }
+    const day = fmtDay.format(new Date(latest.date + 'T00:00:00Z'));
+    const mb = (latest.bytes / 1e6).toFixed(1);
+    const link = el('a', 'btn', 'Download');
+    link.href = '/api/admin/backup/download';
+    link.download = `solar-${latest.date}.db`;
+    const actions = el('div', 'aform-actions');
+    actions.append(link);
+    box.replaceChildren(
+      el('p', 'panel-note', `Latest backup: ${day}, ${mb} MB. A new one is made every night at 03:30.`),
+      actions);
   }
 
   // ---------- Recent changes ----------

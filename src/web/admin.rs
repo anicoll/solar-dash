@@ -117,6 +117,64 @@ pub async fn read(
     Ok(response)
 }
 
+/// The newest nightly backup: `{"latest":{"date":"YYYY-MM-DD","bytes":n}}`, or
+/// `{"latest":null}` when there is none (or backups are off and the folder is
+/// empty).
+pub async fn backup_info(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let Some((date, path)) = newest_backup(&state).await? else {
+        return Ok(Json(json!({ "latest": null })));
+    };
+    let bytes = match std::fs::metadata(&path) {
+        Ok(meta) => meta.len(),
+        // Pruned between the listing and now: treat as none.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Json(json!({ "latest": null })));
+        }
+        Err(err) => return Err(anyhow::Error::from(err).into()),
+    };
+    Ok(Json(
+        json!({ "latest": { "date": date.to_string(), "bytes": bytes } }),
+    ))
+}
+
+/// The newest backup file as an attachment. Session cookie only (see
+/// `auth::require_session`). 404 when there is no backup.
+pub async fn backup_download(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let none = || ApiError::new(StatusCode::NOT_FOUND, "there is no backup yet".to_string());
+    let (date, path) = newest_backup(&state).await?.ok_or_else(none)?;
+    // The file is tens of MB, so read it off the async threads.
+    let read = tokio::task::spawn_blocking(move || std::fs::read(path))
+        .await
+        .map_err(anyhow::Error::from)?;
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(none()),
+        Err(err) => return Err(anyhow::Error::from(err).into()),
+    };
+    let disposition = format!("attachment; filename=\"solar-{date}.db\"");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/vnd.sqlite3".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+async fn newest_backup(
+    state: &AppState,
+) -> Result<Option<(NaiveDate, std::path::PathBuf)>, ApiError> {
+    let Some(dir) = state.backup_dir().map(|d| d.to_path_buf()) else {
+        return Ok(None);
+    };
+    let found = tokio::task::spawn_blocking(move || crate::backup::latest(&dir))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(found)
+}
+
 /// What each setting is when it has no row.
 fn setting_defaults() -> Value {
     let d = AdminData::default();
