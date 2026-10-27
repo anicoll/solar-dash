@@ -99,52 +99,14 @@ path = "data/solar.db"
 # Only if the broker needs a login. Give both or neither.
 # username = "mqtt-user"
 # password = "mqtt-password"
-# Optional: compare what charging cost with petrol for the same km. Without
-# petrol_cents_per_litre the comparison is off. The South Australian average
-# for unleaded is roughly 190-200 c/L in 2026; check a fuel price app for
-# what you really pay.
-# petrol_cents_per_litre = 195.0
-# How much petrol a comparable petrol car uses per 100 km.
-# petrol_litres_per_100km = 6.9
-# Optional: the petrol car each TeslaMate model is compared with in the "EV
-# versus petrol" view (/api/ev/cars `compare_with`). The key is TeslaMate's
-# model string ("3", "Y", ...), the value any name you like. A model without
-# an entry has no comparison car. The one petrol_litres_per_100km above is
-# shared by all cars. Keep this before any [[teslamate.petrol_price]] table.
-# compare_cars = { "3" = "Hyundai i30 Sedan N", "Y" = "Toyota RAV4 GX 2WD" }
-# The grade of petrol the price is for; shown as `petrol_grade` by /api/ev/cars.
-# petrol_grade = "Unleaded 91"
-# A flat price per kWh for charging away from home (a public charger, say).
-# Without it, away sessions are listed as uncosted. Home is the geofence
-# "Home" (or no geofence at all).
-# away_cents_per_kwh = 65.0
+# The petrol price, petrol car, away-charging price and the other settings for
+# comparing charging with petrol are edited on the Admin page, not here.
 # Optional: copy TeslaMate's whole history (drives and charging sessions of
 # every car) from its Postgres database into solar-dash's own, so later views
 # can cover more than the live MQTT data. Use a read-only login (see
 # docs/how-to-run.md). Without it the history sync is off. The URL holds a
 # password, so keep this file private; it is never logged.
 # database_url = "postgres://solar_dash:change-me@192.168.1.70:5432/teslamate"
-# Optional: keep the petrol prices that changed over time in a CSV file instead
-# of the [[teslamate.petrol_price]] tables below (set one or the other). The file
-# can be edited by hand (it is re-read when it changes) or updated through
-# /api/petrol-prices. It starts with the line `from,cents_per_litre`, then one
-# `YYYY-MM-DD,195.0` row per change. A missing file counts as empty and is
-# created on the first change, so the solar-dash user must be able to write
-# there. petrol_cents_per_litre still applies before the first row.
-# petrol_prices_file = "/var/lib/solar-dash/petrol-prices.csv"
-# Optional: petrol prices that changed over time, for the per-car savings over
-# the whole history (/api/ev/cars). A day uses the entry with the latest
-# `from` on or before it; before the first entry it uses petrol_cents_per_litre.
-# Dates are YYYY-MM-DD, oldest first, each later than the one before. With
-# entries but no petrol_cents_per_litre, km before the first entry have no
-# price and the petrol cost stays empty. Keep these
-# after the other [teslamate] keys, as TOML needs.
-# [[teslamate.petrol_price]]
-# from = "2025-01-01"
-# cents_per_litre = 185.0
-# [[teslamate.petrol_price]]
-# from = "2026-03-01"
-# cents_per_litre = 199.0
 
 # Optional: your GloBird Energy customer portal login, used by `globird-probe`
 # and by `serve`, which keeps GloBird's daily cost and usage in the database
@@ -160,95 +122,15 @@ path = "data/solar.db"
 # # Default: "09:00".
 # sync_time = "09:00"
 
-# Optional: electricity prices, used to work out what each day cost and what
-# the solar and battery saved. Without this section cost features are off.
-# An example time-of-use plan with a free midday window:
-# peak 16:00-23:00, free 11:00-14:00, shoulder the rest of the day; feed-in
-# 2c 16:00-23:00 plus an 8c top up 18:00-21:00, 0c otherwise.
-# Rates are in cents (per kWh, except the daily supply charge). Times are
-# local "HH:MM". A window includes its start and excludes its end, and may
-# wrap past midnight (for example from = "21:00", to = "06:00"). If windows
-# overlap, the first one listed wins.
-# [tariff]
-# # Optional label for the plan, shown on the payback timeline and by
-# # /api/ev/cars (a [[previous_tariff]] has its own `name`).
-# name = "GloBird ZeroHero"
-# supply_cents_per_day = 150.0
-# # Import price for any time not covered by an `import` window (shoulder).
-# default_import_cents = 40.0
-# import = [
-#   { from = "11:00", to = "14:00", cents = 0.0 },   # off-peak (free)
-#   { from = "16:00", to = "23:00", cents = 60.0 },  # peak
-# ]
-# # Feed-in price for any time not covered by an `export` window.
-# default_export_cents = 0.0
-# export = [
-#   { from = "18:00", to = "21:00", cents = 10.0 },  # 2c + 8c top up
-#   { from = "16:00", to = "23:00", cents = 2.0 },
-# ]
-# # Optional: a credit on days with (almost) no grid import in a window.
-# [tariff.zero_import_credit]
-# from = "18:00"
-# to = "21:00"
-# max_kwh = 0.1
-# credit_cents = 100.0
-# # Optional: a daily tiered feed-in ("first 14 kWh 15c/kWh, thereafter 5c").
-# # The first `first_kwh_per_day` kWh exported in each local day, in time order
-# # from midnight, earn `cents` instead of the time-of-day rate; exports after
-# # that earn the window or default_export_cents rate as usual.
-# [tariff.export_tier]
-# first_kwh_per_day = 14.0
-# cents = 15.0
-
-# Optional: plans you were on before the [tariff] above, so older days are
-# priced on the plan that applied then. Add one [[previous_tariff]] per past
-# plan, oldest first. It takes the same fields as [tariff] (windows and
-# zero_import_credit too), plus `until`: the last local day (inclusive) it
-# applied. The next plan starts the day after, and [tariff] covers every day
-# after the last `until`. `until` must increase down the file; `name` is a
-# label, shown on the payback timeline (a plan without one is left off it; the
-# first plan is dated from the first purchase). A zero_import_credit goes in a [previous_tariff.zero_import_credit]
-# table straight after its entry, and an export_tier in a
-# [previous_tariff.export_tier] table.
-# [[previous_tariff]]
-# name = "Old flat plan"
-# until = "2025-06-30"
-# supply_cents_per_day = 110.0
-# default_import_cents = 32.0
-# default_export_cents = 5.0
-# # First 14 kWh a day at 15c, then the default 5c:
-# [previous_tariff.export_tier]
-# first_kwh_per_day = 14.0
-# cents = 15.0
-
-# Optional: what the system cost, for the payback estimate (`/api/payback`).
-# It needs the [tariff] section above too. Add one [[system.purchase]] per
-# payment; the cost is in dollars. The first date is where the savings count
-# from.
-# The payback date assumes savings grow with electricity prices by
-# price_rise_percent a year (0 to 20, default 3).
-# [system]
-# price_rise_percent = 3.0
-# Optional battery_kwh is the capacity of the battery a purchase added. For a
-# later purchase with it, /api/payback estimates what that battery added: each
-# day's battery discharge beyond 95% of the battery capacity owned before it,
-# priced at that day's highest import rate. List batteries in the first
-# purchase too, so the batteries already owned are counted.
-# [[system.purchase]]
-# name = "Solar, inverter and battery 1"
-# date = "2024-01-01"
-# cost_dollars = 12000.00
-# battery_kwh = 13.0
-# # The day of the month for this one is approximate.
-# [[system.purchase]]
-# name = "Battery 2"
-# date = "2025-06-01"
-# cost_dollars = 8000.00
-# battery_kwh = 12.8
-
-# Optional: real bills for past periods, for when the tariff above cannot
-# price them (say a spot-price retailer) or the meter data has gaps. Money and
-# Payback use each bill's real total for every day it covers. See "Past bills"
-# in docs/how-to-run.md for the CSV format.
-# [bills]
-# file = "/etc/solar-dash/bills.csv"
+# Electricity tariffs (plans over time), petrol prices, what the system cost
+# (purchases), past bills and a few preferences (petrol price and car
+# comparison, away charging price, yearly price rise) are no longer set here.
+# They are edited on the Admin page of the web UI and kept in the database.
+#
+# An older config.toml that still has [tariff], [[previous_tariff]],
+# [[system.purchase]], [system] price_rise_percent, [bills], the petrol and
+# comparison keys of [teslamate] (petrol_cents_per_litre, petrol_litres_per_100km,
+# petrol_prices_file, [[teslamate.petrol_price]], compare_cars, petrol_grade,
+# away_cents_per_kwh) is imported into the database once, the first time
+# `serve` starts. After that those sections are ignored, and `serve` logs a
+# warning naming what to delete from config.toml. Old configs keep loading.

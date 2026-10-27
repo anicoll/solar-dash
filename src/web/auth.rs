@@ -11,7 +11,7 @@ use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use axum::Extension;
 use axum::Form;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::{Cookie, SameSite, SignedCookieJar};
@@ -228,14 +228,17 @@ fn bearer_matches(headers: &HeaderMap, token: Option<&str>) -> bool {
 
 /// Middleware: lets the request through only with a valid session, or, on
 /// `/api/` routes, the configured `api_token` as a Bearer token (no cookie is
-/// issued for those).
+/// issued for those). The token only works for GET and HEAD: anything that
+/// changes data needs the session cookie.
 pub async fn require_session(
     State(state): State<AppState>,
     jar: SignedCookieJar,
     request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path().starts_with("/api/")
+    let reads_only = matches!(*request.method(), Method::GET | Method::HEAD);
+    if reads_only
+        && request.uri().path().starts_with("/api/")
         && bearer_matches(request.headers(), state.api_token.as_deref())
     {
         return next.run(request).await;

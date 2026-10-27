@@ -37,7 +37,6 @@ pub struct PastBill {
     /// All the daily fixed charges and fees of the period.
     pub supply_dollars: f64,
     /// Free text for the owner; not used in any maths.
-    #[allow(dead_code)]
     pub note: String,
 }
 
@@ -45,6 +44,17 @@ impl PastBill {
     /// How many days the bill covers.
     pub fn days(&self) -> i64 {
         (self.to - self.from).num_days() + 1
+    }
+
+    /// Checks one bill on its own (overlaps between bills are checked by the caller).
+    pub fn check(&self) -> Result<()> {
+        if self.from > self.to {
+            bail!("from {} is after to {}", self.from, self.to);
+        }
+        if self.import_kwh < 0.0 || self.export_kwh < 0.0 {
+            bail!("import_kwh and export_kwh cannot be negative");
+        }
+        Ok(())
     }
 
     /// What the period cost before the rebates: `bill_total + excluded`.
@@ -130,12 +140,7 @@ fn parse_line(line: &str) -> Result<PastBill> {
         supply_dollars: number("supply_dollars", fields[8])?,
         note: fields[9].to_string(),
     };
-    if bill.from > bill.to {
-        bail!("from {} is after to {}", bill.from, bill.to);
-    }
-    if bill.import_kwh < 0.0 || bill.export_kwh < 0.0 {
-        bail!("import_kwh and export_kwh cannot be negative");
-    }
+    bill.check()?;
     Ok(bill)
 }
 

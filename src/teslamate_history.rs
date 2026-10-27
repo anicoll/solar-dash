@@ -51,6 +51,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
+use crate::bills::PastBill;
+use crate::cost::TariffSchedule;
 use crate::db::{self, TmCar, TmCharge, TmChargeCost, TmChargeToCost, TmDriveDay};
 use crate::ev_cost::{self, CostSetup};
 use crate::web;
@@ -131,13 +133,14 @@ fn power_curve(readings: &[ChargeReading]) -> Vec<(i64, f64)> {
 /// is not the one they would get today.
 fn needing_cost(
     sessions: Vec<TmChargeToCost>,
-    setup: &CostSetup,
+    schedule: &TariffSchedule,
+    bills: &[PastBill],
     tz: Tz,
 ) -> Vec<(TmChargeToCost, String)> {
     sessions
         .into_iter()
         .filter_map(|s| {
-            let key = ev_cost::historic_cost_key(&setup.schedule, &setup.bills, tz, s.started_at);
+            let key = ev_cost::historic_cost_key(schedule, bills, tz, s.started_at);
             (s.cost_key.as_deref() != Some(key.as_str())).then_some((s, key))
         })
         .collect()
@@ -358,10 +361,15 @@ async fn cost_sessions(
     tz: Tz,
     setup: &CostSetup,
 ) -> Result<()> {
+    // The current data for this round; without a tariff nothing is costed.
+    let data = setup.admin.get();
+    let Some(schedule) = &data.tariff else {
+        return Ok(());
+    };
     let now = db::now();
     let finished = db::tm_charges_at_home(pool, now - COST_AFTER_SECS).await?;
-    let todo = needing_cost(finished, setup, tz);
-    let prices = ev_cost::session_prices(&setup.schedule, &setup.bills, tz);
+    let todo = needing_cost(finished, schedule, &data.bills, tz);
+    let prices = ev_cost::session_prices(schedule, &data.bills, tz);
     let mut costed = 0;
     for (session, key) in &todo {
         if costed >= MAX_COSTED_PER_RUN {
@@ -427,7 +435,7 @@ async fn run_once(
     pg: &PgPool,
     pool: &sqlx::SqlitePool,
     tz: Tz,
-    costing: Option<&CostSetup>,
+    costing: &CostSetup,
 ) -> Result<Counts> {
     let mut counts = Counts::default();
 
@@ -455,9 +463,7 @@ async fn run_once(
         counts.charges_updated += updated;
         counts.charges_new += charges.len() - updated;
     }
-    if let Some(setup) = costing {
-        cost_sessions(pg, pool, tz, setup).await?;
-    }
+    cost_sessions(pg, pool, tz, costing).await?;
     Ok(counts)
 }
 
@@ -466,7 +472,7 @@ async fn connect_and_run(
     database_url: &str,
     pool: &sqlx::SqlitePool,
     tz: Tz,
-    costing: Option<&CostSetup>,
+    costing: &CostSetup,
 ) -> Result<Counts> {
     let pg = PgPoolOptions::new()
         .max_connections(2)
@@ -481,12 +487,13 @@ async fn connect_and_run(
 
 /// Runs the sync until `shutdown` completes. A failed run is logged and the
 /// next one tries again. `tz` decides which local day a drive belongs to.
-/// `costing` is `None` without a `[tariff]`, and sessions are then not costed.
+/// `costing` reads the current tariff each round; without one sessions are
+/// not costed.
 pub async fn run(
     database_url: String,
     pool: sqlx::SqlitePool,
     tz: Tz,
-    costing: Option<CostSetup>,
+    costing: CostSetup,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     tokio::pin!(shutdown);
@@ -499,7 +506,7 @@ pub async fn run(
         }
         let outcome = tokio::select! {
             _ = &mut shutdown => break,
-            outcome = connect_and_run(&database_url, &pool, tz, costing.as_ref()) => outcome,
+            outcome = connect_and_run(&database_url, &pool, tz, &costing) => outcome,
         };
         match outcome {
             Ok(c) => info!(
@@ -577,7 +584,7 @@ mod tests {
         assert_eq!(power_curve(&[a, b, c]), vec![(60, 7000.0), (180, 3000.0)]);
     }
 
-    fn setup() -> CostSetup {
+    fn schedule() -> crate::cost::TariffSchedule {
         #[derive(serde::Deserialize)]
         struct Wrapper {
             tariff: crate::config::Tariff,
@@ -587,13 +594,7 @@ mod tests {
              default_export_cents = 5.0\n",
         )
         .unwrap();
-        CostSetup {
-            schedule: std::sync::Arc::new(
-                crate::cost::TariffSchedule::from_config(&w.tariff, &[]).unwrap(),
-            ),
-            bills: std::sync::Arc::from([]),
-            plant_id: 1,
-        }
+        crate::cost::TariffSchedule::from_config(&w.tariff, &[]).unwrap()
     }
 
     fn session(id: i64, cost_key: Option<String>) -> TmChargeToCost {
@@ -608,16 +609,17 @@ mod tests {
 
     #[test]
     fn only_sessions_with_a_stale_key_need_costing() {
-        let setup = setup();
+        let schedule = schedule();
         let tz: Tz = "Australia/Adelaide".parse().unwrap();
-        let key = ev_cost::historic_cost_key(&setup.schedule, &setup.bills, tz, 1_789_000_000);
+        let key = ev_cost::historic_cost_key(&schedule, &[], tz, 1_789_000_000);
         let todo = needing_cost(
             vec![
                 session(1, None),
                 session(2, Some(key.clone())),
                 session(3, Some("old".to_string())),
             ],
-            &setup,
+            &schedule,
+            &[],
             tz,
         );
         let ids: Vec<i64> = todo.iter().map(|(s, _)| s.id).collect();

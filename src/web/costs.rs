@@ -567,8 +567,8 @@ async fn car_days(
     first: NaiveDate,
     last: NaiveDate,
 ) -> Result<Option<BTreeMap<String, CarDayTotals>>> {
-    // Looks at the petrol prices file, so a hand edit shows on this request.
-    let petrol = state.petrol.current();
+    let data = state.admin.get();
+    let petrol = &data.petrol;
     let cars = db::tm_cars(&state.pool).await?;
     if cars.is_empty() || !petrol.is_configured() {
         return Ok(None);
@@ -599,8 +599,8 @@ async fn car_days(
         NaiveDate::from_str(date).map_or(0.0, |d| schedule.for_date(d).average_import_cents())
     };
     Ok(Some(ev_cost::car_day_totals(
-        &state.ev_prices,
-        &petrol,
+        &data.ev_prices,
+        petrol,
         average,
         &days,
         &charges,
@@ -829,6 +829,24 @@ async fn costed_days_on(
         .collect())
 }
 
+/// The cost of every day in `dates` (sorted, consecutive) that has data, each
+/// priced on the plan `schedule` has for that day, for a "what if" preview.
+/// Unlike [`costed_days`] it never reads or writes the `daily_cost` table (a
+/// plan that is not saved has no stored costs), and it leaves out real bills.
+pub(super) async fn preview_days(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    dates: &[NaiveDate],
+) -> Result<Vec<CostedDay>, ApiError> {
+    let today = today(state.tz);
+    let mut costed = Vec::new();
+    for run in dates.chunk_by(|a, b| std::ptr::eq(schedule.for_date(*a), schedule.for_date(*b))) {
+        let days = compute_days(state, schedule.for_date(run[0]), run, today).await?;
+        costed.extend(days.into_iter().map(|(day, _)| day));
+    }
+    Ok(costed)
+}
+
 /// The kWh GloBird metered on one day. `None` means it has no figure.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct DayKwh {
@@ -945,7 +963,8 @@ pub(super) async fn billed_days(
         return Ok(Vec::new());
     };
     // The bills that touch the request, and the span that covers them all.
-    let touched: Vec<&PastBill> = state
+    let data = state.admin.get();
+    let touched: Vec<&PastBill> = data
         .bills
         .iter()
         .filter(|bill| bill.from <= last && bill.to >= first)
@@ -1049,7 +1068,8 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
         max_days,
         DEFAULT_DAILY_DAYS,
     )?;
-    let Some(tariff) = &state.tariff else {
+    let data = state.admin.get();
+    let Some(tariff) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
 
@@ -1154,7 +1174,8 @@ pub async fn tariff(
             .map_err(|_| ApiError::bad_request("date must look like 2026-10-20"))?,
         None => today(state.tz),
     };
-    let Some(schedule) = &state.tariff else {
+    let data = state.admin.get();
+    let Some(schedule) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
     let t = schedule.for_date(date);

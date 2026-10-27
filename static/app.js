@@ -3548,7 +3548,7 @@
   // ---------- routing (hash) ----------
 
   // Home is the Now content with History below it; Day, Month and Year are History's periods.
-  const VIEWS = ['home', 'money', 'payback', 'cars'];
+  const VIEWS = ['home', 'money', 'payback', 'cars', 'admin'];
   const PERIODS = ['day', 'week', 'month', 'year', 'lifetime', 'custom'];
   let period = 'day'; // the period History opens on: the last one shown
   // Money's `mode` is month, year or all; `when` is its month (2026-09) or year (2025).
@@ -3641,6 +3641,7 @@
     document.getElementById('view-money').hidden = state.view !== 'money';
     document.getElementById('view-payback').hidden = state.view !== 'payback';
     document.getElementById('view-cars').hidden = state.view !== 'cars';
+    document.getElementById('view-admin').hidden = state.view !== 'admin';
     closePop(false);
     const brand = document.querySelector('.brand');
     if (home) brand.setAttribute('aria-current', 'page');
@@ -3671,6 +3672,7 @@
       guarded(() => loadHistory());
     } else if (state.view === 'money') guarded(() => loadMoneyView(state.mode, state.when));
     else if (state.view === 'cars') guarded(() => loadCarsView());
+    else if (state.view === 'admin') window.SolarAdmin.load(); // admin.js shows its own errors
     else guarded(() => loadPaybackView());
   }
 

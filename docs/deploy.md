@@ -163,6 +163,14 @@ Fill in:
 The file holds secrets, which is why it is readable only by root and the
 `solar-dash` group (mode 640).
 
+Tariffs, petrol prices, purchases, past bills and preferences are not set in
+this file any more: they are edited on the Admin page and kept in the database
+(see "Where the settings live" in [how-to-run.md](how-to-run.md)). If you are
+upgrading and your `config.toml` still has `[tariff]`, `[[previous_tariff]]`,
+`[[system.purchase]]`, `[bills]` or the petrol keys, the first start copies
+them into the database once. After that they are ignored, and the log warns on
+every start until you delete them from the file.
+
 ## 4. Copy your existing data (optional)
 
 If you already backfilled `data/solar.db` on your laptop, copy it over so you do
