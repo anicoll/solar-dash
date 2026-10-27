@@ -761,7 +761,7 @@
     }
     const day = fmtDay.format(new Date(latest.date + 'T00:00:00Z'));
     const mb = (latest.bytes / 1e6).toFixed(1);
-    const link = el('a', 'btn', 'Download');
+    const link = el('a', 'btn primary', 'Download');
     link.href = '/api/admin/backup/download';
     link.download = `solar-${latest.date}.db`;
     const actions = el('div', 'aform-actions');

@@ -710,7 +710,7 @@ table.car-table tr.car-year th { text-align: left; color: var(--fg); font-weight
 
 /* ---------- Admin ---------- */
 .admin-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
-.admin-head .btn { display: inline-flex; align-items: center; text-decoration: none; }
+a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .alist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .arow {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;
