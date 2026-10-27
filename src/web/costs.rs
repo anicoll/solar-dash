@@ -68,6 +68,22 @@ fn live_intervals(samples: &[Sample]) -> Vec<Interval> {
         .collect()
 }
 
+/// How late iSolarCloud stamps its 5-minute readings: the value stamped
+/// 11:10 is the counter as it stood at 11:05. Checked against the inverter's
+/// own samples and GloBird's meter, which both agree with each other.
+const CLOUD_LAG_SECS: i64 = 300;
+
+/// A day's counter readings moved back to the time they were really taken.
+/// A reading that lands on or before midnight is dropped: it belongs to the
+/// day before, and `with_midnight_zero` starts the day at 0 anyway.
+fn undo_cloud_lag(day_start: i64, counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
+    counter
+        .iter()
+        .map(|&(ts, wh)| (ts - CLOUD_LAG_SECS, wh))
+        .filter(|&(ts, _)| ts > day_start)
+        .collect()
+}
+
 /// A day's counter readings with a Wh = 0 reading added at local midnight.
 /// The counter resets then, so whatever the first reading shows was earned
 /// since midnight. Without this the first 5 minutes of energy would be lost.
@@ -167,7 +183,9 @@ pub(super) fn day_intervals(
     if !cloud_has_data {
         return None;
     }
-    let intervals = cloud_intervals(day.start, day.import, day.export, day.load);
+    let [import, export, load] =
+        [day.import, day.export, day.load].map(|c| undo_cloud_lag(day.start, c));
+    let intervals = cloud_intervals(day.start, &import, &export, &load);
     Some(("cloud", intervals, true))
 }
 
@@ -660,8 +678,9 @@ fn known_source(text: &str) -> Option<&'static str> {
 /// Bump this when the way a day is costed changes, so days stored by the old
 /// rules are worked out again. Version 2: finished days need 98% live coverage
 /// (not 90%) to use the inverter, and the zero-import credit waits for the
-/// window to finish. Old rows are replaced by date as days are recomputed.
-const COST_CACHE_VERSION: u32 = 2;
+/// window to finish. Version 3: cloud readings are moved 5 minutes earlier
+/// (see [`CLOUD_LAG_SECS`]). Old rows are replaced by date as days are recomputed.
+const COST_CACHE_VERSION: u32 = 3;
 
 /// What stored costs are tagged with. The time zone is in it too, because
 /// moving it moves where every local day starts.
@@ -1296,6 +1315,54 @@ mod tests {
     }
 
     #[test]
+    fn cloud_readings_move_back_five_minutes() {
+        let start = 86_400;
+        // The midnight reading (the reset to 0) and the one stamped 00:05
+        // land on or before midnight and are dropped; the rest move back.
+        let counter = [
+            (start, 0.0),
+            (start + 300, 0.0),
+            (start + 600, 100.0),
+            (start + 900, 700.0),
+        ];
+        assert_eq!(
+            undo_cloud_lag(start, &counter),
+            vec![(start + 300, 100.0), (start + 600, 700.0)]
+        );
+        assert!(undo_cloud_lag(start, &[]).is_empty());
+    }
+
+    #[test]
+    fn free_window_charging_is_not_priced_past_its_end() {
+        // Charging at 6 kW until 14:00: iSolarCloud stamps its last 500 Wh
+        // 14:05. Moved back, it all lands before 14:00.
+        let start = 0;
+        let import = [
+            (13 * 3600 + 3300, 0.0),
+            (13 * 3600 + 3600, 500.0),
+            (14 * 3600 + 300, 1000.0),
+            (14 * 3600 + 600, 1000.0),
+        ];
+        let day = DayData {
+            start,
+            end: start + 86_400,
+            live: &[],
+            import: &import,
+            export: &[],
+            load: &[],
+        };
+        let (source, intervals, _) = day_intervals(&day, start + 2 * 86_400).unwrap();
+        assert_eq!(source, "cloud");
+        let after_two: f64 = intervals
+            .iter()
+            .filter(|i| i.start_ts >= 14 * 3600)
+            .map(|i| i.import_kwh)
+            .sum();
+        assert!(after_two.abs() < 1e-12);
+        assert!((total(&intervals, |i| i.import_kwh) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn a_counter_step_after_midnight_is_capped_at_half_an_hour() {
         let start = 0;
         // First reading at 03:00 already shows 1 kWh: spread over 02:30-03:00 only.
@@ -1322,7 +1389,7 @@ mod tests {
         };
         assert!(day_intervals(&empty, 100_000).is_none());
         let some = DayData {
-            load: &[(300, 10.0)],
+            load: &[(600, 10.0)],
             ..empty
         };
         let (source, intervals, _) = day_intervals(&some, 100_000).unwrap();
