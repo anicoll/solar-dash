@@ -325,8 +325,9 @@ pub async fn compare(
     // Our estimate, only for the span GloBird has days in. `costed_days`
     // leaves out days it has no data for, and without a tariff there is none.
     let mut ours: BTreeMap<NaiveDate, CostedDay> = BTreeMap::new();
+    let data = state.admin.get();
     if let (Some(tariff), Some(first), Some(last)) = (
-        &state.tariff,
+        &data.tariff,
         lines_by_date.keys().next(),
         lines_by_date.keys().next_back(),
     ) {

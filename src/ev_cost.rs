@@ -10,12 +10,12 @@
 //! with solar charging the home battery before it reaches the load.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Timelike};
 use chrono_tz::Tz;
 use serde::Serialize;
 
+use crate::admin_data::SharedAdminData;
 use crate::bills::{self, PastBill};
 use crate::cost::{Interval, TariffSchedule};
 use crate::db::ChargeSession;
@@ -162,12 +162,12 @@ const MAX_POWER_HOLD_SECS: i64 = 300;
 /// by the old rules are worked out again.
 pub const HISTORIC_COST_VERSION: u32 = 1;
 
-/// What the sync needs to cost past sessions, built from the config the same
-/// way the web side builds it.
-#[derive(Debug, Clone)]
+/// What the sync needs to cost past sessions. The tariff and bills are not
+/// copied: they are read from `admin` on every round, so an edit on the admin
+/// page applies to the next one.
+#[derive(Clone)]
 pub struct CostSetup {
-    pub schedule: Arc<TariffSchedule>,
-    pub bills: Arc<[PastBill]>,
+    pub admin: SharedAdminData,
     pub plant_id: i64,
 }
 
@@ -620,6 +620,17 @@ impl PetrolHistory {
                 .map(|(from, cents)| (from.format("%Y-%m-%d").to_string(), cents))
                 .collect(),
         }
+    }
+
+    /// The price that applies before the first change, if there is one.
+    pub fn fallback(&self) -> Option<f64> {
+        self.base
+    }
+
+    /// The changes, oldest first: the local day ("YYYY-MM-DD") a price
+    /// started on and the price in cents per litre.
+    pub fn changes(&self) -> &[(String, f64)] {
+        &self.changes
     }
 
     /// Whether any petrol price is known at all.

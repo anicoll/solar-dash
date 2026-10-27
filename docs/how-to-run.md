@@ -112,8 +112,9 @@ openssl rand -hex 32
 ```
 
 Scripts then send `Authorization: Bearer <token>` on `/api/` requests. It is
-accepted on `/api/` routes only, never gives a cookie, and is ignored when
-`api_token` is not set. Keep `config.toml` private; the token is never logged.
+accepted on `/api/` routes only, only for `GET` and `HEAD` (anything that
+changes data needs the login cookie, see [Admin API](#admin-api)), never gives
+a cookie, and is ignored when `api_token` is not set. Keep `config.toml` private; the token is never logged.
 
 When you open the dashboard at `http://127.0.0.1:8080` (plain http), also set
 this in `[server]`, or the browser will drop the login cookie:
@@ -214,9 +215,10 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`. A session still charging has `ended_at` `null` and counts as running until now. `energy_used_kwh` is taken from the wall, `energy_added_kwh` reaches the battery. The last six fields (kWh by source, dollars, and the share 0 to 1 of the session the inverter samples cover) are `null` without a `[tariff]`, away from home (geofence not "Home") or with no energy. At most 400 days. Empty without a `[teslamate]` section |
 | `GET /api/ev/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` | The car against petrol, by month and in total: `{"configured":true,"months":[{month,km,home_kwh,home_cost,away_kwh,away_cost,charging_cost,petrol_litres,petrol_cost,saved,ev_cents_per_km,petrol_cents_per_km},...],"total":{...},"petrol_cents_per_litre":...,"petrol_litres_per_100km":...}`. Local dates, both included, at most 400 days; without `from` it covers the last 365 days. Money is in dollars. `away_cost` is `null` when there were away sessions and no `away_cents_per_kwh`, and the `*_cents_per_km` fields are `null` for 0 km. `configured` is `false`, and the money fields `null`, without a `petrol_cents_per_litre`. See [TeslaMate](#teslamate-optional) |
 | `GET /api/ev/cars` | Each TeslaMate car's fuel savings over its whole synced history, newest car first: `{"configured":true,"petrol_litres_per_100km":...,"petrol_grade":"Unleaded 91","charging_by_plan":[...],"away":{...},"self_share_pct":...,"cars":[{car_id,name,model,label,trim,paint,wheels,marketing_name,compare_with,first_day,last_day,total,months:[{month,...}],charging_by_plan,away,self_share_pct}]}`. `charging_by_plan` is `[{plan,first_day,last_day,sessions,kwh,cost,pending_sessions}]`, `away` is `{sessions,kwh,cost}` (`cost` `null` without `away_cents_per_kwh`) and `self_share_pct` is solar and battery kWh over costed home kWh; the top-level ones add up all cars. See [Comparison cars and charging by plan](#comparison-cars-and-charging-by-plan). Each period has `km`, `petrol_litres`, `petrol_cost`, `home_kwh`, `away_kwh`, `away_cost`, `away_uncosted_kwh`, `with_system` and `without_system` (`charging_cost`, `saved`, `cents_per_km`), `system_added`, `grid_kwh`, `self_kwh`, `uncovered_kwh`, `feed_in_forgone` and `pending_sessions`. Dollars. Empty until the history sync has run. See [Car versus petrol](#car-versus-petrol) |
-| `GET /api/petrol-prices` | The petrol prices: `{"file":true,"fallback_cents_per_litre":...,"prices":[{"from":"YYYY-MM-DD","cents_per_litre":...},...]}`, oldest first. `file` is `false` when they come from `[[teslamate.petrol_price]]`. See [Petrol prices file](#petrol-prices-file) |
-| `PUT /api/petrol-prices` | Adds or replaces the price starting on a date. JSON body `{"from":"YYYY-MM-DD","cents_per_litre":189.9}`; answers like the `GET`. 400 for a bad date or price, 415 unless the body is `application/json`, 409 without `petrol_prices_file` |
-| `DELETE /api/petrol-prices/YYYY-MM-DD` | Removes the price starting on that date and answers like the `GET`. 404 if there is none, 409 without `petrol_prices_file` |
+| `GET /api/admin`, `POST/PUT/DELETE /api/admin/...` | Read and edit the tariff plans, purchases, bills and settings. See [Admin API](#admin-api) |
+| `GET /api/petrol-prices` | The petrol prices: `{"fallback_cents_per_litre":...,"prices":[{"from":"YYYY-MM-DD","cents_per_litre":...},...]}`, oldest first. See [Petrol prices](#petrol-prices) |
+| `PUT /api/petrol-prices` | Adds or replaces the price starting on a date. JSON body `{"from":"YYYY-MM-DD","cents_per_litre":189.9}`; answers like the `GET`. 400 for a bad date or price, 415 unless the body is `application/json` |
+| `DELETE /api/petrol-prices/YYYY-MM-DD` | Removes the price starting on that date and answers like the `GET`. 404 if there is none |
 | `GET /api/daily?from=YYYY-MM-DD&to=YYYY-MM-DD` | kWh totals per local day (default: the last 30 days). At most 400 days. Each day has a `source` (see [Modbus in `serve`](#modbus-in-serve))Every day (and every bucket and the `totals`) also has the grid energy split by tariff band: `import_free_kwh`, `import_shoulder_kwh`, `import_peak_kwh`, `export_super_kwh`, `export_peak_kwh`, `export_other_kwh` and `export_tier_kwh`. The bands come from the `[tariff]` (the `[[previous_tariff]]` in effect that day), told apart by price: import at 0 c is free, dearer than `default_import_cents` is peak, the rest shoulder; export at or below `default_export_cents` is other, and of the better rates the highest is super (when a lower one exists, which is peak). With an `export_tier` (a daily "first N kWh at X c" feed-in), the first N kWh exported each local day, in time order, are `export_tier_kwh` whatever the time (an interval that crosses N is split), and only the exports after that are classed super, peak or other. They are summed from the same intervals `/api/costs` prices (live samples when they cover the day, else the 5-minute cloud counters), so they add up to its `import_kwh` and `export_kwh`, and to `/api/daily`'s own totals within rounding (the cloud's daily counter can differ a little from its 5-minute steps). They are `null` without a `[tariff]` or for a day with no interval data |
 | `GET /api/costs?from=YYYY-MM-DD&to=YYYY-MM-DD&group=day\|month\|year` | Dollars from the `[tariff]` section. `totals` is a bill-style breakdown: `supply`, `import` (and `import_kwh`), `feed_in` (and `export_kwh`), `credit` (zero-import credit) and `credit_days`, `actual` (paid), `baseline` (no solar or battery), `savings`, and `not_bought` (baseline less supply and import; `savings` = `not_bought` + `feed_in` + `credit`), plus `load_kwh` and `days` with data. `billed_days` is how many of those days use GloBird's own bill instead of our estimate (see below). With `group=day` (the default) `days` has one row per local day with `source` (`inverter` or `cloud` for our estimate, `globird` for a day billed by GloBird), `actual`, `baseline`, `savings`, `credit`, `supply`, `import`, `feed_in` and the import, export and load kWh. With `group=month` or `year`, `buckets` has one row per period (`period` is `2026-09` or `2026`) with the same fields as `totals`, so a year is 12 small rows. Default: the last 30 days. At most 1,500 days per day-grouped request, 20 years for month or year. Days with no data are left out. Finished days are stored in the database, so repeat requests are fast; editing the `[tariff]` rates makes them be worked out again (editing a `[[previous_tariff]]` only redoes the days on that plan). Days before the current plan are priced on the `[[previous_tariff]]` entry in effect on that day (its `until` is the last day it applies), if any are configured. A day GloBird has billed completely (see [GloBird](#globird-optional)) shows GloBird's figures: `import`, `feed_in`, `supply`, `credit` and `actual` are its lines added up, the import and export kWh are its meter's (when it has them), and `savings` is our `baseline` less that bill; `load_kwh` and `baseline` stay ours, and `source` is `globird`. Other days, and days GloBird has not finished posting, keep our estimate. The stored days are always our estimate; GloBird's figures are applied each time. A day with no data of ours is still left out. Car fuel savings: `cars_available` is true when TeslaMate cars are synced and a petrol price is configured; then `totals` and every day or bucket also has `cars` (`km`, `petrol`, `charging`, `fuel_saved`, `estimated_sessions`; zeros when the cars did not run), and `totals.cars` is the sum of the days returned, so rows and total add up; car activity on a day with no house data (no cost row) is left out. `fuel_saved` is petrol cost less what the charging would cost from the grid with no system (home sessions at their baseline, a home session not costed yet at the plan's average import price, counted in `estimated_sessions`, away sessions at `away_cents_per_kwh`). It is what to add to `savings` to include the cars: the no-solar `baseline` already prices the cars' charging at grid prices, so the system's share of that is in `savings` already. Without `cars_available`, `cars` is left out. Without a `[tariff]` section it answers `{"configured":false}` |
 | `GET /api/tariff?date=YYYY-MM-DD` | The plan in force on that local day (default today; the `[[previous_tariff]]` in effect that day, else `[tariff]`), so the page needs no copy of the config: `supply_cents_per_day`, `default_import_cents`, `default_export_cents`, the `import` and `export` windows (`from`, `to` as `HH:MM`, `cents`, and `band`) `zero_import_credit` (`from`, `to`, `max_kwh`, `credit_cents`, or `null`) and `export_tier` (`first_kwh_per_day`, `cents`, or `null`). `band` uses the same price rule as the `/api/daily` split: `free`, `shoulder` or `peak` for import; `super`, `peak` or `other` for export. `default_import_band` and `default_export_band` say the same for the default rates. Without a `[tariff]` section it answers `{"configured":false}` |
@@ -367,33 +369,22 @@ and only when the reading changed, so a parked car writes nothing. The km on a
 day are its reading minus the previous saved day's. A day with no reading has
 no row; its km land on the next day with one.
 
-To compare charging with petrol, add these to `[teslamate]`:
+To compare charging with petrol, set these (see
+[Where the settings live](#where-the-settings-live); they are no longer
+`config.toml` keys):
 
-```toml
-petrol_cents_per_litre = 195.0   # no default: the comparison is off without it
-petrol_litres_per_100km = 7.5    # a comparable petrol car (the default)
-# away_cents_per_kwh = 65.0      # a flat price for charging away from home
-```
+- `petrol_cents_per_litre` (no default: the comparison is off without it)
+- `petrol_litres_per_100km` (a comparable petrol car, default 7.5)
+- `away_cents_per_kwh` (a flat price for charging away from home)
 
-For the per-car history (below) the petrol price can change over time. Add
-one `[[teslamate.petrol_price]]` table per change, after the other
-`[teslamate]` keys:
-
-```toml
-[[teslamate.petrol_price]]
-from = "2025-01-01"              # YYYY-MM-DD, oldest first, each one later
-cents_per_litre = 185.0
-[[teslamate.petrol_price]]
-from = "2026-03-01"
-cents_per_litre = 199.0
-```
-
-A day uses the entry with the latest `from` on or before it, and the days
-before the first entry use `petrol_cents_per_litre`. Without that, those days
-have no price and the petrol cost stays empty. The single-car summary above
-keeps using `petrol_cents_per_litre` only.
-
-To keep the changes in a file instead, see [Petrol prices file](#petrol-prices-file).
+For the per-car history (below) the petrol price can change over time. Each
+change is a petrol price row: a date (`YYYY-MM-DD`) and cents per litre, for
+example 185.0 from 2025-01-01 and 199.0 from 2026-03-01. A day uses the row
+with the latest date on or before it, and the days before the first row use
+`petrol_cents_per_litre`. Without that, those days have no price and the
+petrol cost stays empty. The single-car summary above keeps using
+`petrol_cents_per_litre` only. The rows are listed and changed through
+[`/api/petrol-prices`](#petrol-prices).
 
 South Australian unleaded averages roughly 190-200 c/L in 2026; check a fuel
 price app for what you pay. The Money tab then shows a car
@@ -413,13 +404,9 @@ price. `GET /api/ev/summary` gives the same numbers.
 
 #### Comparison cars and charging by plan
 
-Two more `[teslamate]` keys feed the "EV versus petrol" view of
-`GET /api/ev/cars`:
-
-```toml
-compare_cars = { "3" = "Hyundai i30 Sedan N", "Y" = "Toyota RAV4 GX 2WD" }
-petrol_grade = "Unleaded 91"     # the default
-```
+Two more settings feed the "EV versus petrol" view of `GET /api/ev/cars`:
+`compare_cars` (for example `{"3": "Hyundai i30 Sedan N", "Y": "Toyota RAV4 GX 2WD"}`)
+and `petrol_grade` (default "Unleaded 91").
 
 `compare_cars` maps TeslaMate's model string to the name of the petrol car it
 is compared with (the key is matched ignoring case); a model with no entry has
@@ -428,7 +415,7 @@ cars. `petrol_grade` is returned as is.
 
 Home charging is also split by the plan that applied on the day each session
 started: `charging_by_plan` has one row per plan with home sessions, oldest
-first, with the plan's `name` from `[tariff]` or `[[previous_tariff]]` (without
+first, with the plan's `name` (without
 one it is "Plan until <date>", "Plan from <date>" or "Plan <date> to <date>").
 `sessions`, `kwh` and `cost` (dollars paid with the system) count costed
 sessions only; sessions not costed yet are in `pending_sessions` and never in
@@ -436,63 +423,30 @@ the money. Days where Amber was billed use the bill's average price, as above.
 The car's details (`trim`, `paint`, `wheels`, `marketing_name`) come from
 TeslaMate's `cars` table and are `null` where TeslaMate has nothing.
 
-#### Petrol prices file
+#### Petrol prices
 
-Instead of `[[teslamate.petrol_price]]` tables, the changes can live in a CSV
-file you edit by hand or update through the API. Set this in `[teslamate]`
-(not together with the tables: `serve` refuses both):
-
-```toml
-petrol_prices_file = "/var/lib/solar-dash/petrol-prices.csv"
-```
-
-The file starts with the header `from,cents_per_litre`, then one row per
-change. Rows can be in any order, but each date may appear once and each price
-must be more than 0. Blank lines and lines starting with `#` are skipped:
-
-```
-# Petrol prices for solar-dash; edit by hand or via /api/petrol-prices
-from,cents_per_litre
-2025-01-01,185.0
-2026-03-01,199.0
-```
-
-`petrol_cents_per_litre` still applies before the first row. A missing file is
-fine: it counts as empty and is created on the first change. At startup a file
-that does not parse stops `serve`, naming the line. While running, solar-dash
-checks the file's size and modified time on each request and reads it again
-when they change, so hand edits show on the next request without a restart. If
-an edit leaves a broken file, a warning is logged once, the last good prices
-stay in use, and the API refuses changes until it is fixed.
-
-The file must be writable by the user solar-dash runs as, and so must its
-directory, because the API writes `petrol-prices.csv.tmp` beside it and renames
-it over the file (`/var/lib/solar-dash` is writable by the service user in the
-systemd setup). The API rewrites the whole file, so comments you added by hand
-are not kept.
-
-With an `api_token` (see above), from a script:
+The petrol price changes over time are rows in the database (table
+`petrol_price`), listed and changed through the API:
 
 ```sh
-TOKEN=...   # the api_token from config.toml
+TOKEN=...   # the api_token from config.toml (reads only)
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/petrol-prices
-curl -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"from":"2026-10-23","cents_per_litre":189.9}' http://127.0.0.1:8080/api/petrol-prices
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/petrol-prices/2026-10-23
-```
-
-Or with the login cookie instead of a token:
-
-```sh
+# Changes need the login cookie:
 curl -c cookies.txt -d 'password=YOUR_PASSWORD' http://127.0.0.1:8080/login
 curl -b cookies.txt -X PUT -H 'Content-Type: application/json' \
   -d '{"from":"2026-10-23","cents_per_litre":189.9}' http://127.0.0.1:8080/api/petrol-prices
+curl -b cookies.txt -X DELETE http://127.0.0.1:8080/api/petrol-prices/2026-10-23
 ```
 
-The write routes need a login (or token) like the rest of `/api/`. The PUT
-must send `Content-Type: application/json`, and the login cookie is
-`SameSite=Lax`, so another website cannot change prices through a visitor's
-browser. Without `petrol_prices_file`, PUT and DELETE answer 409.
+A change applies at once, without a restart, and is written to the change log
+(`admin_change`). The write routes need the login cookie, not the token. The
+PUT must send `Content-Type: application/json`, the cookie is `SameSite=Lax`,
+and a write whose `Origin` header names another host is refused with 403, so
+another website cannot change prices through a visitor's browser.
+
+An older config's `petrol_prices_file` (a `from,cents_per_litre` CSV) or
+`[[teslamate.petrol_price]]` tables are imported into the table once; see
+[Where the settings live](#where-the-settings-live).
 
 #### Per-car savings over the whole history
 
@@ -506,7 +460,7 @@ Cars are listed newest first, and a car with no drives and no charges is left
 out.
 
 - Petrol is each day's km times `petrol_litres_per_100km` times that day's
-  price, from the `[[teslamate.petrol_price]]` entries or the petrol prices file.
+  price, from the petrol price rows.
 - Home is the geofence "Home"; any other geofence, or none, is away. Away
   sessions cost `away_cents_per_kwh` per kWh; without it `away_cost` is `null`,
   `away_uncosted_kwh` says how much was left out, and it counts as nothing.
@@ -521,7 +475,7 @@ out.
   left out of the money and of those four figures, so the savings read low
   until they are.
 - `configured` is `true` with a `petrol_cents_per_litre`, any
-  `[[teslamate.petrol_price]]` or any row in the petrol prices file. Without a petrol price `petrol_cost` and
+  petrol price row. Without a petrol price `petrol_cost` and
   `saved` are `null` but the charging costs still show.
 
 The rest of the state is only kept in memory (the broker keeps the latest
@@ -706,17 +660,14 @@ before sharing it.
 
 For a past period you may have no usable tariff (a spot-price retailer, say) or
 gaps in the meter data (cloud sync was off for a while). If you still have the
-bills, list them in a CSV file and point `[bills]` at it:
-
-```toml
-[bills]
-file = "/etc/solar-dash/bills.csv"
-```
+bills, enter them as bills in the CSV format below. They are kept in the
+database (table `bill`). An older config's `[bills] file = "..."` is imported
+once at start-up; see [Where the settings live](#where-the-settings-live).
 
 Every day a bill covers then uses the bill's real total in Money and Payback,
 spread evenly over the bill's days. The Bill check still compares GloBird with
-our own estimate only. `serve` refuses to start if the file is bad, and the
-error names the line.
+our own estimate only. A bad file stops the import with an error naming the
+line.
 
 The file has a header line, then one line per bill. Blank lines and lines
 starting with `#` are ignored. Periods must not overlap.
@@ -759,6 +710,81 @@ How a bill becomes days:
   added to the import cost, or taken off as extra export credit if negative.
   The days then add up to exactly `bill_total + excluded`.
 - A bill wins over GloBird's daily figures for the same day.
+
+## Admin API
+
+The data in [Where the settings live](#where-the-settings-live) is edited
+through these routes. They are under `/api/`, so they need a login; the
+write routes need the login cookie (the `api_token` Bearer only works for
+`GET` and `HEAD`), and a write whose `Origin` header names a different host
+than the `Host` header is refused with 403 (requests without an `Origin`, such
+as curl, are fine). Bodies and answers are JSON, errors are `{"error":"..."}`.
+Each write runs in one transaction: the whole data set is checked after the
+change, and if it does not work (say two plans start on the same day) nothing
+is saved and the answer is a 400 with the reason. A change shows in the rest of
+the API at once, and is added to `admin_change` with the row before and after.
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/admin` | Everything: `{"tariffs":[Plan..],"petrol":{"fallback_cents_per_litre":..,"prices":[{from,cents_per_litre}..]},"purchases":[{id,name,date,cost_dollars,battery_kwh}..],"bills":[{from,to,bill_total,excluded,import_kwh,import_dollars,export_kwh,export_dollars,supply_dollars,note}..],"settings":{key:value..},"setting_defaults":{key:value..},"changes":[{id,at,what,action,key}..]}`. `settings` holds the keys that are set, `setting_defaults` what the others are. `changes` is the last 50, newest first (`at` is unix seconds). With `?download=1` the answer is sent as `solar-dash-admin-YYYY-MM-DD.json` to save (the Export) |
+| `POST /api/admin/tariffs` | Adds a plan and answers with it (201). Body: a Plan without `id` |
+| `POST /api/admin/tariffs/preview` | Prices the days so far on the current plans and on the plans with this change, without saving anything. Body: a Plan; with an `id` it replaces that plan, without one it is added. Optional `?from=YYYY-MM-DD&to=YYYY-MM-DD` (at most 92 days; default: the last 30 complete days). Answers `{"days":[{"date","current_cents","new_cents"}..],"total":{"current_cents","new_cents"}}`; days with no data are left out, and `current_cents` is null when no plan is saved yet |
+| `PUT /api/admin/tariffs/{id}` | Replaces a plan and answers with it. 404 if there is none |
+| `DELETE /api/admin/tariffs/{id}` | Answers `{"deleted": Plan}`. Deleting the last plan turns the cost features off |
+| `POST /api/admin/purchases` | Adds `{"name","date":"YYYY-MM-DD","cost_dollars","battery_kwh"?}` and answers with it, with its `id` (201) |
+| `PUT /api/admin/purchases/{id}` | Replaces a purchase and answers with it. 404 if there is none |
+| `DELETE /api/admin/purchases/{id}` | Answers `{"deleted": Purchase}` |
+| `PUT /api/admin/bills` | Body: a whole bills CSV (see [Past bills](#past-bills-optional)) with `Content-Type: text/csv`. Replaces every bill and answers `{"rows":n}`. 415 for another content type, 400 naming the line for a bad file |
+| `DELETE /api/admin/bills/YYYY-MM-DD` | Removes the bill starting that day and answers `{"deleted": Bill}`. 404 if there is none |
+| `PUT /api/admin/settings` | A partial object of setting keys (`petrol_cents_per_litre`, `petrol_litres_per_100km`, `away_cents_per_kwh`, `compare_cars`, `petrol_grade`, `price_rise_percent`). `null` puts a key back to its default. An unknown key or a bad value is a 400 and nothing changes. Answers with the settings that are set |
+| `GET`, `PUT`, `DELETE /api/petrol-prices` | The petrol prices; see [Petrol prices](#petrol-prices) |
+
+A Plan is `{"id":1,"valid_from":"2026-05-26"|null,"tariff":{..}}`. It applies
+from `valid_from` (a local day, inclusive) until the day before the next plan
+starts. Only the earliest plan may have `valid_from` `null` (no known start),
+and no two plans may start on the same day. `tariff` has the fields of the old
+`[tariff]` section as JSON: `name`, `supply_cents_per_day`,
+`default_import_cents`, `default_export_cents`, `import` and `export` (lists of
+`{"from":"HH:MM","to":"HH:MM","cents":..}`), `zero_import_credit`
+(`{"from","to","max_kwh","credit_cents"}` or `null`) and `export_tier`
+(`{"first_kwh_per_day","cents"}` or `null`), with the same checks.
+
+```sh
+curl -c cookies.txt -d 'password=YOUR_PASSWORD' http://127.0.0.1:8080/login
+curl -b cookies.txt -o backup.json 'http://127.0.0.1:8080/api/admin?download=1'
+curl -b cookies.txt -X PUT -H 'Content-Type: application/json' \
+  -d '{"petrol_grade":"Premium 98","price_rise_percent":null}' \
+  http://127.0.0.1:8080/api/admin/settings
+curl -b cookies.txt -X PUT -H 'Content-Type: text/csv' --data-binary @bills.csv \
+  http://127.0.0.1:8080/api/admin/bills
+```
+
+## Where the settings live
+
+Secrets, hosts, ports, `bind`, the database path, the time zone, the plant id
+and the sync times stay in `config.toml`. The data below is kept in the
+database instead, so it can be edited while `serve` runs, and every change is
+recorded in the `admin_change` table with the row before and after:
+
+| What | Table | Used to be in `config.toml` |
+| --- | --- | --- |
+| Electricity plans over time | `tariff_plan` | `[tariff]`, `[[previous_tariff]]` |
+| Petrol prices over time | `petrol_price` | `petrol_prices_file`, `[[teslamate.petrol_price]]` |
+| What the system cost | `purchase` | `[[system.purchase]]` |
+| Past bills | `bill` | `[bills]` |
+| Preferences | `setting` | `petrol_cents_per_litre`, `petrol_litres_per_100km`, `away_cents_per_kwh`, `compare_cars`, `petrol_grade`, `price_rise_percent` |
+
+The first time `serve` starts after upgrading it copies whatever the config
+has into these tables, once for each row of the table above, and logs what it
+imported. It records that in `admin_change` (action `import`), even when the
+config had nothing, so emptying a table later never brings the config's copy
+back. From then on the config's copy is ignored. If `config.toml` still has
+any of it, `serve` logs a warning on every start naming what to delete. Old
+configs keep loading, and a mistake in one of those sections still stops
+`serve`.
+
+The tariff cost cache key is unchanged by the move, so costs already stored in
+the database stay valid.
 
 ## Backfill history
 

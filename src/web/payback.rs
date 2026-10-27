@@ -383,7 +383,8 @@ fn by_year(days: &[DaySavings]) -> Vec<YearTotal> {
 }
 
 pub async fn payback(State(state): State<AppState>) -> ApiResult {
-    let (Some(tariff), Some(first)) = (&state.tariff, state.purchases.first()) else {
+    let data = state.admin.get();
+    let (Some(tariff), Some(first)) = (&data.tariff, data.purchases.first()) else {
         return Ok(Json(json!({ "configured": false })));
     };
     let today = today(state.tz);
@@ -397,24 +398,24 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
         .map(|d| (d.date, d.cost.savings_cents / 100.0))
         .collect();
 
-    let total_cost: f64 = state.purchases.iter().map(|p| p.cost_dollars).sum();
+    let total_cost: f64 = data.purchases.iter().map(|p| p.cost_dollars).sum();
     let saved: f64 = days.iter().map(|d| d.1).sum();
     let net = saved - total_cost;
     let rate = rate_per_day(&days);
     let projected = projection_json(&projected_payback(
         net,
         rate,
-        state.price_rise_percent,
+        data.price_rise_percent,
         today,
     ));
-    let purchases: Vec<Value> = state
+    let purchases: Vec<Value> = data
         .purchases
         .iter()
         .map(|p| json!({ "name": p.name, "date": p.date.to_string(), "cost": round2(p.cost_dollars) }))
         .collect();
 
     // What each later battery added, from the days it has a discharge figure for.
-    let battery_from = state
+    let battery_from = data
         .purchases
         .iter()
         .skip(1)
@@ -428,7 +429,7 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
         }
         None => BTreeMap::new(),
     };
-    let added: Vec<Option<BTreeMap<NaiveDate, f64>>> = state
+    let added: Vec<Option<BTreeMap<NaiveDate, f64>>> = data
         .purchases
         .iter()
         .enumerate()
@@ -436,20 +437,20 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
             if i == 0 || p.battery_kwh.is_none() {
                 return None;
             }
-            let owned = battery_owned_before(&state.purchases, i);
+            let owned = battery_owned_before(&data.purchases, i);
             Some(estimated_added(&discharge, p.date, owned, |date| {
                 tariff.for_date(date).peak_import_cents()
             }))
         })
         .collect();
     let parts = build_parts(
-        &state.purchases,
+        &data.purchases,
         &added,
         &days,
-        state.price_rise_percent,
+        data.price_rise_percent,
         today,
     );
-    let parts: Vec<Value> = state
+    let parts: Vec<Value> = data
         .purchases
         .iter()
         .zip(&parts)
@@ -473,13 +474,13 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
         .collect();
 
     // Without the latest battery: only when its savings were estimated.
-    let without = match (state.purchases.split_last(), added.last()) {
+    let without = match (data.purchases.split_last(), added.last()) {
         (Some((last, earlier)), Some(Some(added))) if !earlier.is_empty() => {
             let days = minus_added(&days, &[added]);
             let saved: f64 = days.iter().map(|d| d.1).sum();
             let cost: f64 = earlier.iter().map(|p| p.cost_dollars).sum();
             let rate = rate_per_day(&days);
-            let projection = projected_payback(saved - cost, rate, state.price_rise_percent, today);
+            let projection = projected_payback(saved - cost, rate, data.price_rise_percent, today);
             json!({
                 "name": last.name,
                 "series": monthly_series(&days, earlier, start, today),
@@ -509,12 +510,12 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
         "projected_payback": projected,
         "rate_per_day": round2(rate),
         "last_12_months_saved": round2(last_12_months_saved(&days)),
-        "price_rise_percent": state.price_rise_percent,
+        "price_rise_percent": data.price_rise_percent,
         "purchases": purchases,
         "parts": parts,
         "without": without,
-        "timeline": build_timeline(&state.purchases, &plans),
-        "series": monthly_series(&days, &state.purchases, start, today),
+        "timeline": build_timeline(&data.purchases, &plans),
+        "series": monthly_series(&days, &data.purchases, start, today),
         "by_year": by_year(&days),
     })))
 }

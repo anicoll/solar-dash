@@ -1,3 +1,5 @@
+mod admin_data;
+mod admin_import;
 mod bills;
 mod config;
 mod cost;
@@ -166,6 +168,12 @@ async fn run_serve(config: Config) -> Result<()> {
     info!(path = %config.database.path, "database ready");
     // Check the web settings and the port first, so mistakes fail before any network call.
     let state = web::AppState::from_config(pool.clone(), &config)?;
+    // The tariffs, petrol prices, purchases, bills and preferences live in the
+    // database. Copy them from an older config once, then load them.
+    admin_import::import_from_config(&pool, &config).await?;
+    admin_import::warn_ignored(&config);
+    let admin_data = admin_data::AdminData::load(&mut *pool.acquire().await?).await?;
+    let state = state.with_admin_data(admin_data);
     let listener = TcpListener::bind(&config.server.bind)
         .await
         .with_context(|| format!("could not listen on {}", config.server.bind))?;

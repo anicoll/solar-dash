@@ -465,7 +465,7 @@ fn check_window(section: &str, name: &str, from: &str, to: &str) -> Result<()> {
 impl Tariff {
     /// Check the section for mistakes the TOML parser cannot catch. `section`
     /// names it in errors ("[tariff]" or "[[previous_tariff]] #1").
-    fn check(&self, section: &str) -> Result<()> {
+    pub(crate) fn check(&self, section: &str) -> Result<()> {
         anyhow::ensure!(
             self.supply_cents_per_day >= 0.0,
             "supply_cents_per_day in {section} must not be negative"
@@ -548,12 +548,12 @@ impl Default for System {
     }
 }
 
-fn default_price_rise_percent() -> f64 {
+pub(crate) fn default_price_rise_percent() -> f64 {
     3.0
 }
 
 /// One thing bought for the system: the panels and inverter, a second battery.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Purchase {
     pub name: String,
     /// Local date it was paid for, "YYYY-MM-DD".
@@ -563,6 +563,29 @@ pub struct Purchase {
     /// `/api/payback` estimates the savings this battery added.
     #[serde(default)]
     pub battery_kwh: Option<f64>,
+}
+
+impl Purchase {
+    /// Check one purchase; `label` names it in errors ("purchase[0]").
+    pub(crate) fn check(&self, label: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.name.trim().is_empty(),
+            "{label}.name in [system] must not be empty"
+        );
+        parse_date(&self.date).with_context(|| format!("{label}.date in [system]"))?;
+        // `>= 0.0` is false for NaN as well, so that is rejected too.
+        anyhow::ensure!(
+            self.cost_dollars >= 0.0 && self.cost_dollars.is_finite(),
+            "{label}.cost_dollars in [system] must be zero or more"
+        );
+        if let Some(kwh) = self.battery_kwh {
+            anyhow::ensure!(
+                kwh.is_finite() && kwh > 0.0,
+                "{label}.battery_kwh in [system] must be greater than 0"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Parse a "YYYY-MM-DD" date. Strict, like [`parse_hhmm`].
@@ -580,22 +603,7 @@ impl System {
             "price_rise_percent in [system] must be between 0 and 20"
         );
         for (i, p) in self.purchase.iter().enumerate() {
-            anyhow::ensure!(
-                !p.name.trim().is_empty(),
-                "purchase[{i}].name in [system] must not be empty"
-            );
-            parse_date(&p.date).with_context(|| format!("purchase[{i}].date in [system]"))?;
-            // `>= 0.0` is false for NaN as well, so that is rejected too.
-            anyhow::ensure!(
-                p.cost_dollars >= 0.0 && p.cost_dollars.is_finite(),
-                "purchase[{i}].cost_dollars in [system] must be zero or more"
-            );
-            if let Some(kwh) = p.battery_kwh {
-                anyhow::ensure!(
-                    kwh.is_finite() && kwh > 0.0,
-                    "purchase[{i}].battery_kwh in [system] must be greater than 0"
-                );
-            }
+            p.check(&format!("purchase[{i}]"))?;
         }
         Ok(())
     }
@@ -625,11 +633,11 @@ fn default_teslamate_topic_prefix() -> String {
     "teslamate".to_string()
 }
 
-fn default_petrol_grade() -> String {
+pub(crate) fn default_petrol_grade() -> String {
     "Unleaded 91".to_string()
 }
 
-fn default_petrol_litres_per_100km() -> f64 {
+pub(crate) fn default_petrol_litres_per_100km() -> f64 {
     7.5
 }
 

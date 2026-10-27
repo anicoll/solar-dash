@@ -489,7 +489,8 @@ pub async fn battery(
     Query(params): Query<BatteryParams>,
 ) -> ApiResult {
     let count = parse_days(params.days.as_deref())?;
-    let Some(schedule) = &state.tariff else {
+    let data = state.admin.get();
+    let Some(schedule) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
     let tz = state.tz;
