@@ -63,6 +63,13 @@ bind = "127.0.0.1:8080"
 # Optional section; defaults shown.
 [database]
 path = "data/solar.db"
+# `serve` copies the database once a day (03:30 in the [isolarcloud] timezone,
+# and at startup if today's copy is missing) to <backup_dir>/solar-YYYY-MM-DD.db
+# and keeps the newest `backup_keep` files. Default for backup_dir: a `backups`
+# folder next to the database file. The user running solar-dash must be able to
+# write there. Set backup_keep = 0 to turn backups off.
+# backup_dir = "data/backups"
+# backup_keep = 14
 
 # Optional: read live power straight from the inverter over your LAN (Modbus
 # TCP). Without this section Modbus is off. To use it, first enable Modbus TCP
