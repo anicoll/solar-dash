@@ -746,17 +746,29 @@ impl FailureLog {
 const SETTINGS_EVERY_N_TICKS: u32 = 4;
 
 /// The `(import_wh, export_wh)` to save for `meter`, or `None` to skip it:
-/// when a value is unavailable, nothing changed since `saved`, or a total
-/// went down (a lifetime counter only grows, so that is a glitch).
-fn meter_to_save(saved: Option<(f64, f64)>, meter: &Meter) -> Option<(f64, f64)> {
+/// when a value is unavailable, nothing changed since `saved` (`(ts,
+/// import_wh, export_wh)`), or a total moved in a way the grid cannot. A
+/// lifetime counter only grows, and never faster than [`GRID_MAX_W`]; a
+/// glitch saved as real would make every later true reading look too low.
+fn meter_to_save(saved: Option<(i64, f64, f64)>, meter: &Meter) -> Option<(f64, f64)> {
     let totals = (meter.import_wh?, meter.export_wh?);
-    match saved {
-        Some(saved) if saved == totals => None,
-        Some(saved) if totals.0 < saved.0 || totals.1 < saved.1 => {
-            debug!(?saved, ?totals, "discarding grid totals that went down");
-            None
-        }
-        _ => Some(totals),
+    let Some((saved_ts, saved_import, saved_export)) = saved else {
+        return Some(totals);
+    };
+    let grew = (totals.0 - saved_import, totals.1 - saved_export);
+    // One 100 Wh step is always allowed, however soon after the last row.
+    let most_wh = (GRID_MAX_W * (meter.ts - saved_ts).max(0) as f64 / 3600.0).max(METER_UNIT_WH);
+    if grew == (0.0, 0.0) {
+        None
+    } else if grew.0 < 0.0 || grew.1 < 0.0 || grew.0 > most_wh || grew.1 > most_wh {
+        debug!(
+            ?saved,
+            ?totals,
+            "discarding grid totals the grid could not have made"
+        );
+        None
+    } else {
+        Some(totals)
     }
 }
 
@@ -783,7 +795,7 @@ pub async fn run_poll(
     // The newest saved row, so a restart does not save the same settings again.
     // The grid totals last saved, so only a change is saved again.
     let mut saved_meter = match db::latest_grid_meter(pool).await {
-        Ok(saved) => saved.map(|(_, import_wh, export_wh)| (import_wh, export_wh)),
+        Ok(saved) => saved,
         Err(err) => {
             warn!("could not read saved grid totals: {err:#}");
             None
@@ -822,7 +834,7 @@ pub async fn run_poll(
                     && let Some(totals) = meter_to_save(saved_meter, &meter)
                 {
                     match db::insert_grid_meter(pool, meter.ts, totals.0, totals.1).await {
-                        Ok(()) => saved_meter = Some(totals),
+                        Ok(()) => saved_meter = Some((meter.ts, totals.0, totals.1)),
                         Err(err) => warn!("could not save grid totals: {err:#}"),
                     }
                 }
@@ -1106,11 +1118,11 @@ mod tests {
     #[test]
     fn saves_grid_totals_only_when_they_grow() {
         let meter = |import_wh, export_wh| Meter {
-            ts: 0,
+            ts: 3600,
             import_wh,
             export_wh,
         };
-        let saved = Some((100.0, 200.0));
+        let saved = Some((0, 100.0, 200.0));
         // The first reading is saved; so is a change in either value.
         assert_eq!(
             meter_to_save(None, &meter(Some(100.0), Some(200.0))),
@@ -1129,6 +1141,17 @@ mod tests {
         assert_eq!(meter_to_save(saved, &meter(Some(0.0), Some(300.0))), None);
         assert_eq!(meter_to_save(saved, &meter(None, Some(300.0))), None);
         assert_eq!(meter_to_save(saved, &meter(Some(300.0), None)), None);
+        // More than 30 kW could deliver in the hour since: a glitch.
+        assert_eq!(
+            meter_to_save(saved, &meter(Some(100.0 + 30_100.0), Some(200.0))),
+            None
+        );
+        // A single step right after the last row is fine.
+        let just_now = Some((3599, 100.0, 200.0));
+        assert_eq!(
+            meter_to_save(just_now, &meter(Some(200.0), Some(200.0))),
+            Some((200.0, 200.0))
+        );
     }
 
     #[test]
