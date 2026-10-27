@@ -361,6 +361,47 @@ pub async fn latest_live_sample(pool: &SqlitePool) -> Result<Option<Sample>> {
     .context("could not read latest live sample")
 }
 
+/// Saves the inverter's lifetime grid totals (Wh) as read at `ts`. A second
+/// row with the same second replaces the first.
+pub async fn insert_grid_meter(
+    pool: &SqlitePool,
+    ts: i64,
+    import_wh: f64,
+    export_wh: f64,
+) -> Result<()> {
+    sqlx::query("INSERT OR REPLACE INTO grid_meter (ts, import_wh, export_wh) VALUES (?, ?, ?)")
+        .bind(ts)
+        .bind(import_wh)
+        .bind(export_wh)
+        .execute(pool)
+        .await
+        .context("could not save grid totals")?;
+    Ok(())
+}
+
+/// The newest grid totals as `(ts, import_wh, export_wh)`, or `None` if there
+/// are none.
+pub async fn latest_grid_meter(pool: &SqlitePool) -> Result<Option<(i64, f64, f64)>> {
+    sqlx::query_as("SELECT ts, import_wh, export_wh FROM grid_meter ORDER BY ts DESC LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .context("could not read latest grid totals")
+}
+
+/// Every grid totals row with `from <= ts < to`, oldest first, as
+/// `(ts, import_wh, export_wh)`. Nothing reads these yet; they are only recorded.
+#[allow(dead_code)]
+pub async fn grid_meter_raw(pool: &SqlitePool, from: i64, to: i64) -> Result<Vec<(i64, f64, f64)>> {
+    sqlx::query_as(
+        "SELECT ts, import_wh, export_wh FROM grid_meter WHERE ts >= ? AND ts < ? ORDER BY ts",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read grid totals")
+}
+
 /// Saves one row of inverter settings. A second row with the same second
 /// replaces the first.
 pub async fn insert_inverter_settings(pool: &SqlitePool, s: &Settings) -> Result<()> {
@@ -1667,6 +1708,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn grid_meter_round_trip() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(latest_grid_meter(&pool).await.unwrap(), None);
+
+        insert_grid_meter(&pool, 100, 1000.0, 2000.0).await.unwrap();
+        insert_grid_meter(&pool, 200, 1100.0, 2000.0).await.unwrap();
+        // The same second again replaces the row.
+        insert_grid_meter(&pool, 200, 1100.0, 2100.0).await.unwrap();
+        insert_grid_meter(&pool, 300, 1100.0, 2200.0).await.unwrap();
+
+        assert_eq!(
+            latest_grid_meter(&pool).await.unwrap(),
+            Some((300, 1100.0, 2200.0))
+        );
+        // `to` is exclusive, `from` inclusive, oldest first.
+        assert_eq!(
+            grid_meter_raw(&pool, 100, 300).await.unwrap(),
+            vec![(100, 1000.0, 2000.0), (200, 1100.0, 2100.0)]
+        );
     }
 
     fn settings(ts: i64, ems_mode: u16) -> Settings {

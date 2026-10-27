@@ -287,6 +287,13 @@ in a row, and `Modbus back` is logged when reads work again. Without a
 `[modbus]` section `serve` behaves exactly as before. The samples are served
 by `/api/live` and `/api/live/series` (see [the API table](#dashboard-views)).
 
+It also reads the inverter's lifetime grid import and export counters (input
+registers 13036 and 13045, 0.1 kWh) and stores them in the `grid_meter` table,
+a row only when either value changes. `modbus-test` prints them as
+`grid totals: import ... kWh, export ... kWh`; check them against the
+inverter's own display. If the dongle refuses these registers they show as
+n/a and the samples are saved as usual.
+
 Daily energy: when the live samples cover at least 90% of a local day (for
 today, 90% of the time since midnight), `/api/daily` adds them up itself
 instead of using the iSolarCloud counters, and sets `"source": "inverter"`

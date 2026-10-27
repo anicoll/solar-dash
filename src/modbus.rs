@@ -44,6 +44,13 @@ const BATTERY_POWER_REG: u16 = 5213;
 const BLOCK_START: u16 = 13007;
 const BLOCK_LEN: u16 = 16;
 
+/// The block 13036..=13046 holds the lifetime grid import energy (13036, u32,
+/// 0.1 kWh) and the lifetime grid export energy (13045, u32, 0.1 kWh).
+const METER_START: u16 = 13036;
+const METER_LEN: u16 = 11;
+/// The grid energy counters count in steps of 0.1 kWh.
+const METER_UNIT_WH: f64 = 100.0;
+
 // Control settings. These are read with function 03 (read holding registers),
 // except the running state, which is an input register. Every one is read-only
 // here: nothing in this program ever writes to the inverter.
@@ -115,6 +122,19 @@ pub struct Sample {
     pub battery_w: Option<f64>,
     /// Battery state of charge, 0 to 100.
     pub soc_pct: Option<f64>,
+}
+
+/// The inverter's lifetime grid energy counters. They count what the battery's
+/// fast hunting around 0 W adds up to, which the 15-second samples never see.
+/// A field is `None` when the inverter said the value is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Meter {
+    /// Unix seconds, UTC, when the read finished.
+    pub ts: i64,
+    /// Total energy imported from the grid, Wh (100 Wh steps).
+    pub import_wh: Option<f64>,
+    /// Total energy exported to the grid, Wh (100 Wh steps).
+    pub export_wh: Option<f64>,
 }
 
 /// The newest sample, shared between the poller and the web server so
@@ -260,6 +280,23 @@ pub fn decode_sample(ts: i64, pv: &[u16], battery: &[u16], block: &[u16]) -> Sam
         grid_w,
         battery_w: decode_battery(battery),
         soc_pct,
+    }
+}
+
+/// Turns a lifetime energy counter (two registers, 0.1 kWh) into Wh. The
+/// unavailable values and 0 give `None`: a lifetime total of 0 is not real.
+fn decode_energy(words: &[u16]) -> Option<f64> {
+    let raw = decode_u32(words).filter(|&v| v != UNAVAILABLE_U32_ALL_ONES && v != 0)?;
+    Some(f64::from(raw) * METER_UNIT_WH)
+}
+
+/// Builds a [`Meter`] from the 11-register block starting at 13036.
+pub fn decode_meter(ts: i64, words: &[u16]) -> Meter {
+    // Offsets are the register number minus 13036.
+    Meter {
+        ts,
+        import_wh: decode_energy(&words[0..2]),
+        export_wh: decode_energy(&words[9..11]),
     }
 }
 
@@ -528,6 +565,19 @@ pub fn describe(sample: &Sample) -> String {
     )
 }
 
+/// One line for people, e.g. `grid totals: import 12345.6 kWh, export 23456.7 kWh`.
+pub fn describe_meter(meter: &Meter) -> String {
+    let kwh = |wh: Option<f64>| match wh {
+        Some(w) => format!("{:.1} kWh", w / 1000.0),
+        None => "n/a".to_string(),
+    };
+    format!(
+        "grid totals: import {}, export {}",
+        kwh(meter.import_wh),
+        kwh(meter.export_wh)
+    )
+}
+
 /// Counts successful and failed reads, for the `modbus-test --watch` summary.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Tally {
@@ -564,9 +614,11 @@ impl Reader {
         }
     }
 
-    /// Does the three reads and returns a [`Sample`]. On any error the
-    /// connection is dropped, so calling this again reconnects.
-    pub async fn read_sample(&mut self) -> Result<Sample> {
+    /// Does the three reads and returns a [`Sample`], plus the grid energy
+    /// counters from a fourth read. The inverter refusing that fourth read
+    /// only gives `None` for the meter. On any other error the connection is
+    /// dropped, so calling this again reconnects.
+    pub async fn read_sample(&mut self) -> Result<(Sample, Option<Meter>)> {
         let result = self.try_read().await;
         if result.is_err() {
             self.connection = None;
@@ -574,7 +626,7 @@ impl Reader {
         result
     }
 
-    async fn try_read(&mut self) -> Result<Sample> {
+    async fn try_read(&mut self) -> Result<(Sample, Option<Meter>)> {
         let ctx = match &mut self.connection {
             Some(ctx) => ctx,
             // `insert` stores the new connection and gives back a reference to it.
@@ -587,7 +639,14 @@ impl Reader {
         sleep(REQUEST_PAUSE).await;
         let block = read_registers(ctx, BLOCK_START, BLOCK_LEN).await?;
 
-        Ok(decode_sample(db::now(), &pv, &battery, &block))
+        sleep(REQUEST_PAUSE).await;
+        let meter = refusable(read_input(ctx, METER_START, METER_LEN).await?, METER_START);
+
+        let ts = db::now();
+        Ok((
+            decode_sample(ts, &pv, &battery, &block),
+            meter.map(|words| decode_meter(ts, &words)),
+        ))
     }
 
     /// Reads the control settings, one small request per group. An answer
@@ -686,6 +745,21 @@ impl FailureLog {
 /// ticks (the first tick included): about once a minute at the default interval.
 const SETTINGS_EVERY_N_TICKS: u32 = 4;
 
+/// The `(import_wh, export_wh)` to save for `meter`, or `None` to skip it:
+/// when a value is unavailable, nothing changed since `saved`, or a total
+/// went down (a lifetime counter only grows, so that is a glitch).
+fn meter_to_save(saved: Option<(f64, f64)>, meter: &Meter) -> Option<(f64, f64)> {
+    let totals = (meter.import_wh?, meter.export_wh?);
+    match saved {
+        Some(saved) if saved == totals => None,
+        Some(saved) if totals.0 < saved.0 || totals.1 < saved.1 => {
+            debug!(?saved, ?totals, "discarding grid totals that went down");
+            None
+        }
+        _ => Some(totals),
+    }
+}
+
 /// Reads a sample every `interval_secs`, keeps it in `latest` and saves it,
 /// until `shutdown` completes. Every few ticks it also reads the control
 /// settings into `latest_settings`. Failures are logged (throttled) and never
@@ -707,6 +781,14 @@ pub async fn run_poll(
     let mut ticks: u32 = 0;
     let mut previous_settings: Option<Settings> = None;
     // The newest saved row, so a restart does not save the same settings again.
+    // The grid totals last saved, so only a change is saved again.
+    let mut saved_meter = match db::latest_grid_meter(pool).await {
+        Ok(saved) => saved.map(|(_, import_wh, export_wh)| (import_wh, export_wh)),
+        Err(err) => {
+            warn!("could not read saved grid totals: {err:#}");
+            None
+        }
+    };
     let mut saved_settings = match db::latest_inverter_settings(pool).await {
         Ok(saved) => saved,
         Err(err) => {
@@ -728,13 +810,21 @@ pub async fn run_poll(
             result = reader.read_sample() => result,
         };
         match result {
-            Ok(sample) => {
+            Ok((sample, meter)) => {
                 if let Some(count) = failures.succeeded() {
                     info!(failed_reads = count, "Modbus back");
                 }
                 latest.set(sample);
                 if let Err(err) = db::insert_live_sample(pool, &sample).await {
                     warn!("could not save Modbus sample: {err:#}");
+                }
+                if let Some(meter) = meter
+                    && let Some(totals) = meter_to_save(saved_meter, &meter)
+                {
+                    match db::insert_grid_meter(pool, meter.ts, totals.0, totals.1).await {
+                        Ok(()) => saved_meter = Some(totals),
+                        Err(err) => warn!("could not save grid totals: {err:#}"),
+                    }
                 }
             }
             Err(err) => {
@@ -965,6 +1055,82 @@ mod tests {
         assert!(soc.is_some());
     }
 
+    /// Import 12345.0 kWh (123450 = 0x0001_E23A) and export 23456.0 kWh
+    /// (234560 = 0x0003_9440), low word first, with filler between.
+    const METER: [u16; 11] = [0xE23A, 0x0001, 0, 0, 0, 0, 0, 0, 0, 0x9440, 0x0003];
+
+    #[test]
+    fn decodes_the_grid_meter() {
+        let meter = decode_meter(7, &METER);
+        assert_eq!(meter.ts, 7);
+        assert_eq!(meter.import_wh, Some(12_345_000.0));
+        assert_eq!(meter.export_wh, Some(23_456_000.0));
+    }
+
+    #[test]
+    fn grid_meter_unavailable_values_are_none() {
+        let mut words = METER;
+        // Unavailable as 0x7FFFFFFF.
+        words[0] = 0xFFFF;
+        words[1] = 0x7FFF;
+        // Unavailable as all ones.
+        words[9] = 0xFFFF;
+        words[10] = 0xFFFF;
+        let meter = decode_meter(0, &words);
+        assert_eq!((meter.import_wh, meter.export_wh), (None, None));
+        // A lifetime total of 0 is not real either.
+        words[0] = 0;
+        words[1] = 0;
+        words[9] = 0;
+        words[10] = 0;
+        let meter = decode_meter(0, &words);
+        assert_eq!((meter.import_wh, meter.export_wh), (None, None));
+    }
+
+    #[test]
+    fn describes_the_grid_meter() {
+        assert_eq!(
+            describe_meter(&decode_meter(0, &METER)),
+            "grid totals: import 12345.0 kWh, export 23456.0 kWh"
+        );
+        let meter = Meter {
+            import_wh: None,
+            ..decode_meter(0, &METER)
+        };
+        assert_eq!(
+            describe_meter(&meter),
+            "grid totals: import n/a, export 23456.0 kWh"
+        );
+    }
+
+    #[test]
+    fn saves_grid_totals_only_when_they_grow() {
+        let meter = |import_wh, export_wh| Meter {
+            ts: 0,
+            import_wh,
+            export_wh,
+        };
+        let saved = Some((100.0, 200.0));
+        // The first reading is saved; so is a change in either value.
+        assert_eq!(
+            meter_to_save(None, &meter(Some(100.0), Some(200.0))),
+            Some((100.0, 200.0))
+        );
+        assert_eq!(
+            meter_to_save(saved, &meter(Some(200.0), Some(200.0))),
+            Some((200.0, 200.0))
+        );
+        assert_eq!(
+            meter_to_save(saved, &meter(Some(100.0), Some(300.0))),
+            Some((100.0, 300.0))
+        );
+        // No change, a value that went down, or a missing value: skip.
+        assert_eq!(meter_to_save(saved, &meter(Some(100.0), Some(200.0))), None);
+        assert_eq!(meter_to_save(saved, &meter(Some(0.0), Some(300.0))), None);
+        assert_eq!(meter_to_save(saved, &meter(None, Some(300.0))), None);
+        assert_eq!(meter_to_save(saved, &meter(Some(300.0), None)), None);
+    }
+
     #[test]
     fn describes_a_sample() {
         let sample = decode_sample(0, &PV, &BATTERY, &BLOCK);
@@ -1034,6 +1200,9 @@ mod tests {
                 Request::ReadInputRegisters(13007, 16) => {
                     Ok(Response::ReadInputRegisters(BLOCK.to_vec()))
                 }
+                Request::ReadInputRegisters(13036, 11) => {
+                    Ok(Response::ReadInputRegisters(METER.to_vec()))
+                }
                 Request::ReadInputRegisters(12999, 1) => {
                     Ok(Response::ReadInputRegisters(vec![0x0000]))
                 }
@@ -1092,7 +1261,11 @@ mod tests {
         let server = start_fake(listener, 1);
 
         let mut reader = Reader::new(config_for(addr));
-        let sample = reader.read_sample().await.unwrap();
+        let (sample, meter) = reader.read_sample().await.unwrap();
+        let meter = meter.unwrap();
+        assert_eq!(meter.ts, sample.ts);
+        assert_eq!(meter.import_wh, Some(12_345_000.0));
+        assert_eq!(meter.export_wh, Some(23_456_000.0));
         assert_eq!(sample.pv_w, Some(4895.0));
         assert_eq!(sample.load_w, Some(708.0));
         assert_eq!(sample.grid_w, Some(0.0));
