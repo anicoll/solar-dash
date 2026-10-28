@@ -362,12 +362,25 @@
         SD.h('span', {}, SD.h('i', { class: 'history-key history-key-solar', 'aria-hidden': 'true' }), 'Solar'),
         SD.h('span', {}, SD.h('i', { class: 'history-key history-key-home', 'aria-hidden': 'true' }), 'Home'),
         curves.soc.length ? SD.h('span', {}, SD.h('i', { class: 'history-key history-key-battery', 'aria-hidden': 'true' }), 'Battery %') : null);
+      const smoothSeg = SD.h('div', { class: 'seg history-smooth', role: 'group', 'aria-label': 'Line style' });
+      for (const [on, text] of [[true, 'Smooth'], [false, 'Raw']]) {
+        smoothSeg.append(SD.h('button', {
+          type: 'button', text, 'aria-pressed': String(smoothOn() === on),
+          onclick: () => {
+            setSmooth(on);
+            for (const b of smoothSeg.children) b.setAttribute('aria-pressed', String(b === smoothSeg.children[on ? 0 : 1]));
+            redraw();
+          },
+        }));
+      }
       nodes.push(SD.h('section', { class: 'card history-card', 'aria-labelledby': 'history-power-h' },
-        SD.h('h2', { class: 'section-title', id: 'history-power-h', text: 'Power through the day' }),
+        SD.h('div', { class: 'card-head' },
+          SD.h('h2', { class: 'section-title', id: 'history-power-h', text: 'Power through the day' }),
+          smoothSeg),
         chartBox, ribbonBox, legend));
       let ribbon = null;
       redraw = () => {
-        drawPower(chartBox, dayData, curves, tariff, d);
+        drawPower(chartBox, dayData, smoothOn() ? smoothCurves(curves) : curves, tariff, d);
         if (!ribbon || ribbon.long !== wide()) {
           ribbon = { long: wide(), r: SD.ribbon(ribbonBox, tariffRaw, { showCredit: true, labels: wide() ? 'long' : 'short' }) };
         }
@@ -474,6 +487,108 @@
     return steps.find((s) => s >= v) || Math.ceil(v / 10) * 10;
   };
 
+  /* ---------------------------------------------------------------- smoothing */
+
+  // Smooth or raw lines on the day chart, remembered in this browser.
+  const SMOOTH_KEY = 'sd-history-smooth';
+  const SMOOTH_SECS = 300; // average over 5 minutes either side
+  function smoothOn() {
+    try { return localStorage.getItem(SMOOTH_KEY) !== 'raw'; } catch { return true; }
+  }
+  function setSmooth(on) {
+    try { localStorage.setItem(SMOOTH_KEY, on ? 'smooth' : 'raw'); } catch { /* not saved; fine */ }
+  }
+
+  /** Each reading replaced by the average of the readings within 5 minutes of it; gaps stay gaps. */
+  function smoothSeries(series) {
+    const out = [];
+    let lo = 0;
+    let hi = 0;
+    let total = 0;
+    let count = 0;
+    let runStart = 0;
+    for (let i = 0; i < series.length; i++) {
+      const [ts, v] = series[i];
+      if (v == null) { out.push([ts, null]); runStart = i + 1; lo = hi = runStart; total = count = 0; continue; }
+      // Grow the window forward to ts + 5 min (stopping at a gap), shrink it from behind.
+      while (hi < series.length && series[hi][1] != null && series[hi][0] <= ts + SMOOTH_SECS) { total += series[hi][1]; count++; hi++; }
+      while (lo < hi && (lo < runStart || series[lo][0] < ts - SMOOTH_SECS)) { if (lo >= runStart) { total -= series[lo][1]; count--; } lo++; }
+      out.push([ts, count ? total / count : v]);
+    }
+    return out;
+  }
+
+  /** The day's curves with solar and home smoothed (battery % is already smooth). */
+  function smoothCurves(curves) {
+    return { ...curves, pv: smoothSeries(curves.pv), load: smoothSeries(curves.load) };
+  }
+
+  /* ---------------------------------------------------------------- hover details */
+
+  /**
+   * A small box that follows the pointer over a chart. `contentAt(frac)` gets the pointer's
+   * position across the chart (0..1) and returns {at, nodes} (at = where to centre the box,
+   * 0..1) or null. Charts redraw on resize, so each draw calls this again with its own
+   * `contentAt` and the line to move; the listeners are only added once per box.
+   */
+  function chartTip(box, svg, height, contentAt, { touch = true } = {}) {
+    if (!box.sdTip) {
+      box.sdTip = SD.h('div', { class: 'history-tip', hidden: true });
+      const hide = () => {
+        box.sdTip.hidden = true;
+        if (box.sdHover) box.sdHover.setAttribute('visibility', 'hidden');
+      };
+      box.addEventListener('pointermove', (e) => {
+        if (e.pointerType !== 'mouse' && !box.sdTouch) return;
+        const rect = box.getBoundingClientRect();
+        const got = box.sdContentAt((e.clientX - rect.left) / rect.width);
+        if (!got) return hide();
+        const tip = box.sdTip;
+        tip.replaceChildren(...got.nodes);
+        tip.hidden = false;
+        const w = tip.offsetWidth;
+        const cx = got.at * rect.width;
+        tip.style.left = `${Math.max(0, Math.min(rect.width - w, cx - w / 2))}px`;
+        box.sdHover.setAttribute('x1', cx);
+        box.sdHover.setAttribute('x2', cx);
+        box.sdHover.removeAttribute('visibility');
+      });
+      box.addEventListener('pointerleave', hide);
+    }
+    box.sdContentAt = contentAt;
+    box.sdTouch = touch;
+    box.sdHover = S('line', { x1: 0, x2: 0, y1: 0, y2: height, class: 'history-hover', visibility: 'hidden' });
+    svg.append(box.sdHover);
+    box.sdTip.hidden = true;
+    box.append(box.sdTip);
+  }
+
+  const tipLine = (text) => SD.h('span', { text });
+
+  /** kWh bought and sold in each hour, from the inverter's minute readings. */
+  function hourlyGrid(rows) {
+    const bought = new Array(24).fill(0);
+    const sold = new Array(24).fill(0);
+    for (const r of rows) {
+      if (r[3] == null) continue;
+      const hr = Math.floor(SD.local(r[0]).minute / 60);
+      const kwh = Math.abs(r[3]) * 60 / 3.6e6; // a row is one minute of watts
+      if (r[3] > 0) bought[hr] += kwh;
+      else sold[hr] += kwh;
+    }
+    return { bought, sold };
+  }
+
+  /** The reading nearest a timestamp, or null when the nearest is more than 10 minutes away. */
+  function nearest(series, ts) {
+    let best = null;
+    for (const p of series) {
+      if (p[1] == null) continue;
+      if (!best || Math.abs(p[0] - ts) < Math.abs(best[0] - ts)) best = p;
+    }
+    return best && Math.abs(best[0] - ts) <= 600 ? best[1] : null;
+  }
+
   function drawPower(box, day, curves, tariff, totals) {
     const width = Math.max(box.clientWidth || box.parentElement.clientWidth || 300, 200);
     const height = width >= 560 ? 230 : 170;
@@ -524,6 +639,37 @@
     for (const run of runs(curves.soc)) if (run.length > 1) svg.append(S('path', { d: line(run, ySoc), class: 'history-battery-line' }));
 
     box.replaceChildren(svg);
+    // Hover: the readings at that time, and what was bought and sold in that hour.
+    const hourly = curves.source === 'inverter' ? hourlyGrid(curves.rows) : null;
+    chartTip(box, svg, bottom, (frac) => {
+      if (frac < 0 || frac >= 1) return null;
+      const minute = Math.floor(frac * 1440);
+      const hr = Math.floor(minute / 60);
+      // Timestamp for that wall-clock minute (same as x() above, run backwards).
+      const ts = len === 86400 ? day.start + minute * 60 : day.start + minute * 60;
+      const pv = nearest(curves.pv, ts);
+      const load = nearest(curves.load, ts);
+      const soc = nearest(curves.soc, ts);
+      const nodes = [SD.h('b', { text: SD.fmt.minute(minute) })];
+      const now = [];
+      if (pv != null) now.push(`Solar ${SD.fmt.kw(pv / 1000)}`);
+      if (load != null) now.push(`home ${SD.fmt.kw(load / 1000)}`);
+      if (soc != null) now.push(`battery ${Math.round(soc)}%`);
+      if (now.length) nodes.push(tipLine(now.join(', ')));
+      if (hourly) {
+        const from = SD.fmt.minute(hr * 60);
+        const to = SD.fmt.minute(((hr + 1) % 24) * 60);
+        const b = hourly.bought[hr];
+        let cost = '';
+        if (b > 0.005 && tariff) {
+          const band = SD.tariff.bandAt(tariff, hr * 60 + 30);
+          cost = band === 'free' ? ', free' : `, about ${SD.fmt.cents(b * SD.tariff.centsAt(tariff, hr * 60 + 30))}`;
+        }
+        nodes.push(tipLine(`${from} to ${to}: bought ${b > 0.005 ? SD.fmt.kwh(b, 2) : 'nothing'}${cost}`));
+        nodes.push(tipLine(`sold ${hourly.sold[hr] > 0.005 ? SD.fmt.kwh(hourly.sold[hr], 2) : 'nothing'}`));
+      }
+      return nodes.length > 1 ? { at: frac, nodes } : null;
+    });
   }
 
   /** A sentence for screen readers: the day's peaks and the battery's range. */
@@ -588,6 +734,10 @@
       }
       totals = sumRows((energy.days || []).filter((d) => num(d.pv_kwh) || num(d.import_kwh)));
     }
+    // Money for each slot, for the hover details.
+    const costRows = (costs && (grouped ? costs.buckets : costs.days)) || [];
+    const costBy = new Map(costRows.map((c) => [grouped ? c.period : c.date, c]));
+    for (const s of slots) s.cost = costBy.get(s.key) || null;
     const rows = slots.filter((s) => s.row);
     if (!rows.length) {
       return { nodes: [SD.h('div', { class: 'card history-empty' }, SD.h('p', { text: 'No data for this period.' }))] };
@@ -736,6 +886,22 @@
       } else svg.append(S('g', {}, parts));
     });
     box.replaceChildren(svg);
+    // Hover (mouse only: a tap on a bar opens that period): bought by band, sold, and the money.
+    chartTip(box, svg, base, (frac) => {
+      const i = Math.floor(frac * n);
+      const s = slots[i];
+      if (!s || !s.row) return null;
+      const nodes = [SD.h('b', { text: s.long })];
+      const split = BANDS.filter((b) => num(s.row[`import_${b}_kwh`]) && s.row[`import_${b}_kwh`] >= 0.05)
+        .map((b) => `${BAND_NAME[b].toLowerCase()} ${SD.fmt.kwh(s.row[`import_${b}_kwh`])}`);
+      nodes.push(tipLine(`Bought ${SD.fmt.kwh(total(s))}${split.length ? ` (${split.join(', ')})` : ''}`));
+      if (s.cost && num(s.cost.import)) nodes.push(tipLine(`Cost ${money(s.cost.import)}`));
+      if (num(s.row.export_kwh)) {
+        const earned = s.cost && num(s.cost.feed_in) ? `, earned ${money(s.cost.feed_in)}` : '';
+        nodes.push(tipLine(`Sold ${SD.fmt.kwh(s.row.export_kwh)}${earned}`));
+      }
+      return { at: (i + 0.5) / n, nodes };
+    }, { touch: false });
   }
 
   SD.page('history', { mount, update, unmount });
