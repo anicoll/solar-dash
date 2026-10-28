@@ -523,7 +523,7 @@
   }
 
   /** The chart: sold as outlined bars above the line, bought below it filled with the hour's band colour. */
-  function dayChart(hrs, nowMinute) {
+  function dayChart(hrs, nowMinute, hoverHour) {
     const W = 360;
     const H = 120;
     const mid = H / 2;
@@ -533,6 +533,9 @@
     const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', class: 'today-chart', role: 'img',
       'aria-label': dayChartLabel(hrs) });
     const g = svg('g');
+    if (hoverHour != null) {
+      g.append(svg('rect', { class: 'today-chart-hover', x: (hoverHour * slot).toFixed(1), y: 0, width: slot.toFixed(1), height: H }));
+    }
     for (let hr = 0; hr < 24; hr++) {
       const x = (hr * slot + 2).toFixed(1);
       const bw = (slot - 4).toFixed(1);
@@ -560,8 +563,23 @@
     return `Kilowatt hours sold above the line and bought below it, by hour. Bought ${SD.fmt.kwh(sum(hrs.bought))}, sold ${SD.fmt.kwh(sum(hrs.sold))}${sum(hrs.bought) > 0 ? `; most buying at ${SD.fmt.minute(top * 60)}` : ''}.`;
   }
 
+  /** The hover/tap box for one hour of the chart: what was bought (and roughly what it cost) and sold. */
+  function hourTip(hrs, hr) {
+    const bought = hrs.bought[hr];
+    const sold = hrs.sold[hr];
+    const band = SD.tariff.bandAt(data.tariff, hr * 60 + 30) || 'shoulder';
+    const cents = bought * SD.tariff.centsAt(data.tariff, hr * 60 + 30);
+    const cost = band === 'free' ? 'free' : `about ${SD.fmt.cents(cents)}`;
+    return [
+      h('b', { text: `${SD.fmt.minute(hr * 60)} to ${SD.fmt.minute(((hr + 1) % 24) * 60)}` }),
+      h('span', { text: bought > 0.005 ? `Bought ${SD.fmt.kwh(bought, 2)}, ${cost}` : 'Bought nothing' }),
+      h('span', { text: sold > 0.005 ? `Sold ${SD.fmt.kwh(sold, 2)}` : 'Sold nothing' }),
+    ];
+  }
+
   function daySection() {
     const chartBox = h('div', { class: 'today-chart-box' });
+    const tip = h('div', { class: 'today-chart-tip', hidden: true });
     const ribbonBox = h('div', { class: 'today-ribbon' });
     const summary = h('div', { class: 'today-day-sum' });
     const today = SD.local().date;
@@ -570,8 +588,41 @@
         h('h2', { class: 'section-title', id: 'today-day-h', text: 'Your day so far' }),
         h('a', { class: 'card-link today-link-phone', href: `#history/day/${today}`, text: 'Open day' }),
         h('a', { class: 'card-link today-link-wide', href: '#history', text: 'Open history' })),
-      chartBox, ribbonBox, summary);
+      h('div', { class: 'today-chart-wrap' }, chartBox, tip), ribbonBox, summary);
     let ribbon = null;
+    let hrs = null;
+    let hoverHour = null;
+    function drawChart() {
+      const minute = SD.local().minute;
+      chartBox.replaceChildren(
+        dayChart(hrs, minute, hoverHour),
+        h('span', { class: 'today-chart-tag is-top', text: 'Sold' }),
+        h('span', { class: 'today-chart-tag is-bottom', text: 'Bought' }),
+        h('span', { class: 'today-chart-tag is-now', style: `left: ${(minute / 1440) * 100}%`, text: minute > 1200 ? null : 'Now' }));
+    }
+    function showTip(hr) {
+      if (hr === hoverHour) return;
+      hoverHour = hr;
+      drawChart();
+      tip.replaceChildren(...hourTip(hrs, hr));
+      tip.hidden = false;
+      // Sit above the hour, kept inside the card.
+      const pct = ((hr + 0.5) / 24) * 100;
+      tip.style.left = `clamp(0px, calc(${pct}% - ${tip.offsetWidth / 2}px), calc(100% - ${tip.offsetWidth}px))`;
+    }
+    function hideTip() {
+      if (hoverHour == null) return;
+      hoverHour = null;
+      tip.hidden = true;
+      if (hrs) drawChart();
+    }
+    chartBox.addEventListener('pointermove', (e) => {
+      if (!hrs) return;
+      const r = chartBox.getBoundingClientRect();
+      const hr = Math.floor(((e.clientX - r.left) / r.width) * 24);
+      if (hr >= 0 && hr < 24) showTip(hr);
+    });
+    chartBox.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') hideTip(); });
     let ribbonLong = null;
     function drawRibbon(minute) {
       const long = window.matchMedia('(min-width: 760px)').matches;
@@ -590,13 +641,12 @@
         el.hidden = !data.tariff && !data.samples;
         if (el.hidden) return;
         if (data.tariff && data.tariff.configured && data.samples) {
-          const hrs = hourly();
-          chartBox.replaceChildren(
-            dayChart(hrs, minute),
-            h('span', { class: 'today-chart-tag is-top', text: 'Sold' }),
-            h('span', { class: 'today-chart-tag is-bottom', text: 'Bought' }),
-            h('span', { class: 'today-chart-tag is-now', style: `left: ${(minute / 1440) * 100}%`, text: minute > 1200 ? null : 'Now' }));
+          hrs = hourly();
+          drawChart();
+          if (hoverHour != null) tip.replaceChildren(...hourTip(hrs, hoverHour));
         } else {
+          hrs = null;
+          hideTip();
           chartBox.replaceChildren();
         }
         if (data.tariff) drawRibbon(minute);

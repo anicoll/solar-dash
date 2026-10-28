@@ -344,6 +344,43 @@ html[data-theme="night"] #page-today {
   height: 120px;
 }
 
+/* Hover (or tap) an hour to see what was bought and sold in it. */
+#page-today .today-chart-wrap {
+  position: relative;
+}
+
+#page-today .today-chart-box {
+  touch-action: pan-y;
+  cursor: crosshair;
+}
+
+#page-today .today-chart-hover {
+  fill: var(--ink);
+  fill-opacity: 0.08;
+}
+
+#page-today .today-chart-tip {
+  position: absolute;
+  top: 4px;
+  z-index: 2;
+  width: max-content;
+  max-width: min(300px, 100%);
+  box-sizing: border-box;
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--card);
+  font-size: 13px;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 0.2);
+}
+
+#page-today .today-chart-tip[hidden] {
+  display: none;
+}
+
 #page-today .today-chart-axis {
   stroke: var(--ink);
   stroke-width: 1;

@@ -384,7 +384,14 @@
     for (const s of segs) {
       const cents = s.band === 'free' ? '' : SD.fmt.cents(s.cents, { round: !long });
       const label = s.band === 'free' ? 'Free' : long ? `${BAND_NAME[s.band]} ${cents}` : cents;
-      strip.append(SD.h('div', { class: `ribbon-seg band-${s.band}`, style: `flex: ${s.end - s.start} 1 0`, text: s.end - s.start >= (long ? 150 : 90) ? label : '' })); // too narrow for words
+      // A fixed share of the day each, so the strip lines up with the charts above it
+      // (flex-grow shares would add the padding unevenly and shift the bands).
+      const wordsFit = s.end - s.start >= (long ? 150 : 90); // too narrow for words otherwise
+      strip.append(SD.h('div', {
+        class: `ribbon-seg band-${s.band}${wordsFit ? '' : ' is-bare'}`,
+        style: `flex: 0 0 ${((s.end - s.start) / 14.4).toFixed(4)}%`,
+        text: wordsFit ? label : '',
+      }));
       words.push(`${BAND_NAME[s.band]}${s.band === 'free' ? '' : ' ' + SD.fmt.cents(s.cents)} ${SD.fmt.minute(s.start)} to ${SD.fmt.minute(s.end % 1440)}`);
     }
     root.append(strip);

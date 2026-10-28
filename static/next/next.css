@@ -483,6 +483,7 @@ button {
 }
 
 .ribbon-seg {
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   padding: 0 6px;
@@ -493,6 +494,10 @@ button {
 
 .ribbon-seg.band-free {
   justify-content: center;
+}
+
+.ribbon .ribbon-seg.is-bare {
+  padding: 0;
 }
 
 .ribbon.is-long .ribbon-seg {
