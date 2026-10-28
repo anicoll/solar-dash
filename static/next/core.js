@@ -44,7 +44,7 @@
    detail {theme} on a change (redraw anything that paints its own colours).
 
    SD.page(name, {mount(el, hashRest), unmount(), update?(hashRest)})
-                                           Register a page. name is one of today bill history cars payback.
+                                           Register a page. name is one of today bill history cars payback admin.
                                            mount runs when its hash is opened; el is the empty <section id="page-NAME">.
                                            The router hides the section and clears it after unmount(). hashRest is the
                                            part of the hash after the page name: '#history/day/2026-10-27' gives
@@ -511,8 +511,8 @@
 
   /* ---------------------------------------------------------------- router */
 
-  const NAMES = ['today', 'bill', 'history', 'cars', 'payback'];
-  const TITLES = { today: 'Today', bill: 'Bill', history: 'History', cars: 'Cars', payback: 'Payback' };
+  const NAMES = ['today', 'bill', 'history', 'cars', 'payback', 'admin'];
+  const TITLES = { today: 'Today', bill: 'Bill', history: 'History', cars: 'Cars', payback: 'Payback', admin: 'Settings' };
   const pages = {};
   let current = null; // {name, rest}
 

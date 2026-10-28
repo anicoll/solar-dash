@@ -14,6 +14,7 @@
   <link rel="stylesheet" href="/static/next/history.css">
   <link rel="stylesheet" href="/static/next/cars.css">
   <link rel="stylesheet" href="/static/next/payback.css">
+  <link rel="stylesheet" href="/static/next/admin.css">
   <!-- core.js (the SD namespace and the router) first, then one script per page. -->
   <script src="/static/next/core.js" defer></script>
   <script src="/static/next/today.js" defer></script>
@@ -21,6 +22,7 @@
   <script src="/static/next/history.js" defer></script>
   <script src="/static/next/cars.js" defer></script>
   <script src="/static/next/payback.js" defer></script>
+  <script src="/static/next/admin.js" defer></script>
 </head>
 <body>
   <a class="sr-only" href="#page-main">Skip to the page</a>
@@ -42,7 +44,7 @@
         <button type="button" class="icon-btn" id="sd-theme" aria-label="Theme: auto. Change">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor"></path></svg>
         </button>
-        <a class="icon-btn" href="/classic#admin" aria-label="Settings and admin">
+        <a class="icon-btn" href="#admin" aria-label="Settings and admin">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"></path></svg>
         </a>
         <form method="post" action="/logout" class="logout-form">
@@ -61,6 +63,7 @@
     <section id="page-history" hidden></section>
     <section id="page-cars" hidden></section>
     <section id="page-payback" hidden></section>
+    <section id="page-admin" hidden></section>
   </main>
 
   <nav class="tabbar" aria-label="Main">

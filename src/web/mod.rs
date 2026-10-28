@@ -527,12 +527,14 @@ static NEXT_PAGE: LazyLock<IndexPage> = LazyLock::new(|| {
             "next/history.css",
             "next/cars.css",
             "next/payback.css",
+            "next/admin.css",
             "next/core.js",
             "next/today.js",
             "next/bill.js",
             "next/history.js",
             "next/cars.js",
             "next/payback.js",
+            "next/admin.js",
         ],
     )
 });
@@ -2040,7 +2042,12 @@ mod tests {
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
         let etag = response.headers()[header::ETAG].clone();
         let html = body_text(response).await;
-        for name in ["next/next.css", "next/core.js", "next/today.js"] {
+        for name in [
+            "next/next.css",
+            "next/core.js",
+            "next/today.js",
+            "next/admin.js",
+        ] {
             let version = &hex::encode(Assets::get(name).unwrap().metadata.sha256_hash())[..12];
             assert!(
                 html.contains(&format!("\"/static/{name}?v={version}\"")),
