@@ -37,6 +37,9 @@ pub struct AdminData {
     pub purchases: Arc<[Purchase]>,
     /// Assumed yearly electricity price rise (percent) in the payback projection.
     pub price_rise_percent: f64,
+    /// Day of the month (1 to 28) a bill period starts on; `None` works the
+    /// period out from the last bill instead (see `web::bill`).
+    pub bill_start_day: Option<u32>,
     /// The past bills, oldest first; empty when there are none.
     pub bills: Arc<[PastBill]>,
 }
@@ -52,19 +55,21 @@ impl Default for AdminData {
             petrol_grade: "Unleaded 91".to_string(),
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
+            bill_start_day: None,
             bills: Arc::from([]),
         }
     }
 }
 
 /// The keys of the `setting` table. A missing key means its default.
-pub const SETTING_KEYS: [&str; 6] = [
+pub const SETTING_KEYS: [&str; 7] = [
     "petrol_cents_per_litre",
     "petrol_litres_per_100km",
     "away_cents_per_kwh",
     "compare_cars",
     "petrol_grade",
     "price_rise_percent",
+    "bill_start_day",
 ];
 
 /// The JSON kept in `tariff_plan.body`: the plan as in the config file, plus
@@ -280,6 +285,18 @@ pub fn apply_setting(data: &mut AdminData, key: &str, value: &Value) -> Result<(
                 .filter(|p| (0.0..=20.0).contains(p))
                 .with_context(|| format!("{key} must be a number between 0 and 20"))?;
             data.price_rise_percent = percent;
+        }
+        "bill_start_day" => {
+            // Optional: null means "work it out from the last bill".
+            data.bill_start_day = if value.is_null() {
+                None
+            } else {
+                let day = value
+                    .as_u64()
+                    .filter(|d| (1..=28).contains(d))
+                    .with_context(|| format!("{key} must be a whole number between 1 and 28"))?;
+                Some(day as u32)
+            };
         }
         _ => bail!("unknown setting {key:?}"),
     }

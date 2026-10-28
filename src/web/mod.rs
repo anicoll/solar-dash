@@ -5,6 +5,7 @@ mod admin;
 mod api;
 mod auth;
 mod battery;
+mod bill;
 mod costs;
 mod globird;
 mod payback;
@@ -339,6 +340,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily", get(api::daily))
         .route("/api/battery", get(battery::battery))
         .route("/api/costs", get(costs::costs))
+        .route("/api/bill/current", get(bill::current))
         .route("/api/tariff", get(costs::tariff))
         .route("/api/globird/compare", get(globird::compare))
         .route("/api/payback", get(payback::payback))
@@ -2051,6 +2053,36 @@ mod tests {
             body_json(response).await,
             serde_json::json!({ "configured": false })
         );
+    }
+
+    #[tokio::test]
+    async fn current_bill_is_off_without_a_tariff() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/bill/current", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/bill/current", Some(&cookie))).await;
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "configured": false })
+        );
+    }
+
+    #[tokio::test]
+    async fn current_bill_has_a_period_and_a_projection() {
+        let (_dir, app, _pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/bill/current", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["period_source"], "month");
+        assert!(json["days_total"].as_i64().unwrap() >= 28);
+        let bands = json["so_far"]["bands"].as_array().unwrap();
+        let names: Vec<_> = bands.iter().map(|b| b["band"].as_str().unwrap()).collect();
+        assert_eq!(names, ["free", "shoulder", "peak"]);
+        assert_eq!(json["uses_globird_figures"], false);
+        assert!(json["projected_total_dollars"].is_number());
     }
 
     #[tokio::test]
