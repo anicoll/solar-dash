@@ -1,0 +1,6 @@
+/* Cars page. Use the tokens and classes from next.css. Prefix every selector
+   with #page-cars (or a class starting "cars-") so it cannot touch another page. */
+
+#page-cars .cars-stub {
+  margin-top: 12px;
+}

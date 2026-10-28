@@ -306,6 +306,7 @@ pub fn router(state: AppState) -> Router {
     // before it, so the public routes below are untouched.
     let protected = Router::new()
         .route("/", get(index))
+        .route("/next", get(next_index))
         .route("/static/{*path}", get(static_file))
         .route("/api/latest", get(api::latest))
         .route("/api/live", get(api::live))
@@ -452,11 +453,20 @@ pub async fn serve(
 }
 
 async fn index(headers: HeaderMap) -> Response {
-    let page = &*INDEX_PAGE;
+    serve_page(&INDEX_PAGE, &headers)
+}
+
+/// The new dashboard's page, served at `/next` while it is being built.
+async fn next_index(headers: HeaderMap) -> Response {
+    serve_page(&NEXT_PAGE, &headers)
+}
+
+/// Sends a prepared page with its ETag, or a 304 if the browser has it.
+fn serve_page(page: &IndexPage, headers: &HeaderMap) -> Response {
     let mut response_headers = HeaderMap::new();
     response_headers.insert(header::ETAG, HeaderValue::from_str(&page.etag).unwrap());
     response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    if etag_matches(&headers, &page.etag) {
+    if etag_matches(headers, &page.etag) {
         return (StatusCode::NOT_MODIFIED, response_headers).into_response();
     }
     response_headers.insert(
@@ -466,19 +476,18 @@ async fn index(headers: HeaderMap) -> Response {
     (response_headers, page.html.clone()).into_response()
 }
 
-/// index.html with `?v=<hash>` added to each stylesheet and script link.
+/// An HTML page with `?v=<hash>` added to each stylesheet and script link.
 struct IndexPage {
     html: String,
     etag: String,
 }
 
-/// Each build changes the links to app.js and style.css, so a browser or a
-/// proxy in front (such as Cloudflare) can never pair a new page with an old
-/// cached script, which would leave the page blank.
-static INDEX_PAGE: LazyLock<IndexPage> = LazyLock::new(|| {
-    let file = Assets::get("index.html").expect("index.html is embedded");
-    let mut html = String::from_utf8_lossy(&file.data).into_owned();
-    for name in ["app.js", "style.css"] {
+/// Reads the embedded page `file` and versions the links to `assets` (paths
+/// under `static/`, such as `app.js`).
+fn build_page(file: &str, assets: &[&str]) -> IndexPage {
+    let data = Assets::get(file).unwrap_or_else(|| panic!("{file} is embedded"));
+    let mut html = String::from_utf8_lossy(&data.data).into_owned();
+    for name in assets {
         if let Some(asset) = Assets::get(name) {
             let version = &hex::encode(asset.metadata.sha256_hash())[..12];
             let plain = format!("\"/static/{name}\"");
@@ -487,6 +496,34 @@ static INDEX_PAGE: LazyLock<IndexPage> = LazyLock::new(|| {
     }
     let etag = format!("\"{}\"", hex::encode(Sha256::digest(html.as_bytes())));
     IndexPage { html, etag }
+}
+
+/// Each build changes the links to app.js and style.css, so a browser or a
+/// proxy in front (such as Cloudflare) can never pair a new page with an old
+/// cached script, which would leave the page blank.
+static INDEX_PAGE: LazyLock<IndexPage> =
+    LazyLock::new(|| build_page("index.html", &["app.js", "style.css"]));
+
+/// The same for the new UI: the shared files, then one stylesheet and one
+/// script for each page.
+static NEXT_PAGE: LazyLock<IndexPage> = LazyLock::new(|| {
+    build_page(
+        "next/index.html",
+        &[
+            "next/next.css",
+            "next/today.css",
+            "next/bill.css",
+            "next/history.css",
+            "next/cars.css",
+            "next/payback.css",
+            "next/core.js",
+            "next/today.js",
+            "next/bill.js",
+            "next/history.js",
+            "next/cars.js",
+            "next/payback.js",
+        ],
+    )
 });
 
 /// Whether an If-None-Match header names `etag` (weak or strong) or `*`.
@@ -1964,6 +2001,41 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(send(&app, request).await.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn next_page_needs_login_and_links_versioned_assets() {
+        let (_dir, app) = test_app().await;
+
+        let response = send(&app, get_request("/next", None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/login");
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/next", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let etag = response.headers()[header::ETAG].clone();
+        let html = body_text(response).await;
+        for name in ["next/next.css", "next/core.js", "next/today.js"] {
+            let version = &hex::encode(Assets::get(name).unwrap().metadata.sha256_hash())[..12];
+            assert!(
+                html.contains(&format!("\"/static/{name}?v={version}\"")),
+                "{name}"
+            );
+        }
+
+        let request = Request::get("/next")
+            .header(header::COOKIE, &cookie)
+            .header(header::IF_NONE_MATCH, &etag)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, request).await.status(), StatusCode::NOT_MODIFIED);
+
+        // The font is a static file like the rest, under /static.
+        let font = "/static/next/fonts/archivo-latin-wdth-wght.woff2";
+        let response = send(&app, get_request(font, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

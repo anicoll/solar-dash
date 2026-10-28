@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en" data-theme="day">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>solar-dash</title>
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <!-- Shared styles first, then one stylesheet per page. -->
+  <link rel="stylesheet" href="/static/next/next.css">
+  <link rel="stylesheet" href="/static/next/today.css">
+  <link rel="stylesheet" href="/static/next/bill.css">
+  <link rel="stylesheet" href="/static/next/history.css">
+  <link rel="stylesheet" href="/static/next/cars.css">
+  <link rel="stylesheet" href="/static/next/payback.css">
+  <!-- core.js (the SD namespace and the router) first, then one script per page. -->
+  <script src="/static/next/core.js" defer></script>
+  <script src="/static/next/today.js" defer></script>
+  <script src="/static/next/bill.js" defer></script>
+  <script src="/static/next/history.js" defer></script>
+  <script src="/static/next/cars.js" defer></script>
+  <script src="/static/next/payback.js" defer></script>
+</head>
+<body>
+  <a class="sr-only" href="#page-main">Skip to the page</a>
+  <header class="app-header">
+    <div class="app-header-inner">
+      <a class="wordmark" href="#today" aria-label="solar-dash, Today">
+        <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="5" fill="#FFC21A" stroke="currentColor" stroke-width="1.5"></circle><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path></svg>
+        solar-dash
+      </a>
+      <nav class="topnav" aria-label="Main">
+      <a href="#today" data-nav="today">Today</a>
+      <a href="#bill" data-nav="bill">Bill</a>
+      <a href="#history" data-nav="history">History</a>
+      <a href="#cars" data-nav="cars">Cars</a>
+      <a href="#payback" data-nav="payback">Payback</a>
+      </nav>
+      <div class="header-tools">
+        <span class="live" id="sd-live" data-state="off" role="status"><span class="live-dot" aria-hidden="true"></span><span id="sd-live-text">Live · 4 s</span></span>
+        <button type="button" class="icon-btn" id="sd-theme" aria-label="Theme: auto. Change">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor"></path></svg>
+        </button>
+        <a class="icon-btn" href="/#admin" aria-label="Settings and admin">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"></path></svg>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- One section per page. The router shows one and gives it to that page's script. -->
+  <main class="app-main" id="page-main" tabindex="-1">
+    <section id="page-today" hidden></section>
+    <section id="page-bill" hidden></section>
+    <section id="page-history" hidden></section>
+    <section id="page-cars" hidden></section>
+    <section id="page-payback" hidden></section>
+  </main>
+
+  <nav class="tabbar" aria-label="Main">
+    <a href="#today" data-nav="today"><svg class="icon-sun" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="4.5"></circle><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"></path></svg>Today</a>
+    <a href="#bill" data-nav="bill"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"></path><path d="M9 8h6M9 12h6"></path></svg>Bill</a>
+    <a href="#cars" data-nav="cars"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 16v-4l2-5h12l2 5v4z"></path><circle cx="7.5" cy="16.5" r="1.5"></circle><circle cx="16.5" cy="16.5" r="1.5"></circle><path d="M4 12h16"></path></svg>Cars</a>
+    <a href="#payback" data-nav="payback"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 20h18"></path><path d="M5 16l4-5 4 3 6-8"></path><path d="M15 6h4v4"></path></svg>Payback</a>
+  </nav>
+</body>
+</html>

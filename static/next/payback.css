@@ -1,0 +1,6 @@
+/* Payback page. Use the tokens and classes from next.css. Prefix every selector
+   with #page-payback (or a class starting "payback-") so it cannot touch another page. */
+
+#page-payback .payback-stub {
+  margin-top: 12px;
+}
