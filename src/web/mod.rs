@@ -3124,6 +3124,9 @@ mod tests {
         assert_eq!(earned["soc_at_16"], 60.0);
         assert_eq!(earned["soc_at_21"], 30.0);
         assert_eq!(earned["min_soc_in_window"], 30.0);
+        assert!(earned["soc_at_window_start"].is_number());
+        assert!(earned["soc_at_window_end"].is_number());
+        assert!(earned["window_soc_used_pct"].is_number());
         assert_eq!(earned["reason"], Value::Null);
 
         let missed = &days[2];
@@ -3139,6 +3142,7 @@ mod tests {
         assert_eq!(summary["missed_dollars"], 2.0);
         assert_eq!(summary["battery_floor_pct"], 30.0);
         assert_eq!(summary["avg_soc_at_11"], 60.0);
+        assert!(summary["typical_window_soc_used_pct"].is_number());
     }
 
     #[tokio::test]

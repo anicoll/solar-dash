@@ -103,6 +103,9 @@ struct DaySums {
     window_export_cents: f64,
     /// The highest average load of any spell in the window, if there was data.
     peak_window_load_kw: Option<f64>,
+    /// Start of the interval where the window's import first went over what
+    /// the credit allows: the import that cost the credit. `None` if it never did.
+    first_import_ts: Option<i64>,
     /// Import before free power starts, and what it cost.
     morning_import_kwh: f64,
     morning_import_cents: f64,
@@ -122,6 +125,7 @@ fn peak_load_kw(spells: &BTreeMap<i64, (f64, i64)>) -> Option<f64> {
 /// `free_start` the minute free import begins (both minutes since midnight).
 fn day_sums(tariff: &Tariff, tz: Tz, free_start: u32, intervals: &[Interval]) -> DaySums {
     let mut sums = DaySums::default();
+    let credit_max_kwh = tariff.credit_max_kwh().unwrap_or(0.0);
     let mut spells: BTreeMap<i64, (f64, i64)> = BTreeMap::new();
     // Export so far today, so the daily export tier is valued where it falls.
     let mut exported = 0.0;
@@ -131,6 +135,9 @@ fn day_sums(tariff: &Tariff, tz: Tz, free_start: u32, intervals: &[Interval]) ->
         if tariff.in_credit_window(minute) {
             sums.has_window_data = true;
             sums.window_import_kwh += iv.import_kwh;
+            if sums.first_import_ts.is_none() && sums.window_import_kwh > credit_max_kwh {
+                sums.first_import_ts = Some(iv.start_ts);
+            }
             sums.window_export_kwh += iv.export_kwh;
             sums.window_export_cents += tariff.export_value_cents(minute, exported, iv.export_kwh);
             let spell = spells.entry(iv.start_ts / LOAD_SPELL_SECS).or_default();
@@ -268,6 +275,15 @@ struct DayRow {
     soc_at_11: Option<f64>,
     soc_at_16: Option<f64>,
     soc_at_21: Option<f64>,
+    /// Charge at the start and end of the credit window (from the tariff), and
+    /// what the window used. `None` while the window is not over, or without readings.
+    soc_at_window_start: Option<f64>,
+    soc_at_window_end: Option<f64>,
+    window_soc_used_pct: Option<f64>,
+    /// When the window's import first passed the credit's limit (unix seconds),
+    /// and the charge then. For a missed day these explain the miss.
+    first_import_at: Option<i64>,
+    soc_at_first_import: Option<f64>,
     min_soc_in_window: Option<f64>,
     morning_import_kwh: Option<f64>,
     morning_import_cents: Option<f64>,
@@ -334,6 +350,8 @@ struct Summary {
     avg_window_export_kwh: Option<f64>,
     avg_window_export_cents: Option<f64>,
     avg_soc_at_11: Option<f64>,
+    /// Median of `window_soc_used_pct`: what a typical credit window uses.
+    typical_window_soc_used_pct: Option<f64>,
     avg_morning_import_kwh: Option<f64>,
     avg_morning_import_cents: Option<f64>,
     battery_floor_pct: Option<f64>,
@@ -346,6 +364,20 @@ fn average(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
         None
     } else {
         Some(present.iter().sum::<f64>() / present.len() as f64)
+    }
+}
+
+/// The middle value of those that exist (the mean of the two middle ones for
+/// an even count), or `None` if none do. Unlike the average, one odd night
+/// does not move it.
+fn median(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut present: Vec<f64> = values.flatten().collect();
+    present.sort_by(f64::total_cmp);
+    let mid = present.len() / 2;
+    match present.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(present[mid]),
+        _ => Some((present[mid - 1] + present[mid]) / 2.0),
     }
 }
 
@@ -364,6 +396,7 @@ fn summarise(rows: &[DayRow]) -> Summary {
         avg_window_export_kwh: avg(|r| r.window_export_kwh),
         avg_window_export_cents: avg(|r| r.window_export_cents),
         avg_soc_at_11: avg(|r| r.soc_at_11),
+        typical_window_soc_used_pct: median(rows.iter().map(|r| r.window_soc_used_pct)).map(round1),
         avg_morning_import_kwh: avg(|r| r.morning_import_kwh),
         avg_morning_import_cents: avg(|r| r.morning_import_cents),
         battery_floor_pct: battery_floor(rows).map(round1),
@@ -430,6 +463,18 @@ fn build_day(tariff: &Tariff, tz: Tz, input: &DayInput) -> Option<DayRow> {
         .zip(window_end)
         .and_then(|(from, to)| input.soc.lowest_between(from, to))
         .map(round1);
+    // The window's ends only count once they have passed.
+    let soc_when = |ts: Option<i64>| {
+        ts.filter(|&ts| input.now >= ts)
+            .and_then(|ts| input.soc.at(ts))
+            .map(round1)
+    };
+    let soc_start = soc_when(window_start);
+    let soc_end = soc_when(window_end);
+    let soc_used = soc_start
+        .zip(soc_end)
+        .map(|(start, end)| round1(start - end));
+    let first_import_at = sums_window.and_then(|s| s.first_import_ts);
     let car_charging = window_start
         .zip(window_end)
         .is_some_and(|(from, to)| car_charging_during(input.sessions, from, to, input.now));
@@ -444,6 +489,11 @@ fn build_day(tariff: &Tariff, tz: Tz, input: &DayInput) -> Option<DayRow> {
         soc_at_11: soc_at(free_start),
         soc_at_16: soc_at(EVENING_PEAK_MINUTE),
         soc_at_21: soc_at(window_to),
+        soc_at_window_start: soc_start,
+        soc_at_window_end: soc_end,
+        window_soc_used_pct: soc_used,
+        first_import_at,
+        soc_at_first_import: first_import_at.and_then(|ts| input.soc.at(ts)).map(round1),
         min_soc_in_window: min_soc,
         morning_import_kwh: sums_morning.map(|s| round2(s.morning_import_kwh)),
         morning_import_cents: sums_morning.map(|s| round2(s.morning_import_cents)),
@@ -682,6 +732,20 @@ mod tests {
         assert!((sums.morning_import_cents - 26.4).abs() < 1e-9);
         // 0.6 kWh in 5 minutes is 7.2 kW.
         assert!((sums.peak_window_load_kw.unwrap() - 7.2).abs() < 1e-9);
+        // 0.05 kWh is under the credit's 0.1 kWh limit, so nothing broke it.
+        assert_eq!(sums.first_import_ts, None);
+    }
+
+    #[test]
+    fn the_first_import_is_where_the_window_passes_the_limit() {
+        let tariff = zerohero();
+        let intervals = [
+            iv((18, 0), (18, 5), 0.06, 0.0, 0.1), // under the 0.1 kWh limit so far
+            iv((19, 30), (19, 35), 0.06, 0.0, 0.1), // 0.12 kWh: over
+            iv((20, 0), (20, 5), 1.0, 0.0, 1.0),
+        ];
+        let sums = day_sums(&tariff, ADELAIDE, 11 * 60, &intervals);
+        assert_eq!(sums.first_import_ts, Some(at(19, 30)));
     }
 
     #[test]
@@ -891,6 +955,11 @@ mod tests {
             soc_at_11: soc11,
             soc_at_16: None,
             soc_at_21: None,
+            soc_at_window_start: None,
+            soc_at_window_end: None,
+            window_soc_used_pct: None,
+            first_import_at: None,
+            soc_at_first_import: None,
             min_soc_in_window: min_soc,
             morning_import_kwh: Some(1.0),
             morning_import_cents: Some(44.0),
@@ -938,6 +1007,81 @@ mod tests {
         assert_eq!(empty.days, 0);
         assert_eq!(empty.avg_soc_at_11, None);
         assert_eq!(empty.battery_floor_pct, None);
+    }
+
+    #[test]
+    fn median_ignores_one_odd_night() {
+        let values = |v: &[Option<f64>]| median(v.iter().copied());
+        assert_eq!(values(&[]), None);
+        assert_eq!(values(&[None]), None);
+        assert_eq!(
+            values(&[Some(30.0), None, Some(90.0), Some(34.0)]),
+            Some(34.0)
+        );
+        // An even count takes the mean of the middle two.
+        assert_eq!(
+            values(&[Some(40.0), Some(30.0), Some(20.0), Some(80.0)]),
+            Some(35.0)
+        );
+    }
+
+    #[test]
+    fn summary_has_the_typical_window_use() {
+        let mut rows = vec![
+            row(Credit::Earned, Some(1.0), None, None),
+            row(Credit::Earned, Some(1.0), None, None),
+            row(Credit::Missed, Some(1.0), None, None),
+            row(Credit::Unknown, None, None, None),
+        ];
+        for (r, used) in rows
+            .iter_mut()
+            .zip([Some(30.0), Some(36.0), Some(90.0), None])
+        {
+            r.window_soc_used_pct = used;
+        }
+        assert_eq!(summarise(&rows).typical_window_soc_used_pct, Some(36.0));
+        assert_eq!(summarise(&[]).typical_window_soc_used_pct, None);
+    }
+
+    #[test]
+    fn a_day_row_has_the_window_charge_and_the_first_import() {
+        let tariff = zerohero();
+        let intervals = [iv((19, 30), (19, 35), 0.5, 0.0, 0.6)];
+        let soc = SocSeries {
+            live: vec![(at(18, 0), 80.0), (at(19, 30), 55.0), (at(21, 0), 44.0)],
+            cloud: vec![],
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let mut input = DayInput {
+            date,
+            now: at(23, 0),
+            intervals: Some(&intervals),
+            soc: &soc,
+            billed: None,
+            sessions: &[],
+        };
+        let day = build_day(&tariff, ADELAIDE, &input).unwrap();
+        assert_eq!(day.credit, "missed");
+        assert_eq!(day.soc_at_window_start, Some(80.0));
+        assert_eq!(day.soc_at_window_end, Some(44.0));
+        assert_eq!(day.window_soc_used_pct, Some(36.0));
+        assert_eq!(day.first_import_at, Some(at(19, 30)));
+        assert_eq!(day.soc_at_first_import, Some(55.0));
+
+        // Mid-window the end has not happened, so nothing is used yet.
+        input.now = at(19, 40);
+        let day = build_day(&tariff, ADELAIDE, &input).unwrap();
+        assert_eq!(day.soc_at_window_start, Some(80.0));
+        assert_eq!(day.soc_at_window_end, None);
+        assert_eq!(day.window_soc_used_pct, None);
+
+        // No readings: the fields are null, not zero.
+        let empty = SocSeries::default();
+        input.soc = &empty;
+        input.now = at(23, 0);
+        let day = build_day(&tariff, ADELAIDE, &input).unwrap();
+        assert_eq!(day.window_soc_used_pct, None);
+        assert_eq!(day.soc_at_first_import, None);
     }
 
     #[test]
