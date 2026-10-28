@@ -26,7 +26,7 @@ use axum::extract::{FromRef, Path};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use axum_extra::extract::cookie::Key;
 use base64::Engine;
@@ -306,7 +306,8 @@ pub fn router(state: AppState) -> Router {
     // before it, so the public routes below are untouched.
     let protected = Router::new()
         .route("/", get(index))
-        .route("/next", get(next_index))
+        .route("/classic", get(classic_index))
+        .route("/next", get(next_redirect))
         .route("/static/{*path}", get(static_file))
         .route("/api/latest", get(api::latest))
         .route("/api/live", get(api::live))
@@ -453,12 +454,19 @@ pub async fn serve(
 }
 
 async fn index(headers: HeaderMap) -> Response {
-    serve_page(&INDEX_PAGE, &headers)
+    serve_page(&NEXT_PAGE, &headers)
 }
 
-/// The new dashboard's page, served at `/next` while it is being built.
-async fn next_index(headers: HeaderMap) -> Response {
-    serve_page(&NEXT_PAGE, &headers)
+/// The previous dashboard, kept at `/classic` until it is removed.
+async fn classic_index(headers: HeaderMap) -> Response {
+    serve_page(&CLASSIC_PAGE, &headers)
+}
+
+/// `/next` was the new dashboard's address while it was being built. Old
+/// bookmarks (`/next#bill`) keep working: a browser carries the `#` part over
+/// a redirect.
+async fn next_redirect() -> Redirect {
+    Redirect::to("/")
 }
 
 /// Sends a prepared page with its ETag, or a 304 if the browser has it.
@@ -500,11 +508,12 @@ fn build_page(file: &str, assets: &[&str]) -> IndexPage {
 
 /// Each build changes the links to app.js and style.css, so a browser or a
 /// proxy in front (such as Cloudflare) can never pair a new page with an old
-/// cached script, which would leave the page blank.
-static INDEX_PAGE: LazyLock<IndexPage> =
+/// cached script, which would leave the page blank. This is the previous
+/// dashboard, served at `/classic`.
+static CLASSIC_PAGE: LazyLock<IndexPage> =
     LazyLock::new(|| build_page("index.html", &["app.js", "style.css"]));
 
-/// The same for the new UI: the shared files, then one stylesheet and one
+/// The same for the current dashboard, served at `/`: the shared files, then one stylesheet and one
 /// script for each page.
 static NEXT_PAGE: LazyLock<IndexPage> = LazyLock::new(|| {
     build_page(
@@ -1975,10 +1984,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_links_versioned_assets() {
+    async fn classic_page_links_versioned_assets() {
         let (_dir, app) = test_app().await;
+
+        let response = send(&app, get_request("/classic", None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/login");
+
         let cookie = log_in(&app).await;
-        let response = send(&app, get_request("/", Some(&cookie))).await;
+        let response = send(&app, get_request("/classic", Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
         let etag = response.headers()[header::ETAG].clone();
@@ -1995,7 +2009,7 @@ mod tests {
         let response = send(&app, get_request("/static/app.js?v=abc", Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        let request = Request::get("/")
+        let request = Request::get("/classic")
             .header(header::COOKIE, &cookie)
             .header(header::IF_NONE_MATCH, &etag)
             .body(Body::empty())
@@ -2004,15 +2018,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_page_needs_login_and_links_versioned_assets() {
+    async fn index_serves_new_dashboard_with_versioned_assets() {
         let (_dir, app) = test_app().await;
 
-        let response = send(&app, get_request("/next", None)).await;
+        let response = send(&app, get_request("/", None)).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers()[header::LOCATION], "/login");
 
         let cookie = log_in(&app).await;
-        let response = send(&app, get_request("/next", Some(&cookie))).await;
+        let response = send(&app, get_request("/", Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
         let etag = response.headers()[header::ETAG].clone();
@@ -2025,7 +2039,7 @@ mod tests {
             );
         }
 
-        let request = Request::get("/next")
+        let request = Request::get("/")
             .header(header::COOKIE, &cookie)
             .header(header::IF_NONE_MATCH, &etag)
             .body(Body::empty())
@@ -2036,6 +2050,20 @@ mod tests {
         let font = "/static/next/fonts/archivo-latin-wdth-wght.woff2";
         let response = send(&app, get_request(font, Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn next_redirects_to_the_root() {
+        let (_dir, app) = test_app().await;
+
+        // Logged out, the login comes first, like every page.
+        let response = send(&app, get_request("/next", None)).await;
+        assert_eq!(response.headers()[header::LOCATION], "/login");
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/next", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/");
     }
 
     #[tokio::test]
