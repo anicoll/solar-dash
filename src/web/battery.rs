@@ -20,7 +20,8 @@ use serde_json::json;
 use super::AppState;
 use super::api::{ApiError, ApiResult, SOC_POINT, day_bounds_or_error, display_value, today};
 use super::costs::{
-    DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, day_intervals, round2, slice_between,
+    DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, day_intervals, meter_for_day, meter_in,
+    round2, slice_between,
 };
 use crate::cost::{self, Interval, Tariff, local_minute_of_day};
 use crate::db::{self, ChargeSession, GlobirdCostRow};
@@ -529,6 +530,7 @@ pub async fn battery(
         &db::globird_cost_in_range(&state.pool, &first.to_string(), &last.to_string()).await?,
     );
     let live_range = db::live_ts_range(&state.pool).await?;
+    let meter = meter_in(&state.pool, range_start, range_end).await?;
 
     let mut days = Vec::new();
     for &date in &dates {
@@ -547,6 +549,7 @@ pub async fn battery(
             import: slice_between(&import, |r| r.0, start, end),
             export: slice_between(&export, |r| r.0, start, end),
             load: slice_between(&load, |r| r.0, start, end),
+            meter: meter_for_day(&meter, start, end),
         };
         let intervals = day_intervals(&day, now).map(|(_, intervals, _)| intervals);
         let soc = SocSeries {

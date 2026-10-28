@@ -84,6 +84,103 @@ fn undo_cloud_lag(day_start: i64, counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
         .collect()
 }
 
+/// How far either side of a day the grid totals are loaded, so the step
+/// before midnight (and the one after) brackets the day's first and last span.
+const METER_MARGIN_SECS: i64 = 6 * 3600;
+
+/// Which grid direction [`top_up_from_meter`] is working on.
+#[derive(Clone, Copy)]
+enum Direction {
+    Import,
+    Export,
+}
+
+impl Direction {
+    fn kwh(self, iv: &mut Interval) -> &mut f64 {
+        match self {
+            Direction::Import => &mut iv.import_kwh,
+            Direction::Export => &mut iv.export_kwh,
+        }
+    }
+}
+
+/// Seconds `[a, b)` and `[c, d)` have in common.
+fn overlap(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    (b.min(d) - a.max(c)).max(0)
+}
+
+/// Makes live intervals agree with the inverter's lifetime grid counters
+/// (`(ts, import_wh, export_wh)` rows from `grid_meter`, oldest first).
+///
+/// The 15 s power samples are net readings, so they miss the battery hunting
+/// around 0 W: a little import and a little export within seconds, which the
+/// meter (and GloBird's bill) counts both ways. The counters do count it, in
+/// 100 Wh steps, and a row is saved as soon as a step is seen. So between two
+/// steps of one direction the grid moved exactly their difference. For each
+/// such span the intervals' energy in that direction is made to add up to it,
+/// in proportion to the part of the span they cover: energy the samples
+/// missed is spread evenly over the covered time, and a span where they saw
+/// too much is scaled down. Time before the first step or after the last is
+/// left as it was, and so is everything when there are no rows.
+fn top_up_from_meter(intervals: &mut [Interval], meter: &[(i64, f64, f64)]) {
+    for direction in [Direction::Import, Direction::Export] {
+        let total = |row: &(i64, f64, f64)| match direction {
+            Direction::Import => row.1,
+            Direction::Export => row.2,
+        };
+        // Only the rows where this direction stepped (a row is also saved
+        // when just the other direction moved).
+        let mut steps: Vec<(i64, f64)> = Vec::new();
+        for row in meter {
+            if steps.last().is_none_or(|&(_, wh)| total(row) > wh) {
+                steps.push((row.0, total(row)));
+            }
+        }
+        let mut first = 0;
+        for pair in steps.windows(2) {
+            let ((from, from_wh), (to, to_wh)) = (pair[0], pair[1]);
+            while first < intervals.len() && intervals[first].end_ts <= from {
+                first += 1;
+            }
+            let inside = intervals[first..]
+                .iter()
+                .take_while(|iv| iv.start_ts < to)
+                .count();
+            let span = &mut intervals[first..first + inside];
+            let covered: i64 = span
+                .iter()
+                .map(|iv| overlap(iv.start_ts, iv.end_ts, from, to))
+                .sum();
+            if covered == 0 {
+                continue;
+            }
+            let share = |iv: &Interval| {
+                overlap(iv.start_ts, iv.end_ts, from, to) as f64
+                    / (iv.end_ts - iv.start_ts).max(1) as f64
+            };
+            let target = (to_wh - from_wh) / 1000.0 * covered as f64 / (to - from) as f64;
+            let seen: f64 = span
+                .iter_mut()
+                .map(|iv| *direction.kwh(iv) * share(iv))
+                .sum();
+            if seen >= target {
+                // `seen` > 0 here, since `target` is.
+                let keep = target / seen;
+                for iv in span.iter_mut() {
+                    let part = *direction.kwh(iv) * share(iv);
+                    *direction.kwh(iv) -= part * (1.0 - keep);
+                }
+            } else {
+                let per_sec = (target - seen) / covered as f64;
+                for iv in span.iter_mut() {
+                    let secs = overlap(iv.start_ts, iv.end_ts, from, to);
+                    *direction.kwh(iv) += per_sec * secs as f64;
+                }
+            }
+        }
+    }
+}
+
 /// A day's counter readings with a Wh = 0 reading added at local midnight.
 /// The counter resets then, so whatever the first reading shows was earned
 /// since midnight. Without this the first 5 minutes of energy would be lost.
@@ -163,6 +260,9 @@ pub(super) struct DayData<'a> {
     pub import: &'a [(i64, f64)],
     pub export: &'a [(i64, f64)],
     pub load: &'a [(i64, f64)],
+    /// The inverter's grid totals rows from a little before the day to a
+    /// little after (see [`meter_in`]), `(ts, import_wh, export_wh)`.
+    pub meter: &'a [(i64, f64, f64)],
 }
 
 /// The intervals of one day and where they came from, or `None` if there is
@@ -178,7 +278,9 @@ pub(super) fn day_intervals(
     if let Some(live) = live_totals(day.live, day.start, day.end, now)
         && live.usable(cloud_has_data)
     {
-        return Some(("inverter", live_intervals(day.live), live.solid));
+        let mut intervals = live_intervals(day.live);
+        top_up_from_meter(&mut intervals, day.meter);
+        return Some(("inverter", intervals, live.solid));
     }
     if !cloud_has_data {
         return None;
@@ -218,6 +320,26 @@ async fn counters_in(pool: &SqlitePool, plant_id: i64, start: i64, end: i64) -> 
         export: counter(EXPORT_COUNTER),
         load: counter(LOAD_COUNTER),
     })
+}
+
+/// The grid totals rows for `[start, end)`, plus [`METER_MARGIN_SECS`] either
+/// side so the first and last span of each day are bracketed.
+pub(super) async fn meter_in(
+    pool: &SqlitePool,
+    start: i64,
+    end: i64,
+) -> Result<Vec<(i64, f64, f64)>> {
+    db::grid_meter_raw(pool, start - METER_MARGIN_SECS, end + METER_MARGIN_SECS).await
+}
+
+/// One day's part of rows loaded by [`meter_in`].
+pub(super) fn meter_for_day(meter: &[(i64, f64, f64)], start: i64, end: i64) -> &[(i64, f64, f64)] {
+    slice_between(
+        meter,
+        |r| r.0,
+        start - METER_MARGIN_SECS,
+        end + METER_MARGIN_SECS,
+    )
 }
 
 /// The live samples in `[start, end)`. Only the part the live samples cover
@@ -271,6 +393,7 @@ pub(crate) async fn house_intervals(
     let counters = counters_in(pool, plant_id, range_start, range_end).await?;
     let live_range = db::live_ts_range(pool).await?;
     let live = live_in(pool, live_range, range_start, range_end).await?;
+    let meter = meter_in(pool, range_start, range_end).await?;
 
     let mut intervals = Vec::new();
     for &(day_start, day_end) in &bounds {
@@ -281,6 +404,7 @@ pub(crate) async fn house_intervals(
             import: slice_between(&counters.import, |r| r.0, day_start, day_end),
             export: slice_between(&counters.export, |r| r.0, day_start, day_end),
             load: slice_between(&counters.load, |r| r.0, day_start, day_end),
+            meter: meter_for_day(&meter, day_start, day_end),
         };
         if let Some((_, day_intervals, _)) = day_intervals(&day, now) {
             intervals.extend(day_intervals);
@@ -315,6 +439,7 @@ pub(super) async fn day_grid_split(
     } else {
         counters_in(&state.pool, state.plant_id, start, end).await?
     };
+    let meter = meter_in(&state.pool, start, end).await?;
     let day = DayData {
         start,
         end,
@@ -322,6 +447,7 @@ pub(super) async fn day_grid_split(
         import: &counters.import,
         export: &counters.export,
         load: &counters.load,
+        meter: &meter,
     };
     Ok(day_intervals(&day, now)
         .map(|(_, intervals, _)| cost::grid_split(schedule.for_date(date), state.tz, &intervals)))
@@ -679,8 +805,10 @@ fn known_source(text: &str) -> Option<&'static str> {
 /// rules are worked out again. Version 2: finished days need 98% live coverage
 /// (not 90%) to use the inverter, and the zero-import credit waits for the
 /// window to finish. Version 3: cloud readings are moved 5 minutes earlier
-/// (see [`CLOUD_LAG_SECS`]). Old rows are replaced by date as days are recomputed.
-const COST_CACHE_VERSION: u32 = 3;
+/// (see [`CLOUD_LAG_SECS`]). Version 4: live days are topped up from the
+/// inverter's grid totals (see [`top_up_from_meter`]). Old rows are replaced
+/// by date as days are recomputed.
+const COST_CACHE_VERSION: u32 = 4;
 
 /// What stored costs are tagged with. The time zone is in it too, because
 /// moving it moves where every local day starts.
@@ -749,6 +877,7 @@ async fn compute_days(
         let chunk_start = chunk_bounds[0].0;
         let chunk_end = chunk_bounds[chunk_bounds.len() - 1].1;
         let live = live_in(&state.pool, live_range, chunk_start, chunk_end).await?;
+        let meter = meter_in(&state.pool, chunk_start, chunk_end).await?;
 
         for (&date, &(start, end)) in chunk_dates.iter().zip(chunk_bounds) {
             let day = DayData {
@@ -758,6 +887,7 @@ async fn compute_days(
                 import: slice_between(&counters.import, |r| r.0, start, end),
                 export: slice_between(&counters.export, |r| r.0, start, end),
                 load: slice_between(&counters.load, |r| r.0, start, end),
+                meter: meter_for_day(&meter, start, end),
             };
             let Some((source, intervals, live_solid)) = day_intervals(&day, now) else {
                 continue;
@@ -1314,6 +1444,70 @@ mod tests {
         assert!((at(start + 600).import_kwh - 0.1 / 3.0).abs() < 1e-12);
     }
 
+    /// Intervals of `secs` each from 0, all with `import_kwh` (and no export).
+    fn flat(n: usize, secs: i64, import_kwh: f64) -> Vec<Interval> {
+        (0..n as i64)
+            .map(|i| Interval {
+                start_ts: i * secs,
+                end_ts: (i + 1) * secs,
+                import_kwh,
+                export_kwh: 0.0,
+                load_kwh: 0.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn meter_steps_add_the_energy_the_samples_missed() {
+        // An hour of 15 s intervals that saw nothing, while the counters
+        // stepped 100 Wh import and 100 Wh export across it.
+        let mut intervals = flat(240, 15, 0.0);
+        let meter = [
+            (0, 1000.0, 5000.0),
+            (1800, 1000.0, 5100.0),
+            (3600, 1100.0, 5100.0),
+        ];
+        top_up_from_meter(&mut intervals, &meter);
+        assert!((total(&intervals, |i| i.import_kwh) - 0.1).abs() < 1e-9);
+        // Export stepped at 1800, so its 100 Wh fills the first half hour.
+        assert!((total(&intervals, |i| i.export_kwh) - 0.1).abs() < 1e-9);
+        assert_eq!(intervals[120].export_kwh, 0.0);
+        // Spread evenly over the span.
+        assert!((intervals[0].import_kwh - intervals[239].import_kwh).abs() < 1e-12);
+    }
+
+    #[test]
+    fn meter_steps_scale_down_samples_that_saw_too_much() {
+        let mut intervals = flat(4, 900, 0.05); // 0.2 kWh seen over an hour
+        top_up_from_meter(&mut intervals, &[(0, 0.0, 0.0), (3600, 100.0, 0.0)]);
+        assert!((total(&intervals, |i| i.import_kwh) - 0.1).abs() < 1e-12);
+        assert!((intervals[0].import_kwh - 0.025).abs() < 1e-12);
+    }
+
+    #[test]
+    fn time_outside_the_meter_steps_is_left_alone() {
+        // Steps only cover 900-1800; the other intervals keep what they saw.
+        let mut intervals = flat(4, 900, 0.0);
+        intervals[3].import_kwh = 0.3;
+        top_up_from_meter(&mut intervals, &[(900, 0.0, 0.0), (1800, 200.0, 0.0)]);
+        assert!((intervals[1].import_kwh - 0.2).abs() < 1e-12);
+        assert_eq!(intervals[0].import_kwh, 0.0);
+        assert_eq!(intervals[3].import_kwh, 0.3);
+        // No rows: nothing changes.
+        let mut untouched = flat(4, 900, 0.1);
+        top_up_from_meter(&mut untouched, &[]);
+        assert!(untouched.iter().all(|i| i.import_kwh == 0.1));
+    }
+
+    #[test]
+    fn a_span_reaching_past_the_day_only_counts_the_covered_part() {
+        // The step pair spans 2 hours but the day's samples cover only the
+        // second: half the 200 Wh belongs to the day.
+        let mut intervals = flat(4, 900, 0.0);
+        top_up_from_meter(&mut intervals, &[(-3600, 0.0, 0.0), (3600, 200.0, 0.0)]);
+        assert!((total(&intervals, |i| i.import_kwh) - 0.1).abs() < 1e-12);
+    }
+
     #[test]
     fn cloud_readings_move_back_five_minutes() {
         let start = 86_400;
@@ -1350,6 +1544,7 @@ mod tests {
             import: &import,
             export: &[],
             load: &[],
+            meter: &[],
         };
         let (source, intervals, _) = day_intervals(&day, start + 2 * 86_400).unwrap();
         assert_eq!(source, "cloud");
@@ -1386,6 +1581,7 @@ mod tests {
             import: &[],
             export: &[],
             load: &[],
+            meter: &[],
         };
         assert!(day_intervals(&empty, 100_000).is_none());
         let some = DayData {
@@ -1422,6 +1618,7 @@ mod tests {
                 import: cloud,
                 export: &[],
                 load: &[],
+                meter: &[],
             };
             day_intervals(&day, 1_000_000).map(|(source, _, solid)| (source, solid))
         };

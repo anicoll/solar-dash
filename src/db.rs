@@ -389,8 +389,7 @@ pub async fn latest_grid_meter(pool: &SqlitePool) -> Result<Option<(i64, f64, f6
 }
 
 /// Every grid totals row with `from <= ts < to`, oldest first, as
-/// `(ts, import_wh, export_wh)`. Nothing reads these yet; they are only recorded.
-#[allow(dead_code)]
+/// `(ts, import_wh, export_wh)`.
 pub async fn grid_meter_raw(pool: &SqlitePool, from: i64, to: i64) -> Result<Vec<(i64, f64, f64)>> {
     sqlx::query_as(
         "SELECT ts, import_wh, export_wh FROM grid_meter WHERE ts >= ? AND ts < ? ORDER BY ts",
