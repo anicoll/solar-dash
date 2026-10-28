@@ -344,7 +344,7 @@ pub(super) fn meter_for_day(meter: &[(i64, f64, f64)], start: i64, end: i64) -> 
 
 /// The live samples in `[start, end)`. Only the part the live samples cover
 /// (`live_range`, from [`db::live_ts_range`]) is loaded.
-async fn live_in(
+pub(super) async fn live_in(
     pool: &SqlitePool,
     live_range: Option<(i64, i64)>,
     start: i64,
