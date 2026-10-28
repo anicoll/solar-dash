@@ -23,7 +23,7 @@ rsa = "0.9.10"
 rust-embed = { version = "8.13.0", features = ["mime-guess"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sha2 = "0.10"
+sha2 = "0.11"
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros"] }
 time = "0.3.55"
 tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
