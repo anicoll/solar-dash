@@ -1,6 +1,305 @@
-/* Payback page. Use the tokens and classes from next.css. Prefix every selector
-   with #page-payback (or a class starting "payback-") so it cannot touch another page. */
+/* Payback page. Tokens and shared classes come from next.css; every selector is
+   scoped under #page-payback. */
 
-#page-payback .payback-stub {
+#page-payback .pb-title {
+  font-size: 17px;
+  font-weight: 700;
+  font-stretch: 112%;
+}
+
+#page-payback .pb-head {
+  padding-top: 12px;
+}
+
+#page-payback .pb-head .date-line {
+  margin-bottom: 8px;
+}
+
+#page-payback .pb-verdict {
+  font-size: 34px;
+  line-height: 1.02;
+}
+
+#page-payback .pb-progress {
+  margin-top: 14px;
+  color: var(--ink);
+}
+
+#page-payback .pb-stack {
+  margin-top: 16px;
+}
+
+/* Timeline: a bar from the first purchase to the payback, labels placed by script. */
+
+#page-payback .pb-stage {
+  position: relative;
+  height: 130px;
+  margin-top: 4px;
+}
+
+#page-payback .pb-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 40px;
+  height: 16px;
+  border-radius: 5px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+#page-payback .pb-done {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--ink);
+}
+
+#page-payback .pb-todo {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  background-image: repeating-linear-gradient(135deg, var(--hatch-ink) 0 2px, transparent 2px 6px);
+  opacity: 0.5;
+}
+
+#page-payback .pb-tick {
+  position: absolute;
+  top: 28px;
+  height: 40px;
+  border-left: 2px solid var(--ink-2);
+}
+
+#page-payback .pb-tick-buy {
+  border-left-color: var(--battery);
+}
+
+#page-payback .pb-tick-part {
+  border-left-style: dashed;
+}
+
+#page-payback .pb-tick-today {
+  top: 18px;
+  height: 50px;
+  border-left: 3px solid var(--ink);
+}
+
+#page-payback .pb-tick-end {
+  border-left: 0;
+}
+
+#page-payback .pb-sun {
+  position: absolute;
+  left: -22px;
+  top: -10px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--sun);
+  border: 2px solid var(--ink);
+}
+
+#page-payback .pb-label {
+  position: absolute;
+  left: 0;
+  top: 74px;
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  line-height: 1.25;
+  white-space: nowrap;
+  color: var(--ink-2);
+}
+
+#page-payback .pb-label[data-align="right"] {
+  text-align: right;
+}
+
+#page-payback .pb-label[data-align="center"] {
+  text-align: center;
+}
+
+#page-payback .pb-label-today,
+#page-payback .pb-label-end {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+#page-payback .pb-label-buy {
+  color: var(--battery);
+  font-weight: 700;
+}
+
+#page-payback .pb-label-sub {
+  font-weight: 400;
+  color: var(--ink-2);
+}
+
+#page-payback .pb-note {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+/* Each purchase */
+
+#page-payback .pb-part {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+#page-payback .pb-part:last-of-type {
+  border-bottom: 0;
+  padding-bottom: 4px;
+}
+
+#page-payback .pb-part-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+}
+
+#page-payback .pb-part-sub {
+  font-size: 13px;
+  color: var(--ink-2);
+  margin: 2px 0 8px;
+}
+
+#page-payback .pb-meter {
+  height: 10px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+#page-payback .pb-meter-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--ink);
+}
+
+#page-payback .pb-meter-fill.is-estimate {
+  background: var(--battery);
+}
+
+#page-payback .pb-fine {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+/* Saved each year */
+
+#page-payback .pb-years {
+  display: grid;
+  gap: 12px;
+  align-items: end;
+  height: 140px;
   margin-top: 12px;
+}
+
+#page-payback .pb-year {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  height: 100%;
+  gap: 4px;
+}
+
+#page-payback .pb-year-val {
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+#page-payback .pb-year-bar {
+  background: var(--ink);
+  border-radius: 4px 4px 0 0;
+  min-height: 2px;
+  max-height: 110px;
+}
+
+#page-payback .pb-year-bar.hatch {
+  background: repeating-linear-gradient(135deg, var(--hatch-ink) 0 2px, var(--card) 2px 6px);
+  border: 1.5px solid var(--hatch-ink);
+}
+
+#page-payback .pb-years-axis {
+  display: grid;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+  text-align: center;
+}
+
+/* What moves the date: a dark card in both themes. */
+
+#page-payback .pb-move {
+  background: #10140f;
+  color: #ffffff;
+}
+
+#page-payback .pb-move ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+#page-payback .pb-move li + li {
+  margin-top: 4px;
+}
+
+html[data-theme="night"] #page-payback .pb-move {
+  background: #05060f;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+/* Timeline of plans and purchases */
+
+#page-payback .pb-details {
+  background: var(--card);
+  border-radius: 16px;
+  padding: 14px 16px;
+  font-size: 14px;
+}
+
+#page-payback .pb-details summary {
+  font-weight: 600;
+  cursor: pointer;
+  min-height: 24px;
+}
+
+#page-payback .pb-events {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+#page-payback .pb-events li {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+#page-payback .pb-event-date {
+  color: var(--ink-2);
+  font-size: 13px;
+}
+
+@media (min-width: 760px) {
+  #page-payback .pb-verdict {
+    font-size: 56px;
+  }
+
+  #page-payback .pb-head,
+  #page-payback .pb-stack {
+    max-width: 760px;
+  }
 }
