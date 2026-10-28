@@ -235,13 +235,16 @@ curl -c cookies.txt -d 'password=YOUR_PASSWORD' http://127.0.0.1:8080/login
 curl -b cookies.txt http://127.0.0.1:8080/api/latest
 ```
 
-### The new dashboard at /next
+### The new dashboard at /
 
-A redesigned dashboard is being built at `/next` (same login) next to the
-current one, which stays at `/` until the new one replaces it. It has the
-pages Today, Bill, History, Cars and Payback; the address keeps the page
-(`/next#bill`, `/next#history/day/2026-10-27`), and a gear in the header opens
-the settings and admin page of the current dashboard. The colours follow
+The redesigned dashboard is the default: `/` serves it. It has the pages
+Today, Bill, History, Cars and Payback; the address keeps the page (`/#bill`,
+`/#history/day/2026-10-27`), and a gear in the header opens Admin (`/#admin`):
+settings, plans, past bills, purchases, petrol prices and the backup, using the
+[Admin API](#admin-api). The previous dashboard is still available at
+`/classic` (same login; its admin view is `/classic#admin`) until it is
+removed. `/next`, the address used while the new dashboard was being built,
+redirects to `/` so old bookmarks keep working. The colours follow
 sunrise and sunset by default; a button in the header switches between auto,
 day and night. Pages that are not built yet show a placeholder card.
 
@@ -256,7 +259,7 @@ cp config.toml /tmp/config-try.toml
 cargo run -- --config /tmp/config-try.toml serve
 ```
 
-Then open <http://127.0.0.1:8081/next>. The copy is only read and written by
+Then open <http://127.0.0.1:8081/>. The copy is only read and written by
 that run, so the live database is never touched. (The data sources in the copy
 of `config.toml` are still contacted unless you remove the `[modbus]`,
 `[teslamate]` and `[globird]` sections from it.)

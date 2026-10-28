@@ -218,6 +218,11 @@ button {
   gap: 4px;
 }
 
+/* The logout form only wraps its icon button. */
+.logout-form {
+  display: contents;
+}
+
 .live {
   display: inline-flex;
   align-items: center;
@@ -574,6 +579,23 @@ button {
 }
 
 /* ---------- desktop ---------- */
+
+/* Small phones: the header holds four controls, so the live status keeps
+   only its dot (the words stay for screen readers). */
+@media (max-width: 419px) {
+  #sd-live-text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .wordmark {
+    white-space: nowrap;
+  }
+}
 
 @media (min-width: 760px) {
   .app-header {
