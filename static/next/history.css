@@ -1,0 +1,6 @@
+/* History page. Use the tokens and classes from next.css. Prefix every selector
+   with #page-history (or a class starting "history-") so it cannot touch another page. */
+
+#page-history .history-stub {
+  margin-top: 12px;
+}

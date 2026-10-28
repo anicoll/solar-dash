@@ -1,0 +1,630 @@
+/* solar-dash, new UI: shared styles.
+
+   Everything the pages have in common lives here: the colour tokens for the
+   day and night themes, type, cards, the price-band swatches, the segmented
+   control, the navigation and the day ribbon. Each page adds its own rules in
+   its own <page>.css and should use these tokens rather than raw colours.
+
+   Phone first: the base rules are for a 360 px screen with a 16 px gutter.
+   From 760 px the bottom tab bar becomes a top navigation and `.cols` makes
+   two columns. */
+
+/* Archivo, one variable file with both the width and the weight axes. */
+@font-face {
+  font-family: "Archivo";
+  font-style: normal;
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-display: swap;
+  src: url("fonts/archivo-latin-wdth-wght.woff2") format("woff2");
+}
+
+/* ---------- tokens ---------- */
+
+:root,
+html[data-theme="day"] {
+  color-scheme: light;
+  --paper: #f2f3ef;
+  --card: #ffffff;
+  --ink: #10140f;
+  --ink-2: #4b544f;
+  --line: #dce0db;
+
+  --sun: #ffc21a; /* the free window */
+  --sun-line: #8a5d00; /* outline for sun-coloured shapes on paper */
+  --shoulder: #c5cbc7; /* the middle price */
+  --bar: #8a918d; /* bars and lines that need more weight than a band */
+  --peak: #262a5c; /* the dear price */
+  --credit: #262a5c; /* the $1 credit window bracket and labels */
+  --credit-fill: #dadceb; /* light fill under the credit hatch */
+  --battery: #0f7b6c;
+  --missed: #b4361e;
+
+  --on-sun: #10140f; /* text on a sun, shoulder or other light fill */
+  --on-shoulder: #10140f;
+  --on-peak: #ffffff;
+  --hatch-ink: #10140f; /* stripes for sold, projected and partial */
+  --focus: #10140f;
+  --shadow: 0 1px 0 rgb(16 20 15 / 4%);
+}
+
+html[data-theme="night"] {
+  color-scheme: dark;
+  --paper: #0d0f24;
+  --card: #181b3a;
+  --ink: #eef0fa;
+  --ink-2: #a9aed0;
+  --line: #2c3060;
+
+  --sun: #ffc21a;
+  --sun-line: #ffc21a;
+  --shoulder: #4a4f68;
+  --bar: #7c8199;
+  --peak: #3b4090;
+  --credit: #8f96ff;
+  --credit-fill: #262a55;
+  --battery: #3dd6b0;
+  --missed: #ff8a70;
+
+  --on-sun: #0d0f24;
+  --on-shoulder: #eef0fa;
+  --on-peak: #ffffff;
+  --hatch-ink: #eef0fa;
+  --focus: #eef0fa;
+  --shadow: none;
+}
+
+/* ---------- base ---------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Archivo", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.muted {
+  color: var(--ink-2);
+}
+
+/* ---------- type ---------- */
+
+/* The one-line answer at the top of a page. */
+.verdict {
+  font-size: 42px;
+  line-height: 1;
+  font-weight: 800;
+  font-stretch: 125%;
+  letter-spacing: -0.03em;
+}
+
+/* Numbers: narrow, bold, and they line up in columns. */
+.fig {
+  font-stretch: 87%;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.fig-lg {
+  font-size: 26px;
+}
+
+.fig-md {
+  font-size: 22px;
+}
+
+/* A small sentence-case label above or beside a figure. */
+.label {
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.lede {
+  font-size: 16px;
+  line-height: 1.45;
+  color: var(--ink-2);
+}
+
+.date-line {
+  font-size: 14px;
+  color: var(--ink-2);
+}
+
+/* ---------- shell ---------- */
+
+.app-header {
+  background: var(--paper);
+}
+
+.app-header-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 12px 12px 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px 32px;
+}
+
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 16px;
+  font-stretch: 112%;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+  min-height: 44px;
+}
+
+.wordmark svg {
+  flex: none;
+}
+
+.header-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--battery);
+}
+
+.live[data-state="stale"] .live-dot {
+  background: var(--sun);
+  box-shadow: 0 0 0 1px var(--sun-line);
+}
+
+.live[data-state="off"] .live-dot {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--ink-2);
+}
+
+.icon-btn {
+  width: 44px;
+  height: 44px;
+  border: 0;
+  background: transparent;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  color: var(--ink);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.icon-btn:hover {
+  background: var(--line);
+}
+
+/* The page area. The bottom padding clears the phone tab bar. */
+.app-main {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 8px 16px calc(96px + env(safe-area-inset-bottom));
+}
+
+.page-head {
+  padding: 12px 0 8px;
+}
+
+/* ---------- navigation ---------- */
+
+/* Phone: a bar fixed to the bottom. */
+.tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  background: var(--card);
+  border-top: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 6px 8px calc(8px + env(safe-area-inset-bottom));
+}
+
+.tabbar a {
+  min-height: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  text-decoration: none;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 12px;
+}
+
+.tabbar a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+/* The sun icon is filled for the current page only. */
+.tabbar a[aria-current="page"] .icon-sun {
+  fill: var(--sun);
+}
+
+/* Wide screens: links in the header. */
+.topnav {
+  display: none;
+  gap: 4px;
+}
+
+.topnav a {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 14px;
+  text-decoration: none;
+  color: var(--ink-2);
+  border-bottom: 3px solid transparent;
+}
+
+.topnav a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 700;
+  border-bottom-color: var(--sun);
+}
+
+/* ---------- cards ---------- */
+
+.card {
+  background: var(--card);
+  border-radius: 20px;
+  padding: 16px;
+  box-shadow: var(--shadow);
+}
+
+.card + .card,
+.stack > * + * {
+  margin-top: 12px;
+}
+
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+/* Section title: sentence case, never letter-spaced capitals. */
+.section-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.card-link {
+  font-size: 13px;
+  font-weight: 600;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* A card that outlines itself, such as the credit window card. */
+.card-accent {
+  border: 1px solid var(--credit);
+}
+
+/* ---------- layout ---------- */
+
+/* One column on a phone, two from 760 px. */
+.cols {
+  display: block;
+}
+
+.cols > * + * {
+  margin-top: 12px;
+}
+
+/* ---------- price bands ---------- */
+
+/* Swatches and fills. Always pair them with the word (Free, Shoulder, Peak). */
+.band-free {
+  background: var(--sun);
+  color: var(--on-sun);
+}
+
+.band-free.swatch {
+  box-shadow: inset 0 0 0 1px var(--sun-line);
+}
+
+.band-shoulder {
+  background: var(--shoulder);
+  color: var(--on-shoulder);
+}
+
+.band-peak {
+  background: var(--peak);
+  color: var(--on-peak);
+}
+
+.swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  vertical-align: -1px;
+  margin-right: 6px;
+}
+
+/* ---------- hatch: sold, projected or partial ---------- */
+
+.hatch {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--hatch-ink) 0 2px,
+    transparent 2px 6px
+  );
+  background-color: var(--card);
+  border: 1.5px solid var(--hatch-ink);
+}
+
+/* The same stripes as an SVG fill: <rect fill="url(#sd-hatch)"> after
+   SD.hatchDefs(svg) has added the pattern. */
+
+/* ---------- segmented control ---------- */
+
+.seg {
+  display: inline-flex;
+  padding: 3px;
+  gap: 2px;
+  background: var(--line);
+  border-radius: 12px;
+}
+
+.seg button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--card);
+  color: var(--ink);
+  font-weight: 700;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 18%);
+}
+
+/* ---------- day ribbon ---------- */
+
+.ribbon {
+  position: relative;
+  padding-top: 6px;
+}
+
+.ribbon-strip {
+  display: flex;
+  height: 26px;
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ribbon.is-long .ribbon-strip {
+  height: 30px;
+  font-size: 13px;
+}
+
+.ribbon-seg {
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.ribbon-seg.band-free {
+  justify-content: center;
+}
+
+.ribbon.is-long .ribbon-seg {
+  padding: 0 10px;
+}
+
+/* The line for the current time. */
+.ribbon-now {
+  position: absolute;
+  top: 0;
+  height: 38px;
+  margin-left: -1.5px;
+  border-left: 3px solid var(--ink);
+  pointer-events: none;
+}
+
+.ribbon.is-long .ribbon-now {
+  height: 42px;
+}
+
+/* The bracket under the credit window and its label. */
+.ribbon-credit {
+  position: absolute;
+  top: 32px;
+  height: 8px;
+  border: 2px solid var(--credit);
+  border-top: 0;
+}
+
+.ribbon.is-long .ribbon-credit {
+  top: 36px;
+}
+
+.ribbon-credit-label {
+  position: absolute;
+  top: 44px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--credit);
+  white-space: nowrap;
+}
+
+.ribbon.is-long .ribbon-credit-label {
+  top: 48px;
+}
+
+.ribbon-axis {
+  position: relative;
+  height: 16px;
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--ink-2);
+}
+
+/* Room for the bracket and its label between the strip and the axis. */
+.ribbon.has-credit .ribbon-axis {
+  margin-top: 30px;
+}
+
+.ribbon.has-credit.is-long .ribbon-axis {
+  margin-top: 34px;
+}
+
+.ribbon-axis span {
+  position: absolute;
+  top: 0;
+  white-space: nowrap;
+}
+
+.ribbon-note {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+/* ---------- desktop ---------- */
+
+@media (min-width: 760px) {
+  .app-header {
+    background: var(--card);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .app-header-inner {
+    padding: 10px 32px;
+  }
+
+  .wordmark {
+    font-size: 17px;
+  }
+
+  .topnav {
+    display: flex;
+  }
+
+  .tabbar {
+    display: none;
+  }
+
+  .app-main {
+    padding: 16px 32px 48px;
+  }
+
+  .verdict {
+    font-size: 64px;
+  }
+
+  .cols {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 24px;
+    align-items: start;
+  }
+
+  .cols > * + * {
+    margin-top: 0;
+  }
+
+  /* Wide main column, narrow side column. */
+  .cols.cols-2-1 {
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  }
+
+  .card {
+    padding: 20px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    scroll-behavior: auto !important;
+    transition: none !important;
+    animation: none !important;
+  }
+}

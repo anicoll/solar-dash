@@ -1,0 +1,6 @@
+/* Bill page. Use the tokens and classes from next.css. Prefix every selector
+   with #page-bill (or a class starting "bill-") so it cannot touch another page. */
+
+#page-bill .bill-stub {
+  margin-top: 12px;
+}

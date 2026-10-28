@@ -1,0 +1,6 @@
+/* Today page. Use the tokens and classes from next.css. Prefix every selector
+   with #page-today (or a class starting "today-") so it cannot touch another page. */
+
+#page-today .today-stub {
+  margin-top: 12px;
+}
