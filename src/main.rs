@@ -371,8 +371,9 @@ async fn modbus_test(config: Config, watch: bool) -> Result<()> {
     let mut reader = modbus::Reader::new(modbus);
 
     if !watch {
-        let sample = reader.read_sample().await?;
+        let (sample, meter) = reader.read_sample().await?;
         println!("{}", modbus::describe(&sample));
+        println!("{}", describe_meter(meter.as_ref()));
         print_settings(&mut reader).await;
         return Ok(());
     }
@@ -403,9 +404,10 @@ async fn modbus_test(config: Config, watch: bool) -> Result<()> {
             result = reader.read_sample() => result,
         };
         match result {
-            Ok(sample) => {
+            Ok((sample, meter)) => {
                 tally.ok += 1;
                 println!("{now}  {}", modbus::describe(&sample));
+                println!("{now}  {}", describe_meter(meter.as_ref()));
             }
             Err(err) => {
                 tally.failed += 1;
@@ -415,6 +417,14 @@ async fn modbus_test(config: Config, watch: bool) -> Result<()> {
     }
     println!("{tally}");
     Ok(())
+}
+
+/// The grid totals line, or the same line with n/a when the inverter refused them.
+fn describe_meter(meter: Option<&modbus::Meter>) -> String {
+    match meter {
+        Some(meter) => modbus::describe_meter(meter),
+        None => "grid totals: import n/a, export n/a".to_string(),
+    }
 }
 
 /// Prints the inverter's control settings, or why they could not be read.
