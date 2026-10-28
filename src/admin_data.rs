@@ -39,6 +39,10 @@ pub struct AdminData {
     pub price_rise_percent: f64,
     /// The past bills, oldest first; empty when there are none.
     pub bills: Arc<[PastBill]>,
+    /// Grid import (kW) from which the Today page warns about the main breaker.
+    pub grid_pull_warn_kw: f64,
+    /// Grid import (kW) the owner wants to stay under.
+    pub grid_pull_limit_kw: f64,
 }
 
 impl Default for AdminData {
@@ -53,18 +57,22 @@ impl Default for AdminData {
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
             bills: Arc::from([]),
+            grid_pull_warn_kw: 12.0,
+            grid_pull_limit_kw: 15.0,
         }
     }
 }
 
 /// The keys of the `setting` table. A missing key means its default.
-pub const SETTING_KEYS: [&str; 6] = [
+pub const SETTING_KEYS: [&str; 8] = [
     "petrol_cents_per_litre",
     "petrol_litres_per_100km",
     "away_cents_per_kwh",
     "compare_cars",
     "petrol_grade",
     "price_rise_percent",
+    "grid_pull_warn_kw",
+    "grid_pull_limit_kw",
 ];
 
 /// The JSON kept in `tariff_plan.body`: the plan as in the config file, plus
@@ -109,6 +117,9 @@ impl AdminData {
         for (key, value) in &load_settings(conn).await? {
             apply_setting(&mut data, key, value)?;
         }
+        // Each threshold is checked alone by `apply_setting`; only here are
+        // both known, so this also catches a change to just one of them.
+        data.check_grid_pull()?;
 
         // The setting above is the price before the first `petrol_price` row.
         let rows: Vec<(String, f64)> = sqlx::query_as(
@@ -238,6 +249,19 @@ pub(crate) async fn load_bills(conn: &mut SqliteConnection) -> Result<Vec<PastBi
     Ok(bills)
 }
 
+impl AdminData {
+    /// The warning level must be below the limit.
+    fn check_grid_pull(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.grid_pull_warn_kw < self.grid_pull_limit_kw,
+            "grid_pull_warn_kw ({}) must be less than grid_pull_limit_kw ({})",
+            self.grid_pull_warn_kw,
+            self.grid_pull_limit_kw
+        );
+        Ok(())
+    }
+}
+
 /// Checks one setting's JSON value and applies it to `data`. Used for every
 /// key by `load`, and by the API to validate a new value.
 pub fn apply_setting(data: &mut AdminData, key: &str, value: &Value) -> Result<()> {
@@ -281,6 +305,8 @@ pub fn apply_setting(data: &mut AdminData, key: &str, value: &Value) -> Result<(
                 .with_context(|| format!("{key} must be a number between 0 and 20"))?;
             data.price_rise_percent = percent;
         }
+        "grid_pull_warn_kw" => data.grid_pull_warn_kw = positive()?,
+        "grid_pull_limit_kw" => data.grid_pull_limit_kw = positive()?,
         _ => bail!("unknown setting {key:?}"),
     }
     Ok(())
@@ -367,6 +393,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -380,6 +408,33 @@ mod tests {
         });
         assert_eq!(shared.get().price_rise_percent, 5.0);
         assert_eq!(before.price_rise_percent, 3.0);
+    }
+
+    #[test]
+    fn grid_pull_settings_are_positive_and_warn_is_below_limit() {
+        let mut data = AdminData::default();
+        assert_eq!(
+            (data.grid_pull_warn_kw, data.grid_pull_limit_kw),
+            (12.0, 15.0)
+        );
+        apply_setting(&mut data, "grid_pull_warn_kw", &json!(10.5)).unwrap();
+        apply_setting(&mut data, "grid_pull_limit_kw", &json!(14)).unwrap();
+        assert_eq!(
+            (data.grid_pull_warn_kw, data.grid_pull_limit_kw),
+            (10.5, 14.0)
+        );
+        data.check_grid_pull().unwrap();
+
+        for key in ["grid_pull_warn_kw", "grid_pull_limit_kw"] {
+            for bad in [json!(0), json!(-1), json!("12"), json!(null)] {
+                assert!(apply_setting(&mut data, key, &bad).is_err(), "{key} {bad}");
+            }
+        }
+        // Equal or reversed levels fail the whole-set check.
+        data.grid_pull_warn_kw = 14.0;
+        assert!(data.check_grid_pull().is_err());
+        data.grid_pull_warn_kw = 15.0;
+        assert!(data.check_grid_pull().is_err());
     }
 
     async fn test_state() -> (tempfile::TempDir, AppState) {

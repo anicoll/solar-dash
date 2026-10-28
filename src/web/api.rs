@@ -183,22 +183,63 @@ pub async fn latest(State(state): State<AppState>) -> ApiResult {
     Ok(Json(json!({ "points": points })))
 }
 
-/// `{"sample": ..., "car": ...}`. The sample is the newest Modbus one, or
-/// null if there is none or it is too old to call "live" (for example when
-/// Modbus is off). It comes from memory; the database is only read until the
-/// poller's first sample after a restart.
+/// `{"sample": ..., "car": ..., "grid_pull": ...}`. The sample is the newest
+/// Modbus one, or null if there is none or it is too old to call "live" (for
+/// example when Modbus is off). It comes from memory; the database is only
+/// read until the poller's first sample after a restart.
 ///
 /// The car is TeslaMate's last known state, or null if TeslaMate is off or
 /// has sent nothing yet. It gets no age limit: TeslaMate's values are
 /// retained and stay true while the car sleeps. `car.updated_ts` says how
 /// old they are.
+///
+/// `grid_pull` is how hard the house is drawing from the grid, for watching
+/// the main breaker (see [`grid_pull_json`]).
 pub async fn live(State(state): State<AppState>) -> ApiResult {
     let sample = match state.latest.get() {
         Some(sample) => Some(sample),
         None => db::latest_live_sample(&state.pool).await?,
     };
     let fresh = sample.filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
-    Ok(Json(json!({ "sample": fresh, "car": state.car.get() })))
+    let since = local_midnight(today(state.tz), state.tz).unwrap_or(0);
+    let peak = db::peak_grid_import(&state.pool, since).await?;
+    let data = state.admin.get();
+    let grid_pull = grid_pull_json(
+        fresh.as_ref(),
+        peak,
+        data.grid_pull_warn_kw,
+        data.grid_pull_limit_kw,
+    );
+    Ok(Json(
+        json!({ "sample": fresh, "car": state.car.get(), "grid_pull": grid_pull }),
+    ))
+}
+
+/// The `grid_pull` part of `/api/live`:
+/// `{now_w, peak_today_w, peak_today_at, warn_w, limit_w, volts}`.
+///
+/// `now_w` is the grid import of the fresh sample in W. `Sample::grid_w` is
+/// positive when importing and negative when exporting, so exporting counts
+/// as 0 pulled. It is null when there is no fresh sample. `peak` is the
+/// highest import so far today as `(ts, W)`, or None. `volts` is null: the
+/// Modbus poller does not read the grid voltage yet.
+fn grid_pull_json(
+    sample: Option<&Sample>,
+    peak: Option<(i64, f64)>,
+    warn_kw: f64,
+    limit_kw: f64,
+) -> Value {
+    let now_w = sample
+        .and_then(|s| s.grid_w)
+        .map(|w| w.max(0.0).round() as i64);
+    json!({
+        "now_w": now_w,
+        "peak_today_w": peak.map(|(_, w)| w.round() as i64),
+        "peak_today_at": peak.map(|(ts, _)| ts),
+        "warn_w": (warn_kw * 1000.0).round() as i64,
+        "limit_w": (limit_kw * 1000.0).round() as i64,
+        "volts": Value::Null,
+    })
 }
 
 /// `{"settings": ...}`: the inverter's control settings with their labels, or
@@ -1298,6 +1339,42 @@ mod tests {
     use crate::db::{Point, Reading};
 
     const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+
+    #[test]
+    fn grid_pull_counts_import_only() {
+        let sample = |grid_w| Sample {
+            ts: 100,
+            pv_w: None,
+            load_w: None,
+            grid_w,
+            battery_w: None,
+            soc_pct: None,
+        };
+        // Positive grid_w is importing: 13.8 kW pulled, and the peak is passed through.
+        let json = grid_pull_json(
+            Some(&sample(Some(13_800.4))),
+            Some((90, 14_600.0)),
+            12.0,
+            15.0,
+        );
+        assert_eq!(
+            json,
+            json!({
+                "now_w": 13800, "peak_today_w": 14600, "peak_today_at": 90,
+                "warn_w": 12000, "limit_w": 15000, "volts": null,
+            })
+        );
+        // Negative is exporting: nothing is pulled.
+        assert_eq!(
+            grid_pull_json(Some(&sample(Some(-2_500.0))), None, 12.0, 15.0)["now_w"],
+            0
+        );
+        // No fresh sample, or an unavailable reading: unknown, not 0. No peak: null.
+        let none = grid_pull_json(None, None, 12.5, 15.0);
+        assert!(none["now_w"].is_null() && none["peak_today_w"].is_null());
+        assert_eq!(none["warn_w"], 12500);
+        assert!(grid_pull_json(Some(&sample(None)), None, 12.0, 15.0)["now_w"].is_null());
+    }
 
     #[test]
     fn soc_is_shown_as_a_percentage() {
