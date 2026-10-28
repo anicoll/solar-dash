@@ -1,6 +1,578 @@
-/* Today page. Use the tokens and classes from next.css. Prefix every selector
-   with #page-today (or a class starting "today-") so it cannot touch another page. */
+/* Today page. Tokens and shared classes come from next.css; everything here is
+   scoped under #page-today. */
 
-#page-today .today-stub {
+#page-today {
+  --today-on-battery: #ffffff;
+  --today-warn: color-mix(in srgb, var(--missed) 28%, var(--card));
+  --today-track: color-mix(in srgb, var(--ink) 9%, var(--card));
+  --today-nudge: #fff4d1;
+  --today-on-nudge: #10140f;
+}
+
+html[data-theme="night"] #page-today {
+  --today-on-battery: #0d0f24;
+  --today-nudge: #2b2a3f;
+  --today-on-nudge: #eef0fa;
+}
+
+#page-today .today-lede {
+  margin-top: 14px;
+  color: var(--ink);
+  max-width: 56ch;
+}
+
+#page-today .card-sub {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+#page-today .today-gap {
   margin-top: 12px;
+}
+
+#page-today .today-figs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+
+#page-today .fig.is-battery {
+  color: var(--battery);
+}
+
+/* ---------- credit window ---------- */
+
+#page-today .today-progress {
+  position: relative;
+  height: 40px;
+  margin-top: 14px;
+  border-radius: 10px;
+  background: var(--credit-fill);
+  overflow: hidden;
+}
+
+#page-today .today-progress-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--credit);
+}
+
+#page-today .today-progress-now {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  width: 3px;
+  margin-left: -1.5px;
+  background: var(--ink);
+}
+
+#page-today .today-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+/* ---------- grid pull ---------- */
+
+#page-today .today-pull {
+  border: 2px solid var(--ink);
+}
+
+#page-today .today-pull-now {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 8px;
+}
+
+#page-today .today-pull-kw {
+  font-size: 48px;
+  line-height: 1;
+  font-weight: 800;
+}
+
+#page-today .today-pull-amps {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--ink-2);
+}
+
+#page-today .today-meter {
+  position: relative;
+  height: 28px;
+  margin-top: 14px;
+  border-radius: 6px;
+  background: var(--today-track);
+}
+
+#page-today .today-meter.is-compact {
+  height: 18px;
+  margin-top: 8px;
+}
+
+#page-today .today-meter-warn {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: repeating-linear-gradient(135deg, var(--today-warn) 0 3px, transparent 3px 6px);
+}
+
+#page-today .today-meter-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: var(--sun);
+  border: 1.5px solid var(--sun-line);
+  border-radius: 6px 0 0 6px;
+}
+
+#page-today .today-meter-limit {
+  position: absolute;
+  top: -6px;
+  bottom: -6px;
+  border-left: 3px solid var(--missed);
+}
+
+#page-today .today-meter-ticks {
+  position: relative;
+  height: 18px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+#page-today .today-meter-ticks span {
+  position: absolute;
+  transform: translateX(-50%);
+}
+
+#page-today .today-meter-ticks span:first-child {
+  transform: none;
+}
+
+#page-today .today-meter-ticks .is-limit {
+  color: var(--missed);
+  font-weight: 700;
+}
+
+#page-today .today-pull-recent {
+  margin-top: 14px;
+}
+
+#page-today .today-spark {
+  display: block;
+  width: 100%;
+  height: 70px;
+  margin-top: 4px;
+}
+
+#page-today .today-spark-warn {
+  fill: var(--today-warn);
+  fill-opacity: 0.5;
+}
+
+#page-today .today-spark-limit {
+  stroke: var(--missed);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+#page-today .today-spark-base {
+  stroke: var(--line);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+#page-today .today-spark-line {
+  fill: none;
+  stroke: var(--ink);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+#page-today .today-pull-peak {
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+/* The smaller grid pull block inside the Right now card. */
+#page-today .today-pull-inline {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+#page-today .today-sub-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+#page-today .today-pull-line {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ink-2);
+}
+
+#page-today .today-pull-line b {
+  color: var(--ink);
+}
+
+/* ---------- right now ---------- */
+
+#page-today .today-balances {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+#page-today .today-balance {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#page-today .today-bar {
+  display: flex;
+  gap: 2px;
+  height: 32px;
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+#page-today .today-bar.is-empty {
+  align-items: center;
+  padding: 0 10px;
+  background: var(--today-track);
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+#page-today .today-seg {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 0 8px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+#page-today .today-seg.is-solar {
+  background: var(--sun);
+  color: var(--on-sun);
+}
+
+#page-today .today-seg.is-battery {
+  background: var(--battery);
+  color: var(--today-on-battery);
+}
+
+#page-today .today-seg.is-home {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+#page-today .today-seg.is-car {
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
+}
+
+/* Grid is hatched, as on the day ribbon: buying in sun stripes, selling in neutral ones. */
+#page-today .today-seg.is-grid-in {
+  background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--sun) 55%, var(--card)) 0 6px, var(--sun) 6px 12px);
+  color: var(--on-sun);
+}
+
+#page-today .today-seg.is-grid-out {
+  background: repeating-linear-gradient(135deg, var(--today-track) 0 6px, var(--card) 6px 12px);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
+}
+
+#page-today .today-car {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+#page-today .today-car b {
+  color: var(--ink);
+}
+
+#page-today .today-nudge {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--today-nudge);
+  color: var(--today-on-nudge);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+#page-today .today-nudge svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* ---------- your day so far ---------- */
+
+/* Phone says "Open day"; a wide screen says "Open history". */
+#page-today .today-link-wide {
+  display: none;
+}
+
+#page-today .today-chart-box {
+  position: relative;
+  margin-top: 4px;
+}
+
+#page-today .today-chart {
+  display: block;
+  width: 100%;
+  height: 120px;
+}
+
+#page-today .today-chart-axis {
+  stroke: var(--ink);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+#page-today .today-sold {
+  fill: var(--ink);
+  fill-opacity: 0.1;
+  stroke: var(--ink);
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+}
+
+#page-today .today-bought {
+  vector-effect: non-scaling-stroke;
+}
+
+#page-today .today-bought.is-free {
+  fill: var(--sun);
+  stroke: var(--sun-line);
+  stroke-width: 1;
+}
+
+#page-today .today-bought.is-shoulder {
+  fill: var(--bar);
+}
+
+#page-today .today-bought.is-peak {
+  fill: var(--peak);
+  stroke: var(--ink-2);
+  stroke-width: 1;
+}
+
+/* The hours still to come are dimmed, with a line at now. */
+#page-today .today-future {
+  fill: var(--card);
+  fill-opacity: 0.75;
+}
+
+#page-today .today-chart-now {
+  stroke: var(--ink);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+#page-today .today-chart-tag {
+  position: absolute;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+#page-today .today-chart-tag.is-top {
+  left: 0;
+  top: 0;
+}
+
+#page-today .today-chart-tag.is-bottom {
+  left: 0;
+  bottom: 0;
+}
+
+#page-today .today-chart-tag.is-now {
+  top: 0;
+  padding-left: 4px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+#page-today .today-ribbon {
+  margin-top: 8px;
+}
+
+#page-today .today-day-sum {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+#page-today .today-day-sum:empty {
+  display: none;
+}
+
+#page-today .today-sum-fig {
+  font-size: 18px;
+}
+
+#page-today .today-sum-note {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+/* ---------- coming up ---------- */
+
+#page-today .today-up {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+
+#page-today .today-up li {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+#page-today .today-up li:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+#page-today .today-up-when {
+  font-weight: 700;
+}
+
+/* ---------- evening credit ---------- */
+
+#page-today .today-streak {
+  margin: 8px 0 12px;
+  font-size: 28px;
+  font-weight: 800;
+  font-stretch: 118%;
+  letter-spacing: -0.02em;
+}
+
+#page-today .today-nights {
+  display: grid;
+  grid-template-columns: repeat(14, minmax(0, 1fr));
+  gap: 4px;
+}
+
+#page-today .today-night {
+  display: block;
+  height: 22px;
+  border-radius: 5px;
+  box-sizing: border-box;
+}
+
+#page-today .today-night.is-earned {
+  background: var(--credit);
+}
+
+#page-today .today-night.is-missed {
+  border: 1.5px dashed var(--missed);
+}
+
+#page-today .today-night.is-tonight {
+  border: 1.5px solid var(--credit);
+  background: repeating-linear-gradient(135deg, var(--credit-fill) 0 4px, var(--card) 4px 8px);
+}
+
+#page-today .today-night.is-unknown {
+  border: 1px solid var(--line);
+}
+
+#page-today .today-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+#page-today .today-legend li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#page-today .today-legend .today-night {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+}
+
+#page-today .today-miss {
+  margin-top: 10px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ink-2);
+}
+
+/* ---------- totals ---------- */
+
+#page-today .today-totals {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+#page-today .today-totals[hidden] {
+  display: none;
+}
+
+#page-today .today-tile {
+  background: var(--card);
+  border-radius: 16px;
+  padding: 12px 14px;
+  box-shadow: var(--shadow);
+}
+
+@media (min-width: 760px) {
+  #page-today .today-link-phone {
+    display: none;
+  }
+
+  #page-today .today-link-wide {
+    display: inline-flex;
+  }
+
+  #page-today .today-lede {
+    font-size: 18px;
+  }
+
+  #page-today .today-up li {
+    grid-template-columns: 110px minmax(0, 1fr);
+  }
+
+  #page-today .today-night {
+    height: 26px;
+  }
 }
