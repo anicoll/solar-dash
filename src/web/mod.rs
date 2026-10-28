@@ -5,6 +5,7 @@ mod admin;
 mod api;
 mod auth;
 mod battery;
+mod bill;
 mod costs;
 mod globird;
 mod payback;
@@ -341,6 +342,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily", get(api::daily))
         .route("/api/battery", get(battery::battery))
         .route("/api/costs", get(costs::costs))
+        .route("/api/bill/current", get(bill::current))
         .route("/api/tariff", get(costs::tariff))
         .route("/api/globird/compare", get(globird::compare))
         .route("/api/payback", get(payback::payback))
@@ -1352,7 +1354,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             body_json(response).await,
-            serde_json::json!({ "sample": null, "car": null })
+            serde_json::json!({
+                "sample": null,
+                "car": null,
+                "grid_pull": {
+                    "now_w": null, "peak_today_w": null, "peak_today_at": null,
+                    "warn_w": 12000, "limit_w": 15000, "volts": null,
+                }
+            })
         );
     }
 
@@ -2151,6 +2160,36 @@ mod tests {
             body_json(response).await,
             serde_json::json!({ "configured": false })
         );
+    }
+
+    #[tokio::test]
+    async fn current_bill_is_off_without_a_tariff() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/bill/current", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/bill/current", Some(&cookie))).await;
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "configured": false })
+        );
+    }
+
+    #[tokio::test]
+    async fn current_bill_has_a_period_and_a_projection() {
+        let (_dir, app, _pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/bill/current", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["period_source"], "month");
+        assert!(json["days_total"].as_i64().unwrap() >= 28);
+        let bands = json["so_far"]["bands"].as_array().unwrap();
+        let names: Vec<_> = bands.iter().map(|b| b["band"].as_str().unwrap()).collect();
+        assert_eq!(names, ["free", "shoulder", "peak"]);
+        assert_eq!(json["uses_globird_figures"], false);
+        assert!(json["projected_total_dollars"].is_number());
     }
 
     #[tokio::test]
@@ -3217,6 +3256,9 @@ mod tests {
         assert_eq!(earned["soc_at_16"], 60.0);
         assert_eq!(earned["soc_at_21"], 30.0);
         assert_eq!(earned["min_soc_in_window"], 30.0);
+        assert!(earned["soc_at_window_start"].is_number());
+        assert!(earned["soc_at_window_end"].is_number());
+        assert!(earned["window_soc_used_pct"].is_number());
         assert_eq!(earned["reason"], Value::Null);
 
         let missed = &days[2];
@@ -3232,6 +3274,7 @@ mod tests {
         assert_eq!(summary["missed_dollars"], 2.0);
         assert_eq!(summary["battery_floor_pct"], 30.0);
         assert_eq!(summary["avg_soc_at_11"], 60.0);
+        assert!(summary["typical_window_soc_used_pct"].is_number());
     }
 
     #[tokio::test]
@@ -3912,6 +3955,10 @@ mod tests {
             r#"{"price_rise_percent":-1}"#,
             r#"{"petrol_litres_per_100km":0}"#,
             r#"{"petrol_cents_per_litre":"lots"}"#,
+            // Warning at or above the default limit (15), or limit at or below the warning (12).
+            r#"{"grid_pull_warn_kw":15}"#,
+            r#"{"grid_pull_limit_kw":12}"#,
+            r#"{"grid_pull_warn_kw":0}"#,
             r#"{"away_cents_per_kwh":-4}"#,
             r#"{"compare_cars":{"Y":""}}"#,
             r#"{"compare_cars":["Y"]}"#,
@@ -3923,6 +3970,15 @@ mod tests {
         assert_eq!(count(&pool, "admin_change").await, changes);
         let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
         assert_eq!(body_json(response).await["petrol_grade"], "Premium 98");
+
+        // Both thresholds can move together, and /api/live reports them in W.
+        let (status, _) = put(r#"{"grid_pull_warn_kw":16,"grid_pull_limit_kw":18.5}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        let response = send(&app, get_request("/api/live", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["grid_pull"]["warn_w"], 16000);
+        assert_eq!(json["grid_pull"]["limit_w"], 18500);
+        put(r#"{"grid_pull_warn_kw":null,"grid_pull_limit_kw":null}"#).await;
 
         // null puts a key back to its default (and removes its row).
         let (status, json) = put(r#"{"petrol_grade":null,"petrol_cents_per_litre":null}"#).await;

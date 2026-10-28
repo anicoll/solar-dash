@@ -185,6 +185,9 @@ fn setting_defaults() -> Value {
         "compare_cars": d.compare_cars,
         "petrol_grade": d.petrol_grade,
         "price_rise_percent": d.price_rise_percent,
+        "bill_start_day": d.bill_start_day,
+        "grid_pull_warn_kw": d.grid_pull_warn_kw,
+        "grid_pull_limit_kw": d.grid_pull_limit_kw,
     })
 }
 

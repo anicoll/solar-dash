@@ -710,6 +710,9 @@
       petrol_litres_per_100km: input('number', { step: '0.1', min: '0', inputMode: 'decimal', value: shown('petrol_litres_per_100km') }),
       away_cents_per_kwh: input('number', { step: '0.1', min: '0', inputMode: 'decimal', value: shown('away_cents_per_kwh') }),
       price_rise_percent: input('number', { step: '0.1', min: '0', max: '20', inputMode: 'decimal', value: shown('price_rise_percent') }),
+      bill_start_day: input('number', { step: '1', min: '1', max: '28', inputMode: 'numeric', value: shown('bill_start_day') }),
+      grid_pull_warn_kw: input('number', { step: '0.1', min: '0', inputMode: 'decimal', value: shown('grid_pull_warn_kw') }),
+      grid_pull_limit_kw: input('number', { step: '0.1', min: '0', inputMode: 'decimal', value: shown('grid_pull_limit_kw') }),
       petrol_grade: input('text', { value: shown('petrol_grade'), autocomplete: 'off' }),
     };
     const cars = document.createElement('textarea');
@@ -723,13 +726,16 @@
         field('Petrol car use (L per 100 km)', fields.petrol_litres_per_100km, hint('petrol_litres_per_100km')),
         field('Charging away from home (c/kWh)', fields.away_cents_per_kwh, hint('away_cents_per_kwh')),
         field('Yearly price rise in the Payback forecast (%, 0 to 20)', fields.price_rise_percent, hint('price_rise_percent')),
+        field('Bill period starts on day of month (1 to 28)', fields.bill_start_day, 'Default: worked out from the last bill, else the calendar month. Leave empty for the default.'),
+        field('Grid pull warning (kW, below the limit)', fields.grid_pull_warn_kw, hint('grid_pull_warn_kw')),
+        field('Grid pull limit (kW, house main breaker is 63 A)', fields.grid_pull_limit_kw, hint('grid_pull_limit_kw')),
         field('Petrol grade', fields.petrol_grade, hint('petrol_grade')),
         field('Petrol car to compare with each car', cars, 'One per line, "Tesla model = petrol car". Leave empty for none.'),
       ],
       'Save settings',
       async () => {
         const payload = {};
-        for (const key of ['petrol_cents_per_litre', 'petrol_litres_per_100km', 'away_cents_per_kwh', 'price_rise_percent']) {
+        for (const key of ['petrol_cents_per_litre', 'petrol_litres_per_100km', 'away_cents_per_kwh', 'price_rise_percent', 'bill_start_day', 'grid_pull_warn_kw', 'grid_pull_limit_kw']) {
           payload[key] = numOrNull(fields[key].value);
         }
         payload.petrol_grade = fields.petrol_grade.value.trim() || null;
