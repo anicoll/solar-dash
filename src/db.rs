@@ -361,6 +361,25 @@ pub async fn latest_live_sample(pool: &SqlitePool) -> Result<Option<Sample>> {
     .context("could not read latest live sample")
 }
 
+/// The highest grid import (W) among the live samples from `since` on, as
+/// `(ts, import_w)`, or `None` if nothing was imported in that time.
+///
+/// `live_sample` is keyed by `ts`, so this is a range scan over one day of
+/// rows (about 5,800 at one sample per 15 s), which SQLite does in about a
+/// millisecond. That is cheap enough to run on every `/api/live` poll, and
+/// unlike a running maximum kept in memory it survives a restart.
+pub async fn peak_grid_import(pool: &SqlitePool, since: i64) -> Result<Option<(i64, f64)>> {
+    sqlx::query_as(
+        "SELECT ts, grid_w FROM live_sample
+         WHERE ts >= ? AND grid_w > 0
+         ORDER BY grid_w DESC, ts LIMIT 1",
+    )
+    .bind(since)
+    .fetch_optional(pool)
+    .await
+    .context("could not read the peak grid import")
+}
+
 /// Saves the inverter's lifetime grid totals (Wh) as read at `ts`. A second
 /// row with the same second replaces the first.
 pub async fn insert_grid_meter(
@@ -1683,6 +1702,33 @@ mod tests {
             battery_w: Some(200.0),
             soc_pct: Some(43.4),
         }
+    }
+
+    #[tokio::test]
+    async fn peak_grid_import_is_the_highest_import_since_a_time() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(peak_grid_import(&pool, 0).await.unwrap(), None);
+
+        let grid = |ts, grid_w| Sample {
+            grid_w,
+            ..sample(ts, 0.0)
+        };
+        for s in [
+            grid(100, Some(20_000.0)), // before `since`
+            grid(200, Some(9_000.0)),
+            grid(215, Some(14_600.0)),
+            grid(230, Some(14_600.0)), // a tie keeps the earlier time
+            grid(245, Some(-5_000.0)), // exporting is never the peak
+            grid(260, None),
+        ] {
+            insert_live_sample(&pool, &s).await.unwrap();
+        }
+        assert_eq!(
+            peak_grid_import(&pool, 150).await.unwrap(),
+            Some((215, 14_600.0))
+        );
+        // Only exporting since then: no peak.
+        assert_eq!(peak_grid_import(&pool, 240).await.unwrap(), None);
     }
 
     #[tokio::test]
