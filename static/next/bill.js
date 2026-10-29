@@ -182,35 +182,92 @@
     return button;
   }
 
-  /** Bars of (our estimate minus GloBird's) for each checked day. */
+  /** A rounded top for the gap scale: 20c, 50c, $1, $2, $5 ... */
+  function niceGap(v) {
+    for (const step of [0.2, 0.5, 1, 2, 5, 10, 20, 50]) if (v <= step) return step;
+    return Math.ceil(v / 50) * 50;
+  }
+
+  const signed = (v) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${SD.fmt.dollars(Math.abs(v))}`;
+
+  /** The hover/tap details for one day: both totals, then where they differ. */
+  function dayDetail(d) {
+    const g = d.globird;
+    const o = d.ours;
+    const out = [
+      h('b', { text: SD.fmt.date(d.date, 'medium') }),
+      h('span', { text: `Our estimate ${SD.fmt.dollars(o.total)}, GloBird ${SD.fmt.dollars(g.total)}` }),
+      h('span', { text: `Gap ${signed(d.diff.total)}` }),
+    ];
+    const parts = [
+      ['Power bought', o.import - g.import, d.diff.import_kwh],
+      ['Feed-in', o.export - g.export, d.diff.export_kwh],
+      ['Supply', o.supply - g.supply, null],
+      ['Evening credit', o.credit - g.credit, null],
+      ['Charges we do not price', -g.other, null],
+    ];
+    for (const [name, gap, kwh] of parts) {
+      if (Math.abs(gap) < 0.005) continue;
+      const k = kwh != null && Math.abs(kwh) >= 0.05 ? ` (${kwh > 0 ? '+' : '−'}${SD.fmt.kwh(Math.abs(kwh))})` : '';
+      out.push(h('span', { class: 'bill-tip-part', text: `${name} ${signed(gap)}${k}` }));
+    }
+    return out;
+  }
+
+  /** Bars of (our estimate minus GloBird's) for each checked day, on a dollar scale. */
   function renderCheckCard(check) {
     const rows = check.rows;
-    const W = 300;
-    const H = 100;
-    const max = Math.max(DAY_CLOSE * 2, ...rows.map((d) => Math.abs(d.diff.total)));
-    const half = 46;
-    const mid = H / 2;
-    const slot = W / rows.length;
-    const barW = Math.max(1.5, Math.min(14, slot * 0.7));
+    const top = niceGap(Math.max(DAY_CLOSE * 2, ...rows.map((d) => Math.abs(d.diff.total))) * 1.15); // room for the labels
+    const pct = (v) => `${Math.min(100, (Math.abs(v) / top) * 100).toFixed(1)}%`;
     const biggest = rows.reduce((a, d) => (Math.abs(d.diff.total) > Math.abs(a.diff.total) ? d : a), rows[0]);
-    const label = `Daily difference between our estimate and GloBird's bill for ${plural(rows.length, 'day', 'days')}. `
-      + `The biggest gap was ${SD.fmt.dollars(Math.abs(biggest.diff.total))} ${biggest.diff.total < 0 ? 'under' : 'over'} on ${SD.fmt.date(biggest.date, 'short')}.`;
+    // Label every bar while they fit (a week); on a longer bill only the biggest gap.
+    const dayEvery = rows.length <= 14 ? 1 : rows.length <= 21 ? 2 : 5;
 
-    const chart = svg('svg', { class: 'bill-check-svg', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': label });
-    const bandH = (DAY_CLOSE / max) * half;
-    chart.append(svg('rect', { x: 0, y: mid - bandH, width: W, height: bandH * 2, class: 'bill-check-band' }));
+    const tip = h('div', { class: 'bill-tip', hidden: true, role: 'status' });
+    const plot = h('div', { class: 'bill-check-plot' });
+    let active = null;
+    function show(col, d) {
+      if (active) active.classList.remove('is-active');
+      active = col;
+      col.classList.add('is-active');
+      tip.replaceChildren(...dayDetail(d));
+      tip.hidden = false;
+      const box = plot.getBoundingClientRect();
+      const c = col.getBoundingClientRect();
+      const w = tip.offsetWidth;
+      tip.style.left = `${Math.max(0, Math.min(box.width - w, c.left - box.left + c.width / 2 - w / 2))}px`;
+    }
+    function hide() {
+      if (active) active.classList.remove('is-active');
+      active = null;
+      tip.hidden = true;
+    }
+
     rows.forEach((d, i) => {
       const v = d.diff.total;
-      const hgt = Math.max(1, (Math.abs(v) / max) * half);
-      const bar = svg('rect', {
-        x: i * slot + (slot - barW) / 2, y: v >= 0 ? mid - hgt : mid, width: barW, height: hgt,
-        class: Math.abs(v) <= DAY_CLOSE ? 'bill-check-bar is-close' : 'bill-check-bar',
-      });
-      bar.append(svg('title'));
-      bar.firstChild.textContent = `${SD.fmt.date(d.date, 'short')}: ${v > 0 ? '+' : ''}${SD.fmt.dollars(v)}`;
-      chart.append(bar);
+      const close = Math.abs(v) <= DAY_CLOSE;
+      const said = `${SD.fmt.date(d.date, 'medium')}: our estimate ${signed(v)} against GloBird`;
+      const bar = h('span', { class: `bill-check-bar${close ? ' is-close' : ''}`, style: `height: ${pct(v)}` });
+      const value = rows.length <= 7 || d === biggest ? h('span', { class: 'bill-check-value', text: signed(v).replace('.00', '') }) : null;
+      const col = h('button', {
+        type: 'button', class: `bill-check-col ${v < 0 ? 'is-under' : 'is-over'}`, 'aria-label': said,
+        onmouseenter: () => show(col, d),
+        onfocus: () => show(col, d),
+        onclick: () => (active === col ? hide() : show(col, d)),
+      },
+        h('span', { class: 'bill-check-up' }, v >= 0 ? value : null, v >= 0 ? bar : null),
+        h('span', { class: 'bill-check-down' }, v < 0 ? bar : null, v < 0 ? value : null),
+        h('span', { class: 'bill-check-day', text: i % dayEvery === 0 || i === rows.length - 1 ? String(+d.date.slice(8)) : '' }));
+      plot.append(col);
     });
-    chart.append(svg('line', { x1: 0, y1: mid, x2: W, y2: mid, class: 'bill-check-zero', 'vector-effect': 'non-scaling-stroke' }));
+    plot.addEventListener('mouseleave', hide);
+    plot.addEventListener('focusout', (e) => { if (!plot.contains(e.relatedTarget)) hide(); });
+
+    const scale = h('div', { class: 'bill-check-scale', 'aria-hidden': 'true' },
+      h('span', { text: `+${SD.fmt.dollars(top)}` }),
+      h('span', { text: '$0' }),
+      h('span', { text: `−${SD.fmt.dollars(top)}` }));
+    const band = h('div', { class: 'bill-check-band', 'aria-hidden': 'true', style: `height: ${((DAY_CLOSE / top) * 100).toFixed(1)}%` });
 
     const far = rows.filter((d) => Math.abs(d.diff.total) > DAY_CLOSE).length;
     const summary = far === 0
@@ -219,14 +276,14 @@
 
     return h('section', { class: 'card bill-check-card', id: 'bill-check-card', 'aria-labelledby': 'bill-check-h' },
       h('div', { class: 'card-head bill-wrap' },
-        h('h2', { class: 'section-title', id: 'bill-check-h', text: 'Bill check, day by day' }),
-        h('span', { class: 'label', text: "Our estimate minus GloBird's meter" })),
-      chart,
-      h('div', { class: 'bill-axis' },
-        h('span', { text: SD.fmt.date(rows[0].date, 'short') }),
-        h('span', { text: SD.fmt.date(rows[rows.length - 1].date, 'short') })),
-      h('p', { class: 'bill-note', text: summary }),
-      h('p', { class: 'label', text: `The shaded band is within ${SD.fmt.cents(DAY_CLOSE * 100)}.` }));
+        h('h2', { class: 'section-title', id: 'bill-check-h', text: 'Bill check, day by day' })),
+      h('p', { class: 'bill-check-key' },
+        'Each bar is one day: our estimate minus what GloBird charged. Above the line we estimated more, below it less. ',
+        h('span', { class: 'bill-check-key-band' }), ` Within ${SD.fmt.cents(DAY_CLOSE * 100)}.`),
+      h('div', { class: 'bill-check-chart' }, scale,
+        h('div', { class: 'bill-check-area' }, band, h('div', { class: 'bill-check-zero', 'aria-hidden': 'true' }), plot, tip)),
+      h('p', { class: 'bill-check-month', 'aria-hidden': 'true', text: `${SD.fmt.date(rows[0].date, 'short')} to ${SD.fmt.date(rows[rows.length - 1].date, 'short')} · tap or hover a day for its details` }),
+      h('p', { class: 'bill-note', text: summary }));
   }
 
   /* ---------------------------------------------------------------- 3. lines like the GloBird bill */
