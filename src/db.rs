@@ -1373,6 +1373,8 @@ pub struct ManualCar {
     pub kind: String,
     /// Unix seconds, UTC.
     pub created_at: i64,
+    /// The local day the car was bought, YYYY-MM-DD, when set.
+    pub owned_since: Option<String>,
 }
 
 /// One petrol fill, as stored in `fuel_fill`.
@@ -1392,10 +1394,22 @@ pub struct FuelFill {
 
 /// Every manual car, by id.
 pub async fn manual_cars(pool: &SqlitePool) -> Result<Vec<ManualCar>> {
-    sqlx::query_as("SELECT id, name, model, kind, created_at FROM manual_car ORDER BY id")
+    sqlx::query_as(
+        "SELECT id, name, model, kind, created_at, owned_since FROM manual_car ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("could not read the manual cars")
+}
+
+/// The day each TeslaMate car was bought (YYYY-MM-DD), by car id. Cars with no
+/// date set are missing.
+pub async fn tm_car_owned(pool: &SqlitePool) -> Result<HashMap<i64, String>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as("SELECT car_id, owned_since FROM tm_car_owned")
         .fetch_all(pool)
         .await
-        .context("could not read the manual cars")
+        .context("could not read when the TeslaMate cars were bought")?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Every fill of every manual car, by car and then oldest first.
@@ -1447,12 +1461,13 @@ mod tests {
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
              ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session',
               'ev_odometer_daily', 'globird_cost', 'globird_usage', 'globird_interval',
-              'tm_car', 'tm_drive_daily', 'tm_charge', 'manual_car', 'fuel_fill')",
+              'tm_car', 'tm_drive_daily', 'tm_charge', 'manual_car', 'fuel_fill',
+              'tm_car_owned')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 15);
+        assert_eq!(tables.len(), 16);
     }
 
     #[tokio::test]
@@ -2453,6 +2468,7 @@ mod tests {
             ("A", "phev")
         );
         assert_eq!((cars.len(), &cars[0].model), (2, &None));
+        assert_eq!(cars[0].owned_since, None);
 
         // By car, then oldest first; a fill is a full tank unless said otherwise.
         let fills = fuel_fills(&pool).await.unwrap();
@@ -2470,5 +2486,18 @@ mod tests {
         let left = fuel_fills(&pool).await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].car_id, 2);
+    }
+
+    #[tokio::test]
+    async fn tm_car_owned_is_read_by_car_id() {
+        let (_dir, pool) = test_db().await;
+        assert!(tm_car_owned(&pool).await.unwrap().is_empty());
+        sqlx::query("INSERT INTO tm_car_owned (car_id, owned_since) VALUES (2, '2025-03-04')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let owned = tm_car_owned(&pool).await.unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[&2], "2025-03-04");
     }
 }

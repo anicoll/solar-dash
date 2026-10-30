@@ -384,3 +384,7 @@
 #page-admin .adm-body > .adm-sub {
   margin-top: 20px;
 }
+
+#page-admin .adm-row-stack > .adm-form {
+  flex: 1 1 100%;
+}

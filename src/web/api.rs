@@ -559,11 +559,14 @@ pub async fn ev_summary(
 /// costed yet are counted in `pending_sessions` and left out of the money.
 /// `label` is "Model <model>", else the car's name, else "Car <id>", with the
 /// name added when two cars would share a label. Cars with no drives and no
-/// charges are left out.
+/// charges are left out. Each car also has `owned_since`, the day it was
+/// bought (YYYY-MM-DD) as set on the Admin page, or null; TeslaMate has no
+/// purchase date.
 pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
     let data = state.admin.get();
     let prices = data.ev_prices;
     let petrol = &data.petrol;
+    let owned = db::tm_car_owned(&state.pool).await?;
     let mut cars = Vec::new();
     for car in db::tm_cars(&state.pool).await? {
         let days: Vec<ev_cost::CarDay> = db::tm_drive_days(&state.pool, car.id)
@@ -616,6 +619,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
                 "name": car.name,
                 "model": car.model,
                 "label": label,
+                "owned_since": owned.get(&car.id),
                 "first_day": history.first_day,
                 "last_day": history.last_day,
                 "total": history.total,
