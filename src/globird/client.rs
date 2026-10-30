@@ -15,9 +15,9 @@ use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use reqwest::cookie::Jar;
 use reqwest::header::{ACCEPT, ORIGIN, REFERER, SET_COOKIE};
 use reqwest::{Method, RequestBuilder, StatusCode, Url};
+use rsa::sha2::Sha256;
 use rsa::{BigUint, Oaep, RsaPublicKey};
 use serde_json::{Value, json};
-use sha2::Sha256;
 use tracing::{debug, info};
 
 use crate::config::Globird;
