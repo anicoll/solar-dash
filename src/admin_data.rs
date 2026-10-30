@@ -399,10 +399,23 @@ where
     let shared = state.admin();
     let _one_at_a_time = shared.writing.lock().await;
     let mut tx = state.pool().begin().await.map_err(anyhow::Error::from)?;
-    change(&mut tx).await?;
-    let data = AdminData::load(&mut tx)
-        .await
-        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    let checked = match change(&mut tx).await {
+        Ok(()) => AdminData::load(&mut tx)
+            .await
+            .map_err(|err| ApiError::bad_request(format!("{err:#}"))),
+        Err(err) => Err(err),
+    };
+    let data = match checked {
+        Ok(data) => data,
+        Err(err) => {
+            // Roll back now. A dropped transaction only queues its rollback
+            // for the connection's next use, so an idle connection could keep
+            // the write lock and the next write would fail with "database is
+            // locked".
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
     tx.commit().await.map_err(anyhow::Error::from)?;
     shared.set(data);
     Ok(())
