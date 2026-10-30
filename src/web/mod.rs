@@ -341,6 +341,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/admin/cars/{id}/fills", post(admin::fill_create))
         .route(
+            "/api/admin/teslamate-cars/{id}/owned-since",
+            put(admin::teslamate_car_owned_since),
+        )
+        .route(
             "/api/admin/fills/{id}",
             put(admin::fill_update).delete(admin::fill_delete),
         )
@@ -3393,6 +3397,7 @@ mod tests {
             ("PUT", "/api/admin/cars/1"),
             ("DELETE", "/api/admin/cars/1"),
             ("POST", "/api/admin/cars/1/fills"),
+            ("PUT", "/api/admin/teslamate-cars/1/owned-since"),
             ("PUT", "/api/admin/fills/1"),
             ("DELETE", "/api/admin/fills/1"),
             ("PUT", "/api/admin/bills"),
@@ -4210,6 +4215,192 @@ mod tests {
         let (status, _) = admin_send(&app, "DELETE", "/api/admin/bills/March", &cookie, "").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(count(&pool, "bill").await, 0);
+    }
+
+    #[tokio::test]
+    async fn manual_cars_keep_an_owned_since_date() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+        let cars = "/api/admin/cars";
+
+        let (status, car) = admin_send(
+            &app,
+            "POST",
+            cars,
+            &cookie,
+            r#"{"name":"PHEV","owned_since":"2024-05-06"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(car["owned_since"], "2024-05-06");
+        let id = car["id"].as_i64().unwrap();
+        let uri = format!("/api/admin/cars/{id}");
+
+        // A car with no date says null.
+        let (_, plain) = admin_send(&app, "POST", cars, &cookie, r#"{"name":"Plain"}"#).await;
+        assert_eq!(plain["owned_since"], Value::Null);
+
+        let changes = count(&pool, "admin_change").await;
+        for bad in [
+            r#"{"name":"PHEV","owned_since":"last year"}"#,
+            r#"{"name":"PHEV","owned_since":"2024-02-30"}"#,
+            r#"{"name":"PHEV","owned_since":"2999-01-01"}"#,
+            r#"{"name":"PHEV","owned_since":5}"#,
+        ] {
+            let (status, json) = admin_send(&app, "POST", cars, &cookie, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(json["error"].is_string(), "{bad}");
+            let (status, _) = admin_send(&app, "PUT", &uri, &cookie, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert_eq!(count(&pool, "admin_change").await, changes);
+        assert_eq!(count(&pool, "manual_car").await, 2);
+
+        // Changed, and listed by the admin and fuel reads.
+        let (status, json) = admin_send(
+            &app,
+            "PUT",
+            &uri,
+            &cookie,
+            r#"{"name":"PHEV","owned_since":"2023-01-02"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["owned_since"], "2023-01-02");
+        let json = body_json(send(&app, get_request("/api/admin", Some(&cookie))).await).await;
+        assert_eq!(json["manual_cars"][0]["owned_since"], "2023-01-02");
+        assert_eq!(json["manual_cars"][1]["owned_since"], Value::Null);
+        let json = body_json(send(&app, get_request("/api/fuel/cars", Some(&cookie))).await).await;
+        assert_eq!(json["cars"][0]["owned_since"], "2023-01-02");
+        assert_eq!(json["cars"][1]["owned_since"], Value::Null);
+
+        // The change log has the before and after.
+        let (before, after): (String, String) = sqlx::query_as(
+            "SELECT before, after FROM admin_change WHERE what = 'cars' AND action = 'update'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(before.contains("2024-05-06"), "{before}");
+        assert!(after.contains("2023-01-02"), "{after}");
+
+        // A PUT without it (or with null) clears it.
+        let (status, json) = admin_send(&app, "PUT", &uri, &cookie, r#"{"name":"PHEV"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["owned_since"], Value::Null);
+        let (_, json) = admin_send(
+            &app,
+            "PUT",
+            &uri,
+            &cookie,
+            r#"{"name":"PHEV","owned_since":"2023-01-02"}"#,
+        )
+        .await;
+        assert_eq!(json["owned_since"], "2023-01-02");
+        let (_, json) = admin_send(
+            &app,
+            "PUT",
+            &uri,
+            &cookie,
+            r#"{"name":"PHEV","owned_since":null}"#,
+        )
+        .await;
+        assert_eq!(json["owned_since"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn teslamate_cars_keep_an_owned_since_date() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+        db::upsert_tm_cars(
+            &pool,
+            &[db::TmCar {
+                id: 7,
+                name: Some("Daily".to_string()),
+                model: Some("Y".to_string()),
+                ..db::TmCar::default()
+            }],
+            1,
+        )
+        .await
+        .unwrap();
+        db::upsert_tm_drive_days(
+            &pool,
+            &[db::TmDriveDay {
+                car_id: 7,
+                date: "2026-09-05".to_string(),
+                km: 10.0,
+                drives: 1,
+            }],
+        )
+        .await
+        .unwrap();
+        let uri = "/api/admin/teslamate-cars/7/owned-since";
+        let owned = || async {
+            let json =
+                body_json(send(&app, get_request("/api/ev/cars", Some(&cookie))).await).await;
+            json["cars"][0]["owned_since"].clone()
+        };
+        assert_eq!(owned().await, Value::Null);
+
+        let (status, json) =
+            admin_send(&app, "PUT", uri, &cookie, r#"{"owned_since":"2025-03-04"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::json!({"car_id":7,"owned_since":"2025-03-04"})
+        );
+        assert_eq!(owned().await, "2025-03-04");
+
+        // A TeslaMate sync does not lose it.
+        db::upsert_tm_cars(
+            &pool,
+            &[db::TmCar {
+                id: 7,
+                name: Some("Renamed".to_string()),
+                ..db::TmCar::default()
+            }],
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(owned().await, "2025-03-04");
+
+        // Changing it replaces the row.
+        let (status, _) =
+            admin_send(&app, "PUT", uri, &cookie, r#"{"owned_since":"2025-04-05"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owned().await, "2025-04-05");
+        assert_eq!(count(&pool, "tm_car_owned").await, 1);
+
+        let changes = count(&pool, "admin_change").await;
+        for bad in [
+            r#"{"owned_since":"soon"}"#,
+            r#"{"owned_since":"2999-01-01"}"#,
+            r#"{"owned_since":7}"#,
+            r#"{}"#,
+            "not json",
+        ] {
+            let (status, json) = admin_send(&app, "PUT", uri, &cookie, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(json["error"].is_string(), "{bad}");
+        }
+        assert_eq!(count(&pool, "admin_change").await, changes);
+        assert_eq!(owned().await, "2025-04-05");
+
+        let (status, json) = admin_send(&app, "PUT", uri, &cookie, r#"{"owned_since":null}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!({"car_id":7,"owned_since":null}));
+        assert_eq!(owned().await, Value::Null);
+        assert_eq!(count(&pool, "tm_car_owned").await, 0);
+        let actions: Vec<(String,)> = sqlx::query_as(
+            "SELECT action FROM admin_change WHERE what = 'teslamate_cars' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actions.len(), 3);
     }
 
     #[tokio::test]

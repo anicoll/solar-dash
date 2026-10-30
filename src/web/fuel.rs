@@ -15,8 +15,9 @@ use crate::fuel_log;
 
 /// `GET /api/fuel/cars`: every manual car, oldest first, even with no fills:
 /// `{"cars":[{"car_id","source":"manual","name","model","kind","label",
-/// "totals":{..},"l_per_100km","cost_per_km","months":[..],"fills":[..]}]}`.
-/// `label` is the model, else the name. `fills` has the newest first, each
+/// "owned_since","totals":{..},"l_per_100km","cost_per_km","months":[..],
+/// "fills":[..]}]}`. `label` is the model, else the name. `owned_since` is the
+/// day the car was bought (YYYY-MM-DD), or null. `fills` has the newest first, each
 /// with the price paid, the fuel economy of the full-to-full stretch that
 /// ends there, the km since the last odometer reading and the month's
 /// average petrol price (`avg_cents_per_litre`).
@@ -66,6 +67,7 @@ pub async fn cars(State(state): State<AppState>) -> ApiResult {
             "model": car.model,
             "kind": car.kind,
             "label": label,
+            "owned_since": car.owned_since,
             "totals": summary.totals,
             "l_per_100km": summary.l_per_100km,
             "cost_per_km": summary.cost_per_km,

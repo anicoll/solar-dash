@@ -678,6 +678,7 @@ fn car_json(car: &db::ManualCar) -> Value {
         "name": car.name,
         "model": car.model,
         "kind": car.kind,
+        "owned_since": car.owned_since,
     })
 }
 
@@ -694,10 +695,13 @@ fn fill_json(fill: &db::FuelFill) -> Value {
     })
 }
 
+/// A manual car with its fill count: id, name, model, kind, owned since, fills.
+type CarListRow = (i64, String, Option<String>, String, Option<String>, i64);
+
 /// The manual cars for `GET /api/admin`, each with how many fills it has.
 async fn cars_json(conn: &mut SqliteConnection) -> Result<Vec<Value>, ApiError> {
-    let rows: Vec<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
-        "SELECT c.id, c.name, c.model, c.kind, \
+    let rows: Vec<CarListRow> = sqlx::query_as(
+        "SELECT c.id, c.name, c.model, c.kind, c.owned_since, \
          (SELECT COUNT(*) FROM fuel_fill f WHERE f.car_id = c.id) \
          FROM manual_car c ORDER BY c.id",
     )
@@ -706,18 +710,23 @@ async fn cars_json(conn: &mut SqliteConnection) -> Result<Vec<Value>, ApiError> 
     .map_err(db_error)?;
     Ok(rows
         .into_iter()
-        .map(|(id, name, model, kind, fills)| {
-            json!({ "id": id, "name": name, "model": model, "kind": kind, "fills": fills })
+        .map(|(id, name, model, kind, owned_since, fills)| {
+            json!({
+                "id": id, "name": name, "model": model, "kind": kind,
+                "owned_since": owned_since, "fills": fills,
+            })
         })
         .collect())
 }
 
 async fn car_row(conn: &mut SqliteConnection, id: i64) -> Result<Option<db::ManualCar>, ApiError> {
-    sqlx::query_as("SELECT id, name, model, kind, created_at FROM manual_car WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(db_error)
+    sqlx::query_as(
+        "SELECT id, name, model, kind, created_at, owned_since FROM manual_car WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db_error)
 }
 
 async fn fills_of_car(
@@ -746,8 +755,10 @@ async fn fill_row(conn: &mut SqliteConnection, id: i64) -> Result<Option<db::Fue
 }
 
 /// The body of `POST` and `PUT` on a manual car:
-/// `{"name":..,"model":..,"kind":"phev"}`. `model` is optional; `kind` is
-/// optional too (a new car is a `phev`, an update keeps the kind it has).
+/// `{"name":..,"model":..,"kind":"phev","owned_since":"YYYY-MM-DD"}`. `model`
+/// is optional; `kind` is optional too (a new car is a `phev`, an update keeps
+/// the kind it has). `owned_since` is optional and may be null: a `PUT` that
+/// leaves it out or null clears the date.
 #[derive(Deserialize)]
 pub struct CarBody {
     name: String,
@@ -755,14 +766,32 @@ pub struct CarBody {
     model: Option<String>,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
+    owned_since: Option<String>,
 }
 
-/// A car's checked fields: name, model and kind.
-type CheckedCar = (String, Option<String>, String);
+/// A car's checked fields: name, model, kind and the day it was bought.
+type CheckedCar = (String, Option<String>, String, Option<String>);
+
+/// Checks the day a car was bought: a valid YYYY-MM-DD, not after `today` (the
+/// local day). Gives the date as stored.
+fn checked_owned_since(date: &str, today: NaiveDate) -> Result<String, ApiError> {
+    let date = parse_date(date).map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    if date > today {
+        return Err(ApiError::bad_request(format!(
+            "the date {date} is in the future"
+        )));
+    }
+    Ok(date.to_string())
+}
 
 /// Checks the car and tidies the text. `default_kind` is used when the body
 /// has none.
-fn checked_car(body: CarBody, default_kind: &str) -> Result<CheckedCar, ApiError> {
+fn checked_car(
+    body: CarBody,
+    default_kind: &str,
+    today: NaiveDate,
+) -> Result<CheckedCar, ApiError> {
     let name = body.name.trim().to_string();
     if name.is_empty() {
         return Err(ApiError::bad_request("the car needs a name"));
@@ -778,7 +807,11 @@ fn checked_car(body: CarBody, default_kind: &str) -> Result<CheckedCar, ApiError
             CAR_KINDS.join(", ")
         )));
     }
-    Ok((name, model, kind))
+    let owned_since = body
+        .owned_since
+        .map(|date| checked_owned_since(&date, today))
+        .transpose()?;
+    Ok((name, model, kind, owned_since))
 }
 
 /// `POST /api/admin/cars`: adds a manual car and answers with it (201).
@@ -786,15 +819,17 @@ pub async fn car_create(
     State(state): State<AppState>,
     car: Result<Json<CarBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let (name, model, kind) = checked_car(body(car)?, "phev")?;
+    let (name, model, kind, owned_since) = checked_car(body(car)?, "phev", today(state.tz()))?;
     let mut created = Value::Null;
     admin_data::write(&state, async |tx| {
         let result = sqlx::query(
-            "INSERT INTO manual_car (name, model, kind, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO manual_car (name, model, kind, owned_since, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&name)
         .bind(&model)
         .bind(&kind)
+        .bind(&owned_since)
         .bind(db::now())
         .execute(&mut *tx)
         .await
@@ -832,23 +867,30 @@ pub async fn car_update(
         let Some(before) = car_row(tx, id).await? else {
             return Err(not_found("car", id));
         };
-        let (name, model, kind) = checked_car(
+        let (name, model, kind, owned_since) = checked_car(
             CarBody {
                 name: car.name.clone(),
                 model: car.model.clone(),
                 kind: car.kind.clone(),
+                owned_since: car.owned_since.clone(),
             },
             &before.kind,
+            today(state.tz()),
         )?;
-        sqlx::query("UPDATE manual_car SET name = ?, model = ?, kind = ? WHERE id = ?")
-            .bind(&name)
-            .bind(&model)
-            .bind(&kind)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_error)?;
-        updated = json!({ "id": id, "name": name, "model": model, "kind": kind });
+        sqlx::query(
+            "UPDATE manual_car SET name = ?, model = ?, kind = ?, owned_since = ? WHERE id = ?",
+        )
+        .bind(&name)
+        .bind(&model)
+        .bind(&kind)
+        .bind(&owned_since)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        updated = json!({
+            "id": id, "name": name, "model": model, "kind": kind, "owned_since": owned_since,
+        });
         let key = id.to_string();
         log_change(
             tx,
@@ -863,6 +905,74 @@ pub async fn car_update(
     })
     .await?;
     Ok(Json(updated))
+}
+
+/// The body of `PUT /api/admin/teslamate-cars/{id}/owned-since`:
+/// `{"owned_since":"YYYY-MM-DD"}`, or null to clear the date.
+#[derive(Deserialize)]
+pub struct OwnedSinceBody {
+    // No `default`: leaving the key out is an error, only null clears.
+    #[serde(deserialize_with = "Option::deserialize")]
+    owned_since: Option<String>,
+}
+
+/// `PUT /api/admin/teslamate-cars/{id}/owned-since`: sets the day a TeslaMate
+/// car was bought, or clears it with null. Answers
+/// `{"car_id":id,"owned_since":"YYYY-MM-DD"|null}`. TeslaMate has no purchase
+/// date, so it is kept in `tm_car_owned`, which the sync leaves alone. The id
+/// is not checked against `tm_car` (the sync may not have run yet).
+pub async fn teslamate_car_owned_since(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    owned: Result<Json<OwnedSinceBody>, JsonRejection>,
+) -> ApiResult {
+    let owned_since = body(owned)?
+        .owned_since
+        .map(|date| checked_owned_since(&date, today(state.tz())))
+        .transpose()?;
+    let answer = json!({ "car_id": id, "owned_since": owned_since });
+    admin_data::write(&state, async |tx| {
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT owned_since FROM tm_car_owned WHERE car_id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        match &owned_since {
+            Some(date) => {
+                sqlx::query(
+                    "INSERT INTO tm_car_owned (car_id, owned_since) VALUES (?, ?) \
+                     ON CONFLICT(car_id) DO UPDATE SET owned_since = excluded.owned_since",
+                )
+                .bind(id)
+                .bind(date)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_error)?;
+            }
+            None => {
+                sqlx::query("DELETE FROM tm_car_owned WHERE car_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_error)?;
+            }
+        }
+        let key = id.to_string();
+        let before = json!({ "car_id": id, "owned_since": before });
+        log_change(
+            tx,
+            "teslamate_cars",
+            "update",
+            Some(&key),
+            Some(&before),
+            Some(&answer),
+        )
+        .await?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(answer))
 }
 
 /// `DELETE /api/admin/cars/{id}`: removes a manual car and its fills. Answers
