@@ -10,6 +10,7 @@
      POST   /api/admin/tariffs/preview             PUT /api/admin/bills (text/csv), DELETE /api/admin/bills/DATE
      POST/PUT/DELETE /api/admin/purchases[/id]     PUT /api/petrol-prices, DELETE /api/petrol-prices/DATE
      POST/PUT/DELETE /api/admin/cars[/id]          (manual cars; their fills are on the Cars page)
+     PUT    /api/admin/teslamate-cars/ID/owned-since   (the date a TeslaMate car was bought; null clears it)
      GET    /api/admin/backup, /api/admin/backup/download, /api/admin?download=1 */
 (function () {
   'use strict';
@@ -635,11 +636,14 @@
 
   const CAR_KINDS = [['phev', 'Plug-in hybrid'], ['petrol', 'Petrol'], ['hybrid', 'Hybrid'], ['diesel', 'Diesel']];
 
+  /** A plain date with its year, like "27 Jun 2026"; SD.fmt.date leaves the year out. */
+  const dayText = (d) => fmtDay.format(new Date(`${d}T00:00:00Z`));
+
   function sourceBadge(source) {
     return h('span', { class: 'src-badge', text: source === 'manual' ? 'Manual' : 'TeslaMate' });
   }
 
-  /** The TeslaMate cars are read-only; the manual cars (no TeslaMate) can be added, renamed and deleted. */
+  /** The TeslaMate cars only get an owned-since date; the manual cars (no TeslaMate) can be added, edited and deleted. */
   async function drawCars() {
     const box = boxes.cars;
     let tesla = [];
@@ -652,12 +656,25 @@
     if (!alive || !boxes.cars) return;
     const manual = data.manual_cars;
     const err = note();
+    const today = SD.local().date;
 
     const teslaList = h('ul', { class: 'adm-list adm-cars' });
     for (const c of tesla) {
       const detail = [c.name && c.name !== c.label ? c.name : null, c.first_day ? `since ${c.first_day}` : null].filter(Boolean).join(' · ');
-      teslaList.append(h('li', { class: 'adm-row' },
-        h('div', { class: 'adm-row-text' }, h('strong', null, sourceBadge('teslamate'), c.label), detail ? h('span', { text: detail }) : null)));
+      const owned = inp('date', { value: str(c.owned_since), max: today });
+      const ownedField = field('Owned since', owned, `TeslaMate has no purchase date. Leave empty to use the first day TeslaMate saw the car${c.first_day ? ` (${dayText(c.first_day)})` : ''}.`);
+      owned.id = `adm-tm-owned-${c.car_id}`;
+      ownedField.querySelector('label').htmlFor = owned.id;
+      owned.setAttribute('aria-describedby', `${owned.id}-hint`);
+      ownedField.querySelector('.adm-hint').id = `${owned.id}-hint`;
+      const ownedForm = form([ownedField], 'Save date', async (msg) => {
+        await call('PUT', `/api/admin/teslamate-cars/${c.car_id}/owned-since`, { owned_since: owned.value || null });
+        await refresh('cars', 'changes');
+        if (boxes.cars) boxes.cars.prepend(savedLine('Owned-since date saved.'));
+      });
+      teslaList.append(h('li', { class: 'adm-row adm-row-stack' },
+        h('div', { class: 'adm-row-text' }, h('strong', null, sourceBadge('teslamate'), c.label), detail ? h('span', { text: detail }) : null),
+        ownedForm));
     }
     if (teslaError) teslaList.append(h('li', { class: 'adm-empty', text: `Could not load the TeslaMate cars. ${teslaError.message}` }));
     else if (!tesla.length) teslaList.append(h('li', { class: 'adm-empty', text: 'No TeslaMate cars yet.' }));
@@ -669,7 +686,7 @@
       list.append(h('li', { class: 'adm-row' },
         h('div', { class: 'adm-row-text' },
           h('strong', null, sourceBadge('manual'), c.name),
-          h('span', { text: `${[c.model, kind].filter(Boolean).join(' · ')} · ${plural(c.fills, 'fill')}` })),
+          h('span', { text: `${[c.model, kind].filter(Boolean).join(' · ')} · ${plural(c.fills, 'fill')}${c.owned_since ? ` · owned since ${dayText(c.owned_since)}` : ''}` })),
         h('div', { class: 'adm-row-actions' },
           btn('Edit', () => { carEditing = c.id; drawCars(); }, 'small', `Edit ${c.name}`),
           deleteButton('Delete', `Delete ${c.name}`,
@@ -682,15 +699,17 @@
     const model = inp('text', { value: editing && editing.model ? editing.model : '', autocomplete: 'off' });
     const kind = h('select', null, CAR_KINDS.map(([k, label]) => h('option', { value: k, text: label })));
     kind.value = editing ? editing.kind : 'phev';
+    const ownedSince = inp('date', { value: editing ? str(editing.owned_since) : '', max: today });
     box.replaceChildren(
       blurb('Cars that TeslaMate does not track get a petrol fill log on the Cars page. Cars from TeslaMate appear here as they sync.'),
       sub('From TeslaMate'), teslaList,
       sub('Manual cars'), list, err,
       sub(editing ? `Edit ${editing.name}` : 'Add a car'),
-      form([field('Name', name), field('Model (optional)', model), field('Type', kind, 'Only shown; it does not change any sums.')],
+      form([field('Name', name), field('Model (optional)', model), field('Type', kind, 'Only shown; it does not change any sums.'),
+        field('Owned since (optional)', ownedSince)],
         editing ? 'Save car' : 'Add car',
         async () => {
-          const payload = { name: name.value, model: model.value, kind: kind.value };
+          const payload = { name: name.value, model: model.value, kind: kind.value, owned_since: ownedSince.value || null };
           if (editing) await call('PUT', `/api/admin/cars/${editing.id}`, payload);
           else await call('POST', '/api/admin/cars', payload);
           carEditing = null;
