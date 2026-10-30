@@ -39,18 +39,174 @@
   background: transparent;
 }
 
-#page-cars .cars-car {
-  padding: 12px 4px 4px;
+/* One card per car. The header is a button that opens and closes the body. */
+
+#page-cars .cars-card {
+  padding: 0;
+  overflow: hidden;
+  scroll-margin-top: 16px;
 }
 
-#page-cars .cars-car + .cars-car {
-  margin-top: 20px;
+#page-cars .cars-card-head {
+  margin: 0;
 }
 
-#page-cars .cars-sub {
+#page-cars .cars-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  width: 100%;
+  padding: 14px 16px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+#page-cars .cars-toggle:hover {
+  background: color-mix(in srgb, var(--line) 35%, transparent);
+}
+
+#page-cars .cars-toggle:focus-visible {
+  outline: 3px solid var(--ink);
+  outline-offset: -3px;
+}
+
+#page-cars .cars-toggle[aria-expanded="true"] {
+  border-bottom: 1px solid var(--line);
+}
+
+/* The name as a number plate. */
+#page-cars .cars-plate {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 10px;
+  border: 2px solid var(--ink);
+  border-radius: 5px;
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 2px var(--card);
+  outline: 1px solid var(--line);
+  font-size: 15px;
+  font-weight: 800;
+  font-stretch: 125%;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+html[data-theme="night"] #page-cars .cars-plate {
+  background: var(--ink);
+  color: var(--paper);
+  box-shadow: inset 0 0 0 2px var(--ink);
+}
+
+#page-cars .cars-model {
+  font-weight: 600;
+}
+
+#page-cars .cars-meta {
   font-size: 14px;
   color: var(--ink-2);
-  margin-bottom: 8px;
+}
+
+#page-cars .cars-owned {
+  flex-basis: 100%;
+  order: 5;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+#page-cars .cars-owned::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--battery);
+  vertical-align: 1px;
+}
+
+#page-cars .cars-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+#page-cars .cars-right .src-badge {
+  margin-right: 0;
+}
+
+/* The month's headline figure, shown only while the card is closed. */
+#page-cars .cars-sum {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+#page-cars .cars-sum b {
+  font-size: 22px;
+  font-weight: 700;
+  font-stretch: 75%;
+  color: var(--ink);
+}
+
+#page-cars .cars-toggle[aria-expanded="true"] .cars-sum {
+  display: none;
+}
+
+#page-cars .cars-chev {
+  display: inline-block;
+  font-size: 22px;
+  line-height: 1;
+  transition: transform 0.15s;
+}
+
+#page-cars .cars-toggle[aria-expanded="true"] .cars-chev {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #page-cars .cars-chev {
+    transition: none;
+  }
+}
+
+#page-cars .cars-body {
+  display: grid;
+  gap: 18px;
+  padding: 18px 16px 16px;
+}
+
+#page-cars .cars-body[hidden] {
+  display: none;
+}
+
+#page-cars .cars-sec {
+  display: grid;
+  gap: 10px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+#page-cars .cars-slot:empty {
+  display: none;
+}
+
+#page-cars .cars-slot {
+  display: grid;
+  gap: 18px;
+}
+
+#page-cars .cars-add {
+  margin-top: 4px;
 }
 
 #page-cars .cars-headline {
@@ -74,11 +230,11 @@
 }
 
 #page-cars .cars-sentence {
-  margin-top: 12px;
+  margin: -6px 0 0;
 }
 
 #page-cars .cars-bars {
-  margin-top: 16px;
+  margin-top: -4px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -119,12 +275,8 @@
 
 /* When it charged */
 
-#page-cars .cars-when {
-  margin-top: 16px;
-}
-
 #page-cars .cars-when-line {
-  margin: 6px 0 12px;
+  margin: 0;
   font-size: 14px;
   line-height: 1.4;
 }
@@ -138,6 +290,8 @@
 #page-cars .cars-row {
   position: relative;
   height: 10px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--line) 45%, transparent);
 }
 
 #page-cars .cars-seg {
@@ -225,7 +379,7 @@
 }
 
 #page-cars .cars-manual-box {
-  margin-top: 8px;
+  margin-top: 12px;
 }
 
 #page-cars .cars-stats {
@@ -247,14 +401,6 @@
 #page-cars .cars-stat-label {
   font-size: 14px;
   font-weight: 600;
-}
-
-#page-cars .cars-fills {
-  margin-top: 16px;
-}
-
-#page-cars .cars-fills .card-head {
-  align-items: center;
 }
 
 #page-cars .cars-fill-list {
@@ -330,7 +476,7 @@
 }
 
 #page-cars .cars-hint {
-  padding: 12px 4px 0;
+  padding: 4px 4px 0;
   font-size: 14px;
 }
 
@@ -497,7 +643,6 @@
   }
 
   #page-cars .cars-head,
-  #page-cars .cars-car,
   #page-cars .stack > .card {
     max-width: 720px;
   }
