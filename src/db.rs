@@ -1364,8 +1364,6 @@ pub async fn tm_charge_rows(pool: &SqlitePool, car_id: i64) -> Result<Vec<TmChar
 }
 
 /// A car TeslaMate does not track, as stored in `manual_car`.
-// Unused until the API that serves the manual cars (the next change).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct ManualCar {
     pub id: i64,
@@ -1393,7 +1391,6 @@ pub struct FuelFill {
 }
 
 /// Every manual car, by id.
-#[allow(dead_code)]
 pub async fn manual_cars(pool: &SqlitePool) -> Result<Vec<ManualCar>> {
     sqlx::query_as("SELECT id, name, model, kind, created_at FROM manual_car ORDER BY id")
         .fetch_all(pool)
@@ -1401,18 +1398,7 @@ pub async fn manual_cars(pool: &SqlitePool) -> Result<Vec<ManualCar>> {
         .context("could not read the manual cars")
 }
 
-/// One manual car, or `None` when there is no such id.
-#[allow(dead_code)]
-pub async fn manual_car(pool: &SqlitePool, id: i64) -> Result<Option<ManualCar>> {
-    sqlx::query_as("SELECT id, name, model, kind, created_at FROM manual_car WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .context("could not read a manual car")
-}
-
 /// Every fill of every manual car, by car and then oldest first.
-#[allow(dead_code)]
 pub async fn fuel_fills(pool: &SqlitePool) -> Result<Vec<FuelFill>> {
     sqlx::query_as(
         "SELECT id, car_id, date, litres, cost_dollars, odometer_km, full_tank, note
@@ -1421,19 +1407,6 @@ pub async fn fuel_fills(pool: &SqlitePool) -> Result<Vec<FuelFill>> {
     .fetch_all(pool)
     .await
     .context("could not read the fuel fills")
-}
-
-/// One fill, or `None` when there is no such id.
-#[allow(dead_code)]
-pub async fn fuel_fill(pool: &SqlitePool, id: i64) -> Result<Option<FuelFill>> {
-    sqlx::query_as(
-        "SELECT id, car_id, date, litres, cost_dollars, odometer_km, full_tank, note
-         FROM fuel_fill WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .context("could not read a fuel fill")
 }
 
 #[cfg(test)]
@@ -2474,10 +2447,12 @@ mod tests {
             .await
             .unwrap();
         }
-        let car = manual_car(&pool, 1).await.unwrap().unwrap();
-        assert_eq!((car.name.as_str(), car.kind.as_str()), ("A", "phev"));
-        assert_eq!(car.model, None);
-        assert_eq!(manual_car(&pool, 9).await.unwrap(), None);
+        let cars = manual_cars(&pool).await.unwrap();
+        assert_eq!(
+            (cars[0].name.as_str(), cars[0].kind.as_str()),
+            ("A", "phev")
+        );
+        assert_eq!((cars.len(), &cars[0].model), (2, &None));
 
         // By car, then oldest first; a fill is a full tank unless said otherwise.
         let fills = fuel_fills(&pool).await.unwrap();
@@ -2487,8 +2462,6 @@ mod tests {
             [(1, "2026-10-01"), (1, "2026-10-02"), (2, "2026-10-03")]
         );
         assert!(fills[0].full_tank && fills[0].note.is_empty());
-        assert_eq!(fuel_fill(&pool, 99).await.unwrap(), None);
-        assert_eq!(fuel_fill(&pool, 3).await.unwrap().unwrap().car_id, 2);
 
         sqlx::query("DELETE FROM manual_car WHERE id = 1")
             .execute(&pool)

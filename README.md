@@ -38,6 +38,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/config.rs` - config file loading
 - `src/cost.rs` - electricity tariff lookup and the pure daily cost calculation
 - `src/admin_data.rs`, `src/admin_import.rs` - tariffs, petrol prices, purchases, bills and settings kept in tables, the swappable snapshot of them, and the one-time import from an older `config.toml`
+- `src/fuel_log.rs` - fuel economy and petrol spend worked out from the fills of cars TeslaMate does not track
 - `src/db.rs` - SQLite storage: opening, migrations and typed queries
 - `migrations/` - SQL schema, applied automatically on startup
 - `src/modbus.rs` - Modbus TCP reader for live inverter data, and its poll loop

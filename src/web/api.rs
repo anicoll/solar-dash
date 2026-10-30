@@ -612,6 +612,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
             let summary = summarise(charges);
             json!({
                 "car_id": car.id,
+                "source": "teslamate",
                 "name": car.name,
                 "model": car.model,
                 "label": label,

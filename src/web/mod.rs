@@ -7,6 +7,7 @@ mod auth;
 mod battery;
 mod bill;
 mod costs;
+mod fuel;
 mod globird;
 mod payback;
 mod petrol;
@@ -318,6 +319,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ev/sessions", get(api::ev_sessions))
         .route("/api/ev/summary", get(api::ev_summary))
         .route("/api/ev/cars", get(api::ev_cars))
+        .route("/api/fuel/cars", get(fuel::cars))
         .route("/api/petrol-prices", get(petrol::list).put(petrol::put))
         .route("/api/petrol-prices/{from}", delete(petrol::remove))
         .route("/api/admin", get(admin::read))
@@ -331,6 +333,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/purchases/{id}",
             put(admin::purchase_update).delete(admin::purchase_delete),
+        )
+        .route("/api/admin/cars", post(admin::car_create))
+        .route(
+            "/api/admin/cars/{id}",
+            put(admin::car_update).delete(admin::car_delete),
+        )
+        .route("/api/admin/cars/{id}/fills", post(admin::fill_create))
+        .route(
+            "/api/admin/fills/{id}",
+            put(admin::fill_update).delete(admin::fill_delete),
         )
         .route("/api/admin/bills", put(admin::bills_replace))
         .route("/api/admin/bills/{from}", delete(admin::bill_delete))
@@ -1801,6 +1813,7 @@ mod tests {
         // their names added.
         let ids: Vec<_> = cars.iter().map(|c| c["car_id"].as_i64().unwrap()).collect();
         assert_eq!(ids, [4, 2, 1]);
+        assert!(cars.iter().all(|c| c["source"] == "teslamate"));
         assert_eq!(cars[0]["label"], "Model Y (Spare)");
         assert_eq!(cars[1]["label"], "Model Y (Weekend)");
         assert_eq!(cars[2]["label"], "Model 3");
@@ -3376,6 +3389,12 @@ mod tests {
             ("POST", "/api/admin/purchases"),
             ("PUT", "/api/admin/purchases/1"),
             ("DELETE", "/api/admin/purchases/1"),
+            ("POST", "/api/admin/cars"),
+            ("PUT", "/api/admin/cars/1"),
+            ("DELETE", "/api/admin/cars/1"),
+            ("POST", "/api/admin/cars/1/fills"),
+            ("PUT", "/api/admin/fills/1"),
+            ("DELETE", "/api/admin/fills/1"),
             ("PUT", "/api/admin/bills"),
             ("DELETE", "/api/admin/bills/2026-01-01"),
             ("PUT", "/api/admin/settings"),
@@ -3590,6 +3609,7 @@ mod tests {
         assert_eq!(json["petrol"]["prices"][0]["cents_per_litre"], 199.0);
         assert_eq!(json["purchases"][0]["name"], "Panels");
         assert_eq!(json["purchases"][0]["battery_kwh"], Value::Null);
+        assert_eq!(json["manual_cars"], serde_json::json!([]));
         assert_eq!(json["bills"], serde_json::json!([]));
         assert_eq!(json["settings"]["petrol_cents_per_litre"], 190.0);
         assert_eq!(json["setting_defaults"]["petrol_litres_per_100km"], 7.5);
@@ -3852,6 +3872,267 @@ mod tests {
                 .unwrap();
         let actions: Vec<&str> = actions.iter().map(|a| a.0.as_str()).collect();
         assert_eq!(actions, ["create", "create", "update", "delete"]);
+    }
+
+    #[tokio::test]
+    async fn manual_cars_and_fills_can_be_added_changed_and_deleted() {
+        let (_dir, app, pool) = petrol_app(None).await;
+        let cookie = log_in(&app).await;
+
+        let (status, car) = admin_send(
+            &app,
+            "POST",
+            "/api/admin/cars",
+            &cookie,
+            r#"{"name":" Family PHEV ","model":" Outlander "}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(car["name"], "Family PHEV");
+        assert_eq!(car["model"], "Outlander");
+        assert_eq!(car["kind"], "phev");
+        let id = car["id"].as_i64().unwrap();
+        let fills_uri = format!("/api/admin/cars/{id}/fills");
+
+        let changes = count(&pool, "admin_change").await;
+        for bad in [
+            r#"{"name":"  "}"#,
+            r#"{"name":"x","kind":"steam"}"#,
+            r#"{"model":"x"}"#,
+            "not json",
+        ] {
+            let (status, json) = admin_send(&app, "POST", "/api/admin/cars", &cookie, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(json["error"].is_string(), "{bad}");
+        }
+        for (what, bad) in [
+            (
+                "date",
+                r#"{"date":"yesterday","litres":40,"cost_dollars":80}"#,
+            ),
+            (
+                "future",
+                r#"{"date":"2999-01-01","litres":40,"cost_dollars":80}"#,
+            ),
+            (
+                "zero litres",
+                r#"{"date":"2026-03-01","litres":0,"cost_dollars":80}"#,
+            ),
+            (
+                "200 litres",
+                r#"{"date":"2026-03-01","litres":200,"cost_dollars":80}"#,
+            ),
+            (
+                "cost",
+                r#"{"date":"2026-03-01","litres":40,"cost_dollars":-1}"#,
+            ),
+            (
+                "odometer",
+                r#"{"date":"2026-03-01","litres":40,"cost_dollars":80,"odometer_km":-5}"#,
+            ),
+            ("no litres", r#"{"date":"2026-03-01","cost_dollars":80}"#),
+        ] {
+            let (status, json) = admin_send(&app, "POST", &fills_uri, &cookie, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what}");
+            assert!(json["error"].is_string(), "{what}");
+        }
+        assert_eq!(
+            (
+                count(&pool, "manual_car").await,
+                count(&pool, "fuel_fill").await
+            ),
+            (1, 0)
+        );
+        assert_eq!(count(&pool, "admin_change").await, changes);
+
+        // A fill for a car that does not exist.
+        let ok = r#"{"date":"2026-03-01","litres":40.0,"cost_dollars":80.0,"odometer_km":1000}"#;
+        let (status, _) = admin_send(&app, "POST", "/api/admin/cars/999/fills", &cookie, ok).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, fill) = admin_send(&app, "POST", &fills_uri, &cookie, ok).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(fill["car_id"], id);
+        assert_eq!(fill["full_tank"], true);
+        assert_eq!(fill["note"], "");
+        let fill_id = fill["id"].as_i64().unwrap();
+        let second = r#"{"date":"2026-03-10","litres":30.0,"cost_dollars":66.0,
+            "odometer_km":1500,"full_tank":true,"note":" servo "}"#;
+        let (status, json) = admin_send(&app, "POST", &fills_uri, &cookie, second).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json["note"], "servo");
+
+        // The admin read lists the car with its fill count.
+        let response = send(&app, get_request("/api/admin", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["manual_cars"][0]["name"], "Family PHEV");
+        assert_eq!(json["manual_cars"][0]["fills"], 2);
+
+        // Newest fill first, with the maths: 30 L over 500 km.
+        let response = send(&app, get_request("/api/fuel/cars", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let car = &json["cars"][0];
+        assert_eq!(car["source"], "manual");
+        assert_eq!(car["label"], "Outlander");
+        assert_eq!(car["l_per_100km"], 6.0);
+        assert_eq!(car["cost_per_km"], 66.0 / 500.0);
+        assert_eq!(car["totals"]["fills"], 2);
+        assert_eq!(car["totals"]["litres"], 70.0);
+        assert_eq!(car["totals"]["km_tracked"], 500.0);
+        assert_eq!(car["months"][0]["month"], "2026-03");
+        assert_eq!(car["months"][0]["fills"], 2);
+        let fills = car["fills"].as_array().unwrap();
+        assert_eq!(fills[0]["date"], "2026-03-10");
+        assert_eq!(fills[0]["l_per_100km"], 6.0);
+        assert_eq!(fills[0]["km_since_last"], 500.0);
+        assert!((fills[0]["cents_per_litre"].as_f64().unwrap() - 220.0).abs() < 1e-9);
+        // The base petrol price of the test app.
+        assert_eq!(fills[0]["avg_cents_per_litre"], 190.0);
+        assert_eq!(fills[1]["date"], "2026-03-01");
+        assert_eq!(fills[1]["l_per_100km"], Value::Null);
+
+        // Change a fill (it keeps its car) and a car (no kind: it keeps its own).
+        let fill_uri = format!("/api/admin/fills/{fill_id}");
+        let edited = r#"{"date":"2026-03-01","litres":40.0,"cost_dollars":80.0,
+            "odometer_km":1100,"full_tank":true}"#;
+        let (status, json) = admin_send(&app, "PUT", &fill_uri, &cookie, edited).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (json["car_id"].as_i64(), json["odometer_km"].as_f64()),
+            (Some(id), Some(1100.0))
+        );
+        let (status, _) = admin_send(&app, "PUT", "/api/admin/fills/999", &cookie, edited).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = admin_send(
+            &app,
+            "PUT",
+            &fill_uri,
+            &cookie,
+            r#"{"date":"2999-01-01","litres":1,"cost_dollars":1}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let car_uri = format!("/api/admin/cars/{id}");
+        let (status, json) = admin_send(&app, "PUT", &car_uri, &cookie, r#"{"name":"Zoe"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (
+                json["name"].as_str(),
+                json["model"].clone(),
+                json["kind"].as_str()
+            ),
+            (Some("Zoe"), Value::Null, Some("phev"))
+        );
+        let (status, _) = admin_send(
+            &app,
+            "PUT",
+            "/api/admin/cars/999",
+            &cookie,
+            r#"{"name":"x"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let response = send(&app, get_request("/api/fuel/cars", Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["cars"][0]["label"], "Zoe");
+        assert_eq!(json["cars"][0]["l_per_100km"], 30.0 / 400.0 * 100.0);
+
+        // One fill goes; then the car takes the other with it.
+        let (status, json) = admin_send(&app, "DELETE", &fill_uri, &cookie, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["deleted"]["litres"], 40.0);
+        let (status, _) = admin_send(&app, "DELETE", &fill_uri, &cookie, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, json) = admin_send(&app, "DELETE", &car_uri, &cookie, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["deleted"]["name"], "Zoe");
+        assert_eq!(json["fills_deleted"], 1);
+        let (status, _) = admin_send(&app, "DELETE", &car_uri, &cookie, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            (
+                count(&pool, "manual_car").await,
+                count(&pool, "fuel_fill").await
+            ),
+            (0, 0)
+        );
+
+        let log: Vec<(String, String)> = sqlx::query_as(
+            "SELECT what, action FROM admin_change WHERE what IN ('cars', 'fills') ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let log: Vec<(&str, &str)> = log.iter().map(|(w, a)| (w.as_str(), a.as_str())).collect();
+        assert_eq!(
+            log,
+            [
+                ("cars", "create"),
+                ("fills", "create"),
+                ("fills", "create"),
+                ("fills", "update"),
+                ("cars", "update"),
+                ("fills", "delete"),
+                ("cars", "delete"),
+            ]
+        );
+        // The deleted car's fill is kept in the log.
+        let (before,): (String,) = sqlx::query_as(
+            "SELECT before FROM admin_change WHERE what = 'cars' AND action = 'delete'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let before: Value = serde_json::from_str(&before).unwrap();
+        assert_eq!(before["fills"][0]["note"], "servo");
+    }
+
+    #[tokio::test]
+    async fn fuel_cars_are_listed_for_the_token_and_a_car_without_fills_shows() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let (_dir, app, _pool) = petrol_app(Some(token)).await;
+        let cookie = log_in(&app).await;
+        let anonymous = send(&app, get_request("/api/fuel/cars", None)).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let (_, car) = admin_send(
+            &app,
+            "POST",
+            "/api/admin/cars",
+            &cookie,
+            r#"{"name":"Hilux","kind":"diesel"}"#,
+        )
+        .await;
+        let request = Request::get("/api/fuel/cars")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = send(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let listed = &json["cars"][0];
+        assert_eq!(listed["car_id"], car["id"]);
+        assert_eq!(
+            (&listed["label"], &listed["kind"]),
+            (&Value::from("Hilux"), &Value::from("diesel"))
+        );
+        assert_eq!(listed["fills"], serde_json::json!([]));
+        assert_eq!(listed["l_per_100km"], Value::Null);
+        assert_eq!(listed["totals"]["fills"], 0);
+
+        // The token cannot write.
+        let request = admin_request(
+            "POST",
+            "/api/admin/cars",
+            "",
+            r#"{"name":"x"}"#,
+            &[("authorization", &format!("Bearer {token}"))],
+        );
+        assert_eq!(send(&app, request).await.status(), StatusCode::UNAUTHORIZED);
+
+        // TeslaMate cars say where they come from.
+        let response = send(&app, get_request("/api/ev/cars", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn csv_request(

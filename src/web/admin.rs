@@ -1,5 +1,6 @@
 //! The admin API: read and edit the tariff plans, petrol prices, purchases,
-//! past bills and settings that used to live in `config.toml`.
+//! past bills and settings that used to live in `config.toml`, and the
+//! manual cars with their petrol fills.
 //!
 //! Everything here sits behind `auth::require_session`, and the write routes
 //! also need the session cookie (not the Bearer token) and a matching `Origin`;
@@ -29,6 +30,7 @@ use crate::admin_data::{
 use crate::bills::{self, PastBill};
 use crate::config::{self, parse_date};
 use crate::cost::TariffSchedule;
+use crate::db;
 
 /// How many entries of the change log `GET /api/admin` lists.
 const CHANGES_SHOWN: i64 = 50;
@@ -68,8 +70,8 @@ pub struct ReadParams {
 }
 
 /// Everything the admin page edits, plus the latest changes:
-/// `{"tariffs":[Plan..],"petrol":{..},"purchases":[..],"bills":[..],
-/// "settings":{..},"setting_defaults":{..},"changes":[..]}`. `settings` has
+/// `{"tariffs":[Plan..],"petrol":{..},"purchases":[..],"manual_cars":[..],
+/// "bills":[..],"settings":{..},"setting_defaults":{..},"changes":[..]}`. `settings` has
 /// the keys that have been set; the others use their default, which
 /// `setting_defaults` lists. With `?download=1` the answer is an attachment.
 pub async fn read(
@@ -79,6 +81,7 @@ pub async fn read(
     let mut conn = state.pool().acquire().await.map_err(db_error)?;
     let tariffs = plans_json(&mut conn).await?;
     let purchases = purchases_json(&mut conn).await?;
+    let cars = cars_json(&mut conn).await?;
     let bills: Vec<Value> = load_bills(&mut conn).await?.iter().map(bill_json).collect();
     let settings = load_settings(&mut conn).await?;
     let changes: Vec<(i64, i64, String, String, Option<String>)> = sqlx::query_as(
@@ -99,6 +102,7 @@ pub async fn read(
         "tariffs": tariffs,
         "petrol": view_json(&state.admin().get().petrol),
         "purchases": purchases,
+        "manual_cars": cars,
         "bills": bills,
         "settings": settings,
         "setting_defaults": setting_defaults(),
@@ -652,6 +656,415 @@ pub async fn purchase_delete(State(state): State<AppState>, Path(id): Path<i64>)
         let key = id.to_string();
         log_change(tx, "purchases", "delete", Some(&key), Some(&before), None).await?;
         deleted = before;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+// ---------------------------------------------------------------------------
+// Manual cars and their petrol fills
+// ---------------------------------------------------------------------------
+
+/// The kinds of car a manual car can be (display only).
+const CAR_KINDS: [&str; 4] = ["phev", "petrol", "hybrid", "diesel"];
+
+/// A fill of 200 litres or more is a typo.
+const MAX_FILL_LITRES: f64 = 200.0;
+
+fn car_json(car: &db::ManualCar) -> Value {
+    json!({
+        "id": car.id,
+        "name": car.name,
+        "model": car.model,
+        "kind": car.kind,
+    })
+}
+
+fn fill_json(fill: &db::FuelFill) -> Value {
+    json!({
+        "id": fill.id,
+        "car_id": fill.car_id,
+        "date": fill.date,
+        "litres": fill.litres,
+        "cost_dollars": fill.cost_dollars,
+        "odometer_km": fill.odometer_km,
+        "full_tank": fill.full_tank,
+        "note": fill.note,
+    })
+}
+
+/// The manual cars for `GET /api/admin`, each with how many fills it has.
+async fn cars_json(conn: &mut SqliteConnection) -> Result<Vec<Value>, ApiError> {
+    let rows: Vec<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT c.id, c.name, c.model, c.kind, \
+         (SELECT COUNT(*) FROM fuel_fill f WHERE f.car_id = c.id) \
+         FROM manual_car c ORDER BY c.id",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, model, kind, fills)| {
+            json!({ "id": id, "name": name, "model": model, "kind": kind, "fills": fills })
+        })
+        .collect())
+}
+
+async fn car_row(conn: &mut SqliteConnection, id: i64) -> Result<Option<db::ManualCar>, ApiError> {
+    sqlx::query_as("SELECT id, name, model, kind, created_at FROM manual_car WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_error)
+}
+
+async fn fills_of_car(
+    conn: &mut SqliteConnection,
+    car_id: i64,
+) -> Result<Vec<db::FuelFill>, ApiError> {
+    sqlx::query_as(
+        "SELECT id, car_id, date, litres, cost_dollars, odometer_km, full_tank, note \
+         FROM fuel_fill WHERE car_id = ? ORDER BY date, id",
+    )
+    .bind(car_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_error)
+}
+
+async fn fill_row(conn: &mut SqliteConnection, id: i64) -> Result<Option<db::FuelFill>, ApiError> {
+    sqlx::query_as(
+        "SELECT id, car_id, date, litres, cost_dollars, odometer_km, full_tank, note \
+         FROM fuel_fill WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db_error)
+}
+
+/// The body of `POST` and `PUT` on a manual car:
+/// `{"name":..,"model":..,"kind":"phev"}`. `model` is optional; `kind` is
+/// optional too (a new car is a `phev`, an update keeps the kind it has).
+#[derive(Deserialize)]
+pub struct CarBody {
+    name: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// A car's checked fields: name, model and kind.
+type CheckedCar = (String, Option<String>, String);
+
+/// Checks the car and tidies the text. `default_kind` is used when the body
+/// has none.
+fn checked_car(body: CarBody, default_kind: &str) -> Result<CheckedCar, ApiError> {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("the car needs a name"));
+    }
+    let model = body
+        .model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let kind = body.kind.unwrap_or_else(|| default_kind.to_string());
+    if !CAR_KINDS.contains(&kind.as_str()) {
+        return Err(ApiError::bad_request(format!(
+            "kind must be one of {}",
+            CAR_KINDS.join(", ")
+        )));
+    }
+    Ok((name, model, kind))
+}
+
+/// `POST /api/admin/cars`: adds a manual car and answers with it (201).
+pub async fn car_create(
+    State(state): State<AppState>,
+    car: Result<Json<CarBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let (name, model, kind) = checked_car(body(car)?, "phev")?;
+    let mut created = Value::Null;
+    admin_data::write(&state, async |tx| {
+        let result = sqlx::query(
+            "INSERT INTO manual_car (name, model, kind, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&name)
+        .bind(&model)
+        .bind(&kind)
+        .bind(db::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let id = result.last_insert_rowid();
+        let Some(car) = car_row(tx, id).await? else {
+            return Err(not_found("car", id));
+        };
+        created = car_json(&car);
+        log_change(
+            tx,
+            "cars",
+            "create",
+            Some(&id.to_string()),
+            None,
+            Some(&created),
+        )
+        .await?;
+        Ok(())
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// `PUT /api/admin/cars/{id}`: replaces a manual car's details and answers
+/// with it.
+pub async fn car_update(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    car: Result<Json<CarBody>, JsonRejection>,
+) -> ApiResult {
+    let car = body(car)?;
+    let mut updated = Value::Null;
+    admin_data::write(&state, async |tx| {
+        let Some(before) = car_row(tx, id).await? else {
+            return Err(not_found("car", id));
+        };
+        let (name, model, kind) = checked_car(
+            CarBody {
+                name: car.name.clone(),
+                model: car.model.clone(),
+                kind: car.kind.clone(),
+            },
+            &before.kind,
+        )?;
+        sqlx::query("UPDATE manual_car SET name = ?, model = ?, kind = ? WHERE id = ?")
+            .bind(&name)
+            .bind(&model)
+            .bind(&kind)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        updated = json!({ "id": id, "name": name, "model": model, "kind": kind });
+        let key = id.to_string();
+        log_change(
+            tx,
+            "cars",
+            "update",
+            Some(&key),
+            Some(&car_json(&before)),
+            Some(&updated),
+        )
+        .await?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(updated))
+}
+
+/// `DELETE /api/admin/cars/{id}`: removes a manual car and its fills. Answers
+/// `{"deleted": Car, "fills_deleted": n}`. The change log keeps the fills.
+pub async fn car_delete(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    let mut deleted = Value::Null;
+    let mut fills_deleted = 0;
+    admin_data::write(&state, async |tx| {
+        let Some(car) = car_row(tx, id).await? else {
+            return Err(not_found("car", id));
+        };
+        let fills: Vec<Value> = fills_of_car(tx, id).await?.iter().map(fill_json).collect();
+        // The fills go with the car (`ON DELETE CASCADE`).
+        sqlx::query("DELETE FROM manual_car WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        let mut before = car_json(&car);
+        before["fills"] = Value::Array(fills.clone());
+        let key = id.to_string();
+        log_change(tx, "cars", "delete", Some(&key), Some(&before), None).await?;
+        deleted = car_json(&car);
+        fills_deleted = fills.len();
+        Ok(())
+    })
+    .await?;
+    Ok(Json(
+        json!({ "deleted": deleted, "fills_deleted": fills_deleted }),
+    ))
+}
+
+/// The body of `POST` and `PUT` on a fill: `{"date":"YYYY-MM-DD","litres":..,
+/// "cost_dollars":..,"odometer_km":..,"full_tank":true,"note":".."}`. The
+/// odometer and note are optional; `full_tank` is true unless said otherwise.
+#[derive(Deserialize)]
+pub struct FillBody {
+    date: String,
+    litres: f64,
+    cost_dollars: f64,
+    #[serde(default)]
+    odometer_km: Option<f64>,
+    #[serde(default = "full_by_default")]
+    full_tank: bool,
+    #[serde(default)]
+    note: String,
+}
+
+fn full_by_default() -> bool {
+    true
+}
+
+/// Checks a fill (a fill-up cannot be in the future, the local day being
+/// what counts) and tidies the note. `car_id` is not checked here.
+fn checked_fill(body: FillBody, today: NaiveDate) -> Result<FillBody, ApiError> {
+    let date = parse_date(&body.date).map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    if date > today {
+        return Err(ApiError::bad_request(format!(
+            "the date {date} is in the future"
+        )));
+    }
+    // The comparisons are false for NaN, so that is rejected too.
+    if !(body.litres > 0.0 && body.litres < MAX_FILL_LITRES) {
+        return Err(ApiError::bad_request(format!(
+            "litres must be more than 0 and less than {MAX_FILL_LITRES}"
+        )));
+    }
+    if !(body.cost_dollars >= 0.0 && body.cost_dollars.is_finite()) {
+        return Err(ApiError::bad_request("cost_dollars must be zero or more"));
+    }
+    if let Some(km) = body.odometer_km
+        && !(km >= 0.0 && km.is_finite())
+    {
+        return Err(ApiError::bad_request("odometer_km must be zero or more"));
+    }
+    Ok(FillBody {
+        note: body.note.trim().to_string(),
+        ..body
+    })
+}
+
+/// `POST /api/admin/cars/{id}/fills`: adds a fill to a car and answers with
+/// it (201).
+pub async fn fill_create(
+    State(state): State<AppState>,
+    Path(car_id): Path<i64>,
+    fill: Result<Json<FillBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let fill = checked_fill(body(fill)?, today(state.tz()))?;
+    let mut created = Value::Null;
+    admin_data::write(&state, async |tx| {
+        if car_row(tx, car_id).await?.is_none() {
+            return Err(not_found("car", car_id));
+        }
+        let result = sqlx::query(
+            "INSERT INTO fuel_fill (car_id, date, litres, cost_dollars, odometer_km, full_tank, \
+             note) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(car_id)
+        .bind(&fill.date)
+        .bind(fill.litres)
+        .bind(fill.cost_dollars)
+        .bind(fill.odometer_km)
+        .bind(fill.full_tank)
+        .bind(&fill.note)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let id = result.last_insert_rowid();
+        created = fill_json(&db::FuelFill {
+            id,
+            car_id,
+            date: fill.date.clone(),
+            litres: fill.litres,
+            cost_dollars: fill.cost_dollars,
+            odometer_km: fill.odometer_km,
+            full_tank: fill.full_tank,
+            note: fill.note.clone(),
+        });
+        log_change(
+            tx,
+            "fills",
+            "create",
+            Some(&id.to_string()),
+            None,
+            Some(&created),
+        )
+        .await?;
+        Ok(())
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// `PUT /api/admin/fills/{id}`: replaces a fill (it stays with its car) and
+/// answers with it.
+pub async fn fill_update(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    fill: Result<Json<FillBody>, JsonRejection>,
+) -> ApiResult {
+    let fill = checked_fill(body(fill)?, today(state.tz()))?;
+    let mut updated = Value::Null;
+    admin_data::write(&state, async |tx| {
+        let Some(before) = fill_row(tx, id).await? else {
+            return Err(not_found("fill", id));
+        };
+        sqlx::query(
+            "UPDATE fuel_fill SET date = ?, litres = ?, cost_dollars = ?, odometer_km = ?, \
+             full_tank = ?, note = ? WHERE id = ?",
+        )
+        .bind(&fill.date)
+        .bind(fill.litres)
+        .bind(fill.cost_dollars)
+        .bind(fill.odometer_km)
+        .bind(fill.full_tank)
+        .bind(&fill.note)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        updated = fill_json(&db::FuelFill {
+            id,
+            car_id: before.car_id,
+            date: fill.date.clone(),
+            litres: fill.litres,
+            cost_dollars: fill.cost_dollars,
+            odometer_km: fill.odometer_km,
+            full_tank: fill.full_tank,
+            note: fill.note.clone(),
+        });
+        let key = id.to_string();
+        log_change(
+            tx,
+            "fills",
+            "update",
+            Some(&key),
+            Some(&fill_json(&before)),
+            Some(&updated),
+        )
+        .await?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(updated))
+}
+
+/// `DELETE /api/admin/fills/{id}`: answers `{"deleted": Fill}`.
+pub async fn fill_delete(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    let mut deleted = Value::Null;
+    admin_data::write(&state, async |tx| {
+        let Some(before) = fill_row(tx, id).await? else {
+            return Err(not_found("fill", id));
+        };
+        sqlx::query("DELETE FROM fuel_fill WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        deleted = fill_json(&before);
+        let key = id.to_string();
+        log_change(tx, "fills", "delete", Some(&key), Some(&deleted), None).await?;
         Ok(())
     })
     .await?;

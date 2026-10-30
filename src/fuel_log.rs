@@ -7,9 +7,6 @@
 //! measured against the last such fill. All the petrol put in between (partial
 //! fills included) counts towards the distance between the two.
 
-// Nothing calls this until the API that serves it (the next change).
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use chrono::{Datelike, NaiveDate};
