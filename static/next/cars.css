@@ -218,6 +218,275 @@
   text-decoration: underline;
 }
 
+/* Manual cars (petrol fills) */
+
+#page-cars .cars-manual-box:empty {
+  display: none;
+}
+
+#page-cars .cars-manual-box {
+  margin-top: 8px;
+}
+
+#page-cars .cars-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 12px;
+}
+
+#page-cars .cars-stat {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+#page-cars .cars-stat-value {
+  line-height: 1.1;
+}
+
+#page-cars .cars-stat-label {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+#page-cars .cars-fills {
+  margin-top: 16px;
+}
+
+#page-cars .cars-fills .card-head {
+  align-items: center;
+}
+
+#page-cars .cars-fill-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  font-size: 14px;
+}
+
+/* Phone: the date and cost on one line, the details beneath. */
+#page-cars .cars-fill {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+#page-cars .cars-fill:last-child {
+  border-bottom: 0;
+}
+
+#page-cars .cars-c-date {
+  flex: 1 1 auto;
+}
+
+#page-cars .cars-c-cost {
+  font-size: 16px;
+}
+
+#page-cars .cars-c-litres {
+  flex-basis: auto;
+}
+
+#page-cars .cars-cell {
+  color: var(--ink);
+}
+
+#page-cars .cars-fill .cars-cell:not(.cars-c-date):not(.cars-c-cost) {
+  color: var(--ink-2);
+}
+
+#page-cars .cars-cell.is-empty,
+#page-cars .cars-fill-head {
+  display: none;
+}
+
+#page-cars .cars-c-note {
+  flex-basis: 100%;
+}
+
+#page-cars .cars-edit {
+  margin-left: auto;
+  background: transparent;
+  border: 0;
+  padding: 0 4px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+#page-cars .cars-mark {
+  margin-left: 4px;
+  font-size: 10px;
+  color: var(--ink-2);
+  vertical-align: 1px;
+}
+
+#page-cars .cars-key,
+#page-cars .cars-none {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+#page-cars .cars-hint {
+  padding: 12px 4px 0;
+  font-size: 14px;
+}
+
+#page-cars .cars-hint a {
+  font-weight: 600;
+}
+
+/* Add and edit form */
+
+#page-cars .cars-form {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+#page-cars .cars-form-title {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+#page-cars .cars-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+  margin-top: 10px;
+}
+
+#page-cars .cars-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+#page-cars .cars-field label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#page-cars .cars-field-wide,
+#page-cars .cars-field-date {
+  grid-column: 1 / -1;
+}
+
+#page-cars .cars-field input[type="text"],
+#page-cars .cars-field input[type="date"] {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--bar);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 16px;
+}
+
+#page-cars .cars-field-check {
+  flex-direction: row;
+  align-items: center;
+  grid-column: 1 / -1;
+  gap: 4px;
+}
+
+#page-cars .cars-field-check input {
+  width: 24px;
+  height: 24px;
+  margin: 10px;
+  flex: none;
+  accent-color: var(--ink);
+}
+
+#page-cars .cars-field-check label {
+  font-size: 15px;
+}
+
+#page-cars .cars-live {
+  min-height: 1.45em;
+  margin-top: 8px;
+  font-size: 15px;
+}
+
+#page-cars .cars-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+#page-cars .cars-del {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+#page-cars .cars-ask {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+#page-cars .cars-msg {
+  margin-top: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--missed);
+}
+
+#page-cars .cars-btn {
+  min-height: 44px;
+  padding: 0 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--bar);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#page-cars .cars-btn:hover:not(:disabled) {
+  background: var(--line);
+}
+
+#page-cars .cars-btn.primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--card);
+}
+
+#page-cars .cars-btn.primary:hover:not(:disabled) {
+  background: var(--ink-2);
+  border-color: var(--ink-2);
+}
+
+#page-cars .cars-btn.danger {
+  color: var(--missed);
+  border-color: var(--missed);
+}
+
+#page-cars .cars-btn.danger.solid {
+  background: var(--missed);
+  color: var(--card);
+}
+
+#page-cars .cars-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 @media (min-width: 760px) {
   #page-cars .cars-head {
     padding-top: 16px;
@@ -231,5 +500,55 @@
   #page-cars .cars-car,
   #page-cars .stack > .card {
     max-width: 720px;
+  }
+}
+
+@media (min-width: 760px) {
+  #page-cars .cars-stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  #page-cars .cars-fill-head,
+  #page-cars .cars-fill {
+    display: grid;
+    grid-template-columns: 1.5fr 0.8fr 0.8fr 1fr 1fr 1.1fr auto;
+    align-items: baseline;
+    gap: 0 12px;
+  }
+
+  #page-cars .cars-fill-head {
+    padding: 12px 0 4px;
+    font-size: 12px;
+    color: var(--ink-2);
+    border-bottom: 1px solid var(--line);
+  }
+
+  #page-cars .cars-cell.is-empty {
+    display: inline;
+  }
+
+  #page-cars .cars-c-date { grid-column: 1; }
+  #page-cars .cars-c-cost { grid-column: 2; font-size: 14px; }
+  #page-cars .cars-c-litres { grid-column: 3; }
+  #page-cars .cars-c-cpl { grid-column: 4; }
+  #page-cars .cars-c-odo { grid-column: 5; }
+  #page-cars .cars-c-eco { grid-column: 6; }
+  #page-cars .cars-edit { grid-column: 7; margin-left: 0; }
+
+  #page-cars .cars-c-note {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  #page-cars .cars-fields {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  #page-cars .cars-field-date {
+    grid-column: auto;
+  }
+
+  #page-cars .cars-field-check {
+    grid-column: span 2;
   }
 }
