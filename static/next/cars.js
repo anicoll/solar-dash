@@ -1,30 +1,42 @@
 /* Cars page: was charging the car cheap fuel?
 
-   One block per car with data in the chosen month (cost per 100 km against a
-   petrol car), then one block for each car TeslaMate does not track (a plug-in
-   hybrid, say) with its petrol fills, then when the charging happened drawn on
-   the price ribbon, and the sessions in words. Same data and maths as the
-   current dashboard's Cars view:
+   One card per car, so it is clear where one car ends and the next begins:
+   the TeslaMate cars with data in the chosen month first, then the manual cars
+   (a plug-in hybrid, say) TeslaMate does not track. A card is an accordion. Its
+   header is a number-plate name, the model, the source and when it was owned,
+   and closed it also shows the month's headline figure. Inside:
+     TeslaMate car  cost per 100 km against a petrol car, when the charging
+                    happened drawn on the price ribbon, then the sessions in words
+     manual car     petrol per 100 km, a few stats, then the month's fills
+   Same data and maths as the current dashboard's Cars view:
      /api/ev/cars      each car's months (km, petrol cost, charging cost),
-                       the comparison petrol car and its L/100 km
+                       the comparison petrol car and its L/100 km, owned_since
      /api/ev/sessions  the month's charging sessions, costed from the house data
+                       (they carry no car id, so they go in a card only when one
+                       TeslaMate car was active that month)
      /api/tariff       (through SD.tariff) the price bands for the ribbon
-     /api/fuel/cars    the manual cars: totals, L/100 km and the fills
+     /api/fuel/cars    the manual cars: totals, L/100 km, owned_since and the fills
    The manual cars' fills are added, changed and deleted here:
      POST /api/admin/cars/ID/fills     PUT/DELETE /api/admin/fills/ID
-   The month lives in the address: #cars, or #cars/2026-09 for September. */
+   The address names the month and a car to open: #cars, #cars/2026-09,
+   #cars/zippy or #cars/2026-09/zippy. Which cars are open is kept in
+   localStorage by car key (the name, plus the model when two cars share it). */
 (function () {
   'use strict';
 
   const h = SD.h;
   const SESSIONS_SHOWN = 4;
+  const OPEN_KEY = 'solar-dash.cars.open';
 
   let root = null; // the page element while mounted
   let alive = false; // false after unmount, so late fetches draw nothing
   let carsPromise = null;
   let fuelPromise = null; // never rejects: resolves {cars} or {error}
-  let manualBox = null; // where the manual cars are drawn, so a save redraws only them
+  let manualBox = null; // where the manual cards are drawn, so a save redraws only them
   let manualMonth = null; // the month manualBox shows
+  let manualKeys = null; // car_id -> car key of the manual cars
+  let singleCar = false; // only one car in all: its card starts open
+  let opened = {}; // car key -> true/false: the cards left open or closed
   let adding = null; // id of the manual car whose Add fill form is open
   let editing = null; // id of the fill being edited
   let ribbon = null;
@@ -46,6 +58,12 @@
   function monthFrom(rest) {
     const ym = (rest || '').split('/')[0];
     return MONTH_RE.test(ym) && ym <= thisMonth() ? ym : thisMonth();
+  }
+
+  /** The car named after the month in the address (#cars/2026-09/zippy or #cars/zippy), or ''. */
+  function carFrom(rest) {
+    const parts = (rest || '').split('/');
+    return (MONTH_RE.test(parts[0]) ? parts[1] : parts[0]) || '';
   }
 
   const monthName = (ym) => SD.fmt.date(`${ym}-01`, 'month');
@@ -82,6 +100,41 @@
     return m.km > 0 || m.home_kwh > 0 || m.away_kwh > 0 ? m : null;
   }
 
+  /** Dollars, but under a dollar in cents: 0.0204 -> '2c' (rounded), 0.009 -> '0.9c'. */
+  function money(dollars, round) {
+    if (dollars == null || !Number.isFinite(dollars)) return SD.fmt.dollars(null);
+    return Math.abs(dollars) < 1 ? SD.fmt.cents(dollars * 100, { round: !!round }) : SD.fmt.dollars(dollars);
+  }
+
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+  /** "1 week", "3 weeks", "4 months", "1 year 2 months": how long from a 'YYYY-MM-DD' until today. */
+  function sinceWords(from) {
+    const [y, m, d] = from.split('-').map(Number);
+    const [ty, tm, td] = SD.local().date.split('-').map(Number);
+    let months = (ty - y) * 12 + (tm - m) - (td < d ? 1 : 0);
+    if (months < 0) months = 0;
+    if (months >= 12) {
+      const years = Math.floor(months / 12);
+      return [plural(years, 'year'), months % 12 ? plural(months % 12, 'month') : null].filter(Boolean).join(' ');
+    }
+    if (months >= 1) return plural(months, 'month');
+    const days = Math.max(0, Math.round((Date.UTC(ty, tm - 1, td) - Date.UTC(y, m - 1, d)) / 86400000));
+    return days >= 7 ? plural(Math.floor(days / 7), 'week') : days === 1 ? '1 day' : days ? `${days} days` : 'today';
+  }
+
+  /** "1 Jul 2026" from a 'YYYY-MM-DD'. */
+  const dateWithYear = (ymd) => {
+    const [y, m, d] = ymd.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString('en-AU', { timeZone: 'UTC', day: 'numeric', month: 'short', year: 'numeric' });
+  };
+
+  /** "27 June" from a 'YYYY-MM-DD'. */
+  const dayAndMonth = (ymd) => {
+    const [y, m, d] = ymd.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString('en-AU', { timeZone: 'UTC', day: 'numeric', month: 'long' });
+  };
+
   /** Dollars per 100 km from a total and the km it covered. */
   const per100 = (dollars, km) => (dollars == null || !(km > 0) ? null : (dollars / km) * 100);
 
@@ -89,6 +142,81 @@
   function withArticle(name) {
     if (!name) return 'A petrol car';
     return `${/^[aeiou]/i.test(name) ? 'An' : 'A'} ${name}`;
+  }
+
+  /* ---------------------------------------------------------------- car cards */
+
+  const slug = (text) => String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+  /** Each car's key for the address and for remembering it is open: its name, plus the
+      model when two cars share a name, plus the source and id if that is not enough. */
+  function carKeys(all) {
+    const keys = new Map();
+    const same = (c, f) => all.filter((o) => f(o) === f(c)).length > 1;
+    const base = (c) => slug(c.name || c.label) || 'car';
+    const withModel = (c) => (same(c, base) ? `${base(c)}-${slug(c.model ? (c.source === 'manual' ? c.model : `model ${c.model}`) : '')}`.replace(/-$/, '') : base(c));
+    for (const c of all) {
+      keys.set(c, same(c, withModel) ? `${withModel(c)}-${c.source === 'manual' ? 'm' : 't'}${c.car_id}` : withModel(c));
+    }
+    return keys;
+  }
+
+  function loadOpen() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(OPEN_KEY));
+      return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    } catch { return {}; }
+  }
+
+  function saveOpen() {
+    try { localStorage.setItem(OPEN_KEY, JSON.stringify(opened)); } catch { /* not saved; fine */ }
+  }
+
+  const isOpen = (key) => (key in opened ? !!opened[key] : singleCar);
+
+  /** One car's card. `info`: key, name, model, meta, source, owned, big, small. The header
+      button opens and closes the body; closed, it also shows the month's headline figure. */
+  function carCard(info, ...content) {
+    const open = isOpen(info.key);
+    const id = `cars-${info.key}`;
+    const body = h('div', { class: 'cars-body', id: `${id}-body`, hidden: !open }, content);
+    const toggle = h('button', { type: 'button', class: 'cars-toggle', 'aria-expanded': String(open), 'aria-controls': `${id}-body` },
+      h('span', { class: 'cars-plate', id: `${id}-h`, text: info.name }),
+      info.model ? h('span', { class: 'cars-model', text: info.model }) : null,
+      h('span', { class: 'cars-meta', text: info.meta }),
+      info.owned ? h('span', { class: 'cars-owned', text: info.owned }) : null,
+      h('span', { class: 'cars-right' },
+        sourceBadge(info.source),
+        h('span', { class: 'cars-sum' }, h('b', { class: 'fig', text: info.big }), h('span', { text: info.small })),
+        h('span', { class: 'cars-chev', 'aria-hidden': 'true', text: '›' })));
+    toggle.addEventListener('click', () => {
+      const now = toggle.getAttribute('aria-expanded') !== 'true';
+      toggle.setAttribute('aria-expanded', String(now));
+      body.hidden = !now;
+      opened[info.key] = now;
+      saveOpen();
+    });
+    return h('article', { class: 'card cars-card', id, 'aria-labelledby': `${id}-h` },
+      h('header', { class: 'cars-card-head' }, toggle), body);
+  }
+
+  /** "Owned since 1 Jul 2026 · 4 months", or '' when there is no date. `since` falls back
+      to the first day of data; a TeslaMate car says where its own data starts. */
+  function ownedLine(ownedSince, fallback, dataFrom) {
+    const date = ownedSince || fallback;
+    if (!date) return '';
+    const parts = [`Owned since ${dateWithYear(date)}`, sinceWords(date)];
+    if (dataFrom && date < dataFrom) parts.push(`TeslaMate data from ${SD.fmt.date(dataFrom, 'short')}`);
+    return parts.join(' · ');
+  }
+
+  /** A titled part of a card body, with a label at the right of the title. */
+  function section(id, title, label, ...content) {
+    return h('section', { class: 'cars-sec', 'aria-labelledby': id },
+      h('div', { class: 'card-head' },
+        h('h3', { class: 'section-title', id, text: title }),
+        label ? h('span', { class: 'label', text: label }) : null),
+      content);
   }
 
   /* ---------------------------------------------------------------- headline block */
@@ -99,53 +227,53 @@
       h('span', { class: 'cars-bar-label', text: label }),
       h('div', { class: 'cars-bar-track' },
         h('div', { class: `cars-bar cars-bar-${kind}${kind === 'petrol' ? ' hatch' : ''}`, style: `width: ${pct.toFixed(1)}%` })),
-      h('span', { class: 'cars-bar-value fig', text: SD.fmt.dollars(value) }));
+      h('span', { class: 'cars-bar-value fig', text: money(value, true) }));
   }
 
-  function carBlock(car, m, data, ym) {
+  /** The TeslaMate car's card. Its charging sections are added to `slot` once the sessions load. */
+  function carBlock(car, m, data, ym, key, slot) {
     const when = ym === thisMonth() ? 'this month' : `in ${monthOnly(ym)}`;
-    const model = car.model ? `Model ${car.model}` : (car.marketing_name || null);
     const name = car.name || car.label;
-    const sub = [name, model !== name ? model : null, m.km > 0 ? `${Math.round(m.km).toLocaleString('en-AU')} km ${when}` : `no driving ${when}`]
-      .filter(Boolean).join(' · ');
-
     const ev100 = m.km > 0 ? m.with_system.cents_per_km : null; // cents a km is dollars per 100 km
     const petrol100 = per100(m.petrol_cost, m.km);
     const saved = m.with_system.saved;
+    const keptDollars = saved != null && saved > 0 ? SD.fmt.dollars(saved, saved >= 100 ? 0 : 2) : null;
 
-    const el = h('section', { class: 'cars-car', 'aria-label': `${name} ${when}` },
-      h('p', { class: 'cars-sub' }, sourceBadge('teslamate'), sub));
+    const info = {
+      key, name, source: 'teslamate',
+      model: car.model ? `Tesla Model ${car.model}` : (car.marketing_name || null),
+      meta: [car.marketing_name && car.model ? car.marketing_name : car.trim, m.km > 0 ? `${Math.round(m.km).toLocaleString('en-AU')} km ${when}` : `no driving ${when}`]
+        .filter(Boolean).join(' · '),
+      owned: ownedLine(car.owned_since, car.first_day, car.first_day),
+      big: ev100 == null ? '–' : money(ev100, true),
+      small: ev100 == null ? `no driving ${when}` : `per 100 km${keptDollars ? ` · ${keptDollars} kept` : ''}`,
+    };
+    const content = [];
 
     if (ev100 == null) {
-      el.append(h('p', { class: 'lede', text: `${name} did not drive ${when}, so there is no cost per 100 km to show.` }));
-      return el;
+      content.push(h('p', { class: 'lede', text: `${name} did not drive ${when}, so there is no cost per 100 km to show.` }));
+    } else {
+      content.push(h('div', { class: 'cars-headline' },
+        h('span', { class: 'cars-big fig', text: money(ev100, true) }),
+        h('span', { class: 'cars-big-unit', text: 'per 100 km' })));
+      if (petrol100 == null || !data.configured) {
+        content.push(h('p', { class: 'lede', text: 'Add a petrol price in Admin to compare this with a petrol car.' }));
+      } else {
+        const litres = data.petrol_litres_per_100km;
+        const grade = data.petrol_grade ? ` of ${data.petrol_grade}` : '';
+        const sentence = h('p', { class: 'cars-sentence' },
+          `${withArticle(car.compare_with)}${litres ? ` on ${litres.toFixed(1)} L/100 km${grade}` : ''} would cost `,
+          h('b', { text: money(petrol100) }), ' per 100 km.');
+        if (keptDollars) sentence.append(` ${name} kept `, h('b', { text: keptDollars }), ` in your pocket ${when}.`);
+        const max = Math.max(ev100, petrol100);
+        content.push(sentence, h('div', {
+          class: 'cars-bars', role: 'img',
+          'aria-label': `Cost per 100 km: ${name} ${money(ev100, true)}, petrol ${money(petrol100)}.`,
+        }, bar(name, ev100, max, 'ev'), bar('Petrol', petrol100, max, 'petrol')));
+      }
     }
-
-    el.append(h('div', { class: 'cars-headline' },
-      h('span', { class: 'cars-big fig', text: SD.fmt.dollars(ev100) }),
-      h('span', { class: 'cars-big-unit', text: 'per 100 km' })));
-
-    if (petrol100 == null || !data.configured) {
-      el.append(h('p', { class: 'lede', text: 'Add a petrol price in Admin to compare this with a petrol car.' }));
-      return el;
-    }
-
-    const litres = data.petrol_litres_per_100km;
-    const grade = data.petrol_grade ? ` of ${data.petrol_grade}` : '';
-    const sentence = h('p', { class: 'cars-sentence' },
-      `${withArticle(car.compare_with)}${litres ? ` on ${litres.toFixed(1)} L/100 km${grade}` : ''} would cost `,
-      h('b', { text: SD.fmt.dollars(petrol100) }), ' per 100 km.');
-    if (saved != null && saved > 0) {
-      sentence.append(' That\'s ', h('b', { text: SD.fmt.dollars(saved, Math.abs(saved) >= 100 ? 0 : 2) }), ` kept ${when}.`);
-    }
-    el.append(sentence);
-
-    const max = Math.max(ev100, petrol100);
-    el.append(h('div', {
-      class: 'cars-bars', role: 'img',
-      'aria-label': `Cost per 100 km: ${name} ${SD.fmt.dollars(ev100)}, petrol ${SD.fmt.dollars(petrol100)}.`,
-    }, bar(name, ev100, max, 'ev'), bar('Petrol', petrol100, max, 'petrol')));
-    return el;
+    content.push(slot);
+    return carCard(info, content);
   }
 
   /* ---------------------------------------------------------------- when it charged */
@@ -177,11 +305,10 @@
     return costsNothing(s) ? 'free' : paidBand(s, tariff);
   }
 
-  function chargedCard(sessions, tariff) {
-    const card = h('section', { class: 'card cars-when', 'aria-labelledby': 'cars-when-h' },
-      h('div', { class: 'card-head' },
-        h('h2', { class: 'section-title', id: 'cars-when-h', text: 'When it charged' }),
-        h('span', { class: 'label', text: `${sessions.length} ${sessions.length === 1 ? 'session' : 'sessions'}` })));
+  function chargedCard(sessions, tariff, name, ym, key) {
+    const kwhAll = sessions.reduce((a, s) => a + (sessionKwh(s) || 0), 0);
+    const card = section(`cars-${key}-when`, `When ${name} charged in ${monthOnly(ym)}`, `${plural(sessions.length, 'session')} · ${SD.fmt.kwh(kwhAll)}`);
+    card.classList.add('cars-when');
 
     const kinds = sessions.map((s) => sessionKind(s, tariff));
     const costed = sessions.filter((s, i) => kinds[i] !== 'away');
@@ -276,15 +403,15 @@
     const kwh = sessionKwh(s);
     return h('li', { class: 'cars-session' },
       h('b', { class: 'cars-session-when', text: `${SD.fmt.date(SD.local(s.started_at).date, 'medium')} · ${timeRange(s)}` }),
-      h('span', { class: 'cars-session-cost fig', text: s.cost == null ? SD.fmt.dollars(null) : SD.fmt.dollars(s.cost) }),
+      h('span', { class: 'cars-session-cost fig', text: money(s.cost) }),
       h('span', { class: 'label cars-session-what', text: `${kwh == null ? SD.fmt.kwh(null) : SD.fmt.kwh(kwh)} · ${sourceWords(s, tariff)}` }));
   }
 
-  function sessionsCard(sessions, tariff) {
+  function sessionsCard(sessions, tariff, name, ym, key) {
     const newest = sessions.slice().reverse();
     const list = h('ul', { class: 'cars-sessions' });
-    const card = h('section', { class: 'card cars-list', 'aria-labelledby': 'cars-sess-h' },
-      h('h2', { class: 'section-title', id: 'cars-sess-h', text: 'Sessions' }), list);
+    const total = sessions.reduce((a, s) => a + (s.cost || 0), 0);
+    const card = section(`cars-${key}-sess`, `${name}'s charging sessions in ${monthOnly(ym)}`, `${plural(sessions.length, 'session')} · ${money(total)}`, list);
 
     const draw = () => {
       list.replaceChildren(...(showAll ? newest : newest.slice(0, SESSIONS_SHOWN)).map((s) => sessionItem(s, tariff)));
@@ -477,25 +604,41 @@
     drawManual();
   }
 
-  function manualBlock(car, ym) {
+  function manualBlock(car, ym, key) {
     const when = ym === thisMonth() ? 'this month' : `in ${monthOnly(ym)}`;
     const totals = car.totals;
-    const kind = KIND_WORDS[car.kind] || car.kind;
-    const sub = [car.model && car.model !== car.name ? car.model : null, kind].filter(Boolean).join(' · ');
     const month = (car.months || []).find((m) => m.month === ym);
     const fills = car.fills.filter((f) => f.date.startsWith(ym));
+    const monthCost = fills.reduce((a, f) => a + f.cost_dollars, 0);
+    const since = car.owned_since || totals.first_date;
+    const per100km = car.cost_per_km == null ? null : SD.fmt.cents(car.cost_per_km * 100, { round: true });
 
-    const el = h('section', { class: 'cars-car cars-manual', 'aria-label': car.name },
-      h('p', { class: 'cars-sub' }, sourceBadge('manual'), `${car.name} · ${sub}`));
+    const info = {
+      key, name: car.name, source: 'manual',
+      model: car.model && car.model !== car.name ? car.model : null,
+      meta: [KIND_WORDS[car.kind] || car.kind, fills.length ? `${plural(fills.length, 'fill')} ${when}` : `no fills ${when}`].filter(Boolean).join(' · '),
+      owned: ownedLine(car.owned_since, totals.first_date, null),
+      big: per100km || '–',
+      small: `per 100 km petrol · ${money(monthCost, true)} ${when === 'this month' ? when : `in ${monthOnly(ym).slice(0, 3)}`}`,
+    };
+    const content = [];
 
     if (!totals.fills) {
-      el.append(h('p', { class: 'lede', text: 'No fills yet. Add the first to see its fuel economy and what the petrol costs.' }));
+      content.push(h('p', { class: 'lede', text: 'No fills yet. Add the first to see its fuel economy and what the petrol costs.' }));
     } else {
-      el.append(h('div', { class: 'cars-stats' },
-        stat(car.l_per_100km == null ? '–' : car.l_per_100km.toFixed(1), 'L/100 km', car.l_per_100km == null ? 'needs two full tanks with the odometer' : 'full tank to full tank'),
-        stat(car.cost_per_km == null ? '–' : SD.fmt.cents(car.cost_per_km * 100), 'per km', 'petrol only'),
-        stat(SD.fmt.dollars(month ? month.cost_dollars : 0), `petrol ${when}`, month ? `${litresText(month.litres)} in ${month.fills} ${month.fills === 1 ? 'fill' : 'fills'}` : 'no fills'),
-        stat(SD.fmt.dollars(totals.cost_dollars), 'petrol so far', `since ${SD.fmt.date(totals.first_date, 'short')}`)));
+      const months = since ? (Date.parse(SD.local().date) - Date.parse(since)) / 86400000 / 30.44 : 0;
+      const perMonth = months >= 1 ? ` · about ${SD.fmt.dollars(totals.cost_dollars / months, 0)} a month` : '';
+      const last = car.fills.reduce((a, f) => (!a || f.date > a.date ? f : a), null); // the list order is not relied on
+      content.push(
+        h('div', { class: 'cars-headline' },
+          h('span', { class: 'cars-big fig', text: per100km || '–' }),
+          h('span', { class: 'cars-big-unit', text: 'per 100 km of petrol' })),
+        h('p', { class: 'cars-sentence', text: `${since ? `Averaged full tank to full tank since ${dayAndMonth(since)}. ` : ''}Charging at home isn't counted, so this is the petrol side only.` }),
+        h('div', { class: 'cars-stats' },
+          stat(car.l_per_100km == null ? '–' : car.l_per_100km.toFixed(1), 'L/100 km', car.l_per_100km == null ? 'needs two full tanks with the odometer' : 'km on battery included'),
+          stat(SD.fmt.dollars(month ? month.cost_dollars : 0), `petrol ${when}`, month ? `${litresText(month.litres)} in ${plural(month.fills, 'fill')}` : 'no fills'),
+          stat(SD.fmt.dollars(totals.cost_dollars), 'petrol since you got it', since ? `${sinceWords(since)}${perMonth}` : null),
+          stat(last ? SD.fmt.date(last.date, 'short') : '–', 'last fill', last ? cplText(last.cents_per_litre) : null)));
     }
 
     const addOpen = adding === car.car_id;
@@ -503,27 +646,25 @@
       type: 'button', class: 'cars-btn primary', text: 'Add fill', 'aria-expanded': String(addOpen),
       onclick: () => { adding = addOpen ? null : car.car_id; editing = null; drawManual(); },
     });
-    const card = h('div', { class: 'card cars-fills' },
-      h('div', { class: 'card-head' },
-        h('h2', { class: 'section-title', text: `Fills in ${monthOnly(ym)}` }), addButton));
-    if (addOpen) card.append(fillForm(car, null));
-
     const list = h('ul', { class: 'cars-fill-list' });
     for (const fill of fills) {
       list.append(fill.id === editing ? h('li', { class: 'cars-fill-edit' }, fillForm(car, fill)) : fillRow(car, fill));
     }
+    const part = section(`cars-${key}-fills`, `${car.name}'s fills in ${monthOnly(ym)}`, `${plural(fills.length, 'fill')} · ${SD.fmt.dollars(monthCost)}`);
     if (fills.length) {
-      card.append(h('div', { class: 'cars-fill-head', 'aria-hidden': 'true' },
+      part.append(h('div', { class: 'cars-fill-head', 'aria-hidden': 'true' },
         h('span', { text: 'Date' }), h('span', { text: 'Cost' }), h('span', { text: 'Litres' }), h('span', { text: 'Price' }),
         h('span', { text: 'Odometer' }), h('span', { text: 'Economy' }), h('span')), list);
       if (fills.some((f) => priceMark(f))) {
-        card.append(h('p', { class: 'cars-key label' }, '▲ ▼ dearer or cheaper than the Adelaide average that month.'));
+        part.append(h('p', { class: 'cars-key label' }, '▲ ▼ dearer or cheaper than the Adelaide average that month.'));
       }
     } else if (totals.fills || !addOpen) {
-      card.append(h('p', { class: 'muted cars-none', text: totals.fills ? `No fills in ${monthName(ym)}.` : 'Nothing logged yet.' }));
+      part.append(h('p', { class: 'muted cars-none', text: totals.fills ? `No fills in ${monthOnly(ym)}. Use ‹ to see earlier months.` : 'Nothing logged yet.' }));
     }
-    el.append(card);
-    return el;
+    part.append(h('div', { class: 'cars-add' }, addButton));
+    if (addOpen) part.append(fillForm(car, null));
+    content.push(part);
+    return carCard(info, content);
   }
 
   /** Redraws the manual cars alone (after a save, an edit or Cancel). */
@@ -543,7 +684,7 @@
         'Have a car TeslaMate does not track? ', h('a', { href: '#admin', text: 'Add it in Admin' }), ' to log its petrol.'));
       return;
     }
-    box.replaceChildren(...cars.map((car) => manualBlock(car, ym)));
+    box.replaceChildren(...cars.map((car) => manualBlock(car, ym, manualKeys.get(car.car_id))));
   }
 
   function loadFuel() {
@@ -565,12 +706,13 @@
     return h('section', { class: 'card' }, h('p', { class: 'muted', role, text }));
   }
 
-  async function draw(ym) {
+  async function draw(ym, wanted) {
     const my = ++token;
     showAll = false;
     adding = null;
     editing = null;
     manualBox = null;
+    opened = loadOpen();
     if (ribbon) { ribbon.destroy(); ribbon = null; }
     const head = h('header', { class: 'page-head cars-head' }, h('h1', { class: 'cars-title', text: 'Cars' }));
     const body = h('div', { class: 'stack' });
@@ -600,6 +742,12 @@
     manualMonth = ym;
 
     const active = cars.map((car) => ({ car, m: carMonth(car, ym) })).filter((x) => x.m);
+    const keys = carKeys([...cars, ...manual]);
+    manualKeys = new Map(manual.map((car) => [car.car_id, keys.get(car)]));
+    singleCar = active.length + manual.length === 1;
+    if (wanted && [...keys.values()].includes(wanted)) { opened[wanted] = true; saveOpen(); }
+    // Where each active TeslaMate car's charging sections go once the sessions arrive.
+    const slots = active.map(() => h('div', { class: 'cars-slot' }));
     const parts = [];
     if (failure) {
       parts.push(note(`Could not load the cars: ${failure.message}`, 'alert'));
@@ -611,9 +759,14 @@
     } else if (!active.length) {
       parts.push(note(`No driving or charging in ${monthName(ym)}.`));
     }
-    parts.push(...active.map(({ car, m }) => carBlock(car, m, data, ym)), manualBox);
+    parts.push(...active.map(({ car, m }, i) => carBlock(car, m, data, ym, keys.get(car), slots[i])), manualBox);
     body.replaceChildren(...parts);
-    drawManual();
+    await drawManual();
+    if (my !== token || !alive) return;
+    if (wanted) {
+      const target = body.querySelector(`#${CSS.escape(`cars-${wanted}`)}`);
+      if (target) target.scrollIntoView({ block: 'start' });
+    }
     if (failure || !active.length) return;
 
     // The month's charging sessions, costed by the server.
@@ -633,8 +786,12 @@
       body.append(note(`Could not load the charging sessions: ${err.message}`, 'alert'));
       return;
     }
-    if (my !== token || !alive || !sessions.length) return;
-    body.append(chargedCard(sessions, tariff), sessionsCard(sessions, tariff));
+    // The sessions carry no car id, so they can only be placed when one car drove.
+    if (my !== token || !alive || !sessions.length || active.length !== 1) return;
+    const { car } = active[0];
+    const name = car.name || car.label;
+    const key = keys.get(car);
+    slots[0].append(chargedCard(sessions, tariff, name, ym, key), sessionsCard(sessions, tariff, name, ym, key));
   }
 
   SD.page('cars', {
@@ -644,10 +801,10 @@
       carsPromise = SD.fetchJSON('/api/ev/cars');
       carsPromise.catch(() => {}); // handled where it is awaited
       fuelPromise = loadFuel();
-      draw(monthFrom(hashRest));
+      draw(monthFrom(hashRest), carFrom(hashRest));
     },
     update(hashRest) {
-      draw(monthFrom(hashRest));
+      draw(monthFrom(hashRest), carFrom(hashRest));
     },
     unmount() {
       alive = false;
@@ -655,6 +812,7 @@
       if (ribbon) ribbon.destroy();
       ribbon = null;
       manualBox = null;
+      manualKeys = null;
       root = null;
     },
   });
