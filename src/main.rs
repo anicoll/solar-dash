@@ -6,6 +6,7 @@ mod config;
 mod cost;
 mod db;
 mod ev_cost;
+mod fuel_log;
 mod globird;
 mod ingest;
 mod isolar;
