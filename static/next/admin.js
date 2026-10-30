@@ -1,7 +1,7 @@
 /* Admin page (the gear in the header): the data that lives in the database.
 
    Cards, in the order they are used: Settings, Plans (with a preview), Past
-   bills, Purchases, Petrol prices, Backup and Recent changes. One GET /api/admin
+   bills, Purchases, Cars, Petrol prices, Backup and Recent changes. One GET /api/admin
    feeds every card but Backup; each card draws on its own, so one that fails
    shows its own message and the others stay.
 
@@ -9,18 +9,20 @@
      PUT    /api/admin/settings                    PUT/POST/DELETE /api/admin/tariffs[/id]
      POST   /api/admin/tariffs/preview             PUT /api/admin/bills (text/csv), DELETE /api/admin/bills/DATE
      POST/PUT/DELETE /api/admin/purchases[/id]     PUT /api/petrol-prices, DELETE /api/petrol-prices/DATE
+     POST/PUT/DELETE /api/admin/cars[/id]          (manual cars; their fills are on the Cars page)
      GET    /api/admin/backup, /api/admin/backup/download, /api/admin?download=1 */
 (function () {
   'use strict';
 
   const { h } = SD;
-  const CARDS = ['settings', 'plans', 'bills', 'purchases', 'petrol', 'backup', 'changes'];
+  const CARDS = ['settings', 'plans', 'bills', 'purchases', 'cars', 'petrol', 'backup', 'changes'];
 
   let alive = false;
   let data = null; // the last answer of GET /api/admin
   let boxes = {}; // card id -> the element its content goes in
   let petrolEditing = null; // the from-date being edited, or null when adding
   let purchaseEditing = null; // the purchase id being edited, or null when adding
+  let carEditing = null; // the manual car id being edited, or null when adding
   let draft = null; // the plan being edited or added, as the text of its inputs
   let previewOk = false; // the preview on screen matches the draft; Save needs it
   const timers = [];
@@ -149,7 +151,7 @@
     drawAll(ids.length ? ids : CARDS.filter((c) => c !== 'backup'));
   }
 
-  const DRAW = { settings: drawSettings, plans: drawPlans, bills: drawBills, purchases: drawPurchases, petrol: drawPetrol, backup: drawBackup, changes: drawChanges };
+  const DRAW = { settings: drawSettings, plans: drawPlans, bills: drawBills, purchases: drawPurchases, cars: drawCars, petrol: drawPetrol, backup: drawBackup, changes: drawChanges };
 
   /** Each card draws on its own, so a fault in one shows in that card only. */
   function drawAll(ids) {
@@ -629,6 +631,75 @@
         editing ? () => { purchaseEditing = null; drawPurchases(); } : null));
   }
 
+  /* ---------------------------------------------------------------- Cars */
+
+  const CAR_KINDS = [['phev', 'Plug-in hybrid'], ['petrol', 'Petrol'], ['hybrid', 'Hybrid'], ['diesel', 'Diesel']];
+
+  function sourceBadge(source) {
+    return h('span', { class: 'src-badge', text: source === 'manual' ? 'Manual' : 'TeslaMate' });
+  }
+
+  /** The TeslaMate cars are read-only; the manual cars (no TeslaMate) can be added, renamed and deleted. */
+  async function drawCars() {
+    const box = boxes.cars;
+    let tesla = [];
+    let teslaError = null;
+    try {
+      tesla = (await call('GET', '/api/ev/cars')).cars || [];
+    } catch (err) {
+      teslaError = err;
+    }
+    if (!alive || !boxes.cars) return;
+    const manual = data.manual_cars;
+    const err = note();
+
+    const teslaList = h('ul', { class: 'adm-list adm-cars' });
+    for (const c of tesla) {
+      const detail = [c.name && c.name !== c.label ? c.name : null, c.first_day ? `since ${c.first_day}` : null].filter(Boolean).join(' · ');
+      teslaList.append(h('li', { class: 'adm-row' },
+        h('div', { class: 'adm-row-text' }, h('strong', null, sourceBadge('teslamate'), c.label), detail ? h('span', { text: detail }) : null)));
+    }
+    if (teslaError) teslaList.append(h('li', { class: 'adm-empty', text: `Could not load the TeslaMate cars. ${teslaError.message}` }));
+    else if (!tesla.length) teslaList.append(h('li', { class: 'adm-empty', text: 'No TeslaMate cars yet.' }));
+
+    const list = h('ul', { class: 'adm-list adm-cars' });
+    if (!manual.length) list.append(h('li', { class: 'adm-empty', text: 'No manual cars yet.' }));
+    for (const c of manual) {
+      const kind = (CAR_KINDS.find(([k]) => k === c.kind) || [null, c.kind])[1];
+      list.append(h('li', { class: 'adm-row' },
+        h('div', { class: 'adm-row-text' },
+          h('strong', null, sourceBadge('manual'), c.name),
+          h('span', { text: `${[c.model, kind].filter(Boolean).join(' · ')} · ${plural(c.fills, 'fill')}` })),
+        h('div', { class: 'adm-row-actions' },
+          btn('Edit', () => { carEditing = c.id; drawCars(); }, 'small', `Edit ${c.name}`),
+          deleteButton('Delete', `Delete ${c.name}`,
+            c.fills ? `Delete ${c.name} and its ${plural(c.fills, 'fill')}?` : `Delete ${c.name}?`,
+            async () => { await call('DELETE', `/api/admin/cars/${c.id}`); await refresh('cars', 'changes'); }, err))));
+    }
+
+    const editing = manual.find((c) => c.id === carEditing);
+    const name = inp('text', { value: editing ? editing.name : '', autocomplete: 'off' });
+    const model = inp('text', { value: editing && editing.model ? editing.model : '', autocomplete: 'off' });
+    const kind = h('select', null, CAR_KINDS.map(([k, label]) => h('option', { value: k, text: label })));
+    kind.value = editing ? editing.kind : 'phev';
+    box.replaceChildren(
+      blurb('Cars that TeslaMate does not track get a petrol fill log on the Cars page. Cars from TeslaMate appear here as they sync.'),
+      sub('From TeslaMate'), teslaList,
+      sub('Manual cars'), list, err,
+      sub(editing ? `Edit ${editing.name}` : 'Add a car'),
+      form([field('Name', name), field('Model (optional)', model), field('Type', kind, 'Only shown; it does not change any sums.')],
+        editing ? 'Save car' : 'Add car',
+        async () => {
+          const payload = { name: name.value, model: model.value, kind: kind.value };
+          if (editing) await call('PUT', `/api/admin/cars/${editing.id}`, payload);
+          else await call('POST', '/api/admin/cars', payload);
+          carEditing = null;
+          await refresh('cars', 'changes');
+          if (boxes.cars) boxes.cars.prepend(savedLine('Car saved.'));
+        },
+        editing ? () => { carEditing = null; drawCars(); } : null));
+  }
+
   /* ---------------------------------------------------------------- Petrol prices */
 
   function drawPetrol() {
@@ -718,8 +789,9 @@
       previewOk = false;
       petrolEditing = null;
       purchaseEditing = null;
+      carEditing = null;
       const titles = {
-        settings: 'Settings', plans: 'Plans', bills: 'Past bills', purchases: 'Purchases',
+        settings: 'Settings', plans: 'Plans', bills: 'Past bills', purchases: 'Purchases', cars: 'Cars',
         petrol: 'Petrol prices', backup: 'Backup', changes: 'Recent changes',
       };
       const wide = new Set(['settings', 'plans']);

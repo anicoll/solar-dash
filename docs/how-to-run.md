@@ -241,7 +241,7 @@ curl -b cookies.txt http://127.0.0.1:8080/api/latest
 The redesigned dashboard is the default: `/` serves it. It has the pages
 Today, Bill, History, Cars and Payback; the address keeps the page (`/#bill`,
 `/#history/day/2026-10-27`), and a gear in the header opens Admin (`/#admin`):
-settings, plans, past bills, purchases, petrol prices and the backup, using the
+settings, plans, past bills, purchases, cars (the manual ones, with their petrol fills on the Cars tab), petrol prices and the backup, using the
 [Admin API](#admin-api). The previous dashboard is still available at
 `/classic` (same login; its admin view is `/classic#admin`) until it is
 removed. `/next`, the address used while the new dashboard was being built,

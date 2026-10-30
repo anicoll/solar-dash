@@ -115,6 +115,7 @@
 #page-admin input[type="date"],
 #page-admin input[type="time"],
 #page-admin input[type="file"],
+#page-admin select,
 #page-admin textarea {
   width: 100%;
   min-height: 44px;

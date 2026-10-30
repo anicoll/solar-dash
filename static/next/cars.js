@@ -1,12 +1,17 @@
 /* Cars page: was charging the car cheap fuel?
 
    One block per car with data in the chosen month (cost per 100 km against a
-   petrol car), when the charging happened drawn on the price ribbon, and the
-   sessions in words. Same data and maths as the current dashboard's Cars view:
+   petrol car), then one block for each car TeslaMate does not track (a plug-in
+   hybrid, say) with its petrol fills, then when the charging happened drawn on
+   the price ribbon, and the sessions in words. Same data and maths as the
+   current dashboard's Cars view:
      /api/ev/cars      each car's months (km, petrol cost, charging cost),
                        the comparison petrol car and its L/100 km
      /api/ev/sessions  the month's charging sessions, costed from the house data
      /api/tariff       (through SD.tariff) the price bands for the ribbon
+     /api/fuel/cars    the manual cars: totals, L/100 km and the fills
+   The manual cars' fills are added, changed and deleted here:
+     POST /api/admin/cars/ID/fills     PUT/DELETE /api/admin/fills/ID
    The month lives in the address: #cars, or #cars/2026-09 for September. */
 (function () {
   'use strict';
@@ -17,6 +22,11 @@
   let root = null; // the page element while mounted
   let alive = false; // false after unmount, so late fetches draw nothing
   let carsPromise = null;
+  let fuelPromise = null; // never rejects: resolves {cars} or {error}
+  let manualBox = null; // where the manual cars are drawn, so a save redraws only them
+  let manualMonth = null; // the month manualBox shows
+  let adding = null; // id of the manual car whose Add fill form is open
+  let editing = null; // id of the fill being edited
   let ribbon = null;
   let token = 0; // bumps on every draw, so a slow fetch cannot overwrite a newer one
   let showAll = false;
@@ -104,7 +114,7 @@
     const saved = m.with_system.saved;
 
     const el = h('section', { class: 'cars-car', 'aria-label': `${name} ${when}` },
-      h('p', { class: 'cars-sub', text: sub }));
+      h('p', { class: 'cars-sub' }, sourceBadge('teslamate'), sub));
 
     if (ev100 == null) {
       el.append(h('p', { class: 'lede', text: `${name} did not drive ${when}, so there is no cost per 100 km to show.` }));
@@ -295,6 +305,251 @@
     return card;
   }
 
+  /* ---------------------------------------------------------------- manual cars */
+
+  const KIND_WORDS = { phev: 'Plug-in hybrid', petrol: 'Petrol', hybrid: 'Hybrid', diesel: 'Diesel' };
+  /** A difference in c/L smaller than this is not worth a marker. */
+  const MARK_CENTS = 2;
+
+  /** The small pill saying where a car's numbers come from. */
+  function sourceBadge(source) {
+    return h('span', { class: 'src-badge', text: source === 'manual' ? 'Manual' : 'TeslaMate' });
+  }
+
+  const litresText = (l) => `${l.toFixed(1)} L`;
+  const cplText = (c) => `${c.toFixed(1)}c/L`;
+  const economyText = (v) => `${v.toFixed(1)} L/100 km`;
+  const kmText = (km) => `${Math.round(km).toLocaleString('en-AU')} km`;
+  /** A typed number: a comma is taken as a decimal point; empty or bad is null. */
+  const typed = (text) => {
+    const t = text.trim().replace(',', '.');
+    return t === '' || !Number.isFinite(Number(t)) ? null : Number(t);
+  };
+
+  /** One headline figure with its label and a line of small print. */
+  function stat(value, label, small) {
+    return h('div', { class: 'cars-stat' },
+      h('span', { class: 'cars-stat-value fig fig-lg', text: value }),
+      h('span', { class: 'cars-stat-label', text: label }),
+      small ? h('span', { class: 'label', text: small }) : null);
+  }
+
+  /** The marker beside a price that is above or below the month's average. */
+  function priceMark(fill) {
+    const diff = fill.avg_cents_per_litre == null ? 0 : fill.cents_per_litre - fill.avg_cents_per_litre;
+    if (Math.abs(diff) < MARK_CENTS) return null;
+    const words = `${Math.abs(diff).toFixed(0)}c ${diff > 0 ? 'above' : 'below'} the Adelaide average`;
+    return h('span', { class: `cars-mark ${diff > 0 ? 'is-above' : 'is-below'}`, title: words },
+      h('span', { 'aria-hidden': 'true', text: diff > 0 ? '▲' : '▼' }),
+      h('span', { class: 'sr-only', text: ` (${words})` }));
+  }
+
+  /** A tidy fill row; Edit swaps it for the form. */
+  function fillRow(car, fill) {
+    const cell = (cls, text) => h('span', { class: `cars-cell ${cls}${text == null ? ' is-empty' : ''}`, text: text == null ? '–' : text });
+    const price = h('span', { class: 'cars-cell cars-c-cpl' }, cplText(fill.cents_per_litre), priceMark(fill));
+    const edit = h('button', {
+      type: 'button', class: 'card-link cars-edit',
+      'aria-label': `Edit the fill on ${SD.fmt.date(fill.date, 'medium')}`,
+      onclick: () => { editing = fill.id; adding = null; drawManual(); },
+    }, 'Edit');
+    return h('li', { class: 'cars-fill' },
+      h('b', { class: 'cars-cell cars-c-date', text: SD.fmt.date(fill.date, 'medium') + (fill.full_tank ? '' : ' · part fill') }),
+      h('span', { class: 'cars-cell cars-c-cost fig', text: SD.fmt.dollars(fill.cost_dollars) }),
+      cell('cars-c-litres', litresText(fill.litres)),
+      price,
+      cell('cars-c-odo', fill.odometer_km == null ? null : kmText(fill.odometer_km)),
+      cell('cars-c-eco', fill.l_per_100km == null ? null : economyText(fill.l_per_100km)),
+      fill.note ? h('span', { class: 'cars-cell cars-c-note label', text: fill.note }) : null,
+      edit);
+  }
+
+  /** The add or edit form for a fill. `fill` is null when adding. */
+  function fillForm(car, fill) {
+    let n = 0;
+    const field = (label, control, cls) => {
+      const id = `cars-f${car.car_id}-${++n}`;
+      control.id = id;
+      return h('div', { class: `cars-field ${cls || ''}` }, h('label', { for: id, text: label }), control);
+    };
+    const text = (extra) => h('input', Object.assign({ type: 'text', autocomplete: 'off' }, extra));
+    const today = SD.local().date;
+    const date = h('input', { type: 'date', max: today, value: fill ? fill.date : today, required: true });
+    const litres = text({ inputmode: 'decimal', placeholder: '0.0', value: fill ? fill.litres : '' });
+    const cost = text({ inputmode: 'decimal', placeholder: '0.00', value: fill ? fill.cost_dollars : '' });
+    const odo = text({ inputmode: 'decimal', placeholder: 'optional', value: fill && fill.odometer_km != null ? fill.odometer_km : '' });
+    const note = text({ maxlength: '200', placeholder: 'optional', value: fill ? fill.note : '' });
+    const full = h('input', { type: 'checkbox', id: `cars-f${car.car_id}-full` });
+    full.checked = fill ? fill.full_tank : true;
+    const live = h('p', { class: 'cars-live fig', 'aria-live': 'polite' });
+    const msg = h('p', { class: 'cars-msg', role: 'alert', hidden: true });
+
+    const showLive = () => {
+      const l = typed(litres.value);
+      const c = typed(cost.value);
+      live.textContent = l > 0 && c != null && c >= 0 ? `${cplText((c / l) * 100)} per litre` : '';
+    };
+    litres.addEventListener('input', showLive);
+    cost.addEventListener('input', showLive);
+    showLive();
+
+    const save = h('button', { type: 'submit', class: 'cars-btn primary', text: fill ? 'Save fill' : 'Add fill' });
+    const close = () => { adding = null; editing = null; drawManual(); };
+    const actions = h('div', { class: 'cars-actions' }, save, h('button', { type: 'button', class: 'cars-btn', text: 'Cancel', onclick: close }));
+    if (fill) actions.append(deleteControl(fill, msg));
+
+    const form = h('form', { class: 'cars-form', novalidate: true },
+      h('h3', { class: 'cars-form-title', text: fill ? 'Edit fill' : `Add a fill for ${car.name}` }),
+      h('div', { class: 'cars-fields' },
+        field('Date', date, 'cars-field-date'),
+        field('Litres', litres),
+        field('Cost ($)', cost),
+        field('Odometer (km)', odo),
+        h('div', { class: 'cars-field cars-field-check' }, full, h('label', { for: full.id, text: 'Filled to full' })),
+        field('Note', note, 'cars-field-wide')),
+      live, actions, msg);
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      msg.hidden = true;
+      const body = { date: date.value, litres: typed(litres.value), cost_dollars: typed(cost.value), odometer_km: typed(odo.value), full_tank: full.checked, note: note.value };
+      if (!body.date || body.litres == null || body.cost_dollars == null) {
+        msg.textContent = 'Enter the date, the litres and the cost.';
+        msg.hidden = false;
+        return;
+      }
+      save.disabled = true;
+      try {
+        await SD.fetchJSON(fill ? `/api/admin/fills/${fill.id}` : `/api/admin/cars/${car.car_id}/fills`, {
+          method: fill ? 'PUT' : 'POST',
+          headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        await saved(body.date.slice(0, 7));
+      } catch (err) {
+        if (!alive) return;
+        msg.textContent = err.status == null ? 'Network error. Nothing was saved.' : err.message;
+        msg.hidden = false;
+        save.disabled = false;
+      }
+    });
+    return form;
+  }
+
+  /** Delete with a question first, in place of the button. */
+  function deleteControl(fill, msg) {
+    const holder = h('span', { class: 'cars-del' });
+    const show = () => holder.replaceChildren(h('button', { type: 'button', class: 'cars-btn danger', text: 'Delete', onclick: ask }));
+    function ask() {
+      const yes = h('button', {
+        type: 'button', class: 'cars-btn danger solid', text: 'Yes, delete',
+        onclick: async () => {
+          yes.disabled = true;
+          try {
+            await SD.fetchJSON(`/api/admin/fills/${fill.id}`, { method: 'DELETE' });
+            await saved(null);
+          } catch (err) {
+            if (!alive) return;
+            show();
+            msg.textContent = err.status == null ? 'Network error. Nothing was deleted.' : err.message;
+            msg.hidden = false;
+          }
+        },
+      });
+      holder.replaceChildren(
+        h('span', { class: 'cars-ask', role: 'alert', text: 'Delete this fill?' }), yes,
+        h('button', { type: 'button', class: 'cars-btn', text: 'Keep', onclick: show }));
+      yes.focus();
+    }
+    show();
+    return holder;
+  }
+
+  /** After a write: reload the manual cars, and show the month the fill is in. */
+  async function saved(month) {
+    adding = null;
+    editing = null;
+    fuelPromise = loadFuel();
+    if (!alive) return;
+    if (month && month !== manualMonth) {
+      SD.go(`cars/${month}`);
+      return;
+    }
+    drawManual();
+  }
+
+  function manualBlock(car, ym) {
+    const when = ym === thisMonth() ? 'this month' : `in ${monthOnly(ym)}`;
+    const totals = car.totals;
+    const kind = KIND_WORDS[car.kind] || car.kind;
+    const sub = [car.model && car.model !== car.name ? car.model : null, kind].filter(Boolean).join(' · ');
+    const month = (car.months || []).find((m) => m.month === ym);
+    const fills = car.fills.filter((f) => f.date.startsWith(ym));
+
+    const el = h('section', { class: 'cars-car cars-manual', 'aria-label': car.name },
+      h('p', { class: 'cars-sub' }, sourceBadge('manual'), `${car.name} · ${sub}`));
+
+    if (!totals.fills) {
+      el.append(h('p', { class: 'lede', text: 'No fills yet. Add the first to see its fuel economy and what the petrol costs.' }));
+    } else {
+      el.append(h('div', { class: 'cars-stats' },
+        stat(car.l_per_100km == null ? '–' : car.l_per_100km.toFixed(1), 'L/100 km', car.l_per_100km == null ? 'needs two full tanks with the odometer' : 'full tank to full tank'),
+        stat(car.cost_per_km == null ? '–' : SD.fmt.cents(car.cost_per_km * 100), 'per km', 'petrol only'),
+        stat(SD.fmt.dollars(month ? month.cost_dollars : 0), `petrol ${when}`, month ? `${litresText(month.litres)} in ${month.fills} ${month.fills === 1 ? 'fill' : 'fills'}` : 'no fills'),
+        stat(SD.fmt.dollars(totals.cost_dollars), 'petrol so far', `since ${SD.fmt.date(totals.first_date, 'short')}`)));
+    }
+
+    const addOpen = adding === car.car_id;
+    const addButton = h('button', {
+      type: 'button', class: 'cars-btn primary', text: 'Add fill', 'aria-expanded': String(addOpen),
+      onclick: () => { adding = addOpen ? null : car.car_id; editing = null; drawManual(); },
+    });
+    const card = h('div', { class: 'card cars-fills' },
+      h('div', { class: 'card-head' },
+        h('h2', { class: 'section-title', text: `Fills in ${monthOnly(ym)}` }), addButton));
+    if (addOpen) card.append(fillForm(car, null));
+
+    const list = h('ul', { class: 'cars-fill-list' });
+    for (const fill of fills) {
+      list.append(fill.id === editing ? h('li', { class: 'cars-fill-edit' }, fillForm(car, fill)) : fillRow(car, fill));
+    }
+    if (fills.length) {
+      card.append(h('div', { class: 'cars-fill-head', 'aria-hidden': 'true' },
+        h('span', { text: 'Date' }), h('span', { text: 'Cost' }), h('span', { text: 'Litres' }), h('span', { text: 'Price' }),
+        h('span', { text: 'Odometer' }), h('span', { text: 'Economy' }), h('span')), list);
+      if (fills.some((f) => priceMark(f))) {
+        card.append(h('p', { class: 'cars-key label' }, '▲ ▼ dearer or cheaper than the Adelaide average that month.'));
+      }
+    } else if (totals.fills || !addOpen) {
+      card.append(h('p', { class: 'muted cars-none', text: totals.fills ? `No fills in ${monthName(ym)}.` : 'Nothing logged yet.' }));
+    }
+    el.append(card);
+    return el;
+  }
+
+  /** Redraws the manual cars alone (after a save, an edit or Cancel). */
+  async function drawManual() {
+    if (!manualBox || !alive) return;
+    const box = manualBox;
+    const ym = manualMonth;
+    const fuel = await fuelPromise;
+    if (!alive || box !== manualBox) return;
+    if (fuel.error) {
+      box.replaceChildren(note(`Could not load the manual cars: ${fuel.error.message}`, 'alert'));
+      return;
+    }
+    const cars = fuel.cars;
+    if (!cars.length) {
+      box.replaceChildren(h('p', { class: 'muted cars-hint' },
+        'Have a car TeslaMate does not track? ', h('a', { href: '#admin', text: 'Add it in Admin' }), ' to log its petrol.'));
+      return;
+    }
+    box.replaceChildren(...cars.map((car) => manualBlock(car, ym)));
+  }
+
+  function loadFuel() {
+    return SD.fetchJSON('/api/fuel/cars').catch((error) => ({ error }));
+  }
+
   /* ---------------------------------------------------------------- page */
 
   function monthBar(ym, first) {
@@ -313,6 +568,9 @@
   async function draw(ym) {
     const my = ++token;
     showAll = false;
+    adding = null;
+    editing = null;
+    manualBox = null;
     if (ribbon) { ribbon.destroy(); ribbon = null; }
     const head = h('header', { class: 'page-head cars-head' }, h('h1', { class: 'cars-title', text: 'Cars' }));
     const body = h('div', { class: 'stack' });
@@ -320,31 +578,43 @@
     head.append(monthBar(ym, null));
     body.append(h('p', { class: 'muted', role: 'status', text: 'Loading…' }));
 
-    let data;
+    let data = null;
+    let failure = null;
     try {
       data = await carsPromise;
     } catch (err) {
-      if (my !== token || !alive) return;
-      body.replaceChildren(note(`Could not load the cars: ${err.message}`, 'alert'));
-      return;
+      failure = err;
     }
+    const fuel = await fuelPromise;
     if (my !== token || !alive) return;
 
     const cars = (data && data.cars) || [];
-    if (!cars.length) {
-      head.querySelector('.cars-month').remove();
-      body.replaceChildren(note('No car history yet. It appears here once the car has been driven or charged and the history has synced.'));
-      return;
-    }
-    const first = cars.map((c) => c.first_day).filter(Boolean).sort()[0];
+    const manual = (fuel.cars || []);
+    // The earliest month with anything, so the month bar stops there.
+    const first = [...cars.map((c) => c.first_day), ...manual.map((c) => c.totals.first_date)]
+      .filter(Boolean).sort()[0];
     head.querySelector('.cars-month').replaceWith(monthBar(ym, first && first.slice(0, 7)));
 
+    // The manual cars have their own box, so a save redraws only them.
+    manualBox = h('div', { class: 'cars-manual-box stack' });
+    manualMonth = ym;
+
     const active = cars.map((car) => ({ car, m: carMonth(car, ym) })).filter((x) => x.m);
-    if (!active.length) {
-      body.replaceChildren(note(`No driving or charging in ${monthName(ym)}.`));
-      return;
+    const parts = [];
+    if (failure) {
+      parts.push(note(`Could not load the cars: ${failure.message}`, 'alert'));
+    } else if (!cars.length) {
+      if (!manual.length && !fuel.error) {
+        head.querySelector('.cars-month').remove();
+        parts.push(note('No car history yet. It appears here once the car has been driven or charged and the history has synced.'));
+      }
+    } else if (!active.length) {
+      parts.push(note(`No driving or charging in ${monthName(ym)}.`));
     }
-    body.replaceChildren(...active.map(({ car, m }) => carBlock(car, m, data, ym)));
+    parts.push(...active.map(({ car, m }) => carBlock(car, m, data, ym)), manualBox);
+    body.replaceChildren(...parts);
+    drawManual();
+    if (failure || !active.length) return;
 
     // The month's charging sessions, costed by the server.
     const lastDay = shiftMonth(ym, 1) + '-01';
@@ -373,6 +643,7 @@
       alive = true;
       carsPromise = SD.fetchJSON('/api/ev/cars');
       carsPromise.catch(() => {}); // handled where it is awaited
+      fuelPromise = loadFuel();
       draw(monthFrom(hashRest));
     },
     update(hashRest) {
@@ -383,6 +654,7 @@
       token++;
       if (ribbon) ribbon.destroy();
       ribbon = null;
+      manualBox = null;
       root = null;
     },
   });
