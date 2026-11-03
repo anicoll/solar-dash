@@ -11,6 +11,7 @@ mod globird;
 mod ingest;
 mod isolar;
 mod modbus;
+mod offsite;
 mod petrol_prices;
 mod teslamate;
 mod teslamate_history;
