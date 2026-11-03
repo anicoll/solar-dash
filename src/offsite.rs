@@ -8,15 +8,16 @@
 //! of the body (not `UNSIGNED-PAYLOAD`), so a file damaged on the way is
 //! rejected by the store.
 
-// Nothing calls this yet; the next change wires it into the backup task.
-#![allow(dead_code)]
-
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+
+use crate::backup;
+use crate::config;
 
 /// R2 ignores the region but requires `auto` in the signature.
 pub const REGION: &str = "auto";
@@ -338,6 +339,118 @@ impl Client {
     }
 }
 
+/// What one upload did.
+#[derive(Debug, PartialEq)]
+pub struct Synced {
+    /// The object that was uploaded.
+    pub key: String,
+    /// Old backups removed from the bucket to stay within `keep`.
+    pub deleted: Vec<String>,
+    /// How many backups the bucket holds now.
+    pub count: usize,
+}
+
+/// The backups in a bucket, kept to the newest `keep`.
+///
+/// Pruning counts backups instead of using an R2 lifecycle rule on purpose. An
+/// age-based rule keeps deleting whether or not new backups arrive, so if the
+/// server stopped uploading (down for weeks, a broken token) the bucket would
+/// slowly empty, exactly when a copy is needed. Counting only deletes when a
+/// new backup has just been stored, so the newest `keep` survive however old
+/// they are.
+pub struct Offsite {
+    client: Client,
+    /// Object names start with this; empty or ending in `/`.
+    prefix: String,
+    keep: usize,
+}
+
+impl Offsite {
+    pub fn new(settings: &config::Offsite) -> Result<Self> {
+        let client = Client::new(
+            &settings.endpoint(),
+            &settings.bucket,
+            Credentials {
+                access_key_id: settings.access_key_id.clone(),
+                secret_access_key: settings.secret_access_key.clone(),
+            },
+        )?;
+        Ok(Self {
+            client,
+            prefix: settings.prefix(),
+            keep: settings.keep,
+        })
+    }
+
+    fn key_for(&self, path: &Path) -> Result<String> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("{} has no usable file name", path.display()))?;
+        Ok(format!("{}{name}", self.prefix))
+    }
+
+    /// The backups among `keys`: those named `<prefix>solar-YYYY-MM-DD.db`
+    /// exactly, oldest first. Anything else in the bucket is not ours.
+    fn backups<'a>(&self, keys: &'a [String]) -> Vec<(chrono::NaiveDate, &'a str)> {
+        let mut found: Vec<_> = keys
+            .iter()
+            .filter_map(|key| {
+                let name = key.strip_prefix(&self.prefix)?;
+                Some((backup::date_of(name)?, key.as_str()))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Uploads the backup at `path`, then deletes the oldest backups in the
+    /// bucket beyond `keep`.
+    pub async fn upload_and_prune(&self, path: &Path) -> Result<Synced> {
+        let key = self.key_for(path)?;
+        let body = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("could not read {}", path.display()))?;
+        self.client.put_object(&key, body).await?;
+        self.prune(key).await
+    }
+
+    /// Uploads the backup at `path` only if the bucket has no object for it
+    /// (say an earlier upload failed). Returns `None` when it was already there.
+    pub async fn upload_if_missing(&self, path: &Path) -> Result<Option<Synced>> {
+        let key = self.key_for(path)?;
+        let keys = self.client.list_objects(&self.prefix).await?;
+        if keys.contains(&key) {
+            return Ok(None);
+        }
+        self.upload_and_prune(path).await.map(Some)
+    }
+
+    /// Deletes backups beyond `keep`, oldest first (by the date in the name).
+    async fn prune(&self, just_uploaded: String) -> Result<Synced> {
+        let keys = self
+            .client
+            .list_objects(&self.prefix)
+            .await
+            .context("uploaded, but could not list the bucket to prune it")?;
+        let backups = self.backups(&keys);
+        let surplus = backups.len().saturating_sub(self.keep);
+        let mut deleted = Vec::new();
+        for (_, key) in backups.iter().take(surplus) {
+            self.client
+                .delete_object(key)
+                .await
+                .context("uploaded, but could not delete an old backup")?;
+            deleted.push(key.to_string());
+        }
+        Ok(Synced {
+            key: just_uploaded,
+            count: backups.len() - deleted.len(),
+            deleted,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +706,101 @@ mod tests {
         let text = format!("{:?}", example_creds());
         assert!(!text.contains("wJalr"));
         assert!(text.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    fn offsite_for(client: Client, prefix: &str, keep: usize) -> Offsite {
+        Offsite {
+            client,
+            prefix: prefix.to_string(),
+            keep,
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_only_the_newest_backups_and_leaves_other_objects() {
+        let (client, store) = mock(2).await;
+        let offsite = offsite_for(client, "p/", 3);
+        // Objects that are not backups, or are under another prefix.
+        for key in [
+            "p/notes.txt",
+            "p/pre-update-20260101-000000.db",
+            "q/solar-2026-01-01.db",
+        ] {
+            offsite.client.put_object(key, b"x".to_vec()).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // Uploaded out of order: the newest by date win, not the last uploaded.
+        for day in [5, 1, 2, 4, 3] {
+            let path = dir.path().join(format!("solar-2026-10-0{day}.db"));
+            std::fs::write(&path, vec![day; 4]).unwrap();
+            let synced = offsite.upload_and_prune(&path).await.unwrap();
+            assert_eq!(synced.key, format!("p/solar-2026-10-0{day}.db"));
+        }
+        let keys: Vec<String> = store.objects.lock().unwrap().keys().cloned().collect();
+        let left: Vec<&str> = keys
+            .iter()
+            .map(|k| k.strip_prefix("bkt/").unwrap())
+            .collect();
+        assert_eq!(
+            left,
+            [
+                "p/notes.txt",
+                "p/pre-update-20260101-000000.db",
+                "p/solar-2026-10-03.db",
+                "p/solar-2026-10-04.db",
+                "p/solar-2026-10-05.db",
+                "q/solar-2026-01-01.db",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_what_was_deleted() {
+        let (client, _) = mock(10).await;
+        let offsite = offsite_for(client, "p/", 2);
+        let dir = tempfile::tempdir().unwrap();
+        let put = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "x").unwrap();
+            path
+        };
+        offsite
+            .upload_and_prune(&put("solar-2026-10-02.db"))
+            .await
+            .unwrap();
+        offsite
+            .upload_and_prune(&put("solar-2026-10-03.db"))
+            .await
+            .unwrap();
+        let synced = offsite
+            .upload_and_prune(&put("solar-2026-10-04.db"))
+            .await
+            .unwrap();
+        assert_eq!(synced.deleted, ["p/solar-2026-10-02.db"]);
+        assert_eq!(synced.count, 2);
+        // The rule is the newest `keep` by date, so a file older than all the
+        // others is removed again at once.
+        let synced = offsite
+            .upload_and_prune(&put("solar-2026-09-01.db"))
+            .await
+            .unwrap();
+        assert_eq!(synced.deleted, ["p/solar-2026-09-01.db"]);
+        assert_eq!(synced.count, 2);
+    }
+
+    #[tokio::test]
+    async fn uploads_a_missing_backup_only_once() {
+        let (client, store) = mock(10).await;
+        let offsite = offsite_for(client, "", 15);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("solar-2026-10-04.db");
+        std::fs::write(&path, "data").unwrap();
+        let first = offsite.upload_if_missing(&path).await.unwrap();
+        assert_eq!(first.unwrap().key, "solar-2026-10-04.db");
+        assert_eq!(
+            store.objects.lock().unwrap()["bkt/solar-2026-10-04.db"],
+            b"data"
+        );
+        assert_eq!(offsite.upload_if_missing(&path).await.unwrap(), None);
     }
 }

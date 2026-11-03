@@ -8,6 +8,10 @@
 //!
 //! When it runs: once at startup if today's backup is missing, then daily at
 //! 03:30 local time. Errors are logged and never stop `serve`.
+//!
+//! With `[database.offsite]` configured, each new backup is also uploaded to
+//! the bucket (see `offsite.rs`), and at startup the newest local backup is
+//! uploaded if the bucket does not have it yet.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -20,6 +24,7 @@ use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::globird::sync::next_daily;
+use crate::offsite::Offsite;
 
 /// The local time of the daily backup.
 const BACKUP_TIME: NaiveTime = NaiveTime::from_hms_opt(3, 30, 0).unwrap();
@@ -31,7 +36,7 @@ fn file_name(date: NaiveDate) -> String {
 
 /// The date in a backup file name, or `None` for any other file (such as a
 /// `pre-update-*.db` made by update.sh), which pruning must leave alone.
-fn date_of(name: &str) -> Option<NaiveDate> {
+pub(crate) fn date_of(name: &str) -> Option<NaiveDate> {
     let text = name.strip_prefix("solar-")?.strip_suffix(".db")?;
     let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
     // Reject lookalikes such as `solar-2026-1-2.db`.
@@ -110,16 +115,33 @@ pub fn prune(dir: &Path, keep: usize) -> Result<Vec<PathBuf>> {
     Ok(deleted)
 }
 
-/// One backup plus pruning. Errors are logged, not returned.
-async fn run_once(pool: &SqlitePool, dir: &Path, keep: usize, tz: Tz) {
+/// Logs what an offsite upload did (or why it failed).
+fn log_offsite(result: Result<crate::offsite::Synced>) {
+    match result {
+        Ok(synced) => {
+            info!(key = %synced.key, copies = synced.count, "offsite backup uploaded");
+            for key in synced.deleted {
+                info!(%key, "old offsite backup deleted");
+            }
+        }
+        Err(err) => warn!("offsite backup failed: {err:#}"),
+    }
+}
+
+/// One backup, local pruning, then the offsite upload. Errors are logged, not
+/// returned.
+async fn run_once(pool: &SqlitePool, dir: &Path, keep: usize, tz: Tz, offsite: Option<&Offsite>) {
     let today = Utc::now().with_timezone(&tz).date_naive();
-    match backup_now(pool, dir, today).await {
-        Ok(path) => info!(path = %path.display(), "database backup written"),
+    let written = match backup_now(pool, dir, today).await {
+        Ok(path) => {
+            info!(path = %path.display(), "database backup written");
+            path
+        }
         Err(err) => {
             error!("database backup failed: {err:#}");
             return;
         }
-    }
+    };
     match prune(dir, keep) {
         Ok(deleted) => {
             for path in deleted {
@@ -128,16 +150,35 @@ async fn run_once(pool: &SqlitePool, dir: &Path, keep: usize, tz: Tz) {
         }
         Err(err) => warn!("could not delete old backups: {err:#}"),
     }
+    if let Some(offsite) = offsite {
+        log_offsite(offsite.upload_and_prune(&written).await);
+    }
+}
+
+/// At startup: uploads the newest local backup if the bucket lacks it, for
+/// example because the last upload failed.
+async fn catch_up(dir: &Path, offsite: &Offsite) {
+    match latest(dir) {
+        Ok(Some((_, path))) => match offsite.upload_if_missing(&path).await {
+            Ok(Some(synced)) => log_offsite(Ok(synced)),
+            Ok(None) => info!("the newest backup is already offsite"),
+            Err(err) => warn!("offsite backup failed: {err:#}"),
+        },
+        Ok(None) => {}
+        Err(err) => warn!("could not look for the newest backup: {err:#}"),
+    }
 }
 
 /// Backs up the database at startup (if today's backup is missing), then every
 /// day at 03:30 in `tz`, until `shutdown` completes. With `keep` 0 it does
-/// nothing. Failures are logged and the loop carries on.
+/// nothing. Failures are logged and the loop carries on. With `offsite` set,
+/// backups are also uploaded.
 pub async fn run(
     pool: SqlitePool,
     dir: PathBuf,
     keep: usize,
     tz: Tz,
+    offsite: Option<Offsite>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     if keep == 0 {
@@ -146,13 +187,19 @@ pub async fn run(
     }
     // Pinning lets `select!` poll the same future in every loop round.
     tokio::pin!(shutdown);
-    info!(dir = %dir.display(), keep, "database backups started");
+    info!(dir = %dir.display(), keep, offsite = offsite.is_some(), "database backups started");
 
     let today = Utc::now().with_timezone(&tz).date_naive();
     if !dir.join(file_name(today)).exists() {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            _ = run_once(&pool, &dir, keep, tz) => {}
+            _ = run_once(&pool, &dir, keep, tz, offsite.as_ref()) => {}
+        }
+    }
+    if let Some(offsite) = &offsite {
+        tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            _ = catch_up(&dir, offsite) => {}
         }
     }
     loop {
@@ -166,7 +213,7 @@ pub async fn run(
         }
         tokio::select! {
             _ = &mut shutdown => break,
-            _ = run_once(&pool, &dir, keep, tz) => {}
+            _ = run_once(&pool, &dir, keep, tz, offsite.as_ref()) => {}
         }
     }
     info!("database backups stopped");
