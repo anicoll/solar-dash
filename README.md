@@ -41,6 +41,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/fuel_log.rs` - fuel economy and petrol spend worked out from the fills of cars TeslaMate does not track
 - `src/db.rs` - SQLite storage: opening, migrations and typed queries
 - `migrations/` - SQL schema, applied automatically on startup
+- `src/backup.rs`, `src/offsite.rs` - nightly database backups, and the optional upload of them to Cloudflare R2 (an S3-compatible client with hand-written request signing); see `[database.offsite]` in `config.example.toml` and `docs/deploy.md`
 - `src/modbus.rs` - Modbus TCP reader for live inverter data, and its poll loop
 - `src/teslamate.rs` - TeslaMate MQTT reader for the car's charge state
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop

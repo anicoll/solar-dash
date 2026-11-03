@@ -390,6 +390,74 @@ systemctl start solar-dash
 The `-wal` and `-shm` files belong to the old database, so they must be removed
 or SQLite may mix them with the restored file.
 
+### Offsite backups to Cloudflare R2
+
+The backups above all live on your own hardware. To keep a copy somewhere else,
+`serve` can upload each nightly backup to a Cloudflare R2 bucket and keep the
+newest 15 there. R2's free tier includes 10 GB of storage, and 15 copies of a
+database of about 70 MB come to roughly 1 GB, so this should cost nothing.
+
+1. In the Cloudflare dashboard, go to **R2 Object Storage, Create bucket**. Name
+   it (say `solar-dash-backups`) and set the location hint to **Oceania**.
+2. On the R2 overview page, choose **Manage API tokens, Create API token**. Pick
+   the permission **Object Read & Write**, and under "Specify bucket(s)" choose
+   only the bucket from step 1. Create it, then copy the **Access Key ID** and
+   **Secret Access Key** (the secret is shown once). Your **Account ID** is on
+   the same overview page.
+3. Add this to `/etc/solar-dash/config.toml`:
+
+   ```toml
+   [database.offsite]
+   account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+   bucket = "solar-dash-backups"
+   access_key_id = "YOUR_ACCESS_KEY_ID"
+   secret_access_key = "YOUR_SECRET_ACCESS_KEY"
+   # prefix = "solar-dash/"   # default; added to every object name
+   # keep = 15                # default; backups kept in the bucket
+   ```
+
+4. Restart and check the log:
+
+   ```sh
+   systemctl restart solar-dash
+   journalctl -u solar-dash | grep offsite
+   ```
+
+   You should see `offsite backup uploaded` (and `old offsite backup deleted`
+   once there are more than 15). A failed upload logs `offsite backup failed`
+   with the reason, such as a wrong key or a bucket name typo. It never stops the
+   dashboard.
+
+How it works: right after the local backup is written, the file is uploaded as
+`<prefix>solar-YYYY-MM-DD.db` in one request, then the bucket is listed and the
+oldest backups beyond `keep` are deleted. At startup, if the newest local backup
+is not in the bucket (for example the last upload failed), it is uploaded then.
+Only objects named exactly `<prefix>solar-YYYY-MM-DD.db` are ever deleted;
+anything else in the bucket is left alone. `[database.offsite]` can point at
+another S3-compatible store with `endpoint = "https://..."` instead of
+`account_id`.
+
+The 15 are kept by count, not with an R2 lifecycle rule ("delete after N days")
+on purpose. An age-based rule keeps deleting whatever its age, whether or not new
+backups arrive. If the server went down for a few weeks, or the token expired,
+the bucket would empty itself, exactly when you need a copy. Counting only
+deletes right after a new backup has been stored, so the newest 15 survive
+however old they are. Do not add a lifecycle rule to this bucket.
+
+To restore from R2, download the backup you want (the bucket's page in the
+Cloudflare dashboard has a **Download** action on each object, or use
+`rclone copy` or `wrangler r2 object get solar-dash-backups/solar-dash/solar-2026-10-20.db --file solar-2026-10-20.db --remote`).
+Then copy it into place with the service stopped, exactly like the restore
+steps above:
+
+```sh
+systemctl stop solar-dash
+cp solar-2026-10-20.db /var/lib/solar-dash/solar.db
+rm -f /var/lib/solar-dash/solar.db-wal /var/lib/solar-dash/solar.db-shm
+chown solar-dash:solar-dash /var/lib/solar-dash/solar.db
+systemctl start solar-dash
+```
+
 The backups live inside the LXC, so a lost container loses them too. Also back
 up the whole container with Proxmox: **Datacenter, Backup, Add** (or the
 container's **Backup** tab, **Backup now**), or on the host:
