@@ -697,6 +697,59 @@ pub async fn save_daily_costs(
     Ok(())
 }
 
+/// One finished day's `/api/battery` figures as stored in `daily_battery`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct DailyBattery {
+    /// Local day, `YYYY-MM-DD`.
+    pub date: String,
+    /// The plan, time zone and cache versions the figures were worked out on.
+    pub tariff_key: String,
+    /// The figures as JSON.
+    pub facts: String,
+}
+
+/// The stored battery days with `from <= date <= to`, oldest first, whatever
+/// their key (each day may be on a different plan, so the caller checks it).
+pub async fn daily_battery_in_range(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+) -> Result<Vec<DailyBattery>> {
+    sqlx::query_as(
+        "SELECT date, tariff_key, facts FROM daily_battery
+         WHERE date >= ? AND date <= ? ORDER BY date",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read stored battery days")
+}
+
+/// Saves finished battery days (replacing any row for the same date) in one
+/// transaction.
+pub async fn save_daily_battery(pool: &SqlitePool, days: &[DailyBattery], now: i64) -> Result<()> {
+    if days.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for day in days {
+        sqlx::query(
+            "INSERT OR REPLACE INTO daily_battery (date, tariff_key, facts, computed_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&day.date)
+        .bind(&day.tariff_key)
+        .bind(&day.facts)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .context("could not save battery day")?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// What we know about a charging session so far.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChargeProgress {
@@ -1462,12 +1515,40 @@ mod tests {
              ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session',
               'ev_odometer_daily', 'globird_cost', 'globird_usage', 'globird_interval',
               'tm_car', 'tm_drive_daily', 'tm_charge', 'manual_car', 'fuel_fill',
-              'tm_car_owned')",
+              'tm_car_owned', 'daily_battery')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 16);
+        assert_eq!(tables.len(), 17);
+    }
+
+    #[tokio::test]
+    async fn daily_battery_rows_are_replaced_by_date() {
+        let (_dir, pool) = test_db().await;
+        let row = |date: &str, key: &str, facts: &str| DailyBattery {
+            date: date.into(),
+            tariff_key: key.into(),
+            facts: facts.into(),
+        };
+        save_daily_battery(
+            &pool,
+            &[row("2026-09-14", "a", "{}"), row("2026-09-15", "a", "{}")],
+            1,
+        )
+        .await
+        .unwrap();
+        save_daily_battery(&pool, &[row("2026-09-15", "b", "[1]")], 2)
+            .await
+            .unwrap();
+        let found = daily_battery_in_range(&pool, "2026-09-15", "2026-09-30")
+            .await
+            .unwrap();
+        assert_eq!(found, vec![row("2026-09-15", "b", "[1]")]);
+        let all = daily_battery_in_range(&pool, "2026-09-01", "2026-09-30")
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]
