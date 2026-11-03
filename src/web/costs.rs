@@ -812,7 +812,7 @@ const COST_CACHE_VERSION: u32 = 4;
 
 /// What stored costs are tagged with. The time zone is in it too, because
 /// moving it moves where every local day starts.
-fn cache_key(tz: Tz, tariff: &Tariff) -> String {
+pub(super) fn cache_key(tz: Tz, tariff: &Tariff) -> String {
     format!("{COST_CACHE_VERSION}|{tz}|{}", tariff.key())
 }
 
@@ -823,7 +823,7 @@ fn cache_key(tz: Tz, tariff: &Tariff) -> String {
 /// minutes (23:50 local or later). `newest_counter_ts` is the latest cloud
 /// reading in the day. A day that fails this is worked out again next time, so
 /// a backfill that fills it in later is picked up.
-fn is_cacheable(
+pub(super) fn is_cacheable(
     date: NaiveDate,
     today: NaiveDate,
     source: &str,

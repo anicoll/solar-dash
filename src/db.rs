@@ -698,7 +698,6 @@ pub async fn save_daily_costs(
 }
 
 /// One finished day's `/api/battery` figures as stored in `daily_battery`.
-#[allow(dead_code)] // Used by /api/battery from the next change.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct DailyBattery {
     /// Local day, `YYYY-MM-DD`.
@@ -711,7 +710,6 @@ pub struct DailyBattery {
 
 /// The stored battery days with `from <= date <= to`, oldest first, whatever
 /// their key (each day may be on a different plan, so the caller checks it).
-#[allow(dead_code)] // Used by /api/battery from the next change.
 pub async fn daily_battery_in_range(
     pool: &SqlitePool,
     from: &str,
@@ -730,7 +728,6 @@ pub async fn daily_battery_in_range(
 
 /// Saves finished battery days (replacing any row for the same date) in one
 /// transaction.
-#[allow(dead_code)] // Used by /api/battery from the next change.
 pub async fn save_daily_battery(pool: &SqlitePool, days: &[DailyBattery], now: i64) -> Result<()> {
     if days.is_empty() {
         return Ok(());
