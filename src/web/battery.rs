@@ -9,6 +9,7 @@
 //! The handler at the bottom only loads data and joins it up.
 
 use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -20,14 +21,13 @@ use serde_json::json;
 use super::AppState;
 use super::api::{ApiError, ApiResult, SOC_POINT, day_bounds_or_error, display_value, today};
 use super::costs::{
-    DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, day_intervals, meter_for_day, meter_in,
-    round2, slice_between,
+    DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, cache_key, day_intervals, is_cacheable,
+    live_in, meter_for_day, meter_in, round2, slice_between,
 };
-use crate::cost::{self, Interval, Tariff, local_minute_of_day};
+use crate::cost::{self, Interval, Tariff, TariffSchedule, local_minute_of_day};
 use crate::db::{self, ChargeSession, GlobirdCostRow};
 use crate::ev_cost;
 use crate::globird::data::{Bucket, bucket_of, is_supply};
-use crate::modbus::Sample;
 
 const DEFAULT_DAYS: u64 = 30;
 const MAX_DAYS: u64 = 92;
@@ -93,7 +93,7 @@ impl SocSeries {
 
 /// What the intervals of one day add up to. Each interval is placed by the
 /// local time of its midpoint, the same way `cost::day_cost` does.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 struct DaySums {
     /// Whether any interval fell inside the credit window.
     has_window_data: bool,
@@ -418,12 +418,64 @@ fn local_time(date: NaiveDate, minutes: u32, tz: Tz) -> Option<i64> {
     }
 }
 
-/// Everything loaded for one day.
+/// What one day's data says, before the bill and the car sessions are added.
+/// Working this out reads the day's raw samples, so finished days are kept in
+/// the `daily_battery` table as JSON (see [`BATTERY_CACHE_VERSION`]). Nothing
+/// in here depends on the time it was worked out, except that a day still
+/// going only has intervals up to now; those days are never stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DayFacts {
+    /// The day's sums, or `None` without any energy data.
+    sums: Option<DaySums>,
+    /// Whether our own estimate earns the credit.
+    estimate_earned: bool,
+    soc_at_free_start: Option<f64>,
+    soc_at_16: Option<f64>,
+    soc_at_window_start: Option<f64>,
+    soc_at_window_end: Option<f64>,
+    min_soc_in_window: Option<f64>,
+    soc_at_first_import: Option<f64>,
+}
+
+/// Works out one day's [`DayFacts`] from its intervals and charge readings.
+/// `None` if the plan in effect has no credit window.
+fn day_facts(
+    tariff: &Tariff,
+    tz: Tz,
+    date: NaiveDate,
+    intervals: Option<&[Interval]>,
+    soc: &SocSeries,
+) -> Option<DayFacts> {
+    let (window_from, window_to) = tariff.credit_window_minutes()?;
+    let free_start = tariff
+        .free_import_start()
+        .unwrap_or(DEFAULT_FREE_START_MINUTE);
+    let at = |minute: u32| local_time(date, minute, tz);
+    let (window_start, window_end) = (at(window_from), at(window_to));
+    let sums = intervals.map(|iv| day_sums(tariff, tz, free_start, iv));
+    let soc_at = |ts: Option<i64>| ts.and_then(|ts| soc.at(ts)).map(round1);
+    let first_import_at = sums.as_ref().and_then(|s| s.first_import_ts);
+    Some(DayFacts {
+        estimate_earned: intervals
+            .is_some_and(|iv| cost::day_cost(tariff, tz, iv).zero_import_credit_cents > 0.0),
+        sums,
+        soc_at_free_start: soc_at(at(free_start)),
+        soc_at_16: soc_at(at(EVENING_PEAK_MINUTE)),
+        soc_at_window_start: soc_at(window_start),
+        soc_at_window_end: soc_at(window_end),
+        min_soc_in_window: window_start
+            .zip(window_end)
+            .and_then(|(from, to)| soc.lowest_between(from, to))
+            .map(round1),
+        soc_at_first_import: soc_at(first_import_at),
+    })
+}
+
+/// Everything one day's row is built from.
 struct DayInput<'a> {
     date: NaiveDate,
     now: i64,
-    intervals: Option<&'a [Interval]>,
-    soc: &'a SocSeries,
+    facts: &'a DayFacts,
     billed: Option<bool>,
     sessions: &'a [ChargeSession],
 }
@@ -436,41 +488,27 @@ fn build_day(tariff: &Tariff, tz: Tz, input: &DayInput) -> Option<DayRow> {
         .free_import_start()
         .unwrap_or(DEFAULT_FREE_START_MINUTE);
     let date = input.date;
+    let facts = input.facts;
     let at = |minute: u32| local_time(date, minute, tz);
     let (window_start, window_end) = (at(window_from), at(window_to));
     // A period only counts once it is over, so today's averages are not skewed.
     let is_over = |end: Option<i64>| end.is_some_and(|end| input.now >= end);
 
-    let sums = input
-        .intervals
-        .map(|iv| day_sums(tariff, tz, free_start, iv));
+    let sums = facts.sums.as_ref();
     let window_over = is_over(window_end);
-    let sums_window = sums.as_ref().filter(|s| s.has_window_data && window_over);
-    let sums_morning = sums.as_ref().filter(|_| is_over(at(free_start)));
+    let sums_window = sums.filter(|s| s.has_window_data && window_over);
+    let sums_morning = sums.filter(|_| is_over(at(free_start)));
 
-    let estimate_earned = input
-        .intervals
-        .is_some_and(|iv| cost::day_cost(tariff, tz, iv).zero_import_credit_cents > 0.0);
     let (credit, credit_source) = decide_credit(
         input.billed,
         window_over,
-        sums.as_ref().is_some_and(|s| s.has_window_data),
-        estimate_earned,
+        sums.is_some_and(|s| s.has_window_data),
+        facts.estimate_earned,
     );
 
-    let soc_at = |minute: u32| at(minute).and_then(|ts| input.soc.at(ts)).map(round1);
-    let min_soc = window_start
-        .zip(window_end)
-        .and_then(|(from, to)| input.soc.lowest_between(from, to))
-        .map(round1);
     // The window's ends only count once they have passed.
-    let soc_when = |ts: Option<i64>| {
-        ts.filter(|&ts| input.now >= ts)
-            .and_then(|ts| input.soc.at(ts))
-            .map(round1)
-    };
-    let soc_start = soc_when(window_start);
-    let soc_end = soc_when(window_end);
+    let soc_start = facts.soc_at_window_start.filter(|_| is_over(window_start));
+    let soc_end = facts.soc_at_window_end.filter(|_| window_over);
     let soc_used = soc_start
         .zip(soc_end)
         .map(|(start, end)| round1(start - end));
@@ -486,15 +524,15 @@ fn build_day(tariff: &Tariff, tz: Tz, input: &DayInput) -> Option<DayRow> {
         window_import_kwh: sums_window.map(|s| round2(s.window_import_kwh)),
         window_export_kwh: sums_window.map(|s| round2(s.window_export_kwh)),
         window_export_cents: sums_window.map(|s| round2(s.window_export_cents)),
-        soc_at_11: soc_at(free_start),
-        soc_at_16: soc_at(EVENING_PEAK_MINUTE),
-        soc_at_21: soc_at(window_to),
+        soc_at_11: facts.soc_at_free_start,
+        soc_at_16: facts.soc_at_16,
+        soc_at_21: facts.soc_at_window_end,
         soc_at_window_start: soc_start,
         soc_at_window_end: soc_end,
         window_soc_used_pct: soc_used,
         first_import_at,
-        soc_at_first_import: first_import_at.and_then(|ts| input.soc.at(ts)).map(round1),
-        min_soc_in_window: min_soc,
+        soc_at_first_import: first_import_at.and(facts.soc_at_first_import),
+        min_soc_in_window: facts.min_soc_in_window,
         morning_import_kwh: sums_morning.map(|s| round2(s.morning_import_kwh)),
         morning_import_cents: sums_morning.map(|s| round2(s.morning_import_cents)),
         reason: None,
@@ -532,9 +570,145 @@ fn point_series(rows: &[(i64, i64, f64)], point_id: i64) -> Vec<(i64, f64)> {
         .collect()
 }
 
+/// Bump this when the way [`DayFacts`] are worked out changes, so days stored
+/// by the old rules are worked out again. The cost cache key is part of the
+/// key too, so a change to how a day's intervals come out (which bumps
+/// `COST_CACHE_VERSION`) also clears these.
+const BATTERY_CACHE_VERSION: u32 = 1;
+
+/// What stored [`DayFacts`] are tagged with: they only count while the time
+/// zone and the plan for that day are unchanged.
+fn battery_cache_key(tz: Tz, tariff: &Tariff) -> String {
+    format!("{BATTERY_CACHE_VERSION}|{}", cache_key(tz, tariff))
+}
+
+/// Works out the [`DayFacts`] of consecutive local `dates` from the stored
+/// readings, each on the plan `schedule` has for it. Each day comes with
+/// whether it is finished and complete enough to store (the same rule
+/// `/api/costs` uses for `daily_cost`).
+async fn compute_facts(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    dates: &[NaiveDate],
+    today: NaiveDate,
+    now: i64,
+) -> Result<Vec<(NaiveDate, DayFacts, bool)>, ApiError> {
+    let tz = state.tz;
+    let range_start = day_bounds_or_error(dates[0], tz)?.0;
+    let range_end = day_bounds_or_error(dates[dates.len() - 1], tz)?.1;
+    let rows = db::readings_for_points(
+        &state.pool,
+        state.plant_id,
+        &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER, SOC_POINT],
+        range_start,
+        range_end,
+    )
+    .await?;
+    let import = point_series(&rows, IMPORT_COUNTER);
+    let export = point_series(&rows, EXPORT_COUNTER);
+    let load = point_series(&rows, LOAD_COUNTER);
+    let cloud_soc: Vec<(i64, f64)> = point_series(&rows, SOC_POINT)
+        .into_iter()
+        .map(|(ts, value)| (ts, display_value(SOC_POINT, value)))
+        .collect();
+    let live_range = db::live_ts_range(&state.pool).await?;
+    let meter = meter_in(&state.pool, range_start, range_end).await?;
+
+    let mut out = Vec::with_capacity(dates.len());
+    for &date in dates {
+        let (start, end) = day_bounds_or_error(date, tz)?;
+        // One day of live samples at a time, to keep memory small.
+        let live = live_in(&state.pool, live_range, start, end).await?;
+        let day = DayData {
+            start,
+            end,
+            live: &live,
+            import: slice_between(&import, |r| r.0, start, end),
+            export: slice_between(&export, |r| r.0, start, end),
+            load: slice_between(&load, |r| r.0, start, end),
+            meter: meter_for_day(&meter, start, end),
+        };
+        let found = day_intervals(&day, now);
+        let newest_counter_ts = [day.import, day.export, day.load]
+            .iter()
+            .filter_map(|c| c.last().map(|r| r.0))
+            .max();
+        let cacheable = found.as_ref().is_some_and(|(source, _, live_solid)| {
+            is_cacheable(date, today, source, *live_solid, newest_counter_ts, end)
+        });
+        let intervals = found.map(|(_, intervals, _)| intervals);
+        let soc = SocSeries {
+            live: live
+                .iter()
+                .filter_map(|s| Some((s.ts, s.soc_pct?)))
+                .collect(),
+            cloud: slice_between(&cloud_soc, |r| r.0, start, end).to_vec(),
+        };
+        let tariff = schedule.for_date(date);
+        if let Some(facts) = day_facts(tariff, tz, date, intervals.as_deref(), &soc) {
+            out.push((date, facts, cacheable));
+        }
+    }
+    Ok(out)
+}
+
+/// The [`DayFacts`] of every day in `dates` (sorted, consecutive) whose plan
+/// has a credit window. Finished days come from the `daily_battery` table when
+/// it has them for that day's plan; only the rest are worked out, and the
+/// finished ones are stored for next time. Without this every request read
+/// every 15-second sample of the whole range again.
+async fn facts_for(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    dates: &[NaiveDate],
+    now: i64,
+) -> Result<HashMap<NaiveDate, DayFacts>, ApiError> {
+    let (Some(first), Some(last)) = (dates.first(), dates.last()) else {
+        return Ok(HashMap::new());
+    };
+    let tz = state.tz;
+    let mut by_date: HashMap<NaiveDate, DayFacts> = HashMap::new();
+    let stored =
+        db::daily_battery_in_range(&state.pool, &first.to_string(), &last.to_string()).await?;
+    for row in stored {
+        let Ok(date) = NaiveDate::from_str(&row.date) else {
+            continue;
+        };
+        if row.tariff_key != battery_cache_key(tz, schedule.for_date(date)) {
+            continue;
+        }
+        // A row that no longer parses is worked out again and replaced.
+        if let Ok(facts) = serde_json::from_str::<DayFacts>(&row.facts) {
+            by_date.insert(date, facts);
+        }
+    }
+
+    let missing: Vec<NaiveDate> = dates
+        .iter()
+        .copied()
+        .filter(|date| !by_date.contains_key(date))
+        .collect();
+    let today = today(tz);
+    let mut to_store = Vec::new();
+    for run in missing.chunk_by(|a, b| a.succ_opt() == Some(*b)) {
+        for (date, facts, cacheable) in compute_facts(state, schedule, run, today, now).await? {
+            if cacheable {
+                to_store.push(db::DailyBattery {
+                    date: date.to_string(),
+                    tariff_key: battery_cache_key(tz, schedule.for_date(date)),
+                    facts: serde_json::to_string(&facts).map_err(anyhow::Error::from)?,
+                });
+            }
+            by_date.insert(date, facts);
+        }
+    }
+    db::save_daily_battery(&state.pool, &to_store, now).await?;
+    Ok(by_date)
+}
+
 /// `{"days":[...],"summary":{...}}` for the last `days` local days (default
-/// 30, at most 92), newest first. `{"configured":false}` without a `[tariff]`
-/// that has a `zero_import_credit`.
+/// 30, at most 92), newest first. `{"configured": false}` when no tariff is
+/// set up or today's plan has no zero-import credit.
 pub async fn battery(
     State(state): State<AppState>,
     Query(params): Query<BatteryParams>,
@@ -560,60 +734,21 @@ pub async fn battery(
     let range_end = day_bounds_or_error(last, tz)?.1;
     let now = db::now();
 
-    let rows = db::readings_for_points(
-        &state.pool,
-        state.plant_id,
-        &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER, SOC_POINT],
-        range_start,
-        range_end,
-    )
-    .await?;
-    let import = point_series(&rows, IMPORT_COUNTER);
-    let export = point_series(&rows, EXPORT_COUNTER);
-    let load = point_series(&rows, LOAD_COUNTER);
-    let cloud_soc: Vec<(i64, f64)> = point_series(&rows, SOC_POINT)
-        .into_iter()
-        .map(|(ts, value)| (ts, display_value(SOC_POINT, value)))
-        .collect();
+    let facts = facts_for(&state, schedule, &dates, now).await?;
     let sessions = db::charge_sessions_in_range(&state.pool, range_start, range_end, now).await?;
     let billed = billed_credit_by_date(
         &db::globird_cost_in_range(&state.pool, &first.to_string(), &last.to_string()).await?,
     );
-    let live_range = db::live_ts_range(&state.pool).await?;
-    let meter = meter_in(&state.pool, range_start, range_end).await?;
 
     let mut days = Vec::new();
     for &date in &dates {
-        let (start, end) = day_bounds_or_error(date, tz)?;
-        // One day of live samples at a time, to keep memory small.
-        let live: Vec<Sample> = match live_range {
-            Some((oldest, newest)) if oldest < end && newest >= start => {
-                db::live_samples_raw(&state.pool, start, end).await?
-            }
-            _ => Vec::new(),
-        };
-        let day = DayData {
-            start,
-            end,
-            live: &live,
-            import: slice_between(&import, |r| r.0, start, end),
-            export: slice_between(&export, |r| r.0, start, end),
-            load: slice_between(&load, |r| r.0, start, end),
-            meter: meter_for_day(&meter, start, end),
-        };
-        let intervals = day_intervals(&day, now).map(|(_, intervals, _)| intervals);
-        let soc = SocSeries {
-            live: live
-                .iter()
-                .filter_map(|s| Some((s.ts, s.soc_pct?)))
-                .collect(),
-            cloud: slice_between(&cloud_soc, |r| r.0, start, end).to_vec(),
+        let Some(facts) = facts.get(&date) else {
+            continue;
         };
         let input = DayInput {
             date,
             now,
-            intervals: intervals.as_deref(),
-            soc: &soc,
+            facts,
             billed: billed.get(&date.to_string()).copied(),
             sessions: &sessions,
         };
@@ -1052,11 +1187,11 @@ mod tests {
             cloud: vec![],
         };
         let date = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let facts = day_facts(&tariff, ADELAIDE, date, Some(&intervals), &soc).unwrap();
         let mut input = DayInput {
             date,
             now: at(23, 0),
-            intervals: Some(&intervals),
-            soc: &soc,
+            facts: &facts,
             billed: None,
             sessions: &[],
         };
@@ -1076,8 +1211,15 @@ mod tests {
         assert_eq!(day.window_soc_used_pct, None);
 
         // No readings: the fields are null, not zero.
-        let empty = SocSeries::default();
-        input.soc = &empty;
+        let empty = day_facts(
+            &tariff,
+            ADELAIDE,
+            date,
+            Some(&intervals),
+            &SocSeries::default(),
+        )
+        .unwrap();
+        input.facts = &empty;
         input.now = at(23, 0);
         let day = build_day(&tariff, ADELAIDE, &input).unwrap();
         assert_eq!(day.window_soc_used_pct, None);
