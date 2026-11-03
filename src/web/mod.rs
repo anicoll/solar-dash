@@ -95,6 +95,8 @@ pub struct AppState {
     globird_configured: bool,
     /// Where the nightly backups are, for the admin page's download.
     backup_dir: Option<PathBuf>,
+    /// How the last offsite upload went, for the admin page.
+    offsite: crate::offsite::Status,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -129,6 +131,7 @@ impl AppState {
             admin: SharedAdminData::new(AdminData::default()),
             globird_configured: false,
             backup_dir: None,
+            offsite: crate::offsite::Status::default(),
         })
     }
 
@@ -136,6 +139,16 @@ impl AppState {
     pub fn with_backup_dir(mut self, dir: PathBuf) -> Self {
         self.backup_dir = Some(dir);
         self
+    }
+
+    /// Shares the offsite backup status that the backup task updates.
+    pub fn with_offsite_status(mut self, status: crate::offsite::Status) -> Self {
+        self.offsite = status;
+        self
+    }
+
+    pub(crate) fn offsite(&self) -> &crate::offsite::Status {
+        &self.offsite
     }
 
     /// The backup folder, if one was set.
@@ -3469,7 +3482,10 @@ mod tests {
         // No folder yet: nothing to show or download.
         let info = send(&app, get_request("/api/admin/backup", Some(&cookie))).await;
         assert_eq!(info.status(), StatusCode::OK);
-        assert_eq!(body_json(info).await, serde_json::json!({ "latest": null }));
+        assert_eq!(
+            body_json(info).await,
+            serde_json::json!({ "latest": null, "offsite": { "configured": false, "last_upload": null, "count": null } })
+        );
         let download = send(
             &app,
             get_request("/api/admin/backup/download", Some(&cookie)),
@@ -3485,7 +3501,10 @@ mod tests {
         let info = send(&app, get_request("/api/admin/backup", Some(&cookie))).await;
         assert_eq!(
             body_json(info).await,
-            serde_json::json!({ "latest": { "date": "2026-10-26", "bytes": 13 } })
+            serde_json::json!({
+                "latest": { "date": "2026-10-26", "bytes": 13 },
+                "offsite": { "configured": false, "last_upload": null, "count": null }
+            })
         );
         let response = send(
             &app,

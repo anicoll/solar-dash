@@ -428,6 +428,11 @@ database of about 70 MB come to roughly 1 GB, so this should cost nothing.
    with the reason, such as a wrong key or a bucket name typo. It never stops the
    dashboard.
 
+The "Backup" card on the Admin page also shows the result, such as
+"Offsite: uploaded 3 Nov 03:31 · 15 copies in R2", or the error if the last
+upload failed. It is kept in memory, so after a restart it shows the number of
+copies once the startup check of the bucket has run.
+
 How it works: right after the local backup is written, the file is uploaded as
 `<prefix>solar-YYYY-MM-DD.db` in one request, then the bucket is listed and the
 oldest backups beyond `keep` are deleted. At startup, if the newest local backup

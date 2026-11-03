@@ -760,24 +760,43 @@
 
   const fmtDay = new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', day: 'numeric', month: 'short', year: 'numeric' });
 
+  // One plain-English line about the copy in R2, or null when offsite is off.
+  function offsiteLine(off) {
+    if (!off || !off.configured) return null;
+    const copies = off.count == null ? '' : `${off.count} ${off.count === 1 ? 'copy' : 'copies'} in R2`;
+    const last = off.last_upload;
+    if (!last) return `Offsite: ${copies || 'nothing uploaded since the server started'}`;
+    const at = when.format(new Date(last.at * 1000));
+    if (!last.ok) return `Offsite: upload failed ${at}. ${last.error}${copies ? ` (${copies})` : ''}`;
+    return `Offsite: uploaded ${at}${copies ? ` · ${copies}` : ''}`;
+  }
+
+  function offsiteNote(off) {
+    const text = offsiteLine(off);
+    if (!text) return null;
+    const failed = off.last_upload && !off.last_upload.ok;
+    return failed ? h('p', { class: 'adm-msg is-error', role: 'alert', text }) : blurb(text);
+  }
+
   async function drawBackup() {
     const box = boxes.backup;
     const exportLink = h('a', { class: 'adm-btn', href: '/api/admin?download=1', download: '', text: 'Export all data' });
-    let latest;
+    let latest, offsite;
     try {
-      latest = (await call('GET', '/api/admin/backup')).latest;
+      ({ latest, offsite } = await call('GET', '/api/admin/backup'));
     } catch (err) {
       if (alive) box.replaceChildren(h('p', { class: 'adm-msg is-error', role: 'alert', text: `Could not check for backups. ${err.message}` }), h('div', { class: 'adm-actions' }, exportLink));
       return;
     }
     if (!alive) return;
     if (!latest) {
-      box.replaceChildren(blurb('No backups yet. One is made every night at 03:30.'), h('div', { class: 'adm-actions' }, exportLink));
+      box.replaceChildren(blurb('No backups yet. One is made every night at 03:30.'), ...[offsiteNote(offsite)].filter(Boolean), h('div', { class: 'adm-actions' }, exportLink));
       return;
     }
     const day = fmtDay.format(new Date(`${latest.date}T00:00:00Z`));
     box.replaceChildren(
       blurb(`Latest backup: ${day}, ${(latest.bytes / 1e6).toFixed(1)} MB. A new one is made every night at 03:30.`),
+      ...[offsiteNote(offsite)].filter(Boolean),
       h('div', { class: 'adm-actions' },
         h('a', { class: 'adm-btn primary', href: '/api/admin/backup/download', download: `solar-${latest.date}.db`, text: 'Download backup' }),
         exportLink));

@@ -123,22 +123,25 @@ pub async fn read(
 
 /// The newest nightly backup: `{"latest":{"date":"YYYY-MM-DD","bytes":n}}`, or
 /// `{"latest":null}` when there is none (or backups are off and the folder is
-/// empty).
+/// empty). Both carry `"offsite": {"configured", "last_upload", "count"}`, the
+/// state of the upload to R2 (see `offsite::Status::to_json`).
 pub async fn backup_info(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let offsite = state.offsite().to_json();
     let Some((date, path)) = newest_backup(&state).await? else {
-        return Ok(Json(json!({ "latest": null })));
+        return Ok(Json(json!({ "latest": null, "offsite": offsite })));
     };
     let bytes = match std::fs::metadata(&path) {
         Ok(meta) => meta.len(),
         // Pruned between the listing and now: treat as none.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Json(json!({ "latest": null })));
+            return Ok(Json(json!({ "latest": null, "offsite": offsite })));
         }
         Err(err) => return Err(anyhow::Error::from(err).into()),
     };
-    Ok(Json(
-        json!({ "latest": { "date": date.to_string(), "bytes": bytes } }),
-    ))
+    Ok(Json(json!({
+        "latest": { "date": date.to_string(), "bytes": bytes },
+        "offsite": offsite,
+    })))
 }
 
 /// The newest backup file as an attachment. Session cookie only (see

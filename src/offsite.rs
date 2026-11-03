@@ -9,11 +9,13 @@
 //! rejected by the store.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use hmac::{Hmac, KeyInit, Mac};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::backup;
@@ -339,6 +341,81 @@ impl Client {
     }
 }
 
+/// The result of one upload attempt.
+#[derive(Clone, Debug, PartialEq)]
+struct Attempt {
+    /// The date of the backup that was uploaded, from its file name.
+    date: Option<NaiveDate>,
+    /// When the attempt finished (Unix seconds).
+    at: i64,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct StatusInner {
+    configured: bool,
+    last: Option<Attempt>,
+    /// How many backups the bucket held when last checked.
+    count: Option<usize>,
+}
+
+/// What the Admin page shows about offsite backups. Kept in memory: after a
+/// restart it is empty until the first check of the bucket. Cloning shares it.
+#[derive(Clone, Debug, Default)]
+pub struct Status(Arc<Mutex<StatusInner>>);
+
+impl Status {
+    fn inner(&self) -> std::sync::MutexGuard<'_, StatusInner> {
+        // Nothing here can be left half-updated, so a poisoned lock is fine.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record(&self, date: Option<NaiveDate>, result: &Result<Synced>) {
+        let mut inner = self.inner();
+        let error = result.as_ref().err().map(|err| {
+            let text = format!("{err:#}");
+            text.chars().take(400).collect::<String>()
+        });
+        if let Ok(synced) = result {
+            inner.count = Some(synced.count);
+        }
+        inner.last = Some(Attempt {
+            date,
+            at: Utc::now().timestamp(),
+            error,
+        });
+    }
+
+    fn set_count(&self, count: usize) {
+        self.inner().count = Some(count);
+    }
+
+    /// `{"configured": bool, "last_upload": {"date", "at", "ok", "error"?} | null,
+    /// "count": n | null}` for `GET /api/admin/backup`.
+    pub fn to_json(&self) -> Value {
+        let inner = self.inner();
+        let last = inner.last.as_ref().map(|attempt| {
+            let mut value = json!({
+                "date": attempt.date.map(|d| d.to_string()),
+                "at": attempt.at,
+                "ok": attempt.error.is_none(),
+            });
+            if let Some(error) = &attempt.error {
+                value["error"] = json!(error);
+            }
+            value
+        });
+        json!({ "configured": inner.configured, "last_upload": last, "count": inner.count })
+    }
+}
+
+/// The date in a backup file's name, if it is named like a backup.
+fn date_of_path(path: &Path) -> Option<NaiveDate> {
+    path.file_name()?.to_str().and_then(backup::date_of)
+}
+
 /// What one upload did.
 #[derive(Debug, PartialEq)]
 pub struct Synced {
@@ -363,10 +440,13 @@ pub struct Offsite {
     /// Object names start with this; empty or ending in `/`.
     prefix: String,
     keep: usize,
+    status: Status,
 }
 
 impl Offsite {
-    pub fn new(settings: &config::Offsite) -> Result<Self> {
+    /// `status` is updated after every upload attempt.
+    pub fn new(settings: &config::Offsite, status: Status) -> Result<Self> {
+        status.inner().configured = true;
         let client = Client::new(
             &settings.endpoint(),
             &settings.bucket,
@@ -379,6 +459,7 @@ impl Offsite {
             client,
             prefix: settings.prefix(),
             keep: settings.keep,
+            status,
         })
     }
 
@@ -407,6 +488,12 @@ impl Offsite {
     /// Uploads the backup at `path`, then deletes the oldest backups in the
     /// bucket beyond `keep`.
     pub async fn upload_and_prune(&self, path: &Path) -> Result<Synced> {
+        let result = self.upload_and_prune_inner(path).await;
+        self.status.record(date_of_path(path), &result);
+        result
+    }
+
+    async fn upload_and_prune_inner(&self, path: &Path) -> Result<Synced> {
         let key = self.key_for(path)?;
         let body = tokio::fs::read(path)
             .await
@@ -419,8 +506,16 @@ impl Offsite {
     /// (say an earlier upload failed). Returns `None` when it was already there.
     pub async fn upload_if_missing(&self, path: &Path) -> Result<Option<Synced>> {
         let key = self.key_for(path)?;
-        let keys = self.client.list_objects(&self.prefix).await?;
+        let keys = match self.client.list_objects(&self.prefix).await {
+            Ok(keys) => keys,
+            Err(err) => {
+                self.status
+                    .record(date_of_path(path), &Err(anyhow::anyhow!("{err:#}")));
+                return Err(err);
+            }
+        };
         if keys.contains(&key) {
+            self.status.set_count(self.backups(&keys).len());
             return Ok(None);
         }
         self.upload_and_prune(path).await.map(Some)
@@ -713,6 +808,7 @@ mod tests {
             client,
             prefix: prefix.to_string(),
             keep,
+            status: Status::default(),
         }
     }
 
@@ -802,5 +898,41 @@ mod tests {
             b"data"
         );
         assert_eq!(offsite.upload_if_missing(&path).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn status_tells_what_happened() {
+        let (client, _) = mock(10).await;
+        let offsite = offsite_for(client, "p/", 15);
+        let status = offsite.status.clone();
+        assert_eq!(
+            status.to_json(),
+            json!({ "configured": false, "last_upload": null, "count": null })
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("solar-2026-10-04.db");
+        std::fs::write(&path, "data").unwrap();
+        offsite.upload_and_prune(&path).await.unwrap();
+        let json = status.to_json();
+        assert_eq!(json["last_upload"]["date"], "2026-10-04");
+        assert_eq!(json["last_upload"]["ok"], true);
+        assert!(json["last_upload"].get("error").is_none());
+        assert!(json["last_upload"]["at"].as_i64().unwrap() > 1_700_000_000);
+        assert_eq!(json["count"], 1);
+
+        // A failure is recorded and the last known count stays.
+        let err = offsite
+            .upload_and_prune(&dir.path().join("solar-2026-10-05.db"))
+            .await;
+        assert!(err.is_err());
+        let json = status.to_json();
+        assert_eq!(json["last_upload"]["ok"], false);
+        assert!(
+            json["last_upload"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("solar-2026-10-05.db")
+        );
+        assert_eq!(json["count"], 1);
     }
 }
