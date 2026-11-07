@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use tracing::error;
 
 use super::AppState;
-use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, round2};
+use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, round2, undo_cloud_lag};
+use super::home_mix::{self, HomeMix};
 use crate::cost::{GridSplit, TariffSchedule};
 use crate::db::{self, LatestReading};
 use crate::ev_cost;
@@ -1000,6 +1001,9 @@ struct DayTotals {
     /// Grid energy by tariff band; all `null` without a tariff or interval data.
     #[serde(flatten)]
     split: SplitSums,
+    /// The home load by source, solar first (see `home_mix`).
+    #[serde(flatten)]
+    home: HomeMix,
 }
 
 /// Grid energy by tariff band in kWh (see `cost::grid_split`), summed over
@@ -1131,6 +1135,7 @@ fn live_day(date: NaiveDate, live: &LiveTotals) -> DayTotals {
         // would not match the live numbers, so leave it out.
         self_consumed_kwh: None,
         split: SplitSums::default(),
+        home: HomeMix::default(),
     }
 }
 
@@ -1152,6 +1157,7 @@ async fn cloud_day(
         battery_discharge_kwh: day_max_kwh(state, 83323, start, end).await?,
         self_consumed_kwh: day_max_kwh(state, 83097, start, end).await?,
         split: SplitSums::default(),
+        home: HomeMix::default(),
     })
 }
 
@@ -1216,6 +1222,8 @@ struct EnergySums {
     battery_discharge_kwh: Option<f64>,
     #[serde(flatten)]
     split: SplitSums,
+    #[serde(flatten)]
+    home: HomeMix,
 }
 
 impl EnergySums {
@@ -1235,6 +1243,10 @@ impl EnergySums {
         add(&mut self.battery_charge_kwh, day.battery_charge_kwh);
         add(&mut self.battery_discharge_kwh, day.battery_discharge_kwh);
         self.split.merge(&day.split);
+        add(&mut self.home.solar_kwh, day.home.solar_kwh);
+        add(&mut self.home.battery_kwh, day.home.battery_kwh);
+        add(&mut self.home.grid_kwh, day.home.grid_kwh);
+        add(&mut self.home.grid_free_kwh, day.home.grid_free_kwh);
     }
 }
 
@@ -1262,6 +1274,36 @@ fn bucket_energy(group: Group, days: &[(NaiveDate, DayTotals)]) -> Vec<EnergyBuc
         }
     }
     buckets
+}
+
+/// The home load of one day by source (see `home_mix`), from the same data
+/// the day's totals came from: the live samples, or else the cloud counters.
+async fn day_home_mix(
+    state: &AppState,
+    data: &crate::admin_data::AdminData,
+    date: NaiveDate,
+    totals: &DayTotals,
+    live: &[Sample],
+) -> Result<HomeMix, ApiError> {
+    let tariff = data.tariff.as_ref().map(|schedule| schedule.for_date(date));
+    let steps = if totals.source == "inverter" {
+        home_mix::live_steps(live)
+    } else if totals.load_kwh.is_some() {
+        let (start, end) = day_bounds_or_error(date, state.tz)?;
+        let read = async |point| -> Result<Vec<(i64, f64)>, ApiError> {
+            let rows =
+                db::readings_in_range(&state.pool, state.plant_id, point, start, end).await?;
+            Ok(undo_cloud_lag(start, &rows))
+        };
+        home_mix::cloud_steps(
+            &read(83022).await?,
+            &read(83118).await?,
+            &read(83323).await?,
+        )
+    } else {
+        Vec::new()
+    };
+    Ok(home_mix::home_mix(&steps, tariff, state.tz))
 }
 
 /// The points `day_totals` reads from the cloud.
@@ -1319,6 +1361,7 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
         {
             totals.split.add(&split);
         }
+        totals.home = day_home_mix(&state, &data, date, &totals, &live).await?;
         days.push((date, totals));
     }
     if group == Group::Day {
@@ -1854,6 +1897,7 @@ mod tests {
             battery_discharge_kwh: None,
             self_consumed_kwh: None,
             split: SplitSums::default(),
+            home: HomeMix::default(),
         };
         (date, day)
     }
