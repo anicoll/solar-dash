@@ -241,13 +241,21 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
-    // Nightly database backups; they only log their errors too.
+    // Nightly database backups; they only log their errors too. A mistake in
+    // the offsite settings that no retry can fix fails at startup instead.
+    let offsite = config
+        .database
+        .offsite
+        .as_ref()
+        .map(offsite::Offsite::new)
+        .transpose()?;
     let backups = async {
         if let Err(err) = backup::run(
             pool.clone(),
             config.database.backup_dir(),
             config.database.backup_keep,
             tz,
+            offsite,
             shutdown_signal(),
         )
         .await

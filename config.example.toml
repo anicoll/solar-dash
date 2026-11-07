@@ -71,6 +71,18 @@ path = "data/solar.db"
 # backup_dir = "data/backups"
 # backup_keep = 14
 
+# Optional: also upload each nightly backup to an S3-compatible bucket such as
+# Cloudflare R2, and keep the newest `keep` there (see docs/deploy.md). Without
+# this section nothing leaves the machine. Use an API token that can only read
+# and write this one bucket.
+# [database.offsite]
+# account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"  # or endpoint = "https://..." for another store
+# bucket = "solar-dash-backups"
+# access_key_id = "YOUR_R2_ACCESS_KEY_ID"
+# secret_access_key = "YOUR_R2_SECRET_ACCESS_KEY"
+# prefix = "solar-dash/"   # added to every object name
+# keep = 15                # newest backups kept in the bucket
+
 # Optional: read live power straight from the inverter over your LAN (Modbus
 # TCP). Without this section Modbus is off. To use it, first enable Modbus TCP
 # in the WiNet-S dongle's settings (its web page, "Advanced settings"): port

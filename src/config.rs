@@ -167,6 +167,9 @@ pub struct Database {
     /// How many daily backups to keep; 0 turns backups off.
     #[serde(default = "default_backup_keep")]
     pub backup_keep: usize,
+    /// Optional copy of each nightly backup in an S3-compatible bucket such as
+    /// Cloudflare R2. Absent: no offsite copy.
+    pub offsite: Option<Offsite>,
 }
 
 impl Default for Database {
@@ -175,7 +178,93 @@ impl Default for Database {
             path: default_db_path(),
             backup_dir: None,
             backup_keep: default_backup_keep(),
+            offsite: None,
         }
+    }
+}
+
+/// Where to send each nightly backup, as `[database.offsite]`; see
+/// config.example.toml.
+#[derive(Clone, Deserialize)]
+pub struct Offsite {
+    /// Cloudflare account id; the store is then
+    /// `https://<account_id>.r2.cloudflarestorage.com`.
+    pub account_id: Option<String>,
+    /// The store's address instead of `account_id`, such as
+    /// `https://s3.example.com` (for another S3-compatible store, or a test).
+    pub endpoint: Option<String>,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// Prepended to every object name. Default `solar-dash/`.
+    #[serde(default = "default_offsite_prefix")]
+    pub prefix: String,
+    /// How many backups to keep in the bucket (the newest by date in the name).
+    #[serde(default = "default_offsite_keep")]
+    pub keep: usize,
+}
+
+impl Offsite {
+    /// The store's address, with no trailing slash.
+    pub fn endpoint(&self) -> String {
+        match (&self.endpoint, &self.account_id) {
+            (Some(endpoint), _) => endpoint.trim_end_matches('/').to_string(),
+            (None, Some(id)) => format!("https://{id}.r2.cloudflarestorage.com"),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// The prefix as it is used in object names: no leading slash, and a
+    /// trailing slash unless empty.
+    pub fn prefix(&self) -> String {
+        let trimmed = self.prefix.trim_matches('/');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}/")
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.endpoint.is_some() || self.account_id.is_some(),
+            "[database.offsite] needs account_id (or endpoint)"
+        );
+        if let Some(id) = &self.account_id {
+            // The id becomes part of a host name.
+            anyhow::ensure!(
+                !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "account_id in [database.offsite] must be letters, digits and dashes only"
+            );
+        }
+        anyhow::ensure!(
+            !self.bucket.trim().is_empty(),
+            "bucket in [database.offsite] must not be empty"
+        );
+        anyhow::ensure!(
+            !self.access_key_id.trim().is_empty() && !self.secret_access_key.trim().is_empty(),
+            "access_key_id and secret_access_key in [database.offsite] must not be empty"
+        );
+        anyhow::ensure!(
+            self.keep >= 1,
+            "keep in [database.offsite] must be at least 1"
+        );
+        Ok(())
+    }
+}
+
+// Written by hand to keep the secret out of logs.
+impl fmt::Debug for Offsite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Offsite")
+            .field("account_id", &self.account_id)
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("prefix", &self.prefix)
+            .field("keep", &self.keep)
+            .finish()
     }
 }
 
@@ -700,6 +789,14 @@ fn default_backup_keep() -> usize {
     14
 }
 
+fn default_offsite_prefix() -> String {
+    "solar-dash/".to_string()
+}
+
+fn default_offsite_keep() -> usize {
+    15
+}
+
 impl Config {
     /// Read and parse the config file at `path`.
     pub fn load(path: &Path) -> Result<Self> {
@@ -715,6 +812,11 @@ impl Config {
             .server
             .check()
             .with_context(|| format!("invalid config file {}", path.display()))?;
+        if let Some(offsite) = &config.database.offsite {
+            offsite
+                .check()
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+        }
         if let Some(modbus) = &config.modbus {
             modbus
                 .check()
@@ -776,6 +878,62 @@ mod tests {
         assert_eq!(cfg.isolarcloud.timezone, "Australia/Adelaide");
         assert_eq!(cfg.isolarcloud.points.len(), 13);
         assert!(cfg.isolarcloud.points.contains(&83252));
+    }
+
+    const OFFSITE: &str = "[database.offsite]\naccount_id = \"abc123\"\nbucket = \"b\"\n\
+                           access_key_id = \"AK\"\nsecret_access_key = \"SECRET-VALUE\"\n";
+
+    #[test]
+    fn offsite_is_off_by_default_and_has_defaults() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.database.offsite.is_none());
+
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{OFFSITE}")).unwrap();
+        let off = cfg.database.offsite.unwrap();
+        off.check().unwrap();
+        assert_eq!(off.endpoint(), "https://abc123.r2.cloudflarestorage.com");
+        assert_eq!(off.prefix(), "solar-dash/");
+        assert_eq!(off.keep, 15);
+        // The section nests under [database], so the other settings still apply.
+        assert_eq!(cfg.database.backup_keep, 14);
+    }
+
+    #[test]
+    fn offsite_settings_can_be_changed_and_are_checked() {
+        let text = |extra: &str| format!("{MINIMAL}\n{OFFSITE}{extra}");
+        let parse = |extra: &str| {
+            toml::from_str::<Config>(&text(extra))
+                .unwrap()
+                .database
+                .offsite
+                .unwrap()
+        };
+        let off = parse("keep = 3\nprefix = \"/a/b\"\nendpoint = \"http://127.0.0.1:9000/\"\n");
+        off.check().unwrap();
+        assert_eq!(off.keep, 3);
+        assert_eq!(off.prefix(), "a/b/");
+        assert_eq!(off.endpoint(), "http://127.0.0.1:9000");
+        assert_eq!(parse("prefix = \"\"\n").prefix(), "");
+
+        assert!(parse("keep = 0\n").check().is_err());
+        let no_bucket = OFFSITE.replace("bucket = \"b\"", "bucket = \"\"");
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{no_bucket}")).unwrap();
+        assert!(cfg.database.offsite.unwrap().check().is_err());
+        let no_where = "[database.offsite]\nbucket = \"b\"\naccess_key_id = \"a\"\nsecret_access_key = \"s\"\n";
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{no_where}")).unwrap();
+        assert!(cfg.database.offsite.unwrap().check().is_err());
+        let bad_id = OFFSITE.replace("abc123", "evil.example/");
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{bad_id}")).unwrap();
+        assert!(cfg.database.offsite.unwrap().check().is_err());
+    }
+
+    #[test]
+    fn offsite_debug_hides_the_secret() {
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{OFFSITE}")).unwrap();
+        let text = format!("{:?}", cfg.database);
+        assert!(!text.contains("SECRET-VALUE"));
+        assert!(text.contains("<redacted>"));
+        assert!(text.contains("AK"));
     }
 
     #[test]
