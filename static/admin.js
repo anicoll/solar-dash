@@ -752,17 +752,30 @@
 
   const fmtDay = new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', day: 'numeric', month: 'short', year: 'numeric' });
 
+  // One plain-English line about the copy in R2, or null when offsite is off.
+  function offsiteNote(off) {
+    if (!off || !off.configured) return null;
+    const copies = off.count == null ? '' : `${off.count} ${off.count === 1 ? 'copy' : 'copies'} in R2`;
+    const last = off.last_upload;
+    let text;
+    if (!last) text = `Offsite: ${copies || 'nothing uploaded since the server started'}`;
+    else if (!last.ok) text = `Offsite: upload failed ${fmtWhen.format(new Date(last.at * 1000))}. ${last.error}`;
+    else text = `Offsite: uploaded ${fmtWhen.format(new Date(last.at * 1000))}${copies ? ' · ' + copies : ''}`;
+    return el('p', last && !last.ok ? 'aform-error' : 'panel-note', text);
+  }
+
   async function drawBackup() {
     const box = body('admin-backup');
     let latest = null;
+    let offsite = null;
     try {
-      latest = (await call('GET', '/api/admin/backup')).latest;
+      ({ latest, offsite } = await call('GET', '/api/admin/backup'));
     } catch (err) {
       box.replaceChildren(el('p', 'aform-error', err.message));
       return;
     }
     if (!latest) {
-      box.replaceChildren(el('p', 'panel-note', 'No backups yet. A backup is made every night at 03:30.'));
+      box.replaceChildren(el('p', 'panel-note', 'No backups yet. A backup is made every night at 03:30.'), ...[offsiteNote(offsite)].filter(Boolean));
       return;
     }
     const day = fmtDay.format(new Date(latest.date + 'T00:00:00Z'));
@@ -774,6 +787,7 @@
     actions.append(link);
     box.replaceChildren(
       el('p', 'panel-note', `Latest backup: ${day}, ${mb} MB. A new one is made every night at 03:30.`),
+      ...[offsiteNote(offsite)].filter(Boolean),
       actions);
   }
 
