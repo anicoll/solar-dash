@@ -342,14 +342,16 @@
       facts.push(total < 0 ? `Day total ${SD.fmt.cents(-total * 100)} back after supply.` : `Day total ${SD.fmt.cents(total * 100)} with supply.`);
     }
     const solarText = num(d.pv_kwh) ? `Solar made ${SD.fmt.kwh(d.pv_kwh)}` : null;
+    const mix = SD.homeMix(d);
     let ownText = null;
-    if (num(d.load_kwh) && d.load_kwh > 0 && num(d.import_kwh)) {
-      const own = Math.max(0, Math.min(100, Math.round((1 - d.import_kwh / d.load_kwh) * 100)));
-      ownText = `the house ran on its own power ${own}% of the time`;
+    if (mix) {
+      ownText = `the house ran on its own power ${mix.own}% of the time`;
+      if (mix.solar != null) ownText += ` (solar ${mix.solar}%, battery ${mix.battery}%)`;
+      if (mix.free > 0) ownText += ` and on free grid power ${mix.free}%`;
     }
     if (solarText && ownText) facts.push(`${solarText} and ${ownText}.`);
     else if (solarText) facts.push(`${solarText}.`);
-    else if (ownText) facts.push(`The ${ownText.slice(4)}.`);
+    else if (ownText) facts.push(`${ownText[0].toUpperCase()}${ownText.slice(1)}.`);
     if (facts.length) head.append(SD.h('p', { class: 'lede history-lede', text: facts.join(' ') }));
     nodes.push(head);
 

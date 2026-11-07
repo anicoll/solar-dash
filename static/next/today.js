@@ -831,18 +831,20 @@
       el,
       update() {
         const d = data.daily || {};
-        const own = d.load_kwh > 0 && d.import_kwh != null
-          ? Math.round(Math.max(0, Math.min(100, (1 - d.import_kwh / d.load_kwh) * 100))) : null;
+        const mix = SD.homeMix(d);
+        const own = mix ? mix.own : null;
+        const freeNote = mix && mix.free > 0 ? `plus ${mix.free}% free grid power` : null;
         const saved = data.costDay && data.costDay.savings != null ? data.costDay.savings : null;
         const tiles = [
           d.pv_kwh != null ? ['Solar made', SD.fmt.kwh(d.pv_kwh)] : null,
           d.load_kwh != null ? ['Home used', SD.fmt.kwh(d.load_kwh)] : null,
-          own != null ? ['Ran on own power', `${own}%`] : null,
+          own != null ? ['Ran on own power', `${own}%`, freeNote] : null,
           saved != null ? ['Saved vs no system', SD.fmt.dollars(saved)] : null,
         ].filter(Boolean);
         el.hidden = !tiles.length;
-        el.replaceChildren(...tiles.map(([label, value]) => h('div', { class: 'today-tile' },
-          h('div', { class: 'label', text: label }), h('div', { class: 'fig fig-lg', text: value }))));
+        el.replaceChildren(...tiles.map(([label, value, note]) => h('div', { class: 'today-tile' },
+          h('div', { class: 'label', text: label }), h('div', { class: 'fig fig-lg', text: value }),
+          note ? h('div', { class: 'today-sum-note', text: note }) : null)));
       },
     };
   }
