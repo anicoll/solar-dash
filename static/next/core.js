@@ -33,6 +33,11 @@
    SD.fmt.date(x, style='medium')          x = 'YYYY-MM-DD' | unix seconds | Date.
                                               style 'long' 'Wednesday 28 October', 'medium' 'Wed 28 Oct',
                                               'short' '28 Oct', 'month' 'October 2026'
+   SD.homeMix(d)                           d = a /api/daily day row -> null when load_kwh is not > 0, else
+                                              {own, solar, battery, free, paid}: whole percentages of home load.
+                                              own = solar + battery (solar first, then battery, then grid);
+                                              free/paid = grid power bought in / outside the free band.
+                                              Falls back to 1 - import/load (solar..paid null) on old rows.
    Every formatter returns an en dash for null, undefined or NaN. Units are joined with a
    non-breaking space.
 
@@ -184,6 +189,27 @@
     const ap = h < 12 ? 'am' : 'pm';
     return dropZero && m === 0 ? `${h12} ${ap}` : `${h12}:${String(m).padStart(2, '0')} ${ap}`;
   }
+
+  /* Share of the home's load by source, as whole percentages. */
+  SD.homeMix = function (d) {
+    if (!d || !(d.load_kwh > 0)) return null;
+    const load = d.load_kwh;
+    const pct = (kwh) => Math.round(Math.max(0, Math.min(100, (kwh / load) * 100)));
+    if (d.home_solar_kwh == null) {
+      if (d.import_kwh == null) return null;
+      return { own: pct(load - d.import_kwh), solar: null, battery: null, free: null, paid: null };
+    }
+    const battery = d.home_battery_kwh || 0;
+    const hasFree = d.home_grid_free_kwh != null;
+    const grid = d.home_grid_kwh || 0;
+    return {
+      own: pct(d.home_solar_kwh + battery),
+      solar: pct(d.home_solar_kwh),
+      battery: pct(battery),
+      free: hasFree ? pct(d.home_grid_free_kwh) : null,
+      paid: hasFree ? pct(Math.max(0, grid - d.home_grid_free_kwh)) : null,
+    };
+  };
 
   SD.fmt = {
     kwh: (n, dp = 1) => (num(n) ? `${fixed(n, dp)}${NBSP}kWh` : DASH),

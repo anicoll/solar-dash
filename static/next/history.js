@@ -342,14 +342,16 @@
       facts.push(total < 0 ? `Day total ${SD.fmt.cents(-total * 100)} back after supply.` : `Day total ${SD.fmt.cents(total * 100)} with supply.`);
     }
     const solarText = num(d.pv_kwh) ? `Solar made ${SD.fmt.kwh(d.pv_kwh)}` : null;
+    const mix = SD.homeMix(d);
     let ownText = null;
-    if (num(d.load_kwh) && d.load_kwh > 0 && num(d.import_kwh)) {
-      const own = Math.max(0, Math.min(100, Math.round((1 - d.import_kwh / d.load_kwh) * 100)));
-      ownText = `the house ran on its own power ${own}% of the time`;
+    if (mix) {
+      ownText = `the house ran on its own power ${mix.own}% of the time`;
+      if (mix.solar != null) ownText += ` (solar ${mix.solar}%, battery ${mix.battery}%)`;
+      if (mix.free > 0) ownText += ` and on free grid power ${mix.free}%`;
     }
     if (solarText && ownText) facts.push(`${solarText} and ${ownText}.`);
     else if (solarText) facts.push(`${solarText}.`);
-    else if (ownText) facts.push(`The ${ownText.slice(4)}.`);
+    else if (ownText) facts.push(`${ownText[0].toUpperCase()}${ownText.slice(1)}.`);
     if (facts.length) head.append(SD.h('p', { class: 'lede history-lede', text: facts.join(' ') }));
     nodes.push(head);
 
@@ -750,7 +752,8 @@
 
   /** Adds up day rows of /api/daily. */
   function sumRows(days) {
-    const keys = ['pv_kwh', 'load_kwh', 'import_kwh', 'export_kwh', 'import_free_kwh', 'import_shoulder_kwh', 'import_peak_kwh'];
+    const keys = ['pv_kwh', 'load_kwh', 'import_kwh', 'export_kwh', 'import_free_kwh', 'import_shoulder_kwh', 'import_peak_kwh',
+      'home_solar_kwh', 'home_battery_kwh', 'home_grid_kwh', 'home_grid_free_kwh'];
     const out = { days: days.length };
     for (const k of keys) {
       const have = days.filter((d) => num(d[k]));
@@ -813,15 +816,16 @@
       if (costs && costs.credit > 0) bits.push(`plus ${money(costs.credit).replace(/\.00$/, '')} in credits`);
       out.append(tile('Sold', SD.fmt.kwh(totals.export_kwh, totals.export_kwh >= 100 ? 0 : 1), bits.join(', ') || null));
     }
-    if (num(totals.load_kwh) && totals.load_kwh > 0 && num(totals.import_kwh)) {
-      const own = (t) => (t && num(t.load_kwh) && t.load_kwh > 0 && num(t.import_kwh) ? Math.round(Math.max(0, 1 - t.import_kwh / t.load_kwh) * 100) : null);
-      const now = own(totals);
-      const before = own(prevTotals);
+    const mixNow = SD.homeMix(totals);
+    if (mixNow) {
+      const before = (SD.homeMix(prevTotals) || {}).own;
+      const now = mixNow.own;
       let name = null;
       if (r.view === 'week') name = 'Last week';
       else if (r.view === 'month') name = SD.fmt.date(`${addMonths(r.key, -1)}-01`, 'month').split(' ')[0];
       else if (r.view === 'year') name = String(+r.key - 1);
-      out.append(tile('Ran on own power', `${now}%`, before != null && name ? `${name} was ${before}%` : null));
+      const notes = [mixNow.free ? `plus ${mixNow.free}% free grid power` : null, before != null && name ? `${name} was ${before}%` : null].filter(Boolean);
+      out.append(tile('Ran on own power', `${now}%`, notes.join(', ') || null));
     }
     return out;
   }
