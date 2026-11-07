@@ -9,6 +9,7 @@ mod bill;
 mod costs;
 mod fuel;
 mod globird;
+mod home_mix;
 mod payback;
 mod petrol;
 

@@ -76,7 +76,7 @@ const CLOUD_LAG_SECS: i64 = 300;
 /// A day's counter readings moved back to the time they were really taken.
 /// A reading that lands on or before midnight is dropped: it belongs to the
 /// day before, and `with_midnight_zero` starts the day at 0 anyway.
-fn undo_cloud_lag(day_start: i64, counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
+pub(super) fn undo_cloud_lag(day_start: i64, counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
     counter
         .iter()
         .map(|&(ts, wh)| (ts - CLOUD_LAG_SECS, wh))
