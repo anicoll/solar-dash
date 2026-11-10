@@ -387,6 +387,28 @@ impl From<&PreviousPeriod> for HistoryEntry {
     }
 }
 
+/// The cars' charging on this bill, as `cars` reports it.
+#[derive(Debug, PartialEq, Serialize)]
+struct CarsOnBill {
+    sessions: i64,
+    kwh: f64,
+    grid_kwh: f64,
+    self_kwh: f64,
+    cost_dollars: f64,
+}
+
+impl CarsOnBill {
+    fn new(totals: &db::TmChargeTotals) -> Self {
+        CarsOnBill {
+            sessions: totals.sessions,
+            kwh: round2(totals.energy_used_kwh),
+            grid_kwh: round2(totals.grid_kwh),
+            self_kwh: round2(totals.self_kwh),
+            cost_dollars: dollars(totals.cost_cents),
+        }
+    }
+}
+
 /// How many past periods `history` goes back.
 const HISTORY_PERIODS: usize = 6;
 
@@ -555,6 +577,16 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
         past_sums.last(),
     );
     let history: Vec<HistoryEntry> = history.iter().map(HistoryEntry::from).collect();
+    // Charging sessions that started on a complete day of this period.
+    let cars = match dates.first().zip(dates.last()) {
+        Some((first, last)) => {
+            let (start, _) = day_bounds_or_error(*first, state.tz)?;
+            let (_, end) = day_bounds_or_error(*last, state.tz)?;
+            db::tm_charge_totals(&state.pool, start, end).await?
+        }
+        None => None,
+    };
+    let cars = cars.as_ref().map(CarsOnBill::new);
     let feed_in_windows = feed_in_windows(&feed_in, &ExportRates::of(rate_plan));
     Ok(Json(json!({
         "configured": true,
@@ -584,6 +616,7 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
         "projected_low_dollars": dollars(projected_low),
         "projected_high_dollars": dollars(projected_high),
         "history": history,
+        "cars": cars,
         "projected_without_system_dollars": projected_without.map(dollars),
         "uses_globird_figures": uses_globird,
     })))
@@ -886,6 +919,27 @@ mod tests {
             source: "inverter",
             cost: day_cost(actual, credit),
         }
+    }
+
+    #[test]
+    fn cars_on_bill_are_rounded_to_cents_and_hundredths() {
+        let totals = db::TmChargeTotals {
+            sessions: 4,
+            energy_used_kwh: 52.456,
+            grid_kwh: 30.004,
+            self_kwh: 22.452,
+            cost_cents: 1234.5,
+        };
+        assert_eq!(
+            CarsOnBill::new(&totals),
+            CarsOnBill {
+                sessions: 4,
+                kwh: 52.46,
+                grid_kwh: 30.0,
+                self_kwh: 22.45,
+                cost_dollars: 12.35,
+            }
+        );
     }
 
     #[test]
