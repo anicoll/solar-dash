@@ -58,6 +58,9 @@
     return r < 0 ? `minus ${text}` : text;
   }
 
+  /** A credit line's amount: minus sign in front, but a zero reads as $0.00, not -$0.00. */
+  const off = (dollars) => (Math.abs(Number(dollars) || 0) < 0.005 ? SD.fmt.dollars(0) : `${MINUS}${SD.fmt.dollars(dollars)}`);
+
   /** Every date from `from` to `to`, inclusive, as 'YYYY-MM-DD'. */
   function datesBetween(from, to) {
     const out = [];
@@ -572,14 +575,14 @@
         const when = from != null && to != null ? ` ${SD.fmt.minute(from)} to ${SD.fmt.minute(to % 1440)}` : '';
         rows.push(item({
           sw: 'is-feed', credit: true, label: `${WINDOW_NAME[w.window] || 'Feed-in'}${when}`,
-          amount: `${MINUS}${SD.fmt.dollars(w.dollars)}`, zero: Number(w.dollars) === 0,
+          amount: off(w.dollars), zero: Number(w.dollars) === 0,
           calc: `${SD.fmt.kwh(w.kwh, 1)}${num(w.cents_per_kwh) ? ` × ${SD.fmt.cents(w.cents_per_kwh)}` : ''}`,
           why: WINDOW_WHY[w.window] || 'Paid for power sent to the grid.',
         }));
       }
     } else if (num(s.feed_in_dollars)) {
       rows.push(item({
-        sw: 'is-feed', credit: true, label: 'Feed-in', amount: `${MINUS}${SD.fmt.dollars(s.feed_in_dollars)}`,
+        sw: 'is-feed', credit: true, label: 'Feed-in', amount: off(s.feed_in_dollars),
         calc: num(s.feed_in_kwh) ? SD.fmt.kwh(s.feed_in_kwh, 1) : null, why: 'Paid for power sent to the grid.',
       }));
     }
@@ -593,7 +596,7 @@
         ? `${nights} of ${plural(possible, 'evening', 'evenings')}${per != null ? ` × ${tidy(per)}` : ''}`
         : plural(nights, 'evening', 'evenings');
       rows.push(item({
-        sw: 'is-credit', credit: true, label: 'ZeroHero credit', amount: `${MINUS}${SD.fmt.dollars(s.credit_dollars || 0)}`,
+        sw: 'is-credit', credit: true, label: 'ZeroHero credit', amount: off(s.credit_dollars),
         calc,
         why: win
           ? `Each evening buying ${num(win.maxKwh) ? SD.fmt.kwh(win.maxKwh, 1) : 'almost nothing'} or less between ${SD.fmt.minute(win.start)} and ${SD.fmt.minute(win.end)}.`
