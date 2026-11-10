@@ -43,13 +43,19 @@ impl Period {
     }
 }
 
+/// The shortest last bill, in days, that is still used to roll a period
+/// forward. A retailer's final bill can be a few days long, and rolling by
+/// that would make every later period just as short.
+const MIN_ROLLING_BILL_DAYS: i64 = 25;
+
 /// The bill period that contains `today`.
 ///
 /// 1. With `start_day` (1 to 28) the period starts on that day of a month and
 ///    runs to the day before the next one.
 /// 2. Else the most recent bill that ended before `today` (`bills` is oldest
 ///    first): the period starts the day after it ended and is as long as it,
-///    rolled forward by that length until it contains `today`.
+///    rolled forward by that length until it contains `today`. A bill shorter
+///    than [`MIN_ROLLING_BILL_DAYS`] (such as a final bill) is not used.
 /// 3. Else the calendar month.
 fn current_period(today: NaiveDate, start_day: Option<u32>, bills: &[PastBill]) -> Period {
     if let Some(day) = start_day.filter(|d| (1..=28).contains(d)) {
@@ -67,8 +73,13 @@ fn current_period(today: NaiveDate, start_day: Option<u32>, bills: &[PastBill]) 
             source: PeriodSource::Setting,
         };
     }
-    if let Some(last) = bills.iter().rev().find(|b| b.to < today) {
-        let length = last.days().max(1);
+    if let Some(last) = bills
+        .iter()
+        .rev()
+        .find(|b| b.to < today)
+        .filter(|b| b.days() >= MIN_ROLLING_BILL_DAYS)
+    {
+        let length = last.days();
         let first = last.to + Days::new(1);
         // Whole periods that have passed since the one after the bill.
         let rolled = (today - first).num_days() / length;
@@ -312,6 +323,42 @@ mod tests {
         // Start day 1 is the calendar month.
         let p = current_period(date("2027-02-14"), Some(1), &[]);
         assert_eq!((p.from, p.to), (date("2027-02-01"), date("2027-02-28")));
+    }
+
+    #[test]
+    fn short_last_bill_falls_back_to_the_calendar_month() {
+        // A 7 day final bill is not used for rolling.
+        let bills = [bill("2026-05-19", "2026-05-25")];
+        let p = current_period(date("2026-11-10"), None, &bills);
+        assert_eq!(
+            span(p),
+            (
+                "2026-11-01".into(),
+                "2026-11-30".into(),
+                PeriodSource::Month
+            )
+        );
+        // 24 days is too short, 25 is the shortest that still rolls.
+        let bills = [bill("2026-09-01", "2026-09-24")];
+        let p = current_period(date("2026-10-10"), None, &bills);
+        assert_eq!(p.source, PeriodSource::Month);
+        let bills = [bill("2026-09-01", "2026-09-25")];
+        let p = current_period(date("2026-10-10"), None, &bills);
+        assert_eq!(p.source, PeriodSource::LastBill);
+    }
+
+    #[test]
+    fn a_28_day_last_bill_still_rolls() {
+        let bills = [bill("2026-09-01", "2026-09-28")];
+        let p = current_period(date("2026-10-10"), None, &bills);
+        assert_eq!(
+            span(p),
+            (
+                "2026-09-29".into(),
+                "2026-10-26".into(),
+                PeriodSource::LastBill
+            )
+        );
     }
 
     #[test]
