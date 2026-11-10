@@ -13,7 +13,7 @@ use serde_json::json;
 use super::AppState;
 use super::api::{ApiResult, day_bounds_or_error, today};
 use super::costs::{
-    SOURCE_BILL, SOURCE_GLOBIRD, billed_days, day_grid_split, hhmm, live_in, round2,
+    CostedDay, SOURCE_BILL, SOURCE_GLOBIRD, billed_days, day_grid_split, hhmm, live_in, round2,
 };
 use crate::bills::PastBill;
 use crate::cost::{DayCost, ExportBand, GridSplit, Tariff};
@@ -96,6 +96,7 @@ struct PeriodSums {
     days: u32,
     credit_days: u32,
     supply_cents: f64,
+    import_cents: f64,
     export_cents: f64,
     export_kwh: f64,
     credit_cents: f64,
@@ -104,12 +105,22 @@ struct PeriodSums {
 }
 
 impl PeriodSums {
+    /// The sums of the days that have a cost row.
+    fn of(days: &[CostedDay]) -> Self {
+        let mut sums = PeriodSums::default();
+        for day in days {
+            sums.add(&day.cost);
+        }
+        sums
+    }
+
     fn add(&mut self, cost: &DayCost) {
         self.days += 1;
         if cost.zero_import_credit_cents > 0.0 {
             self.credit_days += 1;
         }
         self.supply_cents += cost.supply_cents;
+        self.import_cents += cost.import_cents;
         self.export_cents += cost.export_cents;
         self.export_kwh += cost.export_kwh;
         self.credit_cents += cost.zero_import_credit_cents;
@@ -315,6 +326,126 @@ struct DailyEntry {
     source: &'static str,
 }
 
+/// A finished bill period in the `previous` field: the sums of its days that
+/// have a cost row.
+#[derive(Debug, PartialEq, Serialize)]
+struct PreviousPeriod {
+    from: String,
+    to: String,
+    days_total: i64,
+    /// Days with a cost row.
+    days: u32,
+    supply_dollars: f64,
+    import_dollars: f64,
+    feed_in_dollars: f64,
+    credit_dollars: f64,
+    credit_nights: u32,
+    total_dollars: f64,
+    without_system_dollars: f64,
+}
+
+impl PreviousPeriod {
+    /// `None` when no day of the period has a cost row.
+    fn new(period: &Period, sums: &PeriodSums) -> Option<Self> {
+        (sums.days > 0).then(|| PreviousPeriod {
+            from: period.from.to_string(),
+            to: period.to.to_string(),
+            days_total: period.days_total(),
+            days: sums.days,
+            supply_dollars: dollars(sums.supply_cents),
+            import_dollars: dollars(sums.import_cents),
+            feed_in_dollars: dollars(sums.export_cents),
+            credit_dollars: dollars(sums.credit_cents),
+            credit_nights: sums.credit_days,
+            total_dollars: dollars(sums.actual_cents),
+            without_system_dollars: dollars(sums.baseline_cents),
+        })
+    }
+}
+
+/// One past period in `history`.
+#[derive(Debug, PartialEq, Serialize)]
+struct HistoryEntry {
+    from: String,
+    to: String,
+    days_total: i64,
+    days: u32,
+    total_dollars: f64,
+    without_system_dollars: f64,
+}
+
+impl From<&PreviousPeriod> for HistoryEntry {
+    fn from(p: &PreviousPeriod) -> Self {
+        HistoryEntry {
+            from: p.from.clone(),
+            to: p.to.clone(),
+            days_total: p.days_total,
+            days: p.days,
+            total_dollars: p.total_dollars,
+            without_system_dollars: p.without_system_dollars,
+        }
+    }
+}
+
+/// How many past periods `history` goes back.
+const HISTORY_PERIODS: usize = 6;
+
+/// The `count` periods before `period`, oldest first, each found the way the
+/// current one is: the period that contains the day before the next one starts.
+fn periods_before(
+    period: &Period,
+    count: usize,
+    start_day: Option<u32>,
+    bills: &[PastBill],
+) -> Vec<Period> {
+    let mut out = Vec::with_capacity(count);
+    let mut next_from = period.from;
+    for _ in 0..count {
+        let before = current_period(next_from - Days::new(1), start_day, bills);
+        next_from = before.from;
+        out.push(before);
+    }
+    out.reverse();
+    out
+}
+
+/// Sums each of `periods` from `costed` (any days, in any order; a day counts
+/// in the period whose dates contain it).
+fn sum_periods(periods: &[Period], costed: &[CostedDay]) -> Vec<PeriodSums> {
+    periods
+        .iter()
+        .map(|p| {
+            let days: Vec<CostedDay> = costed
+                .iter()
+                .filter(|d| p.from <= d.date && d.date <= p.to)
+                .cloned()
+                .collect();
+            PeriodSums::of(&days)
+        })
+        .collect()
+}
+
+/// The projection as a range `(low, high)` in cents. `projected` is the usual
+/// projection; the other end carries on at the previous period's average day:
+/// `so_far_cents` plus `days_left` days of it. Without a previous period both
+/// ends are `projected`.
+fn projection_range(
+    projected: f64,
+    so_far_cents: f64,
+    days_left: i64,
+    previous: Option<&PeriodSums>,
+) -> (f64, f64) {
+    let Some(prev) = previous.filter(|p| p.days > 0) else {
+        return (projected, projected);
+    };
+    let at_last_bills_pace =
+        so_far_cents + days_left.max(0) as f64 * prev.actual_cents / f64::from(prev.days);
+    (
+        projected.min(at_last_bills_pace),
+        projected.max(at_last_bills_pace),
+    )
+}
+
 fn dollars(cents: f64) -> f64 {
     round2(cents / 100.0)
 }
@@ -344,7 +475,7 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
 
     let live_range = db::live_ts_range(&state.pool).await?;
     let now = db::now();
-    let mut sums = PeriodSums::default();
+    let sums = PeriodSums::of(&costed);
     let mut bands = [BandSum::default(); 3];
     let mut feed_in = [BandSum::default(); 4];
     let mut free_value_cents = 0.0;
@@ -352,7 +483,6 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
     let mut daily = Vec::with_capacity(costed.len());
     let mut uses_globird = false;
     for day in &costed {
-        sums.add(&day.cost);
         uses_globird |= day.source == SOURCE_GLOBIRD || day.source == SOURCE_BILL;
         let has_credit = schedule.for_date(day.date).credit_cents().is_some();
         credit_possible += u32::from(has_credit);
@@ -398,6 +528,33 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
             })
         })
         .collect();
+    // The last six periods in one pass over the costs, oldest first.
+    let before = periods_before(&period, HISTORY_PERIODS, data.bill_start_day, &data.bills);
+    let past_dates: Vec<NaiveDate> = before.first().map_or_else(Vec::new, |first| {
+        first
+            .from
+            .iter_days()
+            .take_while(|d| *d < period.from)
+            .collect()
+    });
+    let past_costed = billed_days(&state, schedule, &past_dates).await?;
+    let past_sums = sum_periods(&before, &past_costed);
+    let history: Vec<PreviousPeriod> = before
+        .iter()
+        .zip(&past_sums)
+        .filter_map(|(p, s)| PreviousPeriod::new(p, s))
+        .collect();
+    let previous = before
+        .last()
+        .zip(past_sums.last())
+        .and_then(|(p, s)| PreviousPeriod::new(p, s));
+    let (projected_low, projected_high) = projection_range(
+        projected,
+        sums.actual_cents,
+        days_total - days_elapsed,
+        past_sums.last(),
+    );
+    let history: Vec<HistoryEntry> = history.iter().map(HistoryEntry::from).collect();
     let feed_in_windows = feed_in_windows(&feed_in, &ExportRates::of(rate_plan));
     Ok(Json(json!({
         "configured": true,
@@ -422,7 +579,11 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
             "without_system_dollars": dollars(sums.baseline_cents),
         },
         "daily": daily,
+        "previous": previous,
         "projected_total_dollars": dollars(projected),
+        "projected_low_dollars": dollars(projected_low),
+        "projected_high_dollars": dollars(projected_high),
+        "history": history,
         "projected_without_system_dollars": projected_without.map(dollars),
         "uses_globird_figures": uses_globird,
     })))
@@ -702,5 +863,107 @@ mod tests {
         assert_eq!(credit_status(false, 100.0), None);
         assert_eq!(credit_status(true, 100.0), Some("earned"));
         assert_eq!(credit_status(true, 0.0), Some("missed"));
+    }
+
+    fn day_cost(actual: f64, credit: f64) -> DayCost {
+        DayCost {
+            import_kwh: 0.0,
+            export_kwh: 1.0,
+            load_kwh: 0.0,
+            import_cents: 300.0,
+            export_cents: 100.0,
+            supply_cents: 100.0,
+            zero_import_credit_cents: credit,
+            actual_cents: actual,
+            baseline_cents: 1000.0,
+            savings_cents: 0.0,
+        }
+    }
+
+    fn costed(day: &str, actual: f64, credit: f64) -> CostedDay {
+        CostedDay {
+            date: date(day),
+            source: "inverter",
+            cost: day_cost(actual, credit),
+        }
+    }
+
+    #[test]
+    fn periods_before_walk_back_one_period_at_a_time() {
+        let current = current_period(date("2026-11-10"), Some(5), &[]);
+        let before = periods_before(&current, 3, Some(5), &[]);
+        let spans: Vec<_> = before
+            .iter()
+            .map(|p| (p.from.to_string(), p.to.to_string()))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("2026-08-05".to_string(), "2026-09-04".to_string()),
+                ("2026-09-05".to_string(), "2026-10-04".to_string()),
+                ("2026-10-05".to_string(), "2026-11-04".to_string()),
+            ]
+        );
+        assert!(periods_before(&current, 0, Some(5), &[]).is_empty());
+    }
+
+    #[test]
+    fn periods_are_summed_from_their_own_days() {
+        let current = current_period(date("2026-11-10"), Some(5), &[]);
+        let before = periods_before(&current, 2, Some(5), &[]);
+        let days = [
+            costed("2026-09-20", 500.0, 0.0),
+            costed("2026-10-04", 300.0, 100.0),
+            costed("2026-10-06", 200.0, 0.0),
+        ];
+        let sums = sum_periods(&before, &days);
+        assert_eq!((sums[0].days, sums[0].actual_cents), (2, 800.0));
+        assert_eq!((sums[1].days, sums[1].credit_days), (1, 0));
+        let first = PreviousPeriod::new(&before[0], &sums[0]).unwrap();
+        assert_eq!(
+            (first.from.as_str(), first.days_total, first.days),
+            ("2026-09-05", 30, 2)
+        );
+        assert_eq!(
+            (
+                first.total_dollars,
+                first.import_dollars,
+                first.credit_nights
+            ),
+            (8.0, 6.0, 1)
+        );
+        // A period with no costed day has no summary.
+        assert_eq!(
+            PreviousPeriod::new(&before[0], &PeriodSums::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn projection_range_spans_this_pace_and_last_bills_pace() {
+        let mut prev = PeriodSums::default();
+        for day in ["2026-10-01", "2026-10-02"] {
+            prev.add(&costed(day, 400.0, 0.0).cost);
+        }
+        // Last bill ran 400c a day; 10 days left on 1000c so far is 5000c.
+        assert_eq!(
+            projection_range(7000.0, 1000.0, 10, Some(&prev)),
+            (5000.0, 7000.0)
+        );
+        assert_eq!(
+            projection_range(3000.0, 1000.0, 10, Some(&prev)),
+            (3000.0, 5000.0)
+        );
+        // Nothing left, or no previous period: no range.
+        assert_eq!(
+            projection_range(900.0, 1000.0, 0, Some(&prev)),
+            (900.0, 1000.0)
+        );
+        assert_eq!(projection_range(900.0, 1000.0, 10, None), (900.0, 900.0));
+        let empty = PeriodSums::default();
+        assert_eq!(
+            projection_range(900.0, 1000.0, 10, Some(&empty)),
+            (900.0, 900.0)
+        );
     }
 }
