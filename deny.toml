@@ -7,4 +7,10 @@ ignore = [
     # key appears in tests only), so there is nothing to leak. No fixed rsa
     # release exists yet; drop this once one does.
     { id = "RUSTSEC-2023-0071", reason = "public-key encryption only; no private key in production" },
+    # Bundled SQLite before 3.54 can return stale page-cache memory when it
+    # opens a database together with a crafted -wal file of a different page
+    # size. solar-dash only opens its own database, written by itself. The fix
+    # is libsqlite3-sys 0.39, but sqlx-sqlite 0.9 requires <0.38; drop this
+    # once an sqlx release allows 0.39 (then `cargo update -p libsqlite3-sys`).
+    { id = "RUSTSEC-2026-0459", reason = "only our own database is opened; no sqlx release allows the fixed libsqlite3-sys yet" },
 ]
