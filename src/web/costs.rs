@@ -1300,7 +1300,7 @@ pub struct TariffParams {
 }
 
 /// "HH:MM" for minutes since local midnight.
-fn hhmm(minute: u32) -> String {
+pub(super) fn hhmm(minute: u32) -> String {
     format!("{:02}:{:02}", minute / 60, minute % 60)
 }
 
