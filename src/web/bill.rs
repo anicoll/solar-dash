@@ -12,9 +12,11 @@ use serde_json::json;
 
 use super::AppState;
 use super::api::{ApiResult, day_bounds_or_error, today};
-use super::costs::{SOURCE_BILL, SOURCE_GLOBIRD, billed_days, day_grid_split, live_in, round2};
+use super::costs::{
+    SOURCE_BILL, SOURCE_GLOBIRD, billed_days, day_grid_split, hhmm, live_in, round2,
+};
 use crate::bills::PastBill;
-use crate::cost::{DayCost, GridSplit, Tariff};
+use crate::cost::{DayCost, ExportBand, GridSplit, Tariff};
 use crate::db;
 
 /// How the period's dates were chosen, as `period_source` reports it.
@@ -166,6 +168,153 @@ fn add_bands(bands: &mut [BandSum; 3], split: &GridSplit, tariff: &Tariff, impor
     }
 }
 
+/// A feed-in window of a tariff: local minutes since midnight and its price.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExportRate {
+    from: u32,
+    to: u32,
+    cents: f64,
+}
+
+/// The feed-in prices of one tariff, by role (see [`Tariff::export_band_for`]).
+/// The super window is the best-paid one (only when a lower better-than-default
+/// one exists too) and the peak window is the other better-than-default one,
+/// normally the wider of the two. Either is `None` when the plan has no such
+/// window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExportRates {
+    super_window: Option<ExportRate>,
+    peak_window: Option<ExportRate>,
+    other_cents: f64,
+    tier_cents: Option<f64>,
+}
+
+impl ExportRates {
+    fn of(tariff: &Tariff) -> Self {
+        let mut rates = ExportRates {
+            super_window: None,
+            peak_window: None,
+            other_cents: tariff.default_export_cents(),
+            tier_cents: tariff.export_tier().map(|(_, cents)| cents),
+        };
+        // The first window of a role wins, as the first match wins when pricing.
+        for (from, to, cents) in tariff.export_windows() {
+            let rate = ExportRate { from, to, cents };
+            match tariff.export_band_for(cents) {
+                ExportBand::Super => rates.super_window = rates.super_window.or(Some(rate)),
+                ExportBand::Peak => rates.peak_window = rates.peak_window.or(Some(rate)),
+                ExportBand::Other => {}
+            }
+        }
+        rates
+    }
+
+    /// The price in cents of each part of a [`GridSplit`]'s export, in the
+    /// order of [`FEED_IN_WINDOWS`]. A part the plan has no price for is 0.
+    fn cents(&self) -> [f64; 4] {
+        [
+            self.super_window.map_or(0.0, |w| w.cents),
+            self.peak_window.map_or(0.0, |w| w.cents),
+            self.other_cents,
+            self.tier_cents.unwrap_or(0.0),
+        ]
+    }
+}
+
+/// The feed-in windows as `feed_in_windows` reports them, in this order.
+const FEED_IN_WINDOWS: [&str; 4] = ["super", "peak", "other", "tier"];
+
+/// Adds one day's feed-in split to `windows` (super, peak, other, tier). Like
+/// [`add_bands`], each part's cents are its usual price times its kWh, scaled
+/// so the four add up to the day's real `export_cents`.
+fn add_feed_in(windows: &mut [BandSum; 4], split: &GridSplit, tariff: &Tariff, export_cents: f64) {
+    let kwh = [
+        split.export_super_kwh,
+        split.export_peak_kwh,
+        split.export_other_kwh,
+        split.export_tier_kwh,
+    ];
+    let price = ExportRates::of(tariff).cents();
+    let priced: Vec<f64> = kwh.iter().zip(price).map(|(k, p)| k * p).collect();
+    let priced_total: f64 = priced.iter().sum();
+    let scale = if priced_total > 0.0 {
+        export_cents / priced_total
+    } else {
+        0.0
+    };
+    for i in 0..4 {
+        windows[i].kwh += kwh[i];
+        windows[i].cents += priced[i] * scale;
+    }
+}
+
+/// One feed-in window on the bill, as `so_far.feed_in_windows` lists it.
+#[derive(Debug, PartialEq, Serialize)]
+struct FeedInWindow {
+    /// "super", "peak", "other" or "tier".
+    window: &'static str,
+    /// Local "HH:MM" start and end; `null` for `other` and `tier`, which have
+    /// no window of their own.
+    from: Option<String>,
+    to: Option<String>,
+    kwh: f64,
+    /// The window's price now; `null` when the current plan has no such window.
+    cents_per_kwh: Option<f64>,
+    dollars: f64,
+}
+
+/// The windows to report: the four parts of `sums` with the times and prices
+/// of `rates`. A part with no energy and no money is left out (so `tier` only
+/// shows when the plan has paid it).
+fn feed_in_windows(sums: &[BandSum; 4], rates: &ExportRates) -> Vec<FeedInWindow> {
+    let times = [rates.super_window, rates.peak_window, None, None];
+    let cents = [
+        rates.super_window.map(|w| w.cents),
+        rates.peak_window.map(|w| w.cents),
+        Some(rates.other_cents),
+        rates.tier_cents,
+    ];
+    let mut out = Vec::new();
+    for i in 0..4 {
+        let sum = sums[i];
+        if sum.kwh <= 0.0 && dollars(sum.cents) == 0.0 {
+            continue;
+        }
+        out.push(FeedInWindow {
+            window: FEED_IN_WINDOWS[i],
+            from: times[i].map(|w| hhmm(w.from)),
+            to: times[i].map(|w| hhmm(w.to)),
+            kwh: round2(sum.kwh),
+            cents_per_kwh: cents[i],
+            dollars: dollars(sum.cents),
+        });
+    }
+    out
+}
+
+/// How a day went for the zero-import credit: `None` when its plan has no
+/// such credit, else "earned" (some credit paid) or "missed".
+fn credit_status(plan_has_credit: bool, credit_cents: f64) -> Option<&'static str> {
+    if !plan_has_credit {
+        return None;
+    }
+    Some(if credit_cents > 0.0 {
+        "earned"
+    } else {
+        "missed"
+    })
+}
+
+/// One complete day in the `daily` series.
+#[derive(Debug, PartialEq, Serialize)]
+struct DailyEntry {
+    date: String,
+    total_dollars: f64,
+    without_system_dollars: f64,
+    credit: Option<&'static str>,
+    source: &'static str,
+}
+
 fn dollars(cents: f64) -> f64 {
     round2(cents / 100.0)
 }
@@ -197,26 +346,59 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
     let now = db::now();
     let mut sums = PeriodSums::default();
     let mut bands = [BandSum::default(); 3];
+    let mut feed_in = [BandSum::default(); 4];
+    let mut free_value_cents = 0.0;
+    let mut credit_possible = 0u32;
+    let mut daily = Vec::with_capacity(costed.len());
     let mut uses_globird = false;
     for day in &costed {
         sums.add(&day.cost);
         uses_globird |= day.source == SOURCE_GLOBIRD || day.source == SOURCE_BILL;
+        let has_credit = schedule.for_date(day.date).credit_cents().is_some();
+        credit_possible += u32::from(has_credit);
+        daily.push(DailyEntry {
+            date: day.date.to_string(),
+            total_dollars: dollars(day.cost.actual_cents),
+            without_system_dollars: dollars(day.cost.baseline_cents),
+            credit: credit_status(has_credit, day.cost.zero_import_credit_cents),
+            source: day.source,
+        });
         let (start, end) = day_bounds_or_error(day.date, state.tz)?;
         let live = live_in(&state.pool, live_range, start, end).await?;
         if let Some(split) = day_grid_split(&state, schedule, day.date, &live, now).await? {
             let tariff = schedule.for_date(day.date);
             add_bands(&mut bands, &split, tariff, day.cost.import_cents);
+            add_feed_in(&mut feed_in, &split, tariff, day.cost.export_cents);
+            free_value_cents += split.import_free_kwh * tariff.default_import_cents();
         }
     }
 
     let supply_per_day = schedule.for_date(today).supply_cents_per_day();
     let (projected, projected_without) = project(&sums, days_total, supply_per_day);
+    // Rates and window times are the last complete day's plan (today's when
+    // there is none yet).
+    let rate_day = costed.last().map_or(today, |day| day.date);
+    let rate_plan = schedule.for_date(rate_day);
+    let band_cents = [
+        0.0,
+        rate_plan.default_import_cents(),
+        rate_plan.peak_import_cents(),
+    ];
     let names = ["free", "shoulder", "peak"];
     let bands: Vec<_> = names
         .iter()
         .zip(bands)
-        .map(|(band, sum)| json!({ "band": band, "kwh": round2(sum.kwh), "dollars": dollars(sum.cents) }))
+        .zip(band_cents)
+        .map(|((band, sum), cents)| {
+            json!({
+                "band": band,
+                "kwh": round2(sum.kwh),
+                "dollars": dollars(sum.cents),
+                "cents_per_kwh": cents,
+            })
+        })
         .collect();
+    let feed_in_windows = feed_in_windows(&feed_in, &ExportRates::of(rate_plan));
     Ok(Json(json!({
         "configured": true,
         "from": period.from.to_string(),
@@ -226,7 +408,12 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
         "period_source": period.source,
         "so_far": {
             "supply_dollars": dollars(sums.supply_cents),
+            "supply_days": sums.days,
+            "supply_cents_per_day": rate_plan.supply_cents_per_day(),
             "bands": bands,
+            "free_value_dollars": dollars(free_value_cents),
+            "feed_in_windows": feed_in_windows,
+            "credit_possible_nights": credit_possible,
             "feed_in_kwh": round2(sums.export_kwh),
             "feed_in_dollars": dollars(sums.export_cents),
             "credit_nights": sums.credit_days,
@@ -234,6 +421,7 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
             "total_dollars": dollars(sums.actual_cents),
             "without_system_dollars": dollars(sums.baseline_cents),
         },
+        "daily": daily,
         "projected_total_dollars": dollars(projected),
         "projected_without_system_dollars": projected_without.map(dollars),
         "uses_globird_figures": uses_globird,
@@ -387,5 +575,132 @@ mod tests {
         let (total, without) = project(&PeriodSums::default(), 31, 100.0);
         assert_eq!(total, 3100.0);
         assert_eq!(without, None);
+    }
+
+    /// A plan with a 10 c "super" window inside a wider 4 c "peak" one, a
+    /// 1 c default and, if asked, a daily tier.
+    fn plan(tier: bool) -> Tariff {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+        }
+        let tier = if tier {
+            "export_tier = { first_kwh_per_day = 5.0, cents = 20.0 }"
+        } else {
+            ""
+        };
+        let text = format!(
+            r#"
+            [tariff]
+            supply_cents_per_day = 100.0
+            default_import_cents = 30.0
+            default_export_cents = 1.0
+            import = [{{ from = "00:00", to = "03:00", cents = 0.0 }}]
+            export = [
+              {{ from = "18:00", to = "20:00", cents = 10.0 }},
+              {{ from = "16:00", to = "21:00", cents = 4.0 }},
+            ]
+            {tier}
+            "#
+        );
+        let w: Wrapper = toml::from_str(&text).unwrap();
+        Tariff::from_config(&w.tariff).unwrap()
+    }
+
+    fn kwh_split(sup: f64, peak: f64, other: f64, tier: f64) -> GridSplit {
+        GridSplit {
+            export_super_kwh: sup,
+            export_peak_kwh: peak,
+            export_other_kwh: other,
+            export_tier_kwh: tier,
+            ..GridSplit::default()
+        }
+    }
+
+    #[test]
+    fn export_rates_tell_the_super_window_from_the_wider_one() {
+        let rates = ExportRates::of(&plan(true));
+        assert_eq!(
+            rates.super_window,
+            Some(ExportRate {
+                from: 18 * 60,
+                to: 20 * 60,
+                cents: 10.0
+            })
+        );
+        assert_eq!(
+            rates.peak_window,
+            Some(ExportRate {
+                from: 16 * 60,
+                to: 21 * 60,
+                cents: 4.0
+            })
+        );
+        assert_eq!(rates.cents(), [10.0, 4.0, 1.0, 20.0]);
+        assert_eq!(ExportRates::of(&plan(false)).tier_cents, None);
+    }
+
+    #[test]
+    fn feed_in_parts_add_up_to_the_days_export_money() {
+        let tariff = plan(false);
+        let mut windows = [BandSum::default(); 4];
+        // 2 kWh super (20c), 5 kWh peak (20c), 10 kWh other (10c) = 50c priced,
+        // but the day really earned 100c: every part doubles.
+        add_feed_in(
+            &mut windows,
+            &kwh_split(2.0, 5.0, 10.0, 0.0),
+            &tariff,
+            100.0,
+        );
+        let cents: Vec<f64> = windows.iter().map(|w| w.cents).collect();
+        assert_eq!(cents, vec![40.0, 40.0, 20.0, 0.0]);
+        // A day with no priced export adds energy but no money.
+        let mut none = [BandSum::default(); 4];
+        add_feed_in(&mut none, &kwh_split(0.0, 0.0, 3.0, 0.0), &tariff, 0.0);
+        assert_eq!((none[2].kwh, none[2].cents), (3.0, 0.0));
+    }
+
+    #[test]
+    fn feed_in_windows_list_in_order_and_skip_empty_ones() {
+        let rates = ExportRates::of(&plan(true));
+        let part = |kwh, cents| BandSum { kwh, cents };
+        let sums = [
+            part(2.0, 40.0),
+            BandSum::default(),
+            part(10.0, 20.0),
+            BandSum::default(),
+        ];
+        let out = feed_in_windows(&sums, &rates);
+        let names: Vec<_> = out.iter().map(|w| w.window).collect();
+        assert_eq!(names, ["super", "other"]);
+        assert_eq!(out[0].from.as_deref(), Some("18:00"));
+        assert_eq!(out[0].to.as_deref(), Some("20:00"));
+        assert_eq!(out[0].cents_per_kwh, Some(10.0));
+        assert_eq!(out[0].dollars, 0.4);
+        assert_eq!(out[1].from, None);
+        assert_eq!(out[1].cents_per_kwh, Some(1.0));
+        // The tier shows once it has energy.
+        let mut all = sums;
+        all[3] = part(5.0, 100.0);
+        let out = feed_in_windows(&all, &rates);
+        let last = out.last().unwrap();
+        assert_eq!((last.window, last.cents_per_kwh), ("tier", Some(20.0)));
+        // A plan without the window reports no times or price for it.
+        let flat = ExportRates {
+            super_window: None,
+            peak_window: None,
+            other_cents: 1.0,
+            tier_cents: None,
+        };
+        let out = feed_in_windows(&sums, &flat);
+        assert_eq!((out[0].from.clone(), out[0].cents_per_kwh), (None, None));
+    }
+
+    #[test]
+    fn credit_status_needs_a_credit_in_the_plan() {
+        assert_eq!(credit_status(false, 0.0), None);
+        assert_eq!(credit_status(false, 100.0), None);
+        assert_eq!(credit_status(true, 100.0), Some("earned"));
+        assert_eq!(credit_status(true, 0.0), Some("missed"));
     }
 }
