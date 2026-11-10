@@ -1416,6 +1416,40 @@ pub async fn tm_charge_rows(pool: &SqlitePool, car_id: i64) -> Result<Vec<TmChar
     .context("could not read a car's charges")
 }
 
+/// Charging sessions added up over a time range, from [`tm_charge_totals`].
+/// Sessions not costed yet add nothing to the cost and grid/self figures.
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::FromRow)]
+pub struct TmChargeTotals {
+    pub sessions: i64,
+    pub energy_used_kwh: f64,
+    pub grid_kwh: f64,
+    pub self_kwh: f64,
+    pub cost_cents: f64,
+}
+
+/// All cars' charging sessions that started in `[start, end)` (unix seconds),
+/// added up. `None` when there are none.
+pub async fn tm_charge_totals(
+    pool: &SqlitePool,
+    start: i64,
+    end: i64,
+) -> Result<Option<TmChargeTotals>> {
+    let totals: TmChargeTotals = sqlx::query_as(
+        "SELECT COUNT(*) AS sessions,
+                CAST(COALESCE(SUM(energy_used_kwh), 0.0) AS REAL) AS energy_used_kwh,
+                CAST(COALESCE(SUM(grid_kwh), 0.0) AS REAL) AS grid_kwh,
+                CAST(COALESCE(SUM(self_kwh), 0.0) AS REAL) AS self_kwh,
+                CAST(COALESCE(SUM(cost_cents), 0.0) AS REAL) AS cost_cents
+         FROM tm_charge WHERE started_at >= ? AND started_at < ?",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_one(pool)
+    .await
+    .context("could not add up the charges in a time range")?;
+    Ok((totals.sessions > 0).then_some(totals))
+}
+
 /// A car TeslaMate does not track, as stored in `manual_car`.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct ManualCar {
@@ -2385,6 +2419,51 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((count, fast), (2, true));
+    }
+
+    #[tokio::test]
+    async fn tm_charge_totals_add_up_sessions_that_started_in_range() {
+        let (_dir, pool) = test_db().await;
+        assert_eq!(tm_charge_totals(&pool, 0, 10_000).await.unwrap(), None);
+        // started_at is 2000 + id: sessions 1 and 2 (car 1), 3 (car 2), 9 (out of range).
+        save_tm_charges(
+            &pool,
+            &[
+                tm_charge(1, 1, Some(100)),
+                tm_charge(2, 1, Some(100)),
+                tm_charge(3, 2, None),
+                tm_charge(9, 1, Some(100)),
+            ],
+        )
+        .await
+        .unwrap();
+        let cost = |cents: f64| TmChargeCost {
+            cost_key: "k".to_string(),
+            grid_kwh: 6.0,
+            self_kwh: 5.0,
+            uncovered_kwh: 0.0,
+            cost_cents: cents,
+            baseline_cents: 300.0,
+            feed_in_forgone_cents: 0.0,
+        };
+        // Session 3 is never costed; its energy still counts.
+        save_tm_charge_cost(&pool, 1, &cost(150.0)).await.unwrap();
+        save_tm_charge_cost(&pool, 2, &cost(50.0)).await.unwrap();
+        let got = tm_charge_totals(&pool, 2000, 2005).await.unwrap().unwrap();
+        assert_eq!(
+            got,
+            TmChargeTotals {
+                sessions: 3,
+                energy_used_kwh: 33.0,
+                grid_kwh: 12.0,
+                self_kwh: 10.0,
+                cost_cents: 200.0,
+            }
+        );
+        // The end is exclusive, the start inclusive.
+        let one = tm_charge_totals(&pool, 2001, 2002).await.unwrap().unwrap();
+        assert_eq!(one.sessions, 1);
+        assert_eq!(tm_charge_totals(&pool, 5000, 6000).await.unwrap(), None);
     }
 
     #[tokio::test]
