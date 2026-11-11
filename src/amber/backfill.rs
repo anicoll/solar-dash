@@ -331,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn a_backfill_never_overwrites_an_actual() {
         let (_dir, pool) = pool().await;
-        let start = 1_700_000_000;
+        let start = 1_700_000_040; // on a minute, as stored starts are
         let now = 1_800_000_000;
         let first = actual_at(IntervalKind::ActualInterval, start, 10.0);
         store::save_prices(&pool, "amber:s1", &[first], now)

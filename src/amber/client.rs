@@ -97,11 +97,14 @@ impl Client {
 
     /// `GET /sites/{id}/prices/current`: the `previous` intervals before now,
     /// the current one, and the next `next` forecast ones, for every channel.
+    /// `resolution` is the interval length in minutes (5 or 30); without it
+    /// Amber uses the site's billing interval, which is often 30.
     pub async fn current_prices(
         &self,
         site_id: &str,
         previous: u32,
         next: u32,
+        resolution: u32,
     ) -> Result<Reply<PriceInterval>> {
         let path = format!("/sites/{site_id}/prices/current");
         self.get(
@@ -109,6 +112,7 @@ impl Client {
             &[
                 ("previous", previous.to_string()),
                 ("next", next.to_string()),
+                ("resolution", resolution.to_string()),
             ],
         )
         .await
@@ -292,7 +296,7 @@ mod tests {
                 get(|query: axum::extract::RawQuery| async move {
                     // Echo that the query reached us by failing when it is wrong.
                     match query.0.as_deref() {
-                        Some("previous=12&next=12") => {
+                        Some("previous=12&next=12&resolution=5") => {
                             (AxumStatus::OK, include_str!("testdata/prices_current.json"))
                         }
                         _ => (AxumStatus::BAD_REQUEST, "bad query"),
@@ -357,7 +361,7 @@ mod tests {
         assert_eq!(sites.items.len(), 2);
         assert!(sites.raw.contains("SA Power Networks"));
 
-        let prices = client.current_prices("s1", 12, 12).await.unwrap();
+        let prices = client.current_prices("s1", 12, 12, 5).await.unwrap();
         assert_eq!(prices.items.len(), 3);
 
         let day = |d| NaiveDate::from_ymd_opt(2021, 5, d).unwrap();

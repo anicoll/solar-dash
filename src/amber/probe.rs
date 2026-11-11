@@ -204,7 +204,7 @@ pub async fn run(config: &Amber, tz: Tz, json_out: Option<&std::path::Path>) -> 
             "\n== Current prices for {site_id} (previous {PRICE_WINDOW}, next {PRICE_WINDOW}) =="
         );
         match client
-            .current_prices(&site_id, PRICE_WINDOW, PRICE_WINDOW)
+            .current_prices(&site_id, PRICE_WINDOW, PRICE_WINDOW, 5)
             .await
         {
             Ok(reply) => {

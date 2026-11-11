@@ -251,9 +251,17 @@
   async function loadDayPrices(day) {
     const p = await quiet(SD.fetchJSON(`/api/prices?from=${day.start}&to=${day.end}`));
     const rows = (p && p.channels && p.channels.general) || [];
-    return rows
-      .filter((r) => (r.kind === 'actual' || r.kind === 'current') && r.end - r.start <= 600 && num(r.cents))
+    // 5-minute rows, or 30-minute ones (any length up to 35 minutes, so Amber's 1799 s rows count) when
+    // that is all a day has. A row that starts inside the previous one is dropped, so lengths never double count.
+    const sorted = rows
+      .filter((r) => (r.kind === 'actual' || r.kind === 'current') && r.end - r.start <= 35 * 60 && num(r.cents))
       .sort((a, b) => a.start - b.start);
+    const out = [];
+    for (const r of sorted) {
+      if (out.length && r.start < out[out.length - 1].end - 60) continue;
+      out.push(r);
+    }
+    return out;
   }
 
   /** "9 h 10 min", "45 min". */
