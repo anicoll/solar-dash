@@ -18,6 +18,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] `/api/ev/cars` gives each TeslaMate car's details (trim, paint, wheels), home charging per plan, and a petrol comparison car; set the `compare_cars` and `petrol_grade` settings, for example `{"3": "Hyundai i30 Sedan N", "Y": "Toyota RAV4 GX 2WD"}` and `Unleaded 91` (kept in the database; see "Where the settings live" in `docs/how-to-run.md`)
 - [x] GloBird portal probe (`globird-probe`) to learn the response shapes (unofficial API)
 - [x] `serve` keeps GloBird's daily cost and usage in SQLite when configured (no API or UI yet)
+- [x] Amber Electric API client and `amber-probe` (optional `[amber]` section; read-only, not used by `serve` yet)
 - [x] Deployment to a Proxmox LXC with systemd, behind a Cloudflare Tunnel
 
 ## Architecture
@@ -47,6 +48,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
 - `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the admin API (`admin.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
 - `static/` - the dashboard, compiled into the binary: the new one in `next/` (served at `/`) and the previous one (`index.html`, `app.js`, `style.css`, served at `/classic`)
+- `src/amber/` - Amber Electric API client (`client.rs`), its JSON types (`models.rs`) and the `amber-probe` command (`probe.rs`)
 - `src/globird/` - GloBird portal client (`client.rs`), the `globird-probe` command (`probe.rs`), the daily sync (`sync.rs`) and the row types it saves (`data.rs`)
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`

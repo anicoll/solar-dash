@@ -715,6 +715,60 @@ meter serial numbers, tokens and payment descriptions are replaced with
 `REDACTED`. The redaction goes by field name, so open the file and check it
 before sharing it.
 
+## Amber (optional)
+
+Amber Electric has an official price API. solar-dash can call it with
+`amber-probe`, which only reads: it prints your sites, the current prices and
+whether usage exists. Nothing is stored and `serve` does not use it yet.
+
+1. Create an API token in the Amber app (Developers). Add it to `config.toml`
+   (see `config.example.toml`). The token is a secret stored in plain text, so
+   keep the file's mode at 600:
+
+   ```toml
+   [amber]
+   token = "psk_your-amber-token"
+   # site_id = "01F5A5CRKMZ5BCX9P1S4V990AM"   # only needed with several sites
+   ```
+
+2. Run the probe:
+
+   ```sh
+   cargo run -- amber-probe
+   ```
+
+   On the deployed server (see [deploy.md](deploy.md)):
+
+   ```sh
+   sudo -u solar-dash /opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml amber-probe --json /tmp/amber-probe.json
+   ```
+
+It prints three sections, and carries on to the next if one fails:
+
+- **Sites**: id, NMI, status (`pending`, `active` or `closed`), network, and
+  the active-from and closed-on dates when Amber gives them. With one site it
+  is used automatically; with several, set `site_id` to the one you want.
+- **Current prices**: the previous 12 and next 12 intervals as a table, with
+  times in the `[isolarcloud]` timezone, the kind (actual, current or
+  forecast), channel (general, feedIn or controlledLoad), `perKwh`,
+  `spotPerKwh` and the interval length. Prices are cents per kWh including GST.
+- **Usage**: whether metered usage exists for the last 7 days, as a count of
+  intervals per channel.
+
+The probe is how we confirm two things before building on Amber:
+
+- **Closed sites**: whether a closed site still returns prices (the probe
+  prints Amber's answer, such as a 404, instead of failing).
+- **The feed-in sign**: `feedIn` rows are printed with `perKwh` exactly as the
+  API returned it, with a count of negative and positive values. Compare them
+  with the Amber app to see whether a positive number means you are paid or
+  you pay. The code does not assume a convention yet; this section will be
+  updated once it is confirmed.
+
+`--json FILE` also saves the raw replies (mode 600). They contain your NMI, so
+check the file before sharing it; with the NMI removed they make good test
+fixtures.
+
 ## Past bills (optional)
 
 For a past period you may have no usable tariff (a spot-price retailer, say) or
