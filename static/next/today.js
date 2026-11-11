@@ -691,12 +691,12 @@
   const PRICE_DESCRIPTORS = {
     extremelyLow: { name: 'Extremely low', tone: 'cheap' },
     veryLow: { name: 'Very low', tone: 'cheap' },
-    low: { name: 'Low', tone: 'low' },
+    low: { name: 'Low', tone: 'cheap' },
     neutral: { name: 'Neutral', tone: 'neutral' },
     high: { name: 'High', tone: 'high' },
     spike: { name: 'Spike', tone: 'spike' },
   };
-  const BAND_TONE = { free: 'low', shoulder: 'neutral', peak: 'high' };
+  const BAND_TONE = { free: 'free', shoulder: 'neutral', peak: 'high' };
 
   /** The same three bands as the engine: 0 or less is Free, above the spike level is Peak, the rest Shoulder. */
   function priceBand(cents, spike) {
@@ -706,6 +706,9 @@
 
   /** How a row is named and coloured: Amber's descriptor when it has one, else our band. */
   function priceLook(row, spike) {
+    // 0c or less always reads as free (sun), whatever Amber's descriptor says, so
+    // the colour matches the Free band used everywhere else.
+    if (row.cents <= 0) return { name: PRICE_BAND_NAME.free, tone: 'free' };
     const d = row.descriptor && PRICE_DESCRIPTORS[row.descriptor];
     if (d) return d;
     const band = priceBand(row.cents, spike);

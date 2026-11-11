@@ -500,7 +500,7 @@ html[data-theme="night"] #page-today {
 
 /* Price tones: Amber's descriptors (or our bands) as colours. Always shown with a word or a number. */
 #page-today .tone-cheap { background: var(--battery); }
-#page-today .tone-low { background: var(--sun); }
+#page-today .tone-free { background: var(--sun); }
 #page-today .tone-neutral { background: var(--bar); }
 #page-today .tone-high { background: var(--peak); }
 #page-today .tone-spike { background: var(--missed); }
