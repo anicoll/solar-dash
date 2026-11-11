@@ -1487,6 +1487,36 @@ pub async fn tm_charge_totals(
     Ok((totals.sessions > 0).then_some(totals))
 }
 
+/// A costed home charging session, for the Amber what-if model.
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::FromRow)]
+pub struct TmHomeSession {
+    pub started_at: i64,
+    pub ended_at: i64,
+    /// The energy that came from the grid, in kWh.
+    pub grid_kwh: f64,
+}
+
+/// Finished sessions at home (geofence "Home") that started in
+/// `[start, end)` (unix seconds) and have a grid figure from costing, oldest
+/// first. Sessions not costed yet are left out.
+pub async fn tm_home_sessions_started_in(
+    pool: &SqlitePool,
+    start: i64,
+    end: i64,
+) -> Result<Vec<TmHomeSession>> {
+    sqlx::query_as(
+        "SELECT started_at, ended_at, grid_kwh FROM tm_charge
+         WHERE geofence = 'Home' AND ended_at IS NOT NULL AND grid_kwh IS NOT NULL
+           AND started_at >= ? AND started_at < ?
+         ORDER BY started_at, id",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await
+    .context("could not read the home charging sessions")
+}
+
 /// A car TeslaMate does not track, as stored in `manual_car`.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct ManualCar {

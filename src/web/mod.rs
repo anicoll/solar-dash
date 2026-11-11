@@ -13,6 +13,7 @@ mod home_mix;
 mod payback;
 mod petrol;
 mod prices;
+mod whatif;
 
 pub(crate) use costs::house_intervals;
 
@@ -421,6 +422,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/costs", get(costs::costs))
         .route("/api/bill/current", get(bill::current))
         .route("/api/bill/compare-dynamic", get(bill::compare_dynamic))
+        .route("/api/bill/amber-whatif", get(whatif::amber_whatif))
         .route("/api/tariff", get(costs::tariff))
         .route("/api/globird/compare", get(globird::compare))
         .route("/api/payback", get(payback::payback))
@@ -834,6 +836,7 @@ mod tests {
         "/api/costs?from=2026-01-01&to=2026-02-01",
         "/api/bill/current",
         "/api/bill/compare-dynamic",
+        "/api/bill/amber-whatif",
         "/api/tariff",
         "/api/globird/compare",
         "/api/payback",
@@ -2842,6 +2845,23 @@ mod tests {
         assert_eq!(json["totals"]["skipped_days"], 1);
         assert_eq!(json["totals"]["difference_dollars"], 0.35);
         assert_eq!(json["assumptions"]["fee_cents_per_day"], 20.0);
+
+        // The what-if endpoint counts the same single day, with no battery
+        // and no sessions, so no switch saves anything.
+        let uri = "/api/bill/amber-whatif?from=2026-09-15&to=2026-09-16";
+        let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["totals"]["days"], 1);
+        assert_eq!(json["totals"]["skipped_days"], 1);
+        assert_eq!(json["days"][0]["date"], "2026-09-15");
+        assert_eq!(json["days"][0]["amber_dollars"], 1.5);
+        assert_eq!(json["days"][0]["globird_dollars"], 1.15);
+        assert_eq!(json["days"][0]["globird_source"], "estimate");
+        assert_eq!(
+            json["days"][0]["savings_dollars"]["car+grid_charge+spikes"],
+            0.0
+        );
+        assert!(json["assumptions"].as_array().unwrap().len() > 5);
     }
 
     #[tokio::test]

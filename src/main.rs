@@ -19,6 +19,7 @@ mod petrol_prices;
 mod teslamate;
 mod teslamate_history;
 mod web;
+mod whatif;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

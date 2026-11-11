@@ -974,6 +974,10 @@ pub(super) struct HypotheticalDay {
     /// The share of the day (0 to 1) that has a stored import price.
     pub coverage: f64,
     pub priced: cost::PricedDayCost,
+    /// The energy intervals and the finished prices the day was priced from,
+    /// kept so the what-if model can replay the very same day.
+    pub intervals: Vec<cost::Interval>,
+    pub prices: cost::DayPrices,
 }
 
 /// [`compute_days`], and when `hypothetical` is given also the same intervals
@@ -1047,6 +1051,8 @@ async fn compute_days_with(
                             Some(&prices),
                             credit,
                         ),
+                        intervals: intervals.clone(),
+                        prices,
                     })
                 }
                 None => None,
