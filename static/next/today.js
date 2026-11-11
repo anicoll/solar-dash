@@ -682,8 +682,10 @@
 
   /* ---------------------------------------------------------------- price now */
 
-  /** How far ahead the forecast slots look. */
-  const PRICE_AHEAD_S = 6 * 3600;
+  /** How far ahead the timeline asks for forecasts. */
+  const PRICE_AHEAD_S = 24 * 3600;
+  /** The timeline is made of Amber's 30-minute blocks. */
+  const BLOCK_S = 1800;
   /** The prices are re-fetched this long after each 5-minute boundary (the server fetches at +15 s). */
   const PRICE_REFRESH_AFTER_S = 20;
   const PRICE_BAND_NAME = { free: 'Free', shoulder: 'Shoulder', peak: 'Peak' };
@@ -722,24 +724,6 @@
     return best;
   }
 
-  /**
-   * The slots to show: rows that start from `from` to `to`, oldest first, with no overlaps. A longer
-   * row is dropped when a shorter one starts inside it, and a row that starts before the last kept
-   * one ends is dropped too.
-   */
-  function priceSlots(rows, from, to) {
-    const list = (rows || []).filter((r) => r.start >= from && r.start < to && r.end > r.start)
-      .sort((a, b) => a.start - b.start);
-    const out = [];
-    for (const r of list) {
-      if (list.some((o) => o !== r && o.start > r.start && o.start < r.end && o.end - o.start < r.end - r.start)) continue;
-      const last = out[out.length - 1];
-      if (last && r.start < last.end) continue;
-      out.push(r);
-    }
-    return out;
-  }
-
   /** What the customer gets for exporting: Amber's feed-in is negative when paid, so flip it. */
   function sellText(cents) {
     const earned = -cents;
@@ -747,12 +731,103 @@
     return earned > 0 ? SD.fmt.cents(earned) : `-${SD.fmt.cents(-earned)}`;
   }
 
-  /** "Price now": the live buy and sell price, and Amber-style slots for the next six hours. */
+  const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+
+  /**
+   * The timeline's 30-minute blocks, from the start of today (local time) as far as the forecasts go.
+   *
+   * - A past block is the simple mean (not weighted) of its 5-minute actual rows.
+   * - The block we are in shows the current 5-minute price, and is marked "now".
+   * - A future block uses Amber's 30-minute forecast row.
+   * Each block keeps its six 5-minute slots for the detail panel. A block with no buy price is left out.
+   */
+  function priceBlocks(prices, buy, nowTs) {
+    const local = SD.local(nowTs);
+    const dayStart = nowTs - local.minute * 60 - local.sec;
+    const curIdx = Math.floor((nowTs - dayStart) / BLOCK_S);
+    const ch = (prices && prices.channels) || {};
+    const idxOf = (ts) => Math.floor((ts - dayStart) / BLOCK_S);
+
+    // Settled 5-minute rows (and the current one) by start time, per channel.
+    const fivesOf = (rows) => {
+      const m = new Map();
+      for (const r of rows || []) {
+        if ((r.kind === 'actual' || r.kind === 'current') && r.end - r.start <= BLOCK_S / 2) m.set(r.start, r);
+      }
+      return m;
+    };
+    const buyFives = fivesOf(ch.general);
+    const sellFives = fivesOf(ch.feed_in);
+    if (buy && !buyFives.has(buy.start)) buyFives.set(buy.start, buy);
+    const forecastOf = (rows) => {
+      const m = new Map();
+      for (const r of rows || []) if (r.kind === 'forecast' && r.end - r.start === BLOCK_S) m.set(idxOf(r.start), r);
+      return m;
+    };
+    const buyForecast = forecastOf(ch.general);
+    const sellForecast = forecastOf(ch.feed_in);
+
+    // The row best standing for a set of rows: Amber's label from the one nearest the mean.
+    const summarise = (rows) => {
+      if (!rows.length) return null;
+      const cents = mean(rows.map((r) => r.cents));
+      const nearest = rows.reduce((a, b) => (Math.abs(b.cents - cents) < Math.abs(a.cents - cents) ? b : a));
+      const ren = rows.filter((r) => r.renewables != null).map((r) => r.renewables);
+      return { cents, descriptor: nearest.descriptor, renewables: ren.length ? mean(ren) : null };
+    };
+
+    const last = Math.max(curIdx, ...buyForecast.keys());
+    const blocks = [];
+    for (let i = 0; i <= last; i++) {
+      const start = dayStart + i * BLOCK_S;
+      const slots = [];
+      for (let k = 0; k < 6; k++) {
+        const t = start + k * 300;
+        slots.push({ start: t, buy: buyFives.get(t) || null, sell: sellFives.get(t) || null });
+      }
+      let kind = 'actual';
+      let b;
+      let s;
+      if (i === curIdx) {
+        kind = 'now';
+        b = buy ? { cents: buy.cents, descriptor: buy.descriptor, renewables: buy.renewables } : summarise(slots.map((x) => x.buy).filter(Boolean));
+        const sRow = slots.find((x) => x.sell && x.start <= nowTs && nowTs < x.sell.end);
+        s = sRow ? sRow.sell.cents : null;
+      } else if (i < curIdx) {
+        b = summarise(slots.map((x) => x.buy).filter(Boolean));
+        const sells = slots.map((x) => x.sell).filter(Boolean);
+        s = sells.length ? mean(sells.map((r) => r.cents)) : null;
+      } else {
+        kind = 'forecast';
+        const f = buyForecast.get(i);
+        b = f ? { cents: f.cents, descriptor: f.descriptor, renewables: f.renewables } : null;
+        const sf = sellForecast.get(i);
+        s = sf ? sf.cents : null;
+      }
+      if (!b) continue;
+      blocks.push({ idx: i, start, end: start + BLOCK_S, kind, buy: b, sell: s, slots });
+    }
+    return blocks;
+  }
+
+  /** Short clock text for a block: "7:30 am". */
+  const blockTime = (ts) => SD.fmt.time(ts);
+
+  /**
+   * "Price now": the live buy and sell price, then a scrollable timeline of 30-minute blocks from
+   * the start of today to the end of Amber's forecast. Tapping a block opens its detail below.
+   */
   function priceSection() {
     const el = h('section', { class: 'card today-price', 'aria-labelledby': 'today-price-h', hidden: true });
-    return {
+    // What the person chose: which price the blocks show and which block is open (null = the current one).
+    const ui = { channel: 'buy', selected: null, scrolled: false, sig: null, dataRef: null };
+    let scroller = null;
+
+    function render() { section.update(true); }
+
+    const section = {
       el,
-      update() {
+      update(force) {
         const prices = SD.caps.prices ? data.prices : null; // no price source: the card stays hidden
         const nowTs = Math.floor(Date.now() / 1000);
         const channels = (prices && prices.channels) || {};
@@ -761,45 +836,137 @@
         // No price source, no data, or only old data (the source stopped): hide the whole card.
         el.hidden = !buy || buy.end <= nowTs;
         if (el.hidden) return;
+        // The live tick calls this every few seconds: redraw only when something that shows has changed,
+        // so a scroll position, focus or open block is never lost for nothing.
+        const sig = `${ui.channel}|${ui.selected}|${Math.floor(nowTs / 60)}|${buy.start}`;
+        if (!force && sig === ui.sig && data.prices === ui.dataRef) return;
+        ui.sig = sig;
+        ui.dataRef = data.prices;
+
         const spike = prices.spike_cents > 0 ? prices.spike_cents : 100;
         const sell = nowRows.feed_in || priceAt(channels.feed_in, nowTs);
         const look = priceLook(buy, spike);
+        const sellMode = ui.channel === 'sell';
+        const fmtVal = (cents) => (sellMode ? sellText(cents) : SD.fmt.cents(cents, { round: true }));
 
         const buyFig = h('div', { class: 'today-fig' },
           h('div', { class: 'label', text: 'Buying' }),
           h('div', { class: 'fig fig-md', text: `${SD.fmt.cents(buy.cents)} a kWh` }),
-          h('div', { class: 'today-price-band' }, h('b', { class: `swatch tone-${look.tone}` }), ` ${look.name}`),
+          h('div', { class: 'today-price-band' }, h('b', { class: `swatch tone-${look.tone}` }),
+            ` ${look.name}`),
           buy.renewables != null ? h('div', { class: 'today-price-sub', text: `${Math.round(buy.renewables)}% renewables` }) : null);
         const sellFig = sell ? h('div', { class: 'today-fig' },
-          h('div', { class: 'label', text: 'Selling' }),
+          h('div', { class: 'label', text: 'Selling earns' }),
           h('div', { class: 'fig fig-md', text: `${sellText(sell.cents)} a kWh` }),
-          sell.cents > 0 ? h('div', { class: 'today-price-sub', text: 'you pay to export' }) : null) : null;
+          h('div', { class: 'today-price-sub', text: sell.cents > 0 ? 'you pay to export' : sell.cents < 0 ? `Amber sends ${SD.fmt.cents(sell.cents)}: paid to you` : '' })) : null;
 
-        const slots = priceSlots(channels.general, buy.start, nowTs + PRICE_AHEAD_S);
-        if (!slots.length || slots[0].start !== buy.start) slots.unshift(buy);
-        const row = h('ol', { class: 'pslots' });
+        const blocks = priceBlocks(prices, buy, nowTs);
+        const cur = blocks.find((b) => b.kind === 'now') || null;
+        let picked = blocks.find((b) => b.start === ui.selected) || cur || blocks[0];
+
+        // Keep keyboard focus on the same block through the redraw.
+        const focused = document.activeElement && el.contains(document.activeElement) ? document.activeElement.dataset.start : null;
+        const prevScroll = scroller ? scroller.scrollLeft : 0;
+
+        const list = h('div', { class: 'ptl' });
         const words = [];
-        slots.forEach((r) => {
-          const cur = r.start === buy.start;
-          const l = priceLook(r, spike);
-          const time = cur ? 'Now' : SD.fmt.time(r.start);
-          words.push(`${time}: ${SD.fmt.cents(r.cents, { round: true })}, ${l.name}`);
-          row.append(h('li', { class: `pslot${cur ? ' is-now' : ''}`, 'aria-current': cur ? 'true' : null },
-            h('span', { class: 'pslot-time', text: time }),
-            h('b', { class: `pslot-dot tone-${l.tone}`, title: l.name }),
-            h('span', { class: 'pslot-cents', text: SD.fmt.cents(r.cents, { round: true }) }),
-            h('span', { class: 'pslot-ren', text: r.renewables != null ? `${Math.round(r.renewables)}%` : ' ' })));
-        });
+        for (const b of blocks) {
+          const l = priceLook(b.buy, spike);
+          const value = sellMode ? (b.sell == null ? null : sellText(b.sell)) : SD.fmt.cents(b.buy.cents, { round: true });
+          const kindText = b.kind === 'now' ? 'now' : b.kind;
+          const time = blockTime(b.start);
+          words.push(`${time}, ${value == null ? 'no price' : value}, ${kindText}`);
+          list.append(h('button', {
+            type: 'button',
+            class: `ptl-block is-${b.kind}${b === picked ? ' is-picked' : ''}`,
+            dataset: { start: String(b.start) },
+            'aria-pressed': b === picked ? 'true' : 'false',
+            'aria-label': `${time} to ${blockTime(b.end)}, ${value == null ? 'no price' : value}, ${l.name}, ${kindText}`,
+            onclick: () => { ui.selected = b.start; render(); },
+          },
+          h('span', { class: 'ptl-time', text: time }),
+          h('b', { class: `ptl-dot tone-${l.tone}${l.tone === 'spike' ? ' is-spike' : ''}`, 'aria-hidden': 'true' }),
+          h('span', { class: 'ptl-cents', text: value == null ? '–' : value }),
+          h('span', { class: 'ptl-ren', text: b.buy.renewables != null ? `${Math.round(b.buy.renewables)}%` : ' ' }),
+          h('span', { class: 'ptl-kind', text: kindText })));
+        }
+        if (!scroller) scroller = h('div', { class: 'ptl-wrap' });
+        scroller.replaceChildren(list);
+
+        const toggle = (key, text) => h('button', {
+          type: 'button', class: 'ptl-toggle-btn', 'aria-pressed': ui.channel === key ? 'true' : 'false',
+          onclick: () => { ui.channel = key; render(); },
+        }, text);
 
         fill(el,
           h('div', { class: 'card-head' },
             h('h2', { class: 'section-title', id: 'today-price-h', text: 'Price now' }),
-            h('span', { class: 'label', text: 'c/kWh' })),
+            h('span', { class: 'label', text: buy.fetched_at ? `Amber · settled ${SD.fmt.time(buy.fetched_at)}` : 'Amber' })),
           h('div', { class: 'today-figs today-price-figs' }, buyFig, sellFig),
-          h('p', { class: 'card-sub today-price-note', text: 'Next 6 hours · renewables % below' }),
-          h('div', { class: 'pslots-wrap', role: 'group', tabindex: '0', 'aria-label': `Forecast prices. ${words.slice(0, 12).join('. ')}.` }, row));
+          h('div', { class: 'ptl-head' },
+            h('span', { class: 'ptl-title', text: 'Today and the next 24 hours · 30-minute blocks' }),
+            h('div', { class: 'ptl-toggle', role: 'group', 'aria-label': 'Price shown' }, toggle('buy', 'Buying'), toggle('sell', 'Selling'))),
+          h('p', { class: 'sr-only', text: `Price timeline. ${words.slice(0, 16).join('. ')}.` }),
+          scroller,
+          picked ? detailPanel(picked, nowTs, spike, fmtVal, sellMode) : null,
+          legend());
+
+        if (focused) {
+          const again = list.querySelector(`[data-start="${focused}"]`);
+          if (again) again.focus({ preventScroll: true });
+        }
+        const curEl = list.querySelector('.is-now');
+        if (!ui.scrolled && curEl && scroller.clientWidth > 0) {
+          // First draw only: bring the current block into view (a redraw must not undo the person's scrolling).
+          scroller.scrollLeft = Math.max(0, curEl.offsetLeft - (scroller.clientWidth - curEl.offsetWidth) / 2);
+          ui.scrolled = true;
+        } else {
+          scroller.scrollLeft = prevScroll;
+        }
       },
     };
+    return section;
+  }
+
+  /** The panel under the timeline for the open block. */
+  function detailPanel(b, nowTs, spike, fmtVal, sellMode) {
+    const l = priceLook(b.buy, spike);
+    const forecast = b.kind === 'forecast';
+    const value = sellMode ? (b.sell == null ? null : sellText(b.sell)) : SD.fmt.cents(b.buy.cents, { round: false });
+    const parts = [h('div', { class: 'ptl-detail-head' },
+      h('span', { class: 'ptl-detail-title', text: `${blockTime(b.start)} block · ${l.name}` }),
+      h('span', { class: 'label', text: { actual: 'Settled', now: 'In progress', forecast: 'Forecast' }[b.kind] }))];
+    if (forecast) {
+      // We do not store Amber's forecast range, so only the forecast itself is shown.
+      parts.push(h('p', { class: 'ptl-detail-line' }, 'Forecast ', h('b', { text: value == null ? 'not available' : value }), '.'),
+        h('p', { class: 'ptl-detail-note', text: 'Amber only forecasts in 30-minute blocks. The six 5-minute prices fill in as each one settles, about 15 seconds after it starts.' }));
+    } else {
+      const grid = h('ol', { class: 'ptl-fives' });
+      for (const s of b.slots) {
+        const row = sellMode ? s.sell : s.buy;
+        const settled = !!row;
+        const fl = s.buy ? priceLook(s.buy, spike) : null;
+        const label = settled ? fmtVal(row.cents) : (s.start >= nowTs ? '…' : '–');
+        grid.append(h('li', { class: `ptl-five${s.start <= nowTs && nowTs < s.start + 300 ? ' is-now' : ''}${settled ? '' : ' is-pending'}` },
+          h('span', { class: 'ptl-five-time', text: SD.fmt.time(s.start).replace(/ (am|pm)$/, '') }),
+          fl ? h('b', { class: `ptl-dot ptl-dot-sm tone-${fl.tone}${fl.tone === 'spike' ? ' is-spike' : ''}`, 'aria-hidden': 'true' }) : h('b', { class: 'ptl-dot ptl-dot-sm ptl-dot-empty', 'aria-hidden': 'true' }),
+          h('span', { class: 'ptl-five-cents', text: label })));
+      }
+      parts.push(grid);
+      parts.push(h('p', { class: 'ptl-detail-note', text: b.kind === 'actual'
+        ? `Block average ${value == null ? 'not available' : value}: the simple mean of its 5-minute prices.`
+        : 'The block in progress. Each 5-minute price settles about 15 seconds after it starts.' }));
+    }
+    if (sellMode) parts.push(h('p', { class: 'ptl-detail-note', text: 'Selling shows what you earn per kWh exported. A minus means you pay to export.' }));
+    return h('div', { class: 'ptl-detail', role: 'region', 'aria-label': 'Selected price block' }, parts);
+  }
+
+  /** The colour key: the dot colour always follows the buying price. */
+  function legend() {
+    const item = (tone, text) => h('span', { class: 'ptl-key' }, h('b', { class: `ptl-dot ptl-dot-sm tone-${tone}${tone === 'spike' ? ' is-spike' : ''}`, 'aria-hidden': 'true' }), text);
+    return h('div', { class: 'ptl-legend' },
+      item('free', 'Free (0c or less)'), item('cheap', 'Low'), item('neutral', 'Neutral'), item('high', 'High'), item('spike', 'Spike'),
+      h('span', { class: 'ptl-key', text: 'Colours follow the buying price' }));
   }
 
   /* ---------------------------------------------------------------- 6. coming up */
@@ -1014,10 +1181,12 @@
 
   const ok = (p) => p.catch(() => null);
 
-  /** The stored prices: a little history so the interval we are in is always there, and the forecast beyond 6 hours. */
+  /** The stored prices: all of today so far, and the forecast up to a day ahead. */
   function refreshPrices() {
     const nowTs = Math.floor(Date.now() / 1000);
-    return ok(SD.fetchJSON(`/api/prices?from=${nowTs - 900}&to=${nowTs + PRICE_AHEAD_S + 1800}`));
+    const local = SD.local(nowTs);
+    const dayStart = nowTs - local.minute * 60 - local.sec; // local midnight, as the rest of Today reads the day
+    return ok(SD.fetchJSON(`/api/prices?from=${dayStart}&to=${nowTs + PRICE_AHEAD_S + BLOCK_S}`));
   }
 
   /** Fetches the slower data and redraws everything. */
