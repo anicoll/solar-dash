@@ -26,6 +26,9 @@ pub struct Config {
     /// `serve`'s daily GloBird sync. `None` (no `[globird]` section) means it
     /// is off.
     pub globird: Option<Globird>,
+    /// Amber Electric API token, used by `amber-probe`. `None` (no `[amber]`
+    /// section) means it is off.
+    pub amber: Option<Amber>,
     /// Electricity prices, used to work out costs and savings. `None` (no
     /// `[tariff]` section) means cost features are off.
     pub tariff: Option<Tariff>,
@@ -479,6 +482,45 @@ impl fmt::Debug for Globird {
     }
 }
 
+/// Amber Electric's API; see config.example.toml.
+#[derive(Clone, Deserialize)]
+pub struct Amber {
+    /// Personal API token from the Amber app. A secret.
+    pub token: String,
+    /// Which site (meter) to use. Optional: with exactly one site on the
+    /// account that one is used.
+    pub site_id: Option<String>,
+    #[serde(default = "default_amber_base_url")]
+    pub base_url: String,
+}
+
+impl Amber {
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.token.trim().is_empty(),
+            "token in [amber] must not be empty"
+        );
+        if let Some(site_id) = &self.site_id {
+            anyhow::ensure!(
+                !site_id.trim().is_empty(),
+                "site_id in [amber] must not be empty (leave it out to pick the only site)"
+            );
+        }
+        crate::amber::client::check_base_url(&self.base_url).context("base_url in [amber]")
+    }
+}
+
+// Written by hand for the same reason as `IsolarCloud`: keep the token out of logs.
+impl fmt::Debug for Amber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Amber")
+            .field("token", &"<redacted>")
+            .field("site_id", &self.site_id)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
 /// Electricity prices; see config.example.toml. Rates are in cents (per kWh,
 /// except `supply_cents_per_day`). This is the raw file shape: `cost::Tariff`
 /// turns it into something quick to look up.
@@ -765,6 +807,10 @@ fn default_points() -> Vec<i64> {
     ]
 }
 
+fn default_amber_base_url() -> String {
+    "https://api.amber.com.au/v1".to_string()
+}
+
 fn default_globird_sync_time() -> String {
     "09:00".to_string()
 }
@@ -829,6 +875,11 @@ impl Config {
         }
         if let Some(globird) = &config.globird {
             globird
+                .check()
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+        }
+        if let Some(amber) = &config.amber {
+            amber
                 .check()
                 .with_context(|| format!("invalid config file {}", path.display()))?;
         }
@@ -1039,6 +1090,57 @@ mod tests {
         let text = format!("{globird:?}");
         assert!(!text.contains("hunter2"));
         assert!(text.contains("<redacted>"));
+    }
+
+    #[test]
+    fn amber_is_off_without_a_section() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.amber.is_none());
+    }
+
+    #[test]
+    fn amber_section_needs_a_token_and_has_defaults() {
+        let ok = format!("{MINIMAL}\n[amber]\ntoken = \"psk_abc\"\n");
+        let amber = toml::from_str::<Config>(&ok).unwrap().amber.unwrap();
+        assert_eq!(amber.token, "psk_abc");
+        assert!(amber.site_id.is_none());
+        assert_eq!(amber.base_url, "https://api.amber.com.au/v1");
+        assert!(amber.check().is_ok());
+
+        let no_token = format!("{MINIMAL}\n[amber]\nsite_id = \"x\"\n");
+        assert!(toml::from_str::<Config>(&no_token).is_err());
+
+        let parse = |extra: &str| -> Amber {
+            let text = format!("{MINIMAL}\n[amber]\ntoken = \"t\"\n{extra}");
+            toml::from_str::<Config>(&text).unwrap().amber.unwrap()
+        };
+        assert!(parse("site_id = \"01ABC\"").check().is_ok());
+        assert!(parse("site_id = \"\"").check().is_err());
+        assert!(parse("base_url = \"not a url\"").check().is_err());
+        assert!(parse("base_url = \"ftp://x\"").check().is_err());
+        assert!(
+            parse("base_url = \"http://127.0.0.1:9/v1\"")
+                .check()
+                .is_ok()
+        );
+        let empty = Amber {
+            token: " ".into(),
+            ..parse("")
+        };
+        assert!(empty.check().is_err());
+    }
+
+    #[test]
+    fn amber_token_is_not_in_debug_output() {
+        let amber = Amber {
+            token: "psk_supersecret".into(),
+            site_id: Some("01ABC".into()),
+            base_url: default_amber_base_url(),
+        };
+        let text = format!("{amber:?}");
+        assert!(!text.contains("psk_supersecret"));
+        assert!(text.contains("<redacted>"));
+        assert!(text.contains("01ABC"));
     }
 
     #[test]

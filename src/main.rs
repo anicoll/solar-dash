@@ -1,5 +1,6 @@
 mod admin_data;
 mod admin_import;
+mod amber;
 mod backup;
 mod bills;
 mod config;
@@ -73,6 +74,13 @@ enum Command {
         /// How many days of usage and cost to ask for.
         #[arg(long, default_value_t = 31)]
         days: u32,
+    },
+    /// Print what the Amber Electric API returns for your site: sites, current
+    /// prices and recent usage (needs an [amber] section). Read-only.
+    AmberProbe {
+        /// Also save the raw API replies to this JSON file (for test fixtures).
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
     /// Call any iSolarCloud endpoint and print the result (for exploring the API).
     Api {
@@ -151,6 +159,12 @@ async fn run() -> Result<()> {
         Command::GlobirdProbe { out, days } => {
             if let Err(err) = globird_probe(config, &out, days).await {
                 eprintln!("GloBird probe failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::AmberProbe { json } => {
+            if let Err(err) = amber_probe(config, json.as_deref()).await {
+                eprintln!("Amber probe failed: {err:#}");
                 std::process::exit(1);
             }
         }
@@ -370,6 +384,20 @@ async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
         .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.isolarcloud.timezone))?;
     let client = globird::client::Client::new(globird)?;
     globird::probe::run(client, tz, days, out).await
+}
+
+/// Prints what the Amber API returns for the configured site.
+async fn amber_probe(config: Config, json: Option<&Path>) -> Result<()> {
+    let amber = config
+        .amber
+        .context("amber-probe needs an [amber] section in config.toml (see config.example.toml)")?;
+    // Times are shown in the same time zone as the iSolarCloud plant.
+    let tz: Tz = config
+        .isolarcloud
+        .timezone
+        .parse()
+        .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.isolarcloud.timezone))?;
+    amber::probe::run(&amber, tz, json).await
 }
 
 /// Reads the inverter once, or with `watch` every `interval_secs` until Ctrl+C.
