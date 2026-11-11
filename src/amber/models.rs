@@ -118,8 +118,9 @@ pub struct PriceInterval {
     #[serde(rename = "type")]
     pub kind: IntervalKind,
     pub channel_type: ChannelType,
-    /// Cents per kWh including GST, as Amber returns it. For `feedIn` the
-    /// sign convention is still to be confirmed with `amber-probe`.
+    /// Cents per kWh including GST, as Amber returns it. For `feedIn` a
+    /// NEGATIVE price means the customer is paid (confirmed against the Amber
+    /// app), and a positive one means they pay to export.
     pub per_kwh: f64,
     /// NEM spot price in cents per kWh including GST.
     pub spot_per_kwh: f64,

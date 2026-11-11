@@ -67,12 +67,14 @@ pub async fn save_prices(
         };
         sqlx::query(
             "INSERT INTO price_interval
-               (source, channel, start_ts, end_ts, cents, spot_cents, kind, fetched_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               (source, channel, start_ts, end_ts, cents, spot_cents, kind, fetched_at,
+                descriptor, renewables)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (source, channel, start_ts) DO UPDATE SET
                end_ts = excluded.end_ts, cents = excluded.cents,
                spot_cents = excluded.spot_cents, kind = excluded.kind,
-               fetched_at = excluded.fetched_at
+               fetched_at = excluded.fetched_at, descriptor = excluded.descriptor,
+               renewables = excluded.renewables
              WHERE price_interval.kind <> 'actual' OR excluded.kind = 'actual'",
         )
         .bind(source)
@@ -83,9 +85,29 @@ pub async fn save_prices(
         .bind(interval.spot_per_kwh)
         .bind(kind)
         .bind(now)
+        .bind(interval.descriptor.as_deref())
+        .bind(interval.renewables)
         .execute(&mut *tx)
         .await
         .context("could not save a price interval")?;
+        // A longer forecast row (say 30 minutes) replacing 5-minute ones would
+        // otherwise sit on top of the stale shorter rows it now covers, which
+        // is a double count in the slot row. Drop forecast rows that lie
+        // entirely inside the row just saved.
+        if kind != "actual" {
+            sqlx::query(
+                "DELETE FROM price_interval
+                 WHERE source = ? AND channel = ? AND kind = 'forecast'
+                   AND start_ts > ? AND end_ts <= ?",
+            )
+            .bind(source)
+            .bind(channel)
+            .bind(interval.start_time.timestamp())
+            .bind(interval.end_time.timestamp())
+            .execute(&mut *tx)
+            .await
+            .context("could not drop forecasts covered by a longer interval")?;
+        }
         saved += 1;
     }
     tx.commit().await?;
@@ -110,10 +132,15 @@ pub struct StoredPrice {
     pub channel: String,
     pub start: i64,
     pub end: i64,
-    /// c/kWh including GST, as the source gave it (feed-in sign not flipped).
+    /// c/kWh including GST, as the source gave it. Not flipped: a negative
+    /// feed-in price means the customer is paid (Amber's convention).
     pub cents: f64,
     pub spot_cents: Option<f64>,
     pub kind: String,
+    /// Amber's label: extremelyLow, veryLow, low, neutral, high or spike.
+    pub descriptor: Option<String>,
+    /// Percent of the grid that is renewable, when known.
+    pub renewables: Option<f64>,
 }
 
 /// Intervals that start from `from` up to (not including) `to`, oldest first.
@@ -125,7 +152,8 @@ pub async fn prices_between(
     to: i64,
 ) -> Result<Vec<StoredPrice>> {
     sqlx::query_as(
-        "SELECT channel, start_ts AS start, end_ts AS end, cents, spot_cents, kind
+        "SELECT channel, start_ts AS start, end_ts AS end, cents, spot_cents, kind,
+                descriptor, renewables
          FROM price_interval
          WHERE start_ts >= ? AND start_ts < ? AND (? IS NULL OR source = ?)
          ORDER BY channel, start_ts",
@@ -146,7 +174,8 @@ pub async fn prices_at(
     now: i64,
 ) -> Result<Vec<StoredPrice>> {
     sqlx::query_as(
-        "SELECT channel, start_ts AS start, end_ts AS end, cents, spot_cents, kind
+        "SELECT channel, start_ts AS start, end_ts AS end, cents, spot_cents, kind,
+                descriptor, renewables
          FROM price_interval
          WHERE start_ts <= ? AND end_ts > ? AND (? IS NULL OR source = ?)
          ORDER BY channel, start_ts DESC",
@@ -359,6 +388,80 @@ mod tests {
         // The end is exclusive: at 600 the next interval is current.
         assert_eq!(prices_at(&pool, None, 600).await.unwrap()[0].cents, 3.0);
         assert!(prices_at(&pool, None, 9000).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn descriptor_and_renewables_round_trip() {
+        use ChannelType::General;
+        let (_dir, pool) = pool().await;
+        let mut with = interval(IntervalKind::CurrentInterval, General, 300, 32.0);
+        with.descriptor = Some("low".into());
+        with.renewables = Some(35.0);
+        let without = interval(IntervalKind::ForecastInterval, General, 600, 30.0);
+        save_prices(&pool, "amber:s", &[with, without], 0)
+            .await
+            .unwrap();
+        let rows = prices_between(&pool, None, 0, 1000).await.unwrap();
+        assert_eq!(rows[0].descriptor.as_deref(), Some("low"));
+        assert_eq!(rows[0].renewables, Some(35.0));
+        assert_eq!(rows[1].descriptor, None);
+        assert_eq!(rows[1].renewables, None);
+        // A later save with new labels replaces them, and clears missing ones.
+        let mut again = interval(IntervalKind::CurrentInterval, General, 300, 33.0);
+        again.descriptor = Some("neutral".into());
+        save_prices(&pool, "amber:s", &[again], 1).await.unwrap();
+        let rows = prices_between(&pool, None, 0, 1000).await.unwrap();
+        assert_eq!(rows[0].descriptor.as_deref(), Some("neutral"));
+        assert_eq!(rows[0].renewables, None);
+    }
+
+    #[tokio::test]
+    async fn a_longer_forecast_replaces_the_short_rows_it_covers() {
+        use ChannelType::General;
+        use IntervalKind::*;
+        let (_dir, pool) = pool().await;
+        // Stale 5-minute forecasts for 1800..2400, then a 30-minute one over them.
+        let short: Vec<_> = (0..6)
+            .map(|i| interval(ForecastInterval, General, 1800 + i * 300, 10.0))
+            .collect();
+        save_prices(&pool, "amber:s", &short, 0).await.unwrap();
+        let mut long = interval(ForecastInterval, General, 1800, 20.0);
+        long.end_time = DateTime::from_timestamp(3600, 0).unwrap();
+        save_prices(&pool, "amber:s", &[long], 1).await.unwrap();
+        let rows = prices_between(&pool, None, 0, 9000).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].start, rows[0].end, rows[0].cents),
+            (1800, 3600, 20.0)
+        );
+        // The other way round (5-minute over 30-minute) leaves a gap, not a double.
+        save_prices(
+            &pool,
+            "amber:s",
+            &[interval(ForecastInterval, General, 1800, 5.0)],
+            2,
+        )
+        .await
+        .unwrap();
+        let rows = prices_between(&pool, None, 0, 9000).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].end, 2100);
+    }
+
+    #[tokio::test]
+    async fn now_prefers_the_newest_start_among_overlapping_rows() {
+        use ChannelType::General;
+        use IntervalKind::*;
+        let (_dir, pool) = pool().await;
+        let mut long = interval(ForecastInterval, General, 0, 50.0);
+        long.end_time = DateTime::from_timestamp(1800, 0).unwrap();
+        let short = interval(CurrentInterval, General, 900, 32.0);
+        save_prices(&pool, "amber:s", &[long, short], 0)
+            .await
+            .unwrap();
+        let now = prices_at(&pool, None, 1000).await.unwrap();
+        assert_eq!(now.len(), 2);
+        assert_eq!(now[0].cents, 32.0); // newest start first
     }
 
     #[tokio::test]
