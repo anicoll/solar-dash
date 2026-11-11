@@ -372,16 +372,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/spokes", get(api::spokes))
         .route("/api/capabilities", get(api::capabilities))
         .route("/api/live", get(api::live))
-        .route(
-            "/api/live/series?from=1767225600&to=1767312000",
-            get(api::live_series),
-        )
+        .route("/api/live/series", get(api::live_series))
         .route("/api/inverter", get(api::inverter))
         .route("/api/inverter/history", get(api::inverter_history))
-        .route(
-            "/api/ev/sessions?from=1767225600&to=1767312000",
-            get(api::ev_sessions),
-        )
+        .route("/api/ev/sessions", get(api::ev_sessions))
         .route("/api/ev/summary", get(api::ev_summary))
         .route("/api/ev/cars", get(api::ev_cars))
         .route("/api/fuel/cars", get(fuel::cars))
@@ -813,12 +807,12 @@ mod tests {
         "/api/spokes",
         "/api/capabilities",
         "/api/live",
-        "/api/live/series",
+        "/api/live/series?from=1767225600&to=1767312000",
         "/api/live/series?from=1767225600",
         "/api/inverter",
         "/api/inverter/history",
         "/api/inverter/history?from=1767225600&to=1767312000",
-        "/api/ev/sessions",
+        "/api/ev/sessions?from=1767225600&to=1767312000",
         "/api/ev/summary",
         "/api/ev/cars",
         "/api/fuel/cars",
