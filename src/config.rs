@@ -566,6 +566,35 @@ pub struct Tariff {
     /// it keep their stored costs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_tier: Option<ExportTier>,
+    /// Optional: price energy from stored live prices (such as Amber's)
+    /// instead of the windows above, which then only fill gaps. Left out of
+    /// the stored key when unset, so static plans keep their stored costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<DynamicPrices>,
+}
+
+/// Marks a plan as priced from the `price_interval` table. Rows are chosen by
+/// `source` and stay read-only: nothing here writes to the price provider.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DynamicPrices {
+    /// Only price rows whose `source` starts with this are used, for example
+    /// `amber` matches `amber:<site id>`.
+    pub source: String,
+    /// The retailer's own daily fee, added to `supply_cents_per_day`.
+    #[serde(default)]
+    pub fee_cents_per_day: f64,
+    /// How to read a feed-in price. Amber's API reports feed-in so that a
+    /// NEGATIVE price means you are paid (this is what Home Assistant's Amber
+    /// integration assumes); with `true` the stored price is flipped, so -8
+    /// earns 8 c/kWh and +3 costs 3 c/kWh. Set `false` if the price is
+    /// already "what you are paid". This is a setting, not a constant,
+    /// because it is still to be confirmed against real data (amber-probe).
+    #[serde(default = "default_true")]
+    pub feed_in_paid_when_negative: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A feed-in rate for the first `first_kwh_per_day` kWh exported in each local
@@ -653,6 +682,16 @@ impl Tariff {
             anyhow::ensure!(
                 t.cents.is_finite() && t.cents >= 0.0,
                 "export_tier.cents in {section} must not be negative"
+            );
+        }
+        if let Some(d) = &self.dynamic {
+            anyhow::ensure!(
+                !d.source.trim().is_empty(),
+                "dynamic.source in {section} must not be empty"
+            );
+            anyhow::ensure!(
+                d.fee_cents_per_day.is_finite(),
+                "dynamic.fee_cents_per_day in {section} must be a number"
             );
         }
         Ok(())

@@ -259,6 +259,9 @@
         ? { from: str(t.zero_import_credit.from), to: str(t.zero_import_credit.to), max_kwh: str(t.zero_import_credit.max_kwh), credit_cents: str(t.zero_import_credit.credit_cents) }
         : null,
       tier: t.export_tier ? { first_kwh_per_day: str(t.export_tier.first_kwh_per_day), cents: str(t.export_tier.cents) } : null,
+      dynamic: t.dynamic
+        ? { source: str(t.dynamic.source), fee: str(t.dynamic.fee_cents_per_day), flip: t.dynamic.feed_in_paid_when_negative !== false }
+        : null,
     };
   }
 
@@ -299,6 +302,14 @@
       tariff.export_tier = {
         first_kwh_per_day: needNumber(d.tier.first_kwh_per_day, 'Export tier kWh'),
         cents: needNumber(d.tier.cents, 'Export tier price'),
+      };
+    }
+    if (d.dynamic) {
+      if (!d.dynamic.source.trim()) throw new Error('Dynamic prices need a price source, such as amber.');
+      tariff.dynamic = {
+        source: d.dynamic.source.trim(),
+        fee_cents_per_day: d.dynamic.fee.trim() === '' ? 0 : needNumber(d.dynamic.fee, 'Retailer fee'),
+        feed_in_paid_when_negative: d.dynamic.flip,
       };
     }
     const plan = { valid_from: d.valid_from || null, tariff };
@@ -391,6 +402,16 @@
     return wrap;
   }
 
+  /** The checkbox for how a feed-in price is read; see `feed_in_paid_when_negative`. */
+  function flipBox(obj) {
+    const box = inp('checkbox', { checked: obj.flip });
+    box.id = `adm-c${++uid}`;
+    box.onchange = () => { obj.flip = box.checked; stale(); };
+    return h('div', { class: 'adm-field' },
+      h('div', { class: 'adm-check' }, box, h('label', { for: box.id, text: 'A negative feed-in price means I am paid' })),
+      h('span', { class: 'adm-hint', text: 'Amber reports feed-in so that a negative price is money in. Untick this if your stored prices already show what you are paid.' }));
+  }
+
   function drawEditor() {
     const box = document.getElementById('adm-plan-editor');
     if (!box) return;
@@ -420,6 +441,17 @@
       () => h('div', { class: 'adm-fields' },
         field('First kWh a day', money2(d.tier, 'first_kwh_per_day')),
         field('Price for them (c/kWh)', money2(d.tier, 'cents'))));
+
+    // Only offered when Amber is set up (or the plan already uses it), so
+    // homes without live prices see nothing new here.
+    const dynamic = data.amber_configured || d.dynamic
+      ? optionalGroup('Price from live prices (Amber)', !!d.dynamic,
+        (on) => { d.dynamic = on ? { source: 'amber', fee: '', flip: true } : null; },
+        () => h('div', { class: 'adm-fields' },
+          field('Price source', bound('text', d.dynamic, 'source', { autocomplete: 'off' }), 'Matches the start of the stored source name, e.g. amber. Stored prices replace the windows; the windows only fill gaps where a price is missing.'),
+          field('Retailer fee (c per day)', money2(d.dynamic, 'fee'), 'Added to the supply charge.'),
+          flipBox(d.dynamic)))
+      : null;
 
     const msg = note();
     const out = h('div', { class: 'adm-preview', id: 'adm-plan-preview', hidden: true });
@@ -468,7 +500,7 @@
       sub(editing ? 'Edit plan' : 'Add a plan'), blurb(PLAN_NUMBERS), basics,
       windowRows('Import windows', d.imports, 'import window'),
       windowRows('Export windows', d.exports, 'export window'),
-      credit, tier,
+      credit, tier, dynamic,
       h('div', { class: 'adm-actions' }, preview, save, btn('Cancel', () => { draft = null; previewOk = false; drawPlans(); })),
       msg, out,
       blurb('Preview prices your last 30 complete days on the plans as they are and with this change. Save turns on after a preview with no error.'));

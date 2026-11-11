@@ -106,6 +106,7 @@ pub async fn read(
         "bills": bills,
         "settings": settings,
         "setting_defaults": setting_defaults(),
+        "amber_configured": state.amber_configured,
         "changes": changes,
     }));
     if params.download.as_deref() != Some("1") {
