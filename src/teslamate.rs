@@ -235,10 +235,13 @@ impl Recorder {
             }
             // The values from the last message while charging are the final
             // ones: the car may clear them once it stops.
-            (Some(_), false) => self
-                .open
-                .take()
-                .map(|open| Step::End(open.id, open.progress)),
+            // Only the energy is topped up: the last power held until now.
+            (Some(open), false) => {
+                open.add_held_energy(now);
+                self.open
+                    .take()
+                    .map(|open| Step::End(open.id, open.progress))
+            }
         }
     }
 
@@ -268,13 +271,20 @@ impl Open {
         let Some(kw) = state.charger_power_kw else {
             return;
         };
+        self.add_held_energy(now);
+        self.last_power = Some((now, kw));
+    }
+
+    /// Adds the last power reading held until `now` (at most
+    /// [`MAX_HOLD_SECS`]). Also used when charging stops, so the final
+    /// stretch is not lost.
+    fn add_held_energy(&mut self, now: i64) {
         if let Some((then, last_kw)) = self.last_power {
             let secs = (now - then).clamp(0, MAX_HOLD_SECS);
             let kwh = last_kw.max(0.0) * secs as f64 / 3600.0;
             self.progress.energy_used_kwh =
                 Some(self.progress.energy_used_kwh.unwrap_or(0.0) + kwh);
         }
-        self.last_power = Some((now, kw));
     }
 }
 
@@ -723,11 +733,12 @@ mod tests {
             soc_pct: Some(50.0),
             max_power_kw: Some(7.0),
         };
-        // 3 kW for the 10 s before the second message.
+        // 3 kW for the 10 s before the second message, and 7 kW for the 10 s
+        // up to the closing message.
         assert_step(
             recorder.next(&stopped, 1020),
             Step::End(5, expected),
-            3.0 * 10.0 / 3600.0,
+            (3.0 * 10.0 + 7.0 * 10.0) / 3600.0,
         );
         // It is over: nothing more, until charging begins again.
         assert_eq!(recorder.next(&stopped, 1030), None);
@@ -752,7 +763,42 @@ mod tests {
             battery_level_pct: Some(50.0),
             ..CarState::default()
         };
-        assert_eq!(recorder.next(&stopped, 1001), Some(Step::End(5, expected)));
+        // The 3 kW held for the 1 s up to the closing message.
+        assert_step(
+            recorder.next(&stopped, 1001),
+            Step::End(5, expected),
+            3.0 / 3600.0,
+        );
+    }
+
+    #[test]
+    fn the_last_power_reading_is_held_to_the_end_but_for_at_most_five_minutes() {
+        let stopped = CarState {
+            charging_state: Some("Complete".to_string()),
+            ..CarState::default()
+        };
+        let expected = |max| ChargeProgress {
+            energy_added_kwh: None,
+            energy_used_kwh: None,
+            soc_pct: Some(50.0),
+            max_power_kw: Some(max),
+        };
+        // 6 kW for the 120 s up to the closing message.
+        let mut recorder = Recorder::new(None, 0);
+        recorder.started(5, &charging("Charging", 6.0), 1000);
+        assert_step(
+            recorder.next(&stopped, 1120),
+            Step::End(5, expected(6.0)),
+            6.0 * 120.0 / 3600.0,
+        );
+        // A long silence is capped at MAX_HOLD_SECS.
+        let mut recorder = Recorder::new(None, 0);
+        recorder.started(5, &charging("Charging", 6.0), 1000);
+        assert_step(
+            recorder.next(&stopped, 5000),
+            Step::End(5, expected(6.0)),
+            6.0 * MAX_HOLD_SECS as f64 / 3600.0,
+        );
     }
 
     #[test]

@@ -1579,7 +1579,14 @@ mod tests {
         for key in ["solar_kwh", "grid_kwh", "cost", "solar_value", "coverage"] {
             assert!(json["sessions"][0][key].is_null(), "{key}");
         }
+        // No geofence is away too (same rule as the TeslaMate history).
         sqlx::query("UPDATE ev_charge_session SET geofence = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
+        assert!(body_json(response).await["sessions"][0]["cost"].is_null());
+        sqlx::query("UPDATE ev_charge_session SET geofence = 'Home'")
             .execute(&pool)
             .await
             .unwrap();
@@ -1607,6 +1614,8 @@ mod tests {
                 AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
                     .unwrap()
                     .with_tariff(Some(flat_tariff()))
+                    // The config loader builds the history from the base price.
+                    .with_petrol_prices(PetrolHistory::new(prices.petrol_cents_per_litre, vec![]))
                     .with_ev_prices(prices),
             )
         };
@@ -1712,6 +1721,36 @@ mod tests {
         for key in ["home_cost", "charging_cost", "petrol_cost", "saved"] {
             assert!(json["total"][key].is_null(), "{key}");
         }
+
+        // A monthly price history works without a base price, and the month
+        // uses its own price ($2.10 from 1 Sep, not the $1.95 base).
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let history = PetrolHistory::new(
+            Some(195.0),
+            vec![(chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), 210.0)],
+        );
+        let app = router(
+            AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+                .unwrap()
+                .with_tariff(Some(flat_tariff()))
+                .with_ev_prices(EvPrices {
+                    petrol_cents_per_litre: None,
+                    petrol_litres_per_100km: 8.0,
+                    away_cents_per_kwh: Some(60.0),
+                })
+                .with_petrol_prices(history),
+        );
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        let json = body_json(response).await;
+        assert_eq!(json["configured"], true);
+        // 8 L at $2.10, and the home session is still costed.
+        assert_eq!(json["months"][0]["petrol_cost"], 16.8);
+        assert_eq!(json["total"]["petrol_cost"], 16.8);
+        assert_eq!(json["total"]["home_cost"], 1.85);
+        // Charging is $1.85 at home plus $6.00 away.
+        assert_eq!(json["total"]["saved"], 8.95);
     }
 
     #[tokio::test]

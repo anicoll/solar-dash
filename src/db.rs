@@ -1237,7 +1237,8 @@ pub async fn open_tm_charge_ids(pool: &SqlitePool, car_id: i64) -> Result<Vec<i6
 }
 
 /// Saves charging sessions, replacing any stored with the same id, in one
-/// transaction.
+/// transaction. A session whose energy or times changed loses its `cost_key`,
+/// so it is costed again instead of keeping a stale cost.
 pub async fn save_tm_charges(pool: &SqlitePool, charges: &[TmCharge]) -> Result<()> {
     let mut tx = pool.begin().await?;
     for c in charges {
@@ -1251,7 +1252,13 @@ pub async fn save_tm_charges(pool: &SqlitePool, charges: &[TmCharge]) -> Result<
                energy_added_kwh = excluded.energy_added_kwh,
                energy_used_kwh = excluded.energy_used_kwh,
                start_soc_pct = excluded.start_soc_pct, end_soc_pct = excluded.end_soc_pct,
-               geofence = excluded.geofence, fast_charger = excluded.fast_charger",
+               geofence = excluded.geofence, fast_charger = excluded.fast_charger,
+               cost_key = CASE
+                 WHEN tm_charge.energy_used_kwh IS NOT excluded.energy_used_kwh
+                   OR tm_charge.energy_added_kwh IS NOT excluded.energy_added_kwh
+                   OR tm_charge.started_at IS NOT excluded.started_at
+                   OR tm_charge.ended_at IS NOT excluded.ended_at
+                 THEN NULL ELSE tm_charge.cost_key END",
         )
         .bind(c.id)
         .bind(c.car_id)
@@ -1427,8 +1434,11 @@ pub struct TmChargeTotals {
     pub cost_cents: f64,
 }
 
-/// All cars' charging sessions that started in `[start, end)` (unix seconds),
-/// added up. `None` when there are none.
+/// All cars' charging sessions at home (geofence "Home", the same rule as
+/// [`tm_charges_at_home`]) that started in `[start, end)` (unix seconds),
+/// added up. Energy is the wall energy, or the energy added to the battery
+/// when that is missing; sessions with no energy are not counted. `None` when
+/// there are none.
 pub async fn tm_charge_totals(
     pool: &SqlitePool,
     start: i64,
@@ -1436,11 +1446,14 @@ pub async fn tm_charge_totals(
 ) -> Result<Option<TmChargeTotals>> {
     let totals: TmChargeTotals = sqlx::query_as(
         "SELECT COUNT(*) AS sessions,
-                CAST(COALESCE(SUM(energy_used_kwh), 0.0) AS REAL) AS energy_used_kwh,
+                CAST(COALESCE(SUM(COALESCE(energy_used_kwh, energy_added_kwh)), 0.0) AS REAL)
+                    AS energy_used_kwh,
                 CAST(COALESCE(SUM(grid_kwh), 0.0) AS REAL) AS grid_kwh,
                 CAST(COALESCE(SUM(self_kwh), 0.0) AS REAL) AS self_kwh,
                 CAST(COALESCE(SUM(cost_cents), 0.0) AS REAL) AS cost_cents
-         FROM tm_charge WHERE started_at >= ? AND started_at < ?",
+         FROM tm_charge
+         WHERE geofence = 'Home' AND started_at >= ? AND started_at < ?
+           AND COALESCE(energy_used_kwh, energy_added_kwh) > 0",
     )
     .bind(start)
     .bind(end)
@@ -2426,12 +2439,28 @@ mod tests {
         let (_dir, pool) = test_db().await;
         assert_eq!(tm_charge_totals(&pool, 0, 10_000).await.unwrap(), None);
         // started_at is 2000 + id: sessions 1 and 2 (car 1), 3 (car 2), 9 (out of range).
+        // Session 4 has no energy used, so its energy added (10) counts.
+        let mut no_used = tm_charge(4, 2, Some(100));
+        no_used.energy_used_kwh = None;
+        // Away from home, and with no geofence at all: neither counts.
+        let mut away = tm_charge(5, 1, Some(100));
+        away.geofence = Some("Nile Street".to_string());
+        let mut unknown = tm_charge(6, 1, Some(100));
+        unknown.geofence = None;
+        // Home, but no energy at all: not a session worth counting.
+        let mut empty = tm_charge(7, 1, Some(100));
+        empty.energy_used_kwh = None;
+        empty.energy_added_kwh = None;
         save_tm_charges(
             &pool,
             &[
                 tm_charge(1, 1, Some(100)),
                 tm_charge(2, 1, Some(100)),
                 tm_charge(3, 2, None),
+                no_used,
+                away,
+                unknown,
+                empty,
                 tm_charge(9, 1, Some(100)),
             ],
         )
@@ -2453,8 +2482,8 @@ mod tests {
         assert_eq!(
             got,
             TmChargeTotals {
-                sessions: 3,
-                energy_used_kwh: 33.0,
+                sessions: 4,
+                energy_used_kwh: 43.0,
                 grid_kwh: 12.0,
                 self_kwh: 10.0,
                 cost_cents: 200.0,
@@ -2464,6 +2493,62 @@ mod tests {
         let one = tm_charge_totals(&pool, 2001, 2002).await.unwrap().unwrap();
         assert_eq!(one.sessions, 1);
         assert_eq!(tm_charge_totals(&pool, 5000, 6000).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_corrected_tm_charge_loses_its_cost_key() {
+        let (_dir, pool) = test_db().await;
+        let charge = tm_charge(1, 1, Some(100));
+        save_tm_charges(&pool, std::slice::from_ref(&charge))
+            .await
+            .unwrap();
+        let cost = TmChargeCost {
+            cost_key: "k1".to_string(),
+            grid_kwh: 6.0,
+            self_kwh: 5.0,
+            uncovered_kwh: 1.0,
+            cost_cents: 150.0,
+            baseline_cents: 330.0,
+            feed_in_forgone_cents: 25.0,
+        };
+        let key = |pool: &SqlitePool| {
+            let pool = pool.clone();
+            async move {
+                tm_charges_at_home(&pool, 1000).await.unwrap()[0]
+                    .cost_key
+                    .clone()
+            }
+        };
+        save_tm_charge_cost(&pool, 1, &cost).await.unwrap();
+        // The same values again keep the cost.
+        save_tm_charges(&pool, std::slice::from_ref(&charge))
+            .await
+            .unwrap();
+        assert_eq!(key(&pool).await.as_deref(), Some("k1"));
+        // Each of the fields that feed the cost clears it.
+        let changes: [fn(&mut TmCharge); 4] = [
+            |c| c.energy_used_kwh = c.energy_used_kwh.map(|k| k + 1.0),
+            |c| c.energy_added_kwh = None,
+            |c| c.started_at -= 60,
+            |c| c.ended_at = Some(90),
+        ];
+        for change in changes {
+            save_tm_charge_cost(&pool, 1, &cost).await.unwrap();
+            let mut corrected = charge.clone();
+            change(&mut corrected);
+            save_tm_charges(&pool, &[corrected]).await.unwrap();
+            assert_eq!(key(&pool).await, None);
+            // Put the original back for the next round.
+            save_tm_charges(&pool, std::slice::from_ref(&charge))
+                .await
+                .unwrap();
+        }
+        // A change to something else keeps it.
+        save_tm_charge_cost(&pool, 1, &cost).await.unwrap();
+        let mut other = charge.clone();
+        other.start_soc_pct = Some(10.0);
+        save_tm_charges(&pool, &[other]).await.unwrap();
+        assert_eq!(key(&pool).await.as_deref(), Some("k1"));
     }
 
     #[tokio::test]

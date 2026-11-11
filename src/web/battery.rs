@@ -21,8 +21,8 @@ use serde_json::json;
 use super::AppState;
 use super::api::{ApiError, ApiResult, SOC_POINT, day_bounds_or_error, display_value, today};
 use super::costs::{
-    DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, cache_key, day_intervals, is_cacheable,
-    live_in, meter_for_day, meter_in, round2, slice_between,
+    DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, cache_key, credit_override_kwh,
+    day_intervals, is_cacheable, live_in, meter_for_day, meter_in, round2, slice_between,
 };
 use crate::cost::{self, Interval, Tariff, TariffSchedule, local_minute_of_day};
 use crate::db::{self, ChargeSession, GlobirdCostRow};
@@ -409,7 +409,7 @@ fn summarise(rows: &[DayRow]) -> Summary {
 
 /// Unix time of `minutes` after local midnight on `date`, or `None` if that
 /// moment does not exist (a daylight saving gap).
-fn local_time(date: NaiveDate, minutes: u32, tz: Tz) -> Option<i64> {
+pub(super) fn local_time(date: NaiveDate, minutes: u32, tz: Tz) -> Option<i64> {
     let naive = date.and_time(NaiveTime::MIN) + chrono::Duration::minutes(minutes.into());
     match tz.from_local_datetime(&naive) {
         LocalResult::Single(t) => Some(t.timestamp()),
@@ -444,6 +444,7 @@ fn day_facts(
     tz: Tz,
     date: NaiveDate,
     intervals: Option<&[Interval]>,
+    credit_import_kwh: Option<f64>,
     soc: &SocSeries,
 ) -> Option<DayFacts> {
     let (window_from, window_to) = tariff.credit_window_minutes()?;
@@ -456,8 +457,11 @@ fn day_facts(
     let soc_at = |ts: Option<i64>| ts.and_then(|ts| soc.at(ts)).map(round1);
     let first_import_at = sums.as_ref().and_then(|s| s.first_import_ts);
     Some(DayFacts {
-        estimate_earned: intervals
-            .is_some_and(|iv| cost::day_cost(tariff, tz, iv).zero_import_credit_cents > 0.0),
+        estimate_earned: intervals.is_some_and(|iv| {
+            cost::day_cost_with_window_import(tariff, tz, iv, credit_import_kwh)
+                .zero_import_credit_cents
+                > 0.0
+        }),
         sums,
         soc_at_free_start: soc_at(at(free_start)),
         soc_at_16: soc_at(at(EVENING_PEAK_MINUTE)),
@@ -574,7 +578,7 @@ fn point_series(rows: &[(i64, i64, f64)], point_id: i64) -> Vec<(i64, f64)> {
 /// by the old rules are worked out again. The cost cache key is part of the
 /// key too, so a change to how a day's intervals come out (which bumps
 /// `COST_CACHE_VERSION`) also clears these.
-const BATTERY_CACHE_VERSION: u32 = 2;
+const BATTERY_CACHE_VERSION: u32 = 3;
 
 /// What stored [`DayFacts`] are tagged with: they only count while the time
 /// zone and the plan for that day are unchanged.
@@ -636,6 +640,9 @@ async fn compute_facts(
         let cacheable = found.as_ref().is_some_and(|(source, _, live_solid)| {
             is_cacheable(date, today, source, *live_solid, newest_counter_ts, end)
         });
+        let source = found.as_ref().map_or("", |(source, _, _)| source);
+        let credit_import =
+            credit_override_kwh(schedule.for_date(date), tz, date, source, day.meter);
         let intervals = found.map(|(_, intervals, _)| intervals);
         let soc = SocSeries {
             live: live
@@ -645,7 +652,8 @@ async fn compute_facts(
             cloud: slice_between(&cloud_soc, |r| r.0, start, end).to_vec(),
         };
         let tariff = schedule.for_date(date);
-        if let Some(facts) = day_facts(tariff, tz, date, intervals.as_deref(), &soc) {
+        if let Some(facts) = day_facts(tariff, tz, date, intervals.as_deref(), credit_import, &soc)
+        {
             out.push((date, facts, cacheable));
         }
     }
@@ -1034,7 +1042,7 @@ mod tests {
             9999
         ));
         assert!(car_charging_during(
-            &[session(1500, Some(3000), None)],
+            &[session(1500, Some(3000), home)],
             from,
             to,
             9999
@@ -1061,6 +1069,13 @@ mod tests {
         ));
         assert!(!car_charging_during(
             &[session(2000, Some(3000), home)],
+            from,
+            to,
+            9999
+        ));
+        // No geofence (a public charger) counts as away too.
+        assert!(!car_charging_during(
+            &[session(500, Some(1500), None)],
             from,
             to,
             9999
@@ -1187,7 +1202,7 @@ mod tests {
             cloud: vec![],
         };
         let date = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
-        let facts = day_facts(&tariff, ADELAIDE, date, Some(&intervals), &soc).unwrap();
+        let facts = day_facts(&tariff, ADELAIDE, date, Some(&intervals), None, &soc).unwrap();
         let mut input = DayInput {
             date,
             now: at(23, 0),
@@ -1216,6 +1231,7 @@ mod tests {
             ADELAIDE,
             date,
             Some(&intervals),
+            None,
             &SocSeries::default(),
         )
         .unwrap();
