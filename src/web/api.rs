@@ -1486,7 +1486,7 @@ mod tests {
         // Still since 10:40, then +1400 Wh at 11:05, readings every 5 minutes.
         let t = |h: i64, m: i64| h * 3600 + m * 60;
         let mut counter = vec![(t(10, 30), 900.0), (t(10, 35), 900.0)];
-        counter.extend((0..4).map(|i| (t(10, 40) + i * 300, 1000.0)));
+        counter.extend((0..5).map(|i| (t(10, 40) + i * 300, 1000.0)));
         counter.push((t(11, 5), 2400.0));
         let steps = spread_steps(&counter);
         // steps[0] is the move to 1000 at 10:40.
@@ -1512,10 +1512,11 @@ mod tests {
         let power = derive_power(&counter);
         assert_eq!(power.last(), Some(&(t(11, 5), 1300.0 * 3600.0 / 300.0)));
         assert_eq!(power[power.len() - 2], (t(11, 0), 300.0));
-        // A big step with no quiet spell is not split.
-        let counter = [(0, 0.0), (300, 0.0), (600, 500.0)];
+        // A big step with no quiet spell (the counter moved at the reading
+        // before) is not split.
+        let counter = [(0, 0.0), (300, 100.0), (600, 600.0)];
         assert_eq!(
-            spread_steps(&counter),
+            spread_steps(&counter)[1..],
             [Spread {
                 start: 300,
                 end: 600,
