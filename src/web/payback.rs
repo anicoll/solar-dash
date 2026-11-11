@@ -200,6 +200,12 @@ fn projected_payback(net: f64, rate: f64, price_rise_percent: f64, today: NaiveD
 /// Dollars a battery adds on one day: the discharge beyond what the batteries
 /// owned before it could supply (`BATTERY_USABLE` of their capacity), priced
 /// at the day's peak import rate in cents. Never negative.
+///
+/// This is a rough, high estimate: extra discharge that went to the grid in
+/// the evening earned only the feed-in price, not the peak price. A day's
+/// total export cannot tell battery export from solar export (on a sunny day
+/// solar exports far more than the battery holds), so it is not used here;
+/// splitting it properly needs the evening export per day.
 fn added_savings(discharge_kwh: f64, owned_kwh: f64, peak_cents: f64) -> f64 {
     (discharge_kwh - BATTERY_USABLE * owned_kwh).max(0.0) * peak_cents / 100.0
 }

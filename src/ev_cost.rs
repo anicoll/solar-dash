@@ -351,7 +351,13 @@ fn cut_pieces(draws: &[Draw], intervals: &[Interval]) -> Vec<Piece> {
 /// The car's energy over time comes from [`car_draws`]. Inside a house
 /// interval the car is part of the house load, so it gets the load's grid
 /// share (import over load); what is left comes from solar or the home
-/// battery. If the car took more than the whole load in an interval (the
+/// battery. Known limit: in the free window the home battery also charges
+/// from the grid, so import can exceed load and the share clamps to 100%
+/// grid even when solar covered part of the house. An `Interval` has no
+/// solar or battery figures to attribute solar first (as the home mix does),
+/// so this overstates grid and understates `self_kwh` and
+/// `feed_in_forgone_cents` there. Cost is unaffected: free-window import is
+/// free. If the car took more than the whole load in an interval (the
 /// data does not agree), the excess counts as grid. Car energy in time no
 /// interval covers counts as grid too and is reported as `uncovered_kwh`.
 ///
