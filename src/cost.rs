@@ -581,7 +581,23 @@ pub(crate) fn local_minute_of_day(tz: Tz, ts: i64) -> u32 {
 
 /// Cost one local day from its intervals. Each interval is priced at the local
 /// time of its midpoint. An empty slice still pays the supply charge.
+/// The app itself always calls [`day_cost_with_window_import`]; this shorter
+/// form keeps the tests readable.
+#[cfg(test)]
 pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
+    day_cost_with_window_import(tariff, tz, intervals, None)
+}
+
+/// Like [`day_cost`], but the zero-import credit is decided from
+/// `window_import_override_kwh` (the grid import inside the credit window as
+/// the meter counter saw it) instead of the sum of the intervals. Money still
+/// comes from the intervals. The window must still be finished in the data.
+pub fn day_cost_with_window_import(
+    tariff: &Tariff,
+    tz: Tz,
+    intervals: &[Interval],
+    window_import_override_kwh: Option<f64>,
+) -> DayCost {
     let mut cost = DayCost {
         import_kwh: 0.0,
         export_kwh: 0.0,
@@ -629,7 +645,7 @@ pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
 
     if let Some(credit) = &tariff.zero_import_credit
         && window_finished
-        && window_import_kwh <= credit.max_kwh
+        && window_import_override_kwh.unwrap_or(window_import_kwh) <= credit.max_kwh
     {
         cost.zero_import_credit_cents = credit.credit_cents;
     }
@@ -701,6 +717,26 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn a_window_import_override_decides_the_credit() {
+        let t = zerohero();
+        // The intervals saw 0.15 kWh in the window; the meter says 0.1.
+        let day = [iv((18, 0), (21, 0), 0.15, 0.0, 1.0)];
+        assert_eq!(day_cost(&t, ADELAIDE, &day).zero_import_credit_cents, 0.0);
+        let earned = day_cost_with_window_import(&t, ADELAIDE, &day, Some(0.1));
+        assert_eq!(earned.zero_import_credit_cents, 100.0);
+        // Money is still worked out from the intervals.
+        assert!(close(earned.import_kwh, 0.15));
+        // And the other way round.
+        let quiet = [iv((18, 0), (21, 0), 0.0, 0.0, 1.0)];
+        let missed = day_cost_with_window_import(&t, ADELAIDE, &quiet, Some(0.2));
+        assert_eq!(missed.zero_import_credit_cents, 0.0);
+        // An unfinished window still never earns it.
+        let early = [iv((18, 0), (19, 0), 0.0, 0.0, 1.0)];
+        let early = day_cost_with_window_import(&t, ADELAIDE, &early, Some(0.0));
+        assert_eq!(early.zero_import_credit_cents, 0.0);
     }
 
     #[test]

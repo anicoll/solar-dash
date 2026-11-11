@@ -18,9 +18,10 @@ use sqlx::SqlitePool;
 
 use super::AppState;
 use super::api::{
-    ApiError, ApiResult, DEFAULT_DAILY_DAYS, MAX_HOLD_SECS, Spread, date_range, day_bounds,
-    day_bounds_or_error, live_totals, spread_steps, today,
+    ApiError, ApiResult, DEFAULT_DAILY_DAYS, MAX_HOLD_SECS, Spread, cloud_counters_rose,
+    date_range, day_bounds, day_bounds_or_error, live_totals, spread_steps, today,
 };
+use super::battery::local_time;
 use crate::bills::{self, Metered, PastBill};
 use crate::cost::{self, DayCost, GridSplit, Interval, Tariff, TariffSchedule};
 use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
@@ -274,7 +275,7 @@ pub(super) fn day_intervals(
     day: &DayData,
     now: i64,
 ) -> Option<(&'static str, Vec<Interval>, bool)> {
-    let cloud_has_data = !(day.import.is_empty() && day.export.is_empty() && day.load.is_empty());
+    let cloud_has_data = cloud_day_has_data(day.import, day.export, day.load);
     if let Some(live) = live_totals(day.live, day.start, day.end, now)
         && live.usable(cloud_has_data)
     {
@@ -289,6 +290,52 @@ pub(super) fn day_intervals(
         [day.import, day.export, day.load].map(|c| undo_cloud_lag(day.start, c));
     let intervals = cloud_intervals(day.start, &import, &export, &load);
     Some(("cloud", intervals, true))
+}
+
+/// Does the cloud have real data for a day? Not when it sent no rows, nor
+/// when every value is 0 (an inverter or cloud gap, which would otherwise be
+/// costed as a day of no load). Same rule as `/api/daily`.
+fn cloud_day_has_data(import: &[(i64, f64)], export: &[(i64, f64)], load: &[(i64, f64)]) -> bool {
+    let max = |rows: &[(i64, f64)]| rows.iter().map(|r| r.1).reduce(f64::max);
+    cloud_counters_rose([max(import), max(export), max(load)])
+}
+
+/// The grid import (kWh) inside the plan's credit window on `date`, read off
+/// the inverter's import counter: its value at the last row at or before the
+/// window end, minus its value at the last row at or before the window start.
+/// The counter moves in 100 Wh steps, so this is what GloBird's meter sees,
+/// where the intervals (topped up and spread evenly between steps) can put
+/// part of a slow overnight step inside the window. `None` when the plan has
+/// no credit or the rows do not reach back to the window start.
+pub(super) fn meter_window_import_kwh(
+    tariff: &Tariff,
+    tz: Tz,
+    date: NaiveDate,
+    meter: &[(i64, f64, f64)],
+) -> Option<f64> {
+    let (from, to) = tariff.credit_window_minutes()?;
+    let start = local_time(date, from, tz)?;
+    let end = local_time(date, to, tz)?;
+    let value_at = |ts: i64| meter.iter().rev().find(|r| r.0 <= ts).map(|r| r.1);
+    let (before, after) = (value_at(start)?, value_at(end)?);
+    Some(((after - before) / 1000.0).max(0.0))
+}
+
+/// The grid import the zero-import credit is decided from, for a day built
+/// from the inverter: the meter counter when it brackets the window (see
+/// [`meter_window_import_kwh`]). `None` means use the intervals.
+pub(super) fn credit_override_kwh(
+    tariff: &Tariff,
+    tz: Tz,
+    date: NaiveDate,
+    source: &str,
+    meter: &[(i64, f64, f64)],
+) -> Option<f64> {
+    if source == "inverter" {
+        meter_window_import_kwh(tariff, tz, date, meter)
+    } else {
+        None
+    }
 }
 
 /// The three cloud counters over a range, `(ts, Wh)` oldest first.
@@ -806,9 +853,12 @@ fn known_source(text: &str) -> Option<&'static str> {
 /// (not 90%) to use the inverter, and the zero-import credit waits for the
 /// window to finish. Version 3: cloud readings are moved 5 minutes earlier
 /// (see [`CLOUD_LAG_SECS`]). Version 4: live days are topped up from the
-/// inverter's grid totals (see [`top_up_from_meter`]). Old rows are replaced
+/// inverter's grid totals (see [`top_up_from_meter`]). Version 5: a cloud day
+/// whose counters never rise above 0 is no data (not a 0 kWh day), and the
+/// zero-import credit of an inverter day is decided from the meter counter
+/// (see [`meter_window_import_kwh`]). Old rows are replaced
 /// by date as days are recomputed.
-const COST_CACHE_VERSION: u32 = 4;
+const COST_CACHE_VERSION: u32 = 5;
 
 /// What stored costs are tagged with. The time zone is in it too, because
 /// moving it moves where every local day starts.
@@ -897,7 +947,8 @@ async fn compute_days(
                 .filter_map(|c| c.last().map(|r| r.0))
                 .max();
             let cacheable = is_cacheable(date, today, source, live_solid, newest_counter_ts, end);
-            let cost = cost::day_cost(tariff, state.tz, &intervals);
+            let credit = credit_override_kwh(tariff, state.tz, date, source, day.meter);
+            let cost = cost::day_cost_with_window_import(tariff, state.tz, &intervals, credit);
             days.push((CostedDay { date, source, cost }, cacheable));
         }
     }
@@ -1629,6 +1680,97 @@ mod tests {
         assert_eq!(day(&at_95, &[]), Some(("inverter", false)));
         // 99% live wins over the cloud.
         assert_eq!(day(&at_99, &cloud), Some(("inverter", true)));
+    }
+
+    #[test]
+    fn a_cloud_day_of_only_zeros_is_no_data() {
+        let zeros = [(300, 0.0), (600, 0.0), (900, 0.0)];
+        let day = DayData {
+            start: 0,
+            end: 86_400,
+            live: &[],
+            import: &zeros,
+            export: &zeros,
+            load: &zeros,
+            meter: &[],
+        };
+        assert!(day_intervals(&day, 1_000_000).is_none());
+        // One counter rising is real data.
+        let rising = [(300, 0.0), (600, 50.0)];
+        let real = DayData {
+            load: &rising,
+            ..day
+        };
+        let (source, intervals, _) = day_intervals(&real, 1_000_000).unwrap();
+        assert_eq!(source, "cloud");
+        assert!(total(&intervals, |iv| iv.load_kwh) > 0.0);
+    }
+
+    fn zerohero() -> Tariff {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+        }
+        let w: Wrapper = toml::from_str(
+            r#"
+            [tariff]
+            supply_cents_per_day = 100.0
+            default_import_cents = 44.0
+            [tariff.zero_import_credit]
+            from = "18:00"
+            to = "21:00"
+            max_kwh = 0.1
+            credit_cents = 100.0
+            "#,
+        )
+        .unwrap();
+        Tariff::from_config(&w.tariff).unwrap()
+    }
+
+    /// Local 2026-10-30 (no DST change, +10:30) at hour:minute:second.
+    fn oct30(h: u32, m: u32, s: u32) -> i64 {
+        use chrono::TimeZone;
+        chrono_tz::Australia::Adelaide
+            .with_ymd_and_hms(2026, 10, 30, h, m, s)
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn the_credit_is_read_from_the_meter_counter() {
+        let (t, tz, d) = (
+            zerohero(),
+            chrono_tz::Australia::Adelaide,
+            date("2026-10-30"),
+        );
+        // Slow overnight steps straddle the window, as on 30 Oct: one step at
+        // 17:57:56 and the next at 20:39:56, so the counter rose 0.1 kWh.
+        let meter = [
+            (oct30(17, 0, 0), 5000.0, 0.0),
+            (oct30(17, 57, 56), 5100.0, 0.0),
+            (oct30(20, 39, 56), 5200.0, 0.0),
+            (oct30(22, 0, 0), 5300.0, 0.0),
+        ];
+        let kwh = meter_window_import_kwh(&t, tz, d, &meter).unwrap();
+        assert!((kwh - 0.1).abs() < 1e-9);
+        assert_eq!(
+            credit_override_kwh(&t, tz, d, "inverter", &meter),
+            Some(kwh)
+        );
+        // Cloud days keep the interval sum.
+        assert_eq!(credit_override_kwh(&t, tz, d, "cloud", &meter), None);
+        // A rise of 0.2 kWh in the window misses the credit.
+        let busy = [
+            (oct30(17, 57, 56), 5100.0, 0.0),
+            (oct30(19, 0, 0), 5200.0, 0.0),
+            (oct30(20, 0, 0), 5300.0, 0.0),
+        ];
+        let kwh = meter_window_import_kwh(&t, tz, d, &busy).unwrap();
+        assert!((kwh - 0.2).abs() < 1e-9);
+        // Nothing at or before the window start: no answer, so the intervals decide.
+        assert_eq!(meter_window_import_kwh(&t, tz, d, &[]), None);
+        let late = [(oct30(19, 0, 0), 5200.0, 0.0)];
+        assert_eq!(meter_window_import_kwh(&t, tz, d, &late), None);
     }
 
     #[test]

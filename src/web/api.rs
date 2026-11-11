@@ -1049,6 +1049,13 @@ impl SplitSums {
     }
 }
 
+/// Did any of the import, export and load counters (day maxima) rise above 0?
+/// When iSolarCloud has a gap it still sends readings, all 0. A real day
+/// always has a load counter above 0, so an all-zero day counts as no data.
+pub(super) fn cloud_counters_rose(maxes: [Option<f64>; 3]) -> bool {
+    maxes.iter().flatten().any(|&max| max > 0.0)
+}
+
 /// The day's total for one counter: its largest value within the local day,
 /// because the counter only grows until it resets at midnight. Wh to kWh.
 async fn day_max_kwh(
@@ -1146,13 +1153,37 @@ async fn cloud_day(
     start: i64,
     end: i64,
 ) -> Result<DayTotals, ApiError> {
+    let load_kwh = day_max_kwh(state, 83118, start, end).await?;
+    let import_kwh = day_max_kwh(state, 83102, start, end).await?;
+    let export_kwh = day_max_kwh(state, 83072, start, end).await?;
+    let pv_kwh = day_max_kwh(state, 83022, start, end).await?;
+    // A day where the cloud sent load readings but every counter stayed at 0
+    // is a gap, not a day of no energy.
+    if load_kwh.is_some()
+        && !cloud_counters_rose([import_kwh, export_kwh, load_kwh])
+        && !pv_kwh.is_some_and(|kwh| kwh > 0.0)
+    {
+        return Ok(DayTotals {
+            date: date.to_string(),
+            source: "cloud",
+            pv_kwh: None,
+            load_kwh: None,
+            import_kwh: None,
+            export_kwh: None,
+            battery_charge_kwh: None,
+            battery_discharge_kwh: None,
+            self_consumed_kwh: None,
+            split: SplitSums::default(),
+            home: HomeMix::default(),
+        });
+    }
     Ok(DayTotals {
         date: date.to_string(),
         source: "cloud",
-        pv_kwh: day_max_kwh(state, 83022, start, end).await?,
-        load_kwh: day_max_kwh(state, 83118, start, end).await?,
-        import_kwh: day_max_kwh(state, 83102, start, end).await?,
-        export_kwh: day_max_kwh(state, 83072, start, end).await?,
+        pv_kwh,
+        load_kwh,
+        import_kwh,
+        export_kwh,
         battery_charge_kwh: day_max_kwh(state, 83322, start, end).await?,
         battery_discharge_kwh: day_max_kwh(state, 83323, start, end).await?,
         self_consumed_kwh: day_max_kwh(state, 83097, start, end).await?,
@@ -1609,6 +1640,14 @@ mod tests {
             battery_charge_kwh: 0.0,
             battery_discharge_kwh: 0.0,
         }
+    }
+
+    #[test]
+    fn all_zero_cloud_counters_are_not_data() {
+        assert!(!cloud_counters_rose([None, None, None]));
+        assert!(!cloud_counters_rose([Some(0.0), Some(0.0), Some(0.0)]));
+        assert!(cloud_counters_rose([Some(0.0), Some(0.0), Some(4.2)]));
+        assert!(cloud_counters_rose([Some(1.0), None, None]));
     }
 
     #[test]
