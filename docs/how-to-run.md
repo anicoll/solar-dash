@@ -877,8 +877,15 @@ command instead.
 To check progress:
 
 ```sh
-sqlite3 data/solar.db "select count(*), datetime(min(ts),'unixepoch'), datetime(max(ts),'unixepoch') from reading"
+sqlite3 data/solar.db "select count(*), datetime(min(ts),'unixepoch'), datetime(max(ts),'unixepoch') from metric_reading"
 ```
+
+Readings are stored by what they mean (`metric`, such as `pv_w`) and where they
+came from (`source`, such as `isolarcloud:1234567`) in the `metric_reading`
+table. The first start after an upgrade copies the old `reading` table into it
+(a minute or so on a long history). The old table is no longer written but is
+kept for one more release in case you need to go back; the database file is
+bigger by about the size of the copy until it is dropped.
 
 ## Exploring the API
 

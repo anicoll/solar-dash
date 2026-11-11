@@ -53,6 +53,11 @@ pub fn for_metric(metric: Metric) -> PointMap {
         .expect("every metric has a point")
 }
 
+/// The `source` of the metric readings that come from one iSolarCloud plant.
+pub fn source(plant_id: i64) -> String {
+    format!("isolarcloud:{plant_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

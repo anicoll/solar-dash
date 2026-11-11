@@ -15,8 +15,9 @@ use sqlx::SqlitePool;
 use tracing::{debug, info, warn};
 
 use crate::config::IsolarCloud;
-use crate::db::{self, Point, Reading};
+use crate::db::{self, MetricReading, Point, Reading};
 use crate::isolar::client::{ApiError, Client};
+use crate::isolar::points;
 
 const HISTORY_ENDPOINT: &str = "/openapi/getDevicePointMinuteDataList";
 const POINT_INFO_ENDPOINT: &str = "/openapi/getOpenPointInfo";
@@ -186,6 +187,38 @@ pub fn parse_history(result_data: &Value, ps_key: &str, tz: Tz, window_start: i6
     readings
 }
 
+/// Turns the cloud's readings into metric readings, in the metric's own unit
+/// (see `isolar::points`). A point with no metric is skipped.
+fn to_metric_readings(readings: &[Reading]) -> Vec<MetricReading> {
+    readings
+        .iter()
+        .filter_map(|r| {
+            let map = points::for_point(r.point_id)?;
+            Some(MetricReading {
+                metric: map.metric,
+                ts: r.ts,
+                value: r.value.map(|v| v * map.scale),
+            })
+        })
+        .collect()
+}
+
+/// Says once which configured points have no metric, so nothing is stored for
+/// them. Called at startup, not on every sync.
+fn warn_unmapped_points(configured: &[i64]) {
+    let unmapped: Vec<i64> = configured
+        .iter()
+        .copied()
+        .filter(|&id| points::for_point(id).is_none())
+        .collect();
+    if !unmapped.is_empty() {
+        warn!(
+            ?unmapped,
+            "these configured points have no metric and will not be stored"
+        );
+    }
+}
+
 /// Reads the point list from `getOpenPointInfo` (`result_data.pageList`).
 fn parse_points(data: &Value) -> Vec<Point> {
     let list = data["pageList"]
@@ -259,8 +292,9 @@ async fn budgeted_call(
     result
 }
 
-/// Makes sure every wanted point has a row, because readings refer to it.
-/// A point that already has a row (maybe with its real name) is left alone.
+/// Makes sure every wanted point has a row in `point`, which holds the names
+/// and units `/api/latest` and `/api/series` show. A point that already has a
+/// row (maybe with its real name) is left alone.
 pub async fn ensure_points(pool: &SqlitePool, wanted: &[i64]) -> Result<()> {
     for &point_id in wanted {
         let point = Point {
@@ -274,8 +308,8 @@ pub async fn ensure_points(pool: &SqlitePool, wanted: &[i64]) -> Result<()> {
     Ok(())
 }
 
-/// Saves the metadata (name, unit) of every point, so readings have a point
-/// row to refer to. Runs once at the start of each backfill.
+/// Saves the metadata (name, unit) of every point. Runs once at the start of
+/// each backfill.
 async fn sync_points(
     client: &Client,
     pool: &SqlitePool,
@@ -410,8 +444,8 @@ pub async fn sync_range(
             Err(err) => return Err(err),
         };
 
-        let readings = parse_history(&data, &plant.ps_key, tz, start);
-        db::upsert_readings(pool, plant.plant_id, &readings).await?;
+        let readings = to_metric_readings(&parse_history(&data, &plant.ps_key, tz, start));
+        db::upsert_metric_readings(pool, &points::source(plant.plant_id), &readings).await?;
         db::set_cursor(pool, job, window_end).await?;
         stats.rows += readings.len();
 
@@ -454,6 +488,7 @@ pub async fn backfill(
         _ => info!(start = %format_local(start, tz), "starting backfill"),
     }
 
+    warn_unmapped_points(&config.points);
     sync_points(client, pool, &config.points, &plant.ps_key).await?;
     sync_range(client, pool, config, BACKFILL_JOB, start, end).await?;
     info!("backfill finished");
@@ -639,8 +674,9 @@ pub async fn run_live_sync(
     config: &IsolarCloud,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    // Readings need point rows. Check the config now, so mistakes fail at startup.
+    // Check the config now, so mistakes fail at startup.
     PlantSetup::from_config(config)?;
+    warn_unmapped_points(&config.points);
     ensure_points(pool, &config.points).await?;
 
     // A future can only be awaited by value, but we wait on it in every loop
@@ -716,6 +752,7 @@ pub async fn run_live_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metric::Metric;
 
     #[test]
     fn backoff_doubles_to_the_cap() {
@@ -723,6 +760,37 @@ mod tests {
         assert_eq!(secs, [60, 120, 240, 480, 960, 1800, 1800, 1800]);
         assert_eq!(backoff_delay(0).as_secs(), 60);
         assert_eq!(backoff_delay(u32::MAX).as_secs(), 1800);
+    }
+
+    #[test]
+    fn readings_become_metric_readings_in_the_metrics_unit() {
+        let soc = points::for_metric(Metric::SocPct).point_id;
+        let pv = points::for_metric(Metric::PvW).point_id;
+        let at = |point_id, value| Reading {
+            point_id,
+            ts: 100,
+            value,
+        };
+        let got = to_metric_readings(&[
+            at(soc, Some(0.5)),
+            at(pv, Some(1500.0)),
+            at(pv, None),
+            // A point with no metric is skipped.
+            at(1, Some(3.0)),
+        ]);
+        let metric = |metric, value| MetricReading {
+            metric,
+            ts: 100,
+            value,
+        };
+        assert_eq!(
+            got,
+            vec![
+                metric(Metric::SocPct, Some(50.0)),
+                metric(Metric::PvW, Some(1500.0)),
+                metric(Metric::PvW, None),
+            ]
+        );
     }
 
     /// A config whose logins fail at once: nothing listens on port 1.
