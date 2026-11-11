@@ -148,6 +148,22 @@ path = "data/solar.db"
 # # Only change this for testing. Default: "https://api.amber.com.au/v1".
 # # base_url = "https://api.amber.com.au/v1"
 
+# Which source wins when two of them can answer the same question. Optional:
+# without this section the defaults below apply, which is how the dashboard
+# has always behaved. Today the only such question is a day's energy totals:
+# the inverter's live Modbus samples or iSolarCloud's daily counters.
+# [sources]
+# # Source ids, best first. Valid ids: "sungrow-modbus", "isolarcloud". Leave one
+# # out to never use it. Putting "isolarcloud" first makes the cloud counters
+# # win whenever they have data; live samples then only fill days it lacks.
+# daily_energy = ["sungrow-modbus", "isolarcloud"]
+# # A finished day needs this share of its time covered by live samples to
+# # win over the cloud counters (0 to 1).
+# finished_day_coverage = 0.98
+# # Today, or a day the cloud has no data for, needs this share before live
+# # samples are used at all. Must not be above finished_day_coverage.
+# partial_day_coverage = 0.9
+
 # Electricity tariffs (plans over time), petrol prices, what the system cost
 # (purchases), past bills and a few preferences (petrol price and car
 # comparison, away charging price, yearly price rise) are no longer set here.

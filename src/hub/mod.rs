@@ -20,6 +20,7 @@
 //! sink (publishing to Home Assistant) will be the first real consumer.
 
 mod bus;
+pub mod rules;
 pub mod spokes;
 
 use std::future::Future;
@@ -33,6 +34,7 @@ use tokio::sync::watch;
 use tracing::{debug, error};
 
 pub use bus::{Hub, HubEvent};
+pub use rules::SourceRules;
 
 /// What a spoke can give the dashboard. A spoke may offer several.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

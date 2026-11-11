@@ -629,6 +629,7 @@ async fn compute_facts(
             export: slice_between(&export, |r| r.0, start, end),
             load: slice_between(&load, |r| r.0, start, end),
             meter: meter_for_day(&meter, start, end),
+            rules: &state.rules,
         };
         let found = day_intervals(&day, now);
         let newest_counter_ts = [day.import, day.export, day.load]
