@@ -1,5 +1,6 @@
 mod admin_data;
 mod admin_import;
+mod amber;
 mod backup;
 mod bills;
 mod config;
@@ -74,6 +75,13 @@ enum Command {
         /// How many days of usage and cost to ask for.
         #[arg(long, default_value_t = 31)]
         days: u32,
+    },
+    /// Print what the Amber Electric API returns for your site: sites, current
+    /// prices and recent usage (needs an [amber] section). Read-only.
+    AmberProbe {
+        /// Also save the raw API replies to this JSON file (for test fixtures).
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
     /// Call any iSolarCloud endpoint and print the result (for exploring the API).
     Api {
@@ -155,6 +163,12 @@ async fn run() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::AmberProbe { json } => {
+            if let Err(err) = amber_probe(config, json.as_deref()).await {
+                eprintln!("Amber probe failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
         Command::Api { path, params } => {
             if let Err(err) = api_call(config, &path, params.as_deref()).await {
                 eprintln!("API call failed: {err:#}");
@@ -229,6 +243,16 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    // The Amber price task only runs with an [amber] section and only logs
+    // its errors. It is read-only: it never changes anything at Amber.
+    let fetch_prices = async {
+        if let Some(amber) = config.amber.clone()
+            && let Err(err) = amber::task::run(amber, pool.clone(), shutdown_signal()).await
+        {
+            error!("Amber price task stopped: {err:#}; the dashboard keeps running");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     // The TeslaMate history sync needs `database_url` in [teslamate]; without
     // it this finishes at once. It does not log the URL, which has a password.
     let costing = state.cost_setup();
@@ -277,10 +301,10 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
-    // Run all seven until Ctrl+C. `try_join!` polls them together on this
+    // Run all eight until Ctrl+C. `try_join!` polls them together on this
     // task and returns early if one fails (neither the live sync, the
     // Modbus poller, the TeslaMate reader, the GloBird sync, the
-    // TeslaMate history sync nor the backups does: their errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
+    // Amber price task, the TeslaMate history sync nor the backups does: their errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
     tokio::try_join!(
         live_sync,
         web::serve(listener, state, shutdown_signal()),
@@ -289,6 +313,7 @@ async fn run_serve(config: Config) -> Result<()> {
         sync_globird,
         sync_teslamate_history,
         backups,
+        fetch_prices,
     )?;
     Ok(())
 }
@@ -371,6 +396,20 @@ async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
         .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.isolarcloud.timezone))?;
     let client = globird::client::Client::new(globird)?;
     globird::probe::run(client, tz, days, out).await
+}
+
+/// Prints what the Amber API returns for the configured site.
+async fn amber_probe(config: Config, json: Option<&Path>) -> Result<()> {
+    let amber = config
+        .amber
+        .context("amber-probe needs an [amber] section in config.toml (see config.example.toml)")?;
+    // Times are shown in the same time zone as the iSolarCloud plant.
+    let tz: Tz = config
+        .isolarcloud
+        .timezone
+        .parse()
+        .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.isolarcloud.timezone))?;
+    amber::probe::run(&amber, tz, json).await
 }
 
 /// Reads the inverter once, or with `watch` every `interval_secs` until Ctrl+C.

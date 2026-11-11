@@ -134,6 +134,20 @@ path = "data/solar.db"
 # # Default: "09:00".
 # sync_time = "09:00"
 
+# Optional: your Amber Electric API token. `amber-probe` uses it to check what
+# Amber's API returns for your site, and `serve` uses it to keep the prices in
+# the database (every 5 minutes). Read-only: nothing is ever changed at Amber. Create the
+# token in the Amber app under Developers. It is a secret stored in plain text,
+# so keep this file's mode at 600 (chmod 600 config.toml). Without this section
+# the feature is off.
+# [amber]
+# token = "psk_your-amber-token"
+# # Which site (meter) to use. Leave it out if the account has just one site;
+# # `amber-probe` lists your sites so you can copy the id of the one you want.
+# # site_id = "01F5A5CRKMZ5BCX9P1S4V990AM"
+# # Only change this for testing. Default: "https://api.amber.com.au/v1".
+# # base_url = "https://api.amber.com.au/v1"
+
 # Electricity tariffs (plans over time), petrol prices, what the system cost
 # (purchases), past bills and a few preferences (petrol price and car
 # comparison, away charging price, yearly price rise) are no longer set here.

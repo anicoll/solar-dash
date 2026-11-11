@@ -1,0 +1,25 @@
+[
+  {
+    "id": "01F5A5CRKMZ5BCX9P1S4V990AM",
+    "nmi": "3052282872",
+    "channels": [
+      { "identifier": "E1", "type": "general", "tariff": "A100" },
+      { "identifier": "B1", "type": "feedIn", "tariff": "A100" }
+    ],
+    "network": "SA Power Networks",
+    "status": "active",
+    "activeFrom": "2022-01-01",
+    "intervalLength": 30,
+    "someFutureField": true
+  },
+  {
+    "id": "01F5A5CRKMZ5BCX9P1S4V990AN",
+    "nmi": "3052282873",
+    "channels": [],
+    "network": "Jemena",
+    "status": "closed",
+    "activeFrom": "2020-01-01",
+    "closedOn": "2022-05-01",
+    "intervalLength": 5
+  }
+]
