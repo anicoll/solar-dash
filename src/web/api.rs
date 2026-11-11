@@ -145,6 +145,10 @@ struct Series {
     /// Only on `/api/day`, so the frontend needs no magic point ids.
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<&'static str>,
+    /// The metric's name, for a series that is a stored metric (not a derived one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metric: Option<&'static str>,
+    /// Deprecated: the data source's own id. Use `metric`.
     point_id: i64,
     name: Option<String>,
     unit: Option<String>,
@@ -173,6 +177,7 @@ async fn stored_series(
     };
     Ok(Series {
         key,
+        metric: points::for_point(point_id).map(|map| map.metric.name()),
         point_id,
         name,
         unit,
@@ -195,7 +200,11 @@ pub async fn latest(State(state): State<AppState>) -> ApiResult {
         let (name, unit) = db::point_info(&state.pool, point_id)
             .await?
             .unwrap_or((None, None));
+        // A point row made only as a placeholder has no unit; the metric knows its own.
+        let unit = unit.unwrap_or_else(|| metric.unit().to_string());
         out.push(json!({
+            "metric": metric.name(),
+            // Deprecated: the data source's own id. Use `metric`.
             "point_id": point_id,
             "name": name,
             "unit": unit,
@@ -447,12 +456,33 @@ pub async fn ev_sessions(
 // JSON one.
 #[derive(Deserialize)]
 pub struct SeriesParams {
+    /// Metric names, such as `pv_w,load_w`.
+    metrics: Option<String>,
+    /// Deprecated: the data source's own point ids. Use `metrics`.
     points: Option<String>,
     from: Option<String>,
     to: Option<String>,
 }
 
-/// Parses a comma-separated list of point ids.
+/// Parses `pv_w,load_w` into metrics.
+fn parse_metrics(text: &str) -> Result<Vec<Metric>, ApiError> {
+    let metrics: Vec<Metric> = text
+        .split(',')
+        .map(|part| {
+            let name = part.trim();
+            Metric::from_name(name)
+                .ok_or_else(|| ApiError::bad_request(format!("{name:?} is not a metric name")))
+        })
+        .collect::<Result<_, _>>()?;
+    if metrics.len() > MAX_SERIES_POINTS {
+        return Err(ApiError::bad_request(format!(
+            "metrics must have between 1 and {MAX_SERIES_POINTS} names"
+        )));
+    }
+    Ok(metrics)
+}
+
+/// Parses a comma-separated list of point ids (the deprecated way to ask).
 fn parse_points(text: &str) -> Result<Vec<i64>, ApiError> {
     let points: Vec<i64> = text
         .split(',')
@@ -476,7 +506,21 @@ pub async fn series(
     State(state): State<AppState>,
     Query(params): Query<SeriesParams>,
 ) -> ApiResult {
-    let points = parse_points(params.points.as_deref().unwrap_or(""))?;
+    // `metrics` is the way to ask. `points` (numeric ids) still works for one
+    // release; the answer says so.
+    let (point_ids, deprecated) = match (params.metrics.as_deref(), params.points.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request("use metrics or points, not both"));
+        }
+        (Some(text), None) => {
+            let ids = parse_metrics(text)?
+                .into_iter()
+                .map(|metric| points::for_metric(metric).point_id)
+                .collect();
+            (ids, false)
+        }
+        (None, text) => (parse_points(text.unwrap_or(""))?, true),
+    };
     let from = parse_unix("from", params.from.as_deref())?;
     let to = parse_unix("to", params.to.as_deref())?;
     if to < from {
@@ -487,11 +531,15 @@ pub async fn series(
     }
 
     let mut series = Vec::new();
-    for point_id in points {
+    for point_id in point_ids {
         // `to` is inclusive here; the query's end is exclusive.
         series.push(stored_series(&state, None, point_id, from, to + 1).await?);
     }
-    Ok(Json(json!({ "series": series })))
+    let mut answer = json!({ "series": series });
+    if deprecated {
+        answer["deprecated"] = json!("points is deprecated and will be removed; ask with metrics");
+    }
+    Ok(Json(answer))
 }
 
 /// Charging, km and petrol for each month of the range, as
@@ -1009,6 +1057,7 @@ pub async fn day(State(state): State<AppState>, Query(params): Query<DayParams>)
             db::readings_in_range(&state.pool, state.plant_id, counter_metric, start, end).await?;
         series.push(Series {
             key: Some(key),
+            metric: None,
             point_id: derived_id,
             name: Some(name.to_string()),
             unit: Some("W".to_string()),

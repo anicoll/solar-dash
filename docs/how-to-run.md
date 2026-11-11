@@ -207,9 +207,9 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | Endpoint | Returns |
 | --- | --- |
 | `GET /healthz` | `{"ok":true}` (public) |
-| `GET /api/latest` | The newest value of every point, with its name and unit |
-| `GET /api/series?points=83033,83106&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per point. At most 20 points and 31 days |
-| `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
+| `GET /api/latest` | The newest value of every metric that has one, as `{"points":[{metric,unit,ts,value,name,point_id},...]}`. `metric` is the [metric name](#metric-names) (`pv_w`, `soc_pct`, ...). `point_id` is deprecated (see below) |
+| `GET /api/series?metrics=pv_w,load_w&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per metric, as `{"series":[{metric,data,...}]}`. At most 20 metrics and 31 days. `points=<id>,<id>` (numeric iSolarCloud point ids) is deprecated: it still works for one more release, and the answer then has a `deprecated` note. Use `metrics` or `points`, not both |
+| `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w`, and the stored ones also a `metric` |
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}, "car": {...}, "grid_pull": {...}}`. `sample` is from Modbus, or `null` if there is none or it is over 5 minutes old. `car` is the Tesla's charge state from TeslaMate (see [TeslaMate](#teslamate-optional)), or `null` if that is off or nothing has arrived yet. `grid_pull` is for watching the main breaker: `now_w` (grid import now in W, 0 while exporting, `null` without a fresh sample), `peak_today_w` and `peak_today_at` (the highest import since local midnight and when, unix seconds; both `null` if nothing was imported), `warn_w` and `limit_w` (the `grid_pull_warn_kw` and `grid_pull_limit_kw` settings in W) and `volts` (always `null` for now: the poller does not read the grid voltage) |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
 | `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`. A session still charging has `ended_at` `null` and counts as running until now. `energy_used_kwh` is taken from the wall, `energy_added_kwh` reaches the battery. The last six fields (kWh by source, dollars, and the share 0 to 1 of the session the inverter samples cover) are `null` without a `[tariff]`, away from home (geofence not "Home") or with no energy. At most 400 days. Empty without a `[teslamate]` section |
@@ -264,6 +264,26 @@ Then open <http://127.0.0.1:8081/>. The copy is only read and written by
 that run, so the live database is never touched. (The data sources in the copy
 of `config.toml` are still contacted unless you remove the `[modbus]`,
 `[teslamate]` and `[globird]` sections from it.)
+
+
+### Metric names
+
+Readings are named by what they mean, not by the id the data source uses. All
+values are in the metric's own unit.
+
+| Metric | Unit | What it is |
+| --- | --- | --- |
+| `pv_w` | W | Solar power (the plant's figure) |
+| `pv_dc_w` | W | Solar power on the DC side |
+| `load_w` | W | Home load |
+| `grid_w` | W | Grid power (positive importing, negative exporting) |
+| `battery_w` | W | Battery power |
+| `soc_pct` | % | Battery charge |
+| `pv_day_wh`, `load_day_wh`, `grid_import_day_wh`, `grid_export_day_wh`, `battery_charge_day_wh`, `battery_discharge_day_wh`, `self_consumed_day_wh` | Wh | Energy so far today; each resets to 0 at local midnight |
+
+The `point_id` fields in `/api/latest` and `/api/day`, and `points=` on
+`/api/series`, are the iSolarCloud point ids. They are deprecated and will be
+removed in the next release: use `metric` and `metrics`.
 
 ## Local Modbus (optional)
 
