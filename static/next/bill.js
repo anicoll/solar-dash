@@ -6,6 +6,9 @@
                            series, the previous bill, past bills and cars (required)
      /api/globird/compare  our estimate against GloBird's meter, day by day
      /api/tariff           band times, through SD.tariff
+     /api/bill/amber-whatif  "Would Amber have been cheaper?" for three periods, with the
+                           per-switch savings (only with prices and a covered day); without
+                           it the panel falls back to:
      /api/bill/compare-dynamic  "What would Amber cost?" (only with [amber] and a covered day)
    Every newer field of /api/bill/current may be missing (an older server): the part
    that needs it is left out and nothing else changes.
@@ -806,6 +809,170 @@
     };
   }
 
+
+  /* ---------------------------------------------------------------- 6c. would Amber have been cheaper */
+
+  /** Same switch order as the API's mix keys: car, grid_charge, spikes. */
+  const LEVERS = [
+    { key: 'car', title: 'Charge the cars in the cheapest hours',
+      detail: 'Move each home charge to the lowest-priced 5-minute slots while the car could have been charging.' },
+    { key: 'grid_charge', title: 'Fill the battery when power is free',
+      detail: 'Charge from the grid whenever Amber’s price is 0c or below, then run the house on it later.' },
+    { key: 'spikes', title: 'Sell into price spikes',
+      detail: 'Export battery charge when the feed-in pays more than 50c, and buy it back later.' },
+  ];
+
+  /** The API's key for a set of switches, e.g. `car+spikes`; '' when none is on. */
+  function mixKey(on) {
+    return LEVERS.filter((l) => on[l.key]).map((l) => l.key).join('+');
+  }
+
+  /** ISO date `n` days from `iso` (UTC arithmetic, so no daylight-saving surprises). */
+  function addDays(iso, n) {
+    const d = new Date(`${iso}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  }
+
+  /** A period is usable when the what-if answered with at least one comparable day. */
+  function usableWhatif(res) {
+    return !!(res && res.configured && res.totals && res.totals.days > 0 && Array.isArray(res.days));
+  }
+
+  /**
+   * "Would Amber have been cheaper?": the verdict, period chips, three bars, three
+   * switches and the day-by-day list. Every figure for a switch mix comes from the
+   * API's `savings_dollars` (one number per mix), so flipping a switch needs no request.
+   * `periods` is [{ key, label, res }] with only usable answers; null when none.
+   */
+  function whatifPanel(periods) {
+    const list = (periods || []).filter((p) => usableWhatif(p.res));
+    if (!list.length) return null;
+    const state = { period: list[0].key, on: { car: true, grid_charge: true, spikes: true }, all: false };
+    const body = h('div', { class: 'bill-wi' });
+    const money = (v) => (v < 0 ? MINUS : '') + SD.fmt.dollars(Math.abs(v));
+
+    function figures() {
+      const res = list.find((p) => p.key === state.period).res;
+      const t = res.totals;
+      const mixes = t.savings_dollars || {};
+      const key = mixKey(state.on);
+      const save = key ? Number(mixes[key]) || 0 : 0;
+      return { res, t, mixes, key, save, shifted: t.amber_dollars - save };
+    }
+
+    function verdict(f) {
+      const { t, save, shifted } = f;
+      const n = plural(t.days, 'day', 'days');
+      const asUsed = t.amber_dollars - t.globird_dollars;
+      if (!mixKey(state.on) || save <= 0.005) {
+        return asUsed < 0
+          ? `Yes. As you actually used power, Amber would have cost ${money(-asUsed)} less than GloBird over ${n}.`
+          : `No. As you actually used power, Amber would have cost ${money(asUsed)} more than GloBird over ${n}.`;
+      }
+      const diff = shifted - t.globird_dollars;
+      if (asUsed < 0) return `Yes. Amber would have cost ${money(-asUsed)} less than GloBird as you used power, and ${money(-diff)} less with your switches, over ${n}.`;
+      return diff < 0
+        ? `Yes, if you had changed habits: Amber would have cost ${money(-diff)} less than GloBird over ${n}.`
+        : `Not quite. Even with these changes Amber would have cost ${money(diff)} more than GloBird over ${n}.`;
+    }
+
+    function render() {
+      const f = figures();
+      const { res, t } = f;
+      const children = [];
+      children.push(h('p', { class: 'bill-wi-verdict', text: verdict(f) }));
+
+      if (list.length > 1) {
+        children.push(h('div', { class: 'bill-wi-chips', role: 'group', 'aria-label': 'Period' },
+          ...list.map((p) => h('button', {
+            type: 'button', class: 'bill-wi-chip', 'aria-pressed': String(p.key === state.period), text: p.label,
+            onclick: () => { state.period = p.key; state.all = false; render(); },
+          }))));
+      }
+
+      const max = Math.max(t.globird_dollars, t.amber_dollars, f.shifted, 0.01);
+      const billedNote = t.globird_billed_days >= t.days ? 'GloBird’s billed figures'
+        : t.globird_billed_days > 0 ? `${t.globird_billed_days} of ${plural(t.days, 'day', 'days')} billed, the rest our estimate`
+          : 'Our estimate of your GloBird bill';
+      const bar = (name, value, tone, sub) => h('div', { class: 'bill-wi-bar' },
+        h('div', { class: 'bill-wi-bar-h' }, h('span', { text: name }), h('b', { text: money(value) })),
+        h('div', { class: 'bill-wi-track', 'aria-hidden': 'true' },
+          h('div', { class: `bill-wi-fill is-${tone}`, style: `width:${Math.max(2, Math.max(0, value) / max * 100).toFixed(1)}%` })),
+        h('span', { class: 'bill-wi-sub', text: sub }));
+      children.push(h('div', { class: 'bill-wi-bars' },
+        bar('GloBird, what you paid', t.globird_dollars, 'globird', billedNote),
+        bar('Amber, as you used it', t.amber_dollars, 'amber', 'Same usage, same times'),
+        bar('Amber, with your switches', f.shifted, 'switches',
+          f.key && f.save > 0.005 ? `Saves ${money(f.save)} against as used` : 'Turn on a switch below')));
+
+      const carSessions = res.days.reduce((n, d) => n + (d.car_sessions || 0), 0);
+      children.push(h('div', { class: 'bill-wi-levers' },
+        h('h3', { class: 'bill-wi-h', text: 'What if you had changed habits?' }),
+        h('p', { class: 'bill-wi-sub', text: 'Each switch replays your real usage against Amber’s settled 5-minute prices: the same kWh, moved in time.' }),
+        ...LEVERS.map((l) => {
+          const on = state.on[l.key];
+          const alone = Number(f.mixes[l.key]) || 0;
+          let extra = '';
+          if (l.key === 'car' && !carSessions) extra = ' No home charging sessions were found in this period.';
+          if (l.key !== 'car' && !(res.battery_kwh > 0)) extra = ' No home battery is recorded in your purchases.';
+          return h('div', { class: 'bill-wi-lever' },
+            h('div', { class: 'bill-wi-lever-t' },
+              h('span', { class: 'bill-wi-lever-n', id: `bill-wi-${l.key}`, text: l.title }),
+              h('span', { class: 'bill-wi-sub', text: l.detail + extra }),
+              h('span', { class: 'bill-wi-save', text: `${on ? 'Saving' : 'Would save'} ${money(alone)}` })),
+            h('button', {
+              type: 'button', class: 'bill-wi-switch', role: 'switch', 'aria-checked': String(on), 'aria-labelledby': `bill-wi-${l.key}`,
+              onclick: () => { state.on[l.key] = !on; render(); },
+            }, h('span', { class: 'bill-wi-knob' })));
+        })));
+
+      const key = f.key;
+      const rows = res.days.slice().reverse().map((d) => {
+        const sv = key ? Number(d.savings_dollars && d.savings_dollars[key]) || 0 : 0;
+        const amber = d.amber_dollars - sv;
+        return { d, amber, paid: amber < 0 };
+      });
+      const shown = state.all ? rows : rows.slice(0, 14);
+      children.push(h('div', { class: 'bill-wi-days' },
+        h('div', { class: 'bill-wi-days-h' }, h('h3', { class: 'bill-wi-h', text: 'Day by day' }),
+          h('span', { class: 'bill-wi-sub', text: 'Amber with your switches' })),
+        h('div', { class: 'bill-wi-row is-head', 'aria-hidden': 'true' },
+          h('span', { text: 'Day' }), h('span', { text: 'GloBird' }), h('span', { text: 'Amber' })),
+        ...shown.map(({ d, amber, paid }) => h('div', { class: `bill-wi-row${paid ? ' is-paid' : ''}` },
+          h('span', { class: 'bill-wi-day' }, SD.fmt.date(d.date, 'short'),
+            h('small', { text: paid ? 'Amber would have paid you' : (d.globird_source === 'billed' ? 'GloBird billed' : 'GloBird estimated') })),
+          h('span', { class: 'bill-wi-num', text: money(d.globird_dollars) }),
+          h('span', { class: `bill-wi-num${paid ? ' is-paid' : amber < d.globird_dollars ? ' is-good' : ''}`, text: money(amber) }))),
+        rows.length > 14 ? h('button', {
+          type: 'button', class: 'bill-wi-more', text: state.all ? 'Show fewer days' : `Show all ${rows.length} days`,
+          onclick: () => { state.all = !state.all; render(); },
+        }) : null,
+        h('p', { class: 'bill-wi-sub', text: 'Highlighted days are ones where Amber would have paid you overall.' })));
+
+      const notes = Array.isArray(res.assumptions) ? res.assumptions : [];
+      if (notes.length) {
+        children.push(h('div', { class: 'bill-wi-how' },
+          h('b', { text: 'How this is worked out' }),
+          ...notes.map((n) => h('span', { text: n })),
+          t.skipped_days > 0 ? h('span', { text: `${plural(t.skipped_days, 'day', 'days')} in this period left out for missing Amber prices.` }) : null));
+      }
+      body.replaceChildren(...children.filter(Boolean));
+    }
+    render();
+
+    const first = figures();
+    const diff = first.shifted - first.t.globird_dollars;
+    return {
+      title: 'Would Amber have been cheaper?',
+      summary: `${plural(first.t.days, 'day', 'days')} covered`,
+      fig: `${diff > 0.0049 ? '+' : ''}${amt(diff)}`,
+      figClass: diff < -0.0049 ? 'is-good' : diff > 0.0049 ? 'is-bad' : '',
+      collapse: true,
+      body,
+    };
+  }
+
   /* ---------------------------------------------------------------- 7. past bills */
 
   function historyPanel(bill) {
@@ -958,7 +1125,7 @@
   }
 
   function build(el, bill, extras) {
-    const { compare, tariff, amber } = extras;
+    const { compare, tariff, amber, whatif } = extras;
     const today = SD.local().date;
     const desktop = () => desktopQuery.matches;
     const ctx = { panels: [], open: readOpen(), desktop, apply: () => applyPanels(ctx) };
@@ -1004,7 +1171,7 @@
       };
       const side = h('div', { class: 'bill-side a-side' },
         safe(() => tiles(bill)),
-        panel('amber', '', () => amberPanel(amber)),
+        panel('amber', '', () => whatifPanel(whatif) || amberPanel(amber)),
         panel('cut', '', () => cutPanel(bill, tariff)));
       grid.append(...[
         panel('flow', 'a-flow', () => waterfall(bill)),
@@ -1054,15 +1221,27 @@
         }
         const today = SD.local().date;
         const last = bill.to < today ? bill.to : today;
-        const [compare, tariff, amber] = await Promise.all([
+        // The what-if answers for each period chip. A longer range is asked for only when the
+        // stored prices cover most of it (see the 60-day rule below).
+        const whatifUrl = (from, to) => `/api/bill/amber-whatif?from=${from}&to=${to}`;
+        const yesterday = addDays(today, -1);
+        const [compare, tariff, amber, wiBill, wi30, wi90] = await Promise.all([
           // No retailer meter source: nothing to check against, so skip the call (and the trust badge).
           SD.caps.meter ? quiet(`/api/globird/compare?from=${bill.from}&to=${last}`) : null,
           SD.tariff.get().catch(() => null),
           // {configured: false} without [amber], and the panel stays out.
           SD.caps.prices ? quiet(`/api/bill/compare-dynamic?from=${bill.from}&to=${last}`) : null,
+          SD.caps.prices ? quiet(whatifUrl(bill.from, last)) : null,
+          SD.caps.prices ? quiet(whatifUrl(addDays(today, -30), yesterday)) : null,
+          SD.caps.prices ? quiet(whatifUrl(addDays(today, -90), yesterday)) : null,
         ]);
         if (!alive) return;
-        build(el, bill, { compare, tariff, amber });
+        const whatif = [
+          { key: 'bill', label: 'This bill so far', res: wiBill },
+          { key: 'd30', label: 'Last 30 days', res: wi30 },
+          { key: 'd90', label: 'Last 90 days', res: wi90 && wi90.totals && wi90.totals.days >= 60 ? wi90 : null },
+        ];
+        build(el, bill, { compare, tariff, amber, whatif });
       }).catch((err) => {
         if (!alive) return;
         el.replaceChildren(

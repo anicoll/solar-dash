@@ -1222,3 +1222,247 @@
     border-top: 0;
   }
 }
+
+/* ---------- would Amber have been cheaper ---------- */
+
+#page-bill .bill-wi {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+#page-bill .bill-wi-verdict {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+#page-bill .bill-wi-sub {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--ink-2);
+}
+
+#page-bill .bill-wi-h {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+#page-bill .bill-wi-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+#page-bill .bill-wi-chip {
+  min-height: 44px;
+  padding: 4px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+#page-bill .bill-wi-chip[aria-pressed='true'] {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--card);
+  font-weight: 700;
+}
+
+#page-bill .bill-wi-bars,
+#page-bill .bill-wi-levers,
+#page-bill .bill-wi-days {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#page-bill .bill-wi-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#page-bill .bill-wi-bar-h {
+  display: flex;
+  justify-content: space-between;
+  font-size: 14px;
+}
+
+#page-bill .bill-wi-bar-h b {
+  font-size: 17px;
+  font-weight: 800;
+  font-stretch: 90%;
+}
+
+#page-bill .bill-wi-track {
+  height: 12px;
+  border-radius: 6px;
+  background: var(--paper);
+}
+
+#page-bill .bill-wi-fill {
+  height: 100%;
+  border-radius: 6px;
+}
+
+#page-bill .bill-wi-fill.is-globird {
+  background: var(--bar);
+}
+
+#page-bill .bill-wi-fill.is-amber {
+  background: var(--battery);
+}
+
+#page-bill .bill-wi-fill.is-switches {
+  background: var(--sun);
+  box-shadow: inset 0 0 0 1px var(--sun-line);
+}
+
+#page-bill .bill-wi-lever {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+#page-bill .bill-wi-lever-t {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+#page-bill .bill-wi-lever-n {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+#page-bill .bill-wi-save {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--battery);
+}
+
+#page-bill .bill-wi-switch {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-start;
+  width: 52px;
+  height: 32px;
+  margin-top: 2px;
+  padding: 3px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--bar);
+  cursor: pointer;
+}
+
+#page-bill .bill-wi-switch[aria-checked='true'] {
+  justify-content: flex-end;
+  background: var(--sun);
+  box-shadow: inset 0 0 0 1px var(--sun-line);
+}
+
+#page-bill .bill-wi-knob {
+  display: block;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--card);
+}
+
+#page-bill .bill-wi-switch[aria-checked='true'] .bill-wi-knob {
+  background: var(--on-sun);
+}
+
+#page-bill .bill-wi-days-h {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+#page-bill .bill-wi-row {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1fr;
+  gap: 6px;
+  align-items: center;
+  padding: 10px 4px;
+  border-top: 1px solid var(--line);
+}
+
+#page-bill .bill-wi-row.is-head {
+  padding: 0 4px;
+  border-top: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+#page-bill .bill-wi-row.is-head span:not(:first-child),
+#page-bill .bill-wi-num {
+  text-align: right;
+}
+
+#page-bill .bill-wi-row.is-paid {
+  border-top-color: transparent;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--sun) 22%, transparent);
+}
+
+#page-bill .bill-wi-day {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+#page-bill .bill-wi-day small {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--ink-2);
+}
+
+#page-bill .bill-wi-num {
+  font-size: 15px;
+  font-stretch: 85%;
+}
+
+#page-bill .bill-wi-num.is-good {
+  color: var(--battery);
+  font-weight: 700;
+}
+
+#page-bill .bill-wi-num.is-paid {
+  font-weight: 800;
+}
+
+#page-bill .bill-wi-more {
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+#page-bill .bill-wi-how {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink-2);
+}
+
+#page-bill .bill-wi-how b {
+  color: var(--ink);
+}
