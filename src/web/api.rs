@@ -1049,8 +1049,6 @@ impl SplitSums {
     }
 }
 
-/// The day's total for one counter: its largest value within the local day,
-/// because the counter only grows until it resets at midnight. Wh to kWh.
 /// Did any of the import, export and load counters (day maxima) rise above 0?
 /// When iSolarCloud has a gap it still sends readings, all 0. A real day
 /// always has a load counter above 0, so an all-zero day counts as no data.
@@ -1058,6 +1056,8 @@ pub(super) fn cloud_counters_rose(maxes: [Option<f64>; 3]) -> bool {
     maxes.iter().flatten().any(|&max| max > 0.0)
 }
 
+/// The day's total for one counter: its largest value within the local day,
+/// because the counter only grows until it resets at midnight. Wh to kWh.
 async fn day_max_kwh(
     state: &AppState,
     point_id: i64,
@@ -1156,8 +1156,13 @@ async fn cloud_day(
     let load_kwh = day_max_kwh(state, 83118, start, end).await?;
     let import_kwh = day_max_kwh(state, 83102, start, end).await?;
     let export_kwh = day_max_kwh(state, 83072, start, end).await?;
-    // A day where the cloud only sent zeros is a gap, not a day of no energy.
-    if !cloud_counters_rose([import_kwh, export_kwh, load_kwh]) {
+    let pv_kwh = day_max_kwh(state, 83022, start, end).await?;
+    // A day where the cloud sent load readings but every counter stayed at 0
+    // is a gap, not a day of no energy.
+    if load_kwh.is_some()
+        && !cloud_counters_rose([import_kwh, export_kwh, load_kwh])
+        && !pv_kwh.is_some_and(|kwh| kwh > 0.0)
+    {
         return Ok(DayTotals {
             date: date.to_string(),
             source: "cloud",
@@ -1175,7 +1180,7 @@ async fn cloud_day(
     Ok(DayTotals {
         date: date.to_string(),
         source: "cloud",
-        pv_kwh: day_max_kwh(state, 83022, start, end).await?,
+        pv_kwh,
         load_kwh,
         import_kwh,
         export_kwh,
