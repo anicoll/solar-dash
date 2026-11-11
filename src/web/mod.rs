@@ -12,6 +12,7 @@ mod globird;
 mod home_mix;
 mod payback;
 mod petrol;
+mod prices;
 
 pub(crate) use costs::house_intervals;
 
@@ -368,6 +369,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/backup", get(admin::backup_info))
         .route("/api/admin/backup/download", get(admin::backup_download))
         .route("/api/series", get(api::series))
+        .route("/api/prices", get(prices::prices))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
         .route("/api/battery", get(battery::battery))
@@ -1365,6 +1367,72 @@ mod tests {
         assert_eq!(series["metric"], "pv_w");
         assert_eq!(series["data"].as_array().unwrap().len(), 2);
         assert_eq!(series["data"][1][1], 1001.0);
+    }
+
+    #[tokio::test]
+    async fn prices_are_grouped_by_channel_with_the_current_one() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        let now = chrono::Utc::now().timestamp();
+        let slot = now - now % 300;
+        let row = |channel: &str, start: i64, cents: f64, kind: &str| {
+            let pool = pool.clone();
+            let channel = channel.to_string();
+            let kind = kind.to_string();
+            async move {
+                sqlx::query(
+                    "INSERT INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, 5.0, ?, 0)",
+                )
+                .bind(channel)
+                .bind(start)
+                .bind(start + 300)
+                .bind(cents)
+                .bind(kind)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        row("general", slot - 300, 20.0, "actual").await;
+        row("general", slot, 25.5, "current").await;
+        row("general", slot + 300, 30.0, "forecast").await;
+        row("feed_in", slot, -3.0, "current").await;
+
+        // Prices need the login like the other /api routes.
+        let uri = format!("/api/prices?from={}&to={}", slot - 600, slot + 900);
+        let response = send(&app, get_request(&uri, None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let general = json["channels"]["general"].as_array().unwrap();
+        assert_eq!(general.len(), 3);
+        assert_eq!(general[0]["kind"], "actual");
+        assert_eq!(general[0]["start"], slot - 300);
+        assert_eq!(general[2]["cents"], 30.0);
+        assert_eq!(general[1]["spot_cents"], 5.0);
+        assert_eq!(json["channels"]["feed_in"][0]["cents"], -3.0);
+        assert_eq!(json["now"]["general"]["cents"], 25.5);
+        assert_eq!(json["now"]["general"]["kind"], "current");
+        assert_eq!(json["now"]["feed_in"]["cents"], -3.0);
+        assert!(json["now"].get("controlled_load").is_none());
+        // An unknown source has nothing, in the range or right now.
+        // A range with nothing in it still gives `now`; an unknown source is empty.
+        let uri = "/api/prices?from=0&to=10&source=amber:other";
+        let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+        assert_eq!(json["channels"], serde_json::json!({}));
+        assert_eq!(json["now"], serde_json::json!({}));
+
+        for bad in [
+            "/api/prices",
+            "/api/prices?from=2&to=1",
+            "/api/prices?from=0&to=2678401",
+            "/api/prices?from=a&to=1",
+        ] {
+            let response = send(&app, get_request(bad, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 
     #[tokio::test]

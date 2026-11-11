@@ -25,7 +25,7 @@ const USAGE_DAYS: u64 = 7;
 
 /// What to do about the site after reading `/sites`.
 #[derive(Debug, PartialEq, Eq)]
-enum SiteChoice {
+pub(super) enum SiteChoice {
     /// Use this site id.
     Use(String),
     /// Several sites and none chosen in the config: the user has to pick.
@@ -37,7 +37,7 @@ enum SiteChoice {
 /// Picks the site: the configured `site_id` if there is one (even when it is
 /// not in the list, because a closed site may be missing from `/sites` but
 /// still worth asking about), otherwise the only site.
-fn choose_site(sites: &[Site], configured: Option<&str>) -> SiteChoice {
+pub(super) fn choose_site(sites: &[Site], configured: Option<&str>) -> SiteChoice {
     if let Some(id) = configured {
         return SiteChoice::Use(id.to_string());
     }

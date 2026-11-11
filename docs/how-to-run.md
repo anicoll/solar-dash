@@ -719,7 +719,17 @@ before sharing it.
 
 Amber Electric has an official price API. solar-dash can call it with
 `amber-probe`, which only reads: it prints your sites, the current prices and
-whether usage exists. Nothing is stored and `serve` does not use it yet.
+whether usage exists. Nothing is stored by the probe.
+
+With an `[amber]` section `serve` also keeps the prices in the database: it
+fetches when it starts and then every 5 minutes (a few seconds after each
+5-minute mark), saving the last day, the current price and the next 8 hours of
+forecast in the `price_interval` table, and deleting forecasts more than 2 days
+old. It only reads from Amber. If Amber answers 404 (the site is closed or
+`site_id` is wrong) it logs that clearly and tries again once an hour. Other
+errors are retried with a growing wait (30 seconds up to 10 minutes). The
+prices are available as `GET /api/prices?from=&to=` (unix seconds, at most 31
+days).
 
 1. Create an API token in the Amber app (Developers). Add it to `config.toml`
    (see `config.example.toml`). The token is a secret stored in plain text, so

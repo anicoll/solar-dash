@@ -243,6 +243,16 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    // The Amber price task only runs with an [amber] section and only logs
+    // its errors. It is read-only: it never changes anything at Amber.
+    let fetch_prices = async {
+        if let Some(amber) = config.amber.clone()
+            && let Err(err) = amber::task::run(amber, pool.clone(), shutdown_signal()).await
+        {
+            error!("Amber price task stopped: {err:#}; the dashboard keeps running");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     // The TeslaMate history sync needs `database_url` in [teslamate]; without
     // it this finishes at once. It does not log the URL, which has a password.
     let costing = state.cost_setup();
@@ -291,10 +301,10 @@ async fn run_serve(config: Config) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
-    // Run all seven until Ctrl+C. `try_join!` polls them together on this
+    // Run all eight until Ctrl+C. `try_join!` polls them together on this
     // task and returns early if one fails (neither the live sync, the
     // Modbus poller, the TeslaMate reader, the GloBird sync, the
-    // TeslaMate history sync nor the backups does: their errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
+    // Amber price task, the TeslaMate history sync nor the backups does: their errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
     tokio::try_join!(
         live_sync,
         web::serve(listener, state, shutdown_signal()),
@@ -303,6 +313,7 @@ async fn run_serve(config: Config) -> Result<()> {
         sync_globird,
         sync_teslamate_history,
         backups,
+        fetch_prices,
     )?;
     Ok(())
 }

@@ -134,8 +134,9 @@ path = "data/solar.db"
 # # Default: "09:00".
 # sync_time = "09:00"
 
-# Optional: your Amber Electric API token, used by `amber-probe` to check what
-# Amber's API returns for your site (prices and usage; read-only). Create the
+# Optional: your Amber Electric API token. `amber-probe` uses it to check what
+# Amber's API returns for your site, and `serve` uses it to keep the prices in
+# the database (every 5 minutes). Read-only: nothing is ever changed at Amber. Create the
 # token in the Amber app under Developers. It is a secret stored in plain text,
 # so keep this file's mode at 600 (chmod 600 config.toml). Without this section
 # the feature is off.
