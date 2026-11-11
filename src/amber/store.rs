@@ -232,6 +232,48 @@ pub async fn day_prices(
     Ok(DayPrices::new(general, feed_in))
 }
 
+/// The `general` (buy) prices that start in `[start, end)`, oldest first, for
+/// the daily stats. Finished `actual` rows only, plus `current` rows that
+/// start at or after `current_from` (the start of today, so the interval
+/// under way counts today and a stale `current` row never counts on an older
+/// day). Forecasts are never read. Rows are skipped when another site's source
+/// already gave the same start time, so a second site does not double count.
+pub async fn known_general_prices(
+    pool: &SqlitePool,
+    source_prefix: &str,
+    start: i64,
+    end: i64,
+    current_from: i64,
+) -> Result<Vec<PriceSpan>> {
+    let rows: Vec<(i64, i64, f64)> = sqlx::query_as(
+        "SELECT start_ts, end_ts, cents FROM price_interval
+         WHERE substr(source, 1, length(?)) = ? AND channel = 'general'
+           AND start_ts >= ? AND start_ts < ?
+           AND (kind = 'actual' OR (kind = 'current' AND start_ts >= ?))
+         ORDER BY start_ts, source",
+    )
+    .bind(source_prefix)
+    .bind(source_prefix)
+    .bind(start)
+    .bind(end)
+    .bind(current_from)
+    .fetch_all(pool)
+    .await
+    .context("could not read the known general prices")?;
+    let mut spans: Vec<PriceSpan> = Vec::with_capacity(rows.len());
+    for (start_ts, end_ts, cents) in rows {
+        if spans.last().is_some_and(|last| last.start_ts == start_ts) {
+            continue;
+        }
+        spans.push(PriceSpan {
+            start_ts,
+            end_ts,
+            cents,
+        });
+    }
+    Ok(spans)
+}
+
 /// A short text that changes when the rows [`day_prices`] would return
 /// change: how many there are, the sum of their prices and the newest
 /// `fetched_at`. A stored day cost is tagged with it, so a late actual price

@@ -414,6 +414,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/backup/download", get(admin::backup_download))
         .route("/api/series", get(api::series))
         .route("/api/prices", get(prices::prices))
+        .route("/api/prices/daily", get(prices::daily))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
         .route("/api/battery", get(battery::battery))
@@ -822,6 +823,7 @@ mod tests {
         "/api/series?metrics=pv_w,load_w,grid_w&from=1767225600&to=1767312000",
         "/api/series?metrics=battery_soc_pct&from=1767225600&to=1767312000&step=300",
         "/api/prices?from=1767225600&to=1767312000",
+        "/api/prices/daily?from=2026-01-01&to=2026-01-07",
         "/api/day?date=2026-01-01",
         "/api/day",
         "/api/daily",

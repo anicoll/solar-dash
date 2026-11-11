@@ -809,7 +809,7 @@ pub(super) fn car_charge(row: &db::TmChargeRow, tz: Tz) -> Option<ev_cost::CarCh
     })
 }
 
-fn parse_date(name: &str, text: &str) -> Result<NaiveDate, ApiError> {
+pub(super) fn parse_date(name: &str, text: &str) -> Result<NaiveDate, ApiError> {
     NaiveDate::parse_from_str(text, "%Y-%m-%d")
         .map_err(|_| ApiError::bad_request(format!("{name} must look like 2026-10-20")))
 }
