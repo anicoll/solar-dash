@@ -17,6 +17,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 
 use crate::cost::DayCost;
 use crate::globird::data::DayRecord;
+use crate::isolar::points;
+use crate::metric::Metric;
 use crate::modbus::{Sample, Settings};
 
 /// A measuring point (a kind of value, such as "battery power").
@@ -132,6 +134,30 @@ pub async fn upsert_readings(pool: &SqlitePool, plant_id: i64, readings: &[Readi
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Test helper: stores readings by metric, the way the tests think about them.
+/// `(metric, ts, value)` has the value in the metric's own unit. The point row
+/// that the reading refers to is created if it is missing.
+#[cfg(test)]
+pub async fn seed_metrics(pool: &SqlitePool, plant_id: i64, rows: &[(Metric, i64, f64)]) {
+    let mut readings = Vec::new();
+    for &(metric, ts, value) in rows {
+        let point = points::for_metric(metric);
+        let row = Point {
+            point_id: point.point_id,
+            code: None,
+            name: None,
+            unit: Some(metric.unit().to_string()),
+        };
+        insert_point_if_missing(pool, &row).await.unwrap();
+        readings.push(Reading {
+            point_id: point.point_id,
+            ts,
+            value: Some(value / point.scale),
+        });
+    }
+    upsert_readings(pool, plant_id, &readings).await.unwrap();
 }
 
 /// How far a sync job has got, or `None` if it has never run.
@@ -255,9 +281,11 @@ pub async fn point_info(
         .context("could not read point")
 }
 
-/// The `(ts, value)` pairs of one point with `from <= ts < to`, oldest first.
-/// Rows without a value are left out.
-pub async fn readings_in_range(
+/// The `(ts, value)` pairs of one point with `from <= ts < to`, oldest first,
+/// as the source stores them. Rows without a value are left out. Only for
+/// callers that are handed a raw point id (`/api/series`); the rest ask for a
+/// [`Metric`] with [`readings_in_range`].
+pub async fn point_readings_in_range(
     pool: &SqlitePool,
     plant_id: i64,
     point_id: i64,
@@ -278,23 +306,45 @@ pub async fn readings_in_range(
     .context("could not read readings")
 }
 
-/// The `(point_id, ts, value)` rows of several points with `from <= ts < to`,
-/// ordered by point and then time. One query for all of them, so a long range
-/// does not cost a query per day. Rows without a value are left out.
-pub async fn readings_for_points(
+/// The `(ts, value)` pairs of one metric with `from <= ts < to`, oldest first,
+/// in the metric's own unit. Rows without a value are left out.
+///
+/// The metric is turned into the source's point id (and the value scaled)
+/// here, so the callers never see a point id.
+pub async fn readings_in_range(
     pool: &SqlitePool,
     plant_id: i64,
-    point_ids: &[i64],
+    metric: Metric,
     from: i64,
     to: i64,
-) -> Result<Vec<(i64, i64, f64)>> {
+) -> Result<Vec<(i64, f64)>> {
+    let point = points::for_metric(metric);
+    let rows = point_readings_in_range(pool, plant_id, point.point_id, from, to).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(ts, value)| (ts, value * point.scale))
+        .collect())
+}
+
+/// The `(metric, ts, value)` rows of several metrics with `from <= ts < to`,
+/// ordered by the source's point id and then time. One query for
+/// all of them, so a long range does not cost a query per day. Rows without a
+/// value are left out. Values are in the metric's own unit.
+pub async fn readings_for_metrics(
+    pool: &SqlitePool,
+    plant_id: i64,
+    metrics: &[Metric],
+    from: i64,
+    to: i64,
+) -> Result<Vec<(Metric, i64, f64)>> {
+    let wanted: Vec<points::PointMap> = metrics.iter().map(|&m| points::for_metric(m)).collect();
     // `QueryBuilder` adds the `?` for each point id, so no value is pasted into the SQL.
     let mut query =
         sqlx::QueryBuilder::new("SELECT point_id, ts, value FROM reading WHERE plant_id = ");
     query.push_bind(plant_id).push(" AND point_id IN (");
     let mut ids = query.separated(", ");
-    for point_id in point_ids {
-        ids.push_bind(point_id);
+    for point in &wanted {
+        ids.push_bind(point.point_id);
     }
     query
         .push(") AND ts >= ")
@@ -302,33 +352,41 @@ pub async fn readings_for_points(
         .push(" AND ts < ")
         .push_bind(to)
         .push(" AND value IS NOT NULL ORDER BY point_id, ts");
-    query
+    let rows: Vec<(i64, i64, f64)> = query
         .build_query_as()
         .fetch_all(pool)
         .await
-        .context("could not read readings")
+        .context("could not read readings")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(point_id, ts, value)| {
+            let point = wanted.iter().find(|p| p.point_id == point_id)?;
+            Some((point.metric, ts, value * point.scale))
+        })
+        .collect())
 }
 
-/// The largest value of one point with `from <= ts < to`, or `None` if there is none.
+/// The largest value of one metric with `from <= ts < to`, or `None` if there is none.
 pub async fn max_value_in_range(
     pool: &SqlitePool,
     plant_id: i64,
-    point_id: i64,
+    metric: Metric,
     from: i64,
     to: i64,
 ) -> Result<Option<f64>> {
-    let max = sqlx::query_scalar(
+    let point = points::for_metric(metric);
+    let max: Option<f64> = sqlx::query_scalar(
         "SELECT MAX(value) FROM reading
          WHERE plant_id = ? AND point_id = ? AND ts >= ? AND ts < ?",
     )
     .bind(plant_id)
-    .bind(point_id)
+    .bind(point.point_id)
     .bind(from)
     .bind(to)
     .fetch_one(pool)
     .await
     .context("could not read maximum")?;
-    Ok(max)
+    Ok(max.map(|value| value * point.scale))
 }
 
 /// Saves one live Modbus sample. A second sample with the same second
@@ -532,15 +590,16 @@ pub async fn live_ts_range(pool: &SqlitePool) -> Result<Option<(i64, i64)>> {
     Ok(min.zip(max))
 }
 
-/// The oldest reading of any of `point_ids`, or `None` if there is none.
+/// The oldest reading of any of `metrics`, or `None` if there is none.
 pub async fn first_reading_ts(
     pool: &SqlitePool,
     plant_id: i64,
-    point_ids: &[i64],
+    metrics: &[Metric],
 ) -> Result<Option<i64>> {
     let mut first: Option<i64> = None;
     // One lookup per point, each answered from the (plant, point, ts) key.
-    for &point_id in point_ids {
+    for &metric in metrics {
+        let point_id = points::for_metric(metric).point_id;
         let ts: Option<i64> =
             sqlx::query_scalar("SELECT MIN(ts) FROM reading WHERE plant_id = ? AND point_id = ?")
                 .bind(plant_id)
@@ -1824,31 +1883,71 @@ mod tests {
     #[tokio::test]
     async fn range_queries_read_back_readings() {
         let (_dir, pool) = test_db().await;
-        upsert_point(&pool, &point(1)).await.unwrap();
+        let id = points::for_metric(Metric::PvW).point_id;
+        upsert_point(&pool, &point(id)).await.unwrap();
         let null_reading = Reading {
-            point_id: 1,
+            point_id: id,
             ts: 300,
             value: None,
         };
-        let rows = [reading(1, 100, 1.0), reading(1, 200, 5.0), null_reading];
+        let rows = [reading(id, 100, 1.0), reading(id, 200, 5.0), null_reading];
         upsert_readings(&pool, 7, &rows).await.unwrap();
 
         assert_eq!(max_reading_ts(&pool, 7).await.unwrap(), Some(300));
         assert_eq!(max_reading_ts(&pool, 8).await.unwrap(), None);
         // The end is exclusive and NULL values are skipped.
-        let got = readings_in_range(&pool, 7, 1, 100, 300).await.unwrap();
+        let got = point_readings_in_range(&pool, 7, id, 100, 300)
+            .await
+            .unwrap();
         assert_eq!(got, vec![(100, 1.0), (200, 5.0)]);
-        assert_eq!(
-            max_value_in_range(&pool, 7, 1, 0, 1000).await.unwrap(),
-            Some(5.0)
-        );
-        assert_eq!(max_value_in_range(&pool, 7, 1, 0, 100).await.unwrap(), None);
+        let got = readings_in_range(&pool, 7, Metric::PvW, 100, 300)
+            .await
+            .unwrap();
+        assert_eq!(got, vec![(100, 1.0), (200, 5.0)]);
+        let max = |from, to| max_value_in_range(&pool, 7, Metric::PvW, from, to);
+        assert_eq!(max(0, 1000).await.unwrap(), Some(5.0));
+        assert_eq!(max(0, 100).await.unwrap(), None);
 
         // The newest reading that has a value is 200, not the NULL at 300.
         let latest = latest_readings(&pool, 7).await.unwrap();
         assert_eq!(latest.len(), 1);
         assert_eq!((latest[0].ts, latest[0].value), (200, 5.0));
         assert_eq!(latest[0].name.as_deref(), Some("Power"));
+    }
+
+    #[tokio::test]
+    async fn metric_reads_use_the_metrics_own_unit() {
+        let (_dir, pool) = test_db().await;
+        // The cloud stores the battery charge as a fraction; the metric is a percentage.
+        seed_metrics(
+            &pool,
+            7,
+            &[(Metric::SocPct, 100, 67.4), (Metric::PvW, 100, 1500.0)],
+        )
+        .await;
+        let soc = readings_in_range(&pool, 7, Metric::SocPct, 0, 200)
+            .await
+            .unwrap();
+        assert!((soc[0].1 - 67.4).abs() < 1e-9);
+        let max = max_value_in_range(&pool, 7, Metric::SocPct, 0, 200)
+            .await
+            .unwrap();
+        assert!((max.unwrap() - 67.4).abs() < 1e-9);
+        let rows = readings_for_metrics(&pool, 7, &[Metric::PvW, Metric::SocPct], 0, 200)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&(Metric::PvW, 100, 1500.0)));
+        assert!(
+            rows.iter()
+                .any(|r| r.0 == Metric::SocPct && (r.2 - 67.4).abs() < 1e-9)
+        );
+        assert_eq!(
+            first_reading_ts(&pool, 7, &[Metric::SocPct, Metric::LoadW])
+                .await
+                .unwrap(),
+            Some(100)
+        );
     }
 
     #[tokio::test]

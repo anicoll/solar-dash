@@ -2,9 +2,6 @@
 //! (with `ingest.rs` and the config) that knows Sungrow's ids; everything else
 //! asks for a metric.
 
-// Nothing uses this yet; the next change in the stack starts to.
-#![allow(dead_code)]
-
 use crate::metric::Metric;
 
 /// One point id and what it means.

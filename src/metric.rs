@@ -3,14 +3,14 @@
 //! (`src/isolar/`, `src/ingest.rs`) talks about a [`Metric`] and never about a
 //! source's own point ids.
 
-// Nothing uses this yet; the next change in the stack starts to.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 /// How a metric's value behaves over time. This tells the readers of the
 /// values what they can do with them (a counter is read by its day's maximum,
 /// a power is integrated over time).
+// The names, units and kinds are for the API and the metric store, which come
+// in the next PRs of the stack; for now only the tests use them.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricKind {
     /// An instant reading in watts.
@@ -48,6 +48,7 @@ pub enum Metric {
     SelfConsumedDayWh,
 }
 
+#[allow(dead_code)] // see `MetricKind`
 impl Metric {
     /// Every metric, in a fixed order.
     pub const ALL: [Metric; 13] = [

@@ -17,6 +17,8 @@ use super::home_mix::{self, HomeMix};
 use crate::cost::{GridSplit, TariffSchedule};
 use crate::db::{self, LatestReading};
 use crate::ev_cost;
+use crate::isolar::points;
+use crate::metric::Metric;
 use crate::modbus::{self, Sample};
 
 const MAX_SERIES_POINTS: usize = 20;
@@ -52,29 +54,47 @@ const MIN_LIVE_COVERAGE: f64 = 0.9;
 /// no cloud data, because up to 10% of the day's energy could be missing.
 const MIN_FINISHED_LIVE_COVERAGE: f64 = 0.98;
 
-/// Battery state of charge. iSolarCloud stores it as a fraction (0.674),
-/// but its unit is "%", so the API scales it to a percentage (67.4).
-pub(super) const SOC_POINT: i64 = 83252;
+/// Power metrics shown by `/api/day`: (key, metric).
+const POWER_METRICS: [(&str, Metric); 3] = [
+    ("pv_w", Metric::PvW),
+    ("load_w", Metric::LoadW),
+    ("soc", Metric::SocPct),
+];
 
-/// Power points shown by `/api/day`: (key, point id).
-const POWER_POINTS: [(&str, i64); 3] = [("pv_w", 83033), ("load_w", 83106), ("soc", SOC_POINT)];
-
-/// A stored value as the API shows it (see [`SOC_POINT`]).
-pub(super) fn display_value(point_id: i64, value: f64) -> f64 {
-    if point_id == SOC_POINT {
-        value * 100.0
-    } else {
-        value
-    }
+/// A stored value of a raw point id as the API shows it. A few points are
+/// stored in another unit than they are shown in (the battery charge is a
+/// fraction in iSolarCloud), which the point mapping knows.
+fn display_value(point_id: i64, value: f64) -> f64 {
+    value * points::for_point(point_id).map_or(1.0, |p| p.scale)
 }
 
 /// Daily counters (Wh) that `/api/day` turns into power:
-/// (key, counter point id, made-up id for the derived series, name).
-const DERIVED_POINTS: [(&str, i64, i64, &str); 4] = [
-    ("grid_import_w", 83102, -1, "Grid import power"),
-    ("grid_export_w", 83072, -2, "Grid export power"),
-    ("battery_charge_w", 83322, -3, "Battery charge power"),
-    ("battery_discharge_w", 83323, -4, "Battery discharge power"),
+/// (key, counter metric, made-up id for the derived series, name).
+const DERIVED_METRICS: [(&str, Metric, i64, &str); 4] = [
+    (
+        "grid_import_w",
+        Metric::GridImportDayWh,
+        -1,
+        "Grid import power",
+    ),
+    (
+        "grid_export_w",
+        Metric::GridExportDayWh,
+        -2,
+        "Grid export power",
+    ),
+    (
+        "battery_charge_w",
+        Metric::BatteryChargeDayWh,
+        -3,
+        "Battery charge power",
+    ),
+    (
+        "battery_discharge_w",
+        Metric::BatteryDischargeDayWh,
+        -4,
+        "Battery discharge power",
+    ),
 ];
 
 /// An error that becomes a JSON response like `{"error":"..."}`.
@@ -139,7 +159,30 @@ struct Series {
     data: Vec<(i64, f64)>,
 }
 
-/// Loads one stored point as a series.
+/// Loads one metric as a series. `point_id` in the answer is still the
+/// source's id for it, so the API does not change.
+async fn metric_series(
+    state: &AppState,
+    key: Option<&'static str>,
+    metric: Metric,
+    from: i64,
+    to: i64,
+) -> Result<Series, ApiError> {
+    let point_id = points::for_metric(metric).point_id;
+    let (name, unit) = db::point_info(&state.pool, point_id)
+        .await?
+        .unwrap_or((None, None));
+    let data = db::readings_in_range(&state.pool, state.plant_id, metric, from, to).await?;
+    Ok(Series {
+        key,
+        point_id,
+        name,
+        unit,
+        data,
+    })
+}
+
+/// Loads one stored point, named by the caller, as a series.
 async fn stored_series(
     state: &AppState,
     key: Option<&'static str>,
@@ -150,7 +193,7 @@ async fn stored_series(
     let (name, unit) = db::point_info(&state.pool, point_id)
         .await?
         .unwrap_or((None, None));
-    let data = db::readings_in_range(&state.pool, state.plant_id, point_id, from, to)
+    let data = db::point_readings_in_range(&state.pool, state.plant_id, point_id, from, to)
         .await?
         .into_iter()
         .map(|(ts, value)| (ts, display_value(point_id, value)))
@@ -432,7 +475,7 @@ pub struct SeriesParams {
     to: Option<String>,
 }
 
-/// Parses `83033,83106` into point ids.
+/// Parses a comma-separated list of point ids.
 fn parse_points(text: &str) -> Result<Vec<i64>, ApiError> {
     let points: Vec<i64> = text
         .split(',')
@@ -980,12 +1023,12 @@ pub async fn day(State(state): State<AppState>, Query(params): Query<DayParams>)
     let (start, end) = day_bounds_or_error(date, state.tz)?;
 
     let mut series = Vec::new();
-    for (key, point_id) in POWER_POINTS {
-        series.push(stored_series(&state, Some(key), point_id, start, end).await?);
+    for (key, metric) in POWER_METRICS {
+        series.push(metric_series(&state, Some(key), metric, start, end).await?);
     }
-    for (key, counter_id, derived_id, name) in DERIVED_POINTS {
+    for (key, counter_metric, derived_id, name) in DERIVED_METRICS {
         let counter =
-            db::readings_in_range(&state.pool, state.plant_id, counter_id, start, end).await?;
+            db::readings_in_range(&state.pool, state.plant_id, counter_metric, start, end).await?;
         series.push(Series {
             key: Some(key),
             point_id: derived_id,
@@ -1085,11 +1128,11 @@ pub(super) fn cloud_counters_rose(maxes: [Option<f64>; 3]) -> bool {
 /// because the counter only grows until it resets at midnight. Wh to kWh.
 async fn day_max_kwh(
     state: &AppState,
-    point_id: i64,
+    metric: Metric,
     start: i64,
     end: i64,
 ) -> Result<Option<f64>, ApiError> {
-    let max = db::max_value_in_range(&state.pool, state.plant_id, point_id, start, end).await?;
+    let max = db::max_value_in_range(&state.pool, state.plant_id, metric, start, end).await?;
     Ok(max.map(|wh| wh / 1000.0))
 }
 
@@ -1178,10 +1221,10 @@ async fn cloud_day(
     start: i64,
     end: i64,
 ) -> Result<DayTotals, ApiError> {
-    let load_kwh = day_max_kwh(state, 83118, start, end).await?;
-    let import_kwh = day_max_kwh(state, 83102, start, end).await?;
-    let export_kwh = day_max_kwh(state, 83072, start, end).await?;
-    let pv_kwh = day_max_kwh(state, 83022, start, end).await?;
+    let load_kwh = day_max_kwh(state, Metric::LoadDayWh, start, end).await?;
+    let import_kwh = day_max_kwh(state, Metric::GridImportDayWh, start, end).await?;
+    let export_kwh = day_max_kwh(state, Metric::GridExportDayWh, start, end).await?;
+    let pv_kwh = day_max_kwh(state, Metric::PvDayWh, start, end).await?;
     // A day where the cloud sent load readings but every counter stayed at 0
     // is a gap, not a day of no energy.
     if load_kwh.is_some()
@@ -1209,9 +1252,10 @@ async fn cloud_day(
         load_kwh,
         import_kwh,
         export_kwh,
-        battery_charge_kwh: day_max_kwh(state, 83322, start, end).await?,
-        battery_discharge_kwh: day_max_kwh(state, 83323, start, end).await?,
-        self_consumed_kwh: day_max_kwh(state, 83097, start, end).await?,
+        battery_charge_kwh: day_max_kwh(state, Metric::BatteryChargeDayWh, start, end).await?,
+        battery_discharge_kwh: day_max_kwh(state, Metric::BatteryDischargeDayWh, start, end)
+            .await?,
+        self_consumed_kwh: day_max_kwh(state, Metric::SelfConsumedDayWh, start, end).await?,
         split: SplitSums::default(),
         home: HomeMix::default(),
     })
@@ -1346,15 +1390,15 @@ async fn day_home_mix(
         home_mix::live_steps(live)
     } else if totals.load_kwh.is_some() {
         let (start, end) = day_bounds_or_error(date, state.tz)?;
-        let read = async |point| -> Result<Vec<(i64, f64)>, ApiError> {
+        let read = async |metric| -> Result<Vec<(i64, f64)>, ApiError> {
             let rows =
-                db::readings_in_range(&state.pool, state.plant_id, point, start, end).await?;
+                db::readings_in_range(&state.pool, state.plant_id, metric, start, end).await?;
             Ok(undo_cloud_lag(start, &rows))
         };
         home_mix::cloud_steps(
-            &read(83022).await?,
-            &read(83118).await?,
-            &read(83323).await?,
+            &read(Metric::PvDayWh).await?,
+            &read(Metric::LoadDayWh).await?,
+            &read(Metric::BatteryDischargeDayWh).await?,
         )
     } else {
         Vec::new()
@@ -1362,8 +1406,16 @@ async fn day_home_mix(
     Ok(home_mix::home_mix(&steps, tariff, state.tz))
 }
 
-/// The points `day_totals` reads from the cloud.
-const DAILY_POINTS: [i64; 7] = [83022, 83118, 83102, 83072, 83322, 83323, 83097];
+/// The metrics `day_totals` reads from the cloud.
+const DAILY_METRICS: [Metric; 7] = [
+    Metric::PvDayWh,
+    Metric::LoadDayWh,
+    Metric::GridImportDayWh,
+    Metric::GridExportDayWh,
+    Metric::BatteryChargeDayWh,
+    Metric::BatteryDischargeDayWh,
+    Metric::SelfConsumedDayWh,
+];
 
 pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyParams>) -> ApiResult {
     let group = Group::parse(params.group.as_deref())?;
@@ -1385,7 +1437,7 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
     let now = db::now();
     if group != Group::Day {
         // Days before the first reading have nothing in them; do not read them.
-        let cloud_first = db::first_reading_ts(&state.pool, state.plant_id, &DAILY_POINTS).await?;
+        let cloud_first = db::first_reading_ts(&state.pool, state.plant_id, &DAILY_METRICS).await?;
         let first = [cloud_first, live_range.map(|(first, _)| first)]
             .into_iter()
             .flatten()
@@ -1440,7 +1492,6 @@ mod tests {
     use axum_extra::extract::cookie::Key;
 
     use super::*;
-    use crate::db::{Point, Reading};
 
     const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
 
@@ -1482,8 +1533,12 @@ mod tests {
 
     #[test]
     fn soc_is_shown_as_a_percentage() {
-        assert!((display_value(SOC_POINT, 0.674) - 67.4).abs() < 1e-9);
-        assert_eq!(display_value(83033, 1500.0), 1500.0);
+        let soc = points::for_metric(Metric::SocPct).point_id;
+        let pv = points::for_metric(Metric::PvW).point_id;
+        assert!((display_value(soc, 0.674) - 67.4).abs() < 1e-9);
+        assert_eq!(display_value(pv, 1500.0), 1500.0);
+        // A point we do not know is shown as stored.
+        assert_eq!(display_value(1, 0.5), 0.5);
     }
 
     #[test]
@@ -1599,13 +1654,6 @@ mod tests {
         let pool = db::open(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let point = Point {
-            point_id: 83022,
-            code: None,
-            name: None,
-            unit: Some("Wh".to_string()),
-        };
-        db::upsert_point(&pool, &point).await.unwrap();
 
         // Adelaide clocks go back on Sunday 2026-04-05, so that day has 25
         // hours: it starts at 13:30 UTC on the 4th and ends at 14:30 UTC on the 5th.
@@ -1621,15 +1669,11 @@ mod tests {
             // Monday 00:00 local.
             (utc("2026-04-05T14:30:00Z"), 0.0),
         ];
-        let readings: Vec<Reading> = rows
+        let readings: Vec<_> = rows
             .iter()
-            .map(|&(ts, value)| Reading {
-                point_id: 83022,
-                ts,
-                value: Some(value),
-            })
+            .map(|&(ts, value)| (Metric::PvDayWh, ts, value))
             .collect();
-        db::upsert_readings(&pool, 7, &readings).await.unwrap();
+        db::seed_metrics(&pool, 7, &readings).await;
 
         let key = Key::generate();
         let hash = super::super::hash_password("x").unwrap();
@@ -1931,28 +1975,17 @@ mod tests {
             .await
             .unwrap();
         // Cloud counter for both days: 5 kWh.
-        let point = Point {
-            point_id: 83102,
-            code: None,
-            name: None,
-            unit: Some("Wh".to_string()),
-        };
-        db::upsert_point(&pool, &point).await.unwrap();
         let state_day = |date: &str| {
             let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
             day_bounds(date, ADELAIDE).unwrap()
         };
         let (start, end) = state_day("2026-10-19");
         let (start2, _) = state_day("2026-10-20");
-        let cloud: Vec<Reading> = [start + 3600, start2 + 3600]
+        let cloud: Vec<_> = [start + 3600, start2 + 3600]
             .iter()
-            .map(|&ts| Reading {
-                point_id: 83102,
-                ts,
-                value: Some(5000.0),
-            })
+            .map(|&ts| (Metric::GridImportDayWh, ts, 5000.0))
             .collect();
-        db::upsert_readings(&pool, 7, &cloud).await.unwrap();
+        db::seed_metrics(&pool, 7, &cloud).await;
 
         // The 19th has a sample every minute all day: import 1000 W (1 kWh/h),
         // export 0, so 24 kWh minus the last minute, which has no next sample.
@@ -2102,31 +2135,18 @@ mod tests {
         let pool = db::open(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        for point_id in [83102, 83072, 83118] {
-            let point = Point {
-                point_id,
-                code: None,
-                name: None,
-                unit: Some("Wh".to_string()),
-            };
-            db::upsert_point(&pool, &point).await.unwrap();
-        }
         let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
         let start = day_bounds(date("2026-10-20"), ADELAIDE).unwrap().0;
         let at = |hour: i64, minute: i64| start + hour * 3600 + minute * 60;
         // Import: 1 kWh in the free window, 0.5 kWh in the peak.
         // Export: 2 kWh in the super window, 1 kWh in the rest of the peak.
-        let counter = |point_id: i64, rows: &[(i64, i64, f64)]| -> Vec<Reading> {
+        let counter = |metric: Metric, rows: &[(i64, i64, f64)]| -> Vec<(Metric, i64, f64)> {
             rows.iter()
-                .map(|&(h, m, wh)| Reading {
-                    point_id,
-                    ts: at(h, m),
-                    value: Some(wh),
-                })
+                .map(|&(h, m, wh)| (metric, at(h, m), wh))
                 .collect()
         };
         let mut rows = counter(
-            83102,
+            Metric::GridImportDayWh,
             &[
                 (12, 0, 0.0),
                 (12, 5, 1000.0),
@@ -2135,7 +2155,7 @@ mod tests {
             ],
         );
         rows.extend(counter(
-            83072,
+            Metric::GridExportDayWh,
             &[
                 (19, 0, 0.0),
                 (19, 5, 2000.0),
@@ -2143,7 +2163,7 @@ mod tests {
                 (22, 5, 3000.0),
             ],
         ));
-        db::upsert_readings(&pool, 7, &rows).await.unwrap();
+        db::seed_metrics(&pool, 7, &rows).await;
         let hash = super::super::hash_password("x").unwrap();
         let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
         let with_tariff = state.clone().with_tariff(Some(schedule));
@@ -2190,30 +2210,19 @@ mod tests {
         let pool = db::open(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let point = Point {
-            point_id: 83022,
-            code: None,
-            name: None,
-            unit: Some("Wh".to_string()),
-        };
-        db::upsert_point(&pool, &point).await.unwrap();
         let day_start = |s: &str| {
             let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
             day_bounds(date, ADELAIDE).unwrap().0
         };
-        let rows: Vec<Reading> = [
+        let rows: Vec<_> = [
             ("2025-12-30", 4000.0),
             ("2026-01-02", 6000.0),
             ("2026-01-03", 1000.0),
         ]
         .iter()
-        .map(|&(d, v)| Reading {
-            point_id: 83022,
-            ts: day_start(d) + 3600,
-            value: Some(v),
-        })
+        .map(|&(d, v)| (Metric::PvDayWh, day_start(d) + 3600, v))
         .collect();
-        db::upsert_readings(&pool, 7, &rows).await.unwrap();
+        db::seed_metrics(&pool, 7, &rows).await;
         let hash = super::super::hash_password("x").unwrap();
         let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
         let ask = |from: &str, to: &str, group: &str| DailyParams {

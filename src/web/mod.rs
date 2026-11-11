@@ -634,6 +634,7 @@ mod tests {
 
     use super::*;
     use crate::db::{self, Point, Reading};
+    use crate::metric::Metric;
     use crate::modbus::Sample;
     use crate::teslamate::CarState;
 
@@ -2207,16 +2208,6 @@ mod tests {
         let pool = db::open(dir.path().join("test.db").to_str().unwrap())
             .await
             .unwrap();
-        // Readings need their points to exist first.
-        for point_id in [83102, 83072, 83118, 83323] {
-            let point = Point {
-                point_id,
-                code: None,
-                name: None,
-                unit: Some("Wh".to_string()),
-            };
-            db::upsert_point(&pool, &point).await.unwrap();
-        }
         let app = costs_router(&pool, flat_tariff());
         (dir, app, pool)
     }
@@ -2325,16 +2316,16 @@ mod tests {
         // Import 1 kWh, export 2 kWh and load 4 kWh, each reached by 01:00 and
         // then flat. A neighbouring day without data is left out.
         let mut readings = Vec::new();
-        for (point_id, wh) in [(83102, 1000.0), (83072, 2000.0), (83118, 4000.0)] {
+        for (metric, wh) in [
+            (Metric::GridImportDayWh, 1000.0),
+            (Metric::GridExportDayWh, 2000.0),
+            (Metric::LoadDayWh, 4000.0),
+        ] {
             for ts in [SEP_15_START + 3600, SEP_15_START + 3900] {
-                readings.push(Reading {
-                    point_id,
-                    ts,
-                    value: Some(wh),
-                });
+                readings.push((metric, ts, wh));
             }
         }
-        db::upsert_readings(&pool, PLANT, &readings).await.unwrap();
+        db::seed_metrics(&pool, PLANT, &readings).await;
 
         let uri = "/api/costs?from=2026-09-14&to=2026-09-16";
         let response = send(&app, get_request(uri, Some(&cookie))).await;
@@ -2400,12 +2391,8 @@ mod tests {
             db::insert_live_sample(&pool, &sample).await.unwrap();
         }
         // Cloud numbers for the same day must be ignored.
-        let reading = Reading {
-            point_id: 83102,
-            ts: SEP_15_START + 3600,
-            value: Some(99_000.0),
-        };
-        db::upsert_readings(&pool, PLANT, &[reading]).await.unwrap();
+        let reading = (Metric::GridImportDayWh, SEP_15_START + 3600, 99_000.0);
+        db::seed_metrics(&pool, PLANT, &[reading]).await;
 
         let uri = "/api/costs?from=2026-09-15&to=2026-09-15";
         let response = send(&app, get_request(uri, Some(&cookie))).await;
@@ -2425,16 +2412,16 @@ mod tests {
     /// load four times that, all at each offset (seconds after `day_start`).
     async fn seed_counters(pool: &SqlitePool, day_start: i64, offsets: &[i64], import_wh: f64) {
         let mut readings = Vec::new();
-        for (point_id, factor) in [(83102, 1.0), (83072, 2.0), (83118, 4.0)] {
+        for (metric, factor) in [
+            (Metric::GridImportDayWh, 1.0),
+            (Metric::GridExportDayWh, 2.0),
+            (Metric::LoadDayWh, 4.0),
+        ] {
             for offset in offsets {
-                readings.push(Reading {
-                    point_id,
-                    ts: day_start + offset,
-                    value: Some(import_wh * factor),
-                });
+                readings.push((metric, day_start + offset, import_wh * factor));
             }
         }
-        db::upsert_readings(pool, PLANT, &readings).await.unwrap();
+        db::seed_metrics(pool, PLANT, &readings).await;
     }
 
     #[tokio::test]
@@ -3189,12 +3176,14 @@ mod tests {
         // One finished day saving 85 c (see `costs_for_a_cloud_day`), with
         // 11.5 kWh discharged.
         seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
-        let discharge = [3600, LAST_READING].map(|offset| Reading {
-            point_id: 83323,
-            ts: SEP_15_START + offset,
-            value: Some(11_500.0),
+        let discharge = [3600, LAST_READING].map(|offset| {
+            (
+                Metric::BatteryDischargeDayWh,
+                SEP_15_START + offset,
+                11_500.0,
+            )
         });
-        db::upsert_readings(&pool, PLANT, &discharge).await.unwrap();
+        db::seed_metrics(&pool, PLANT, &discharge).await;
         let with_battery = |date: &str, cost: f64, kwh: f64| Purchase {
             battery_kwh: Some(kwh),
             ..solar_purchase(date, cost)
@@ -3803,15 +3792,6 @@ mod tests {
 
         // No plan yet: only the new cost is known. Import 1 kWh and export
         // 2 kWh on 15 September (100 + 30 - 10 = 120 c).
-        for point_id in [83102, 83072, 83118] {
-            let point = Point {
-                point_id,
-                code: None,
-                name: None,
-                unit: Some("Wh".to_string()),
-            };
-            db::upsert_point(&pool, &point).await.unwrap();
-        }
         seed_counters(&pool, SEP_15_START, &[3600, 3900], 1000.0).await;
         let (status, json) = admin_send(&app, "POST", preview, &cookie, PLAN).await;
         assert_eq!(status, StatusCode::OK);
