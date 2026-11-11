@@ -49,3 +49,12 @@ tower = { version = "0.5.3", features = ["util"] }
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# Tests run in the debug profile, where RSA key generation and Argon2 password
+# hashing are ~10x slower than in release and dominated the test run. Optimise
+# just those crates (and the maths under them); everything else stays debug.
+[profile.dev.package]
+rsa = { opt-level = 3 }
+num-bigint-dig = { opt-level = 3 }
+argon2 = { opt-level = 3 }
+blake2 = { opt-level = 3 }
