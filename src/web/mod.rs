@@ -370,6 +370,7 @@ pub fn router(state: AppState) -> Router {
         .route("/static/{*path}", get(static_file))
         .route("/api/latest", get(api::latest))
         .route("/api/spokes", get(api::spokes))
+        .route("/api/capabilities", get(api::capabilities))
         .route("/api/live", get(api::live))
         .route("/api/live/series", get(api::live_series))
         .route("/api/inverter", get(api::inverter))
@@ -779,6 +780,147 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let set_cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
         set_cookie.split(';').next().unwrap().to_string()
+    }
+
+    /// A router with no sources at all: plant 0 (no cloud), an empty database.
+    async fn bare_app(enabled: &[&str]) -> (tempfile::TempDir, Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = hash_password(PASSWORD).unwrap();
+        let tz = chrono_tz::Australia::Adelaide;
+        let mut state = AppState::new(pool, 0, tz, &hash, Key::generate())
+            .unwrap()
+            .with_enabled_spokes(enabled);
+        if enabled.contains(&"globird-portal") {
+            state = state.with_globird_configured(true);
+        }
+        if enabled.contains(&"amber") {
+            state = state.with_amber_configured(true);
+        }
+        (dir, router(state))
+    }
+
+    const SWEEP_GETS: &[&str] = &[
+        "/api/latest",
+        "/api/spokes",
+        "/api/capabilities",
+        "/api/live",
+        "/api/live/series?from=1767225600&to=1767312000",
+        "/api/live/series?from=1767225600",
+        "/api/inverter",
+        "/api/inverter/history",
+        "/api/inverter/history?from=1767225600&to=1767312000",
+        "/api/ev/sessions?from=1767225600&to=1767312000",
+        "/api/ev/summary",
+        "/api/ev/cars",
+        "/api/fuel/cars",
+        "/api/petrol-prices",
+        "/api/admin",
+        "/api/admin/backup",
+        "/api/series?metrics=pv_w,load_w,grid_w&from=1767225600&to=1767312000",
+        "/api/series?metrics=battery_soc_pct&from=1767225600&to=1767312000&step=300",
+        "/api/prices?from=1767225600&to=1767312000",
+        "/api/day?date=2026-01-01",
+        "/api/day",
+        "/api/daily",
+        "/api/daily?from=2026-01-01&to=2026-02-01",
+        "/api/battery",
+        "/api/battery?from=2026-01-01&to=2026-02-01",
+        "/api/costs",
+        "/api/costs?from=2026-01-01&to=2026-02-01",
+        "/api/bill/current",
+        "/api/bill/compare-dynamic",
+        "/api/tariff",
+        "/api/globird/compare",
+        "/api/payback",
+    ];
+
+    async fn assert_no_server_errors(app: &Router, cookie: &str, label: &str) {
+        for uri in SWEEP_GETS {
+            let response = send(app, get_request(uri, Some(cookie))).await;
+            let status = response.status();
+            let body = body_text(response).await;
+            assert!(
+                status.as_u16() < 500,
+                "{label}: GET {uri} -> {status}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_get_route_survives_no_sources() {
+        let (_dir, app) = bare_app(&[]).await;
+        let cookie = log_in(&app).await;
+        assert_no_server_errors(&app, &cookie, "empty").await;
+
+        // With a plan entered, the cost screens have something to work on.
+        let (status, _) = admin_send(&app, "POST", "/api/admin/tariffs", &cookie, PLAN).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_no_server_errors(&app, &cookie, "with tariff").await;
+        let purchase = r#"{"name":"Panels","date":"2024-01-02","cost_dollars":9000.0}"#;
+        admin_send(&app, "POST", "/api/admin/purchases", &cookie, purchase).await;
+        assert_no_server_errors(&app, &cookie, "with purchase").await;
+    }
+
+    #[tokio::test]
+    async fn capabilities_with_nothing_configured() {
+        let (_dir, app) = bare_app(&[]).await;
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/capabilities", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = send(&app, get_request("/api/capabilities", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({
+                "live": false, "history": false, "meter": false, "prices": false,
+                "costs": false, "cars": false, "payback": false,
+                "meter_name": null, "sources": [],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn capabilities_with_sources_and_entered_data() {
+        let (_dir, app) = bare_app(&["sungrow-modbus", "globird-portal", "amber"]).await;
+        let cookie = log_in(&app).await;
+        // A plan alone is "costs" but not "payback".
+        admin_send(&app, "POST", "/api/admin/tariffs", &cookie, PLAN).await;
+        let json =
+            body_json(send(&app, get_request("/api/capabilities", Some(&cookie))).await).await;
+        assert_eq!(json["costs"], true);
+        assert_eq!(json["payback"], false);
+        assert_eq!(json["cars"], false);
+
+        admin_send(
+            &app,
+            "POST",
+            "/api/admin/purchases",
+            &cookie,
+            r#"{"name":"Panels","date":"2024-01-02","cost_dollars":9000.0}"#,
+        )
+        .await;
+        admin_send(
+            &app,
+            "POST",
+            "/api/admin/cars",
+            &cookie,
+            r#"{"name":"Hilux","kind":"diesel"}"#,
+        )
+        .await;
+        let json =
+            body_json(send(&app, get_request("/api/capabilities", Some(&cookie))).await).await;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "live": true, "history": false, "meter": true, "prices": true,
+                "costs": true, "cars": true, "payback": true,
+                "meter_name": "GloBird",
+                "sources": ["sungrow-modbus", "globird-portal", "amber"],
+            })
+        );
     }
 
     #[tokio::test]

@@ -185,6 +185,43 @@ pub async fn spokes(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "spokes": &*state.spokes }))
 }
 
+/// What this install can do, from the sources that run and what has been
+/// entered. The UI hides screens that would be empty. The DB-backed answers
+/// (costs, cars, payback) are worked out per request, so they follow the admin
+/// page.
+pub async fn capabilities(State(state): State<AppState>) -> ApiResult {
+    let enabled = |id: &str| state.spokes.iter().any(|s| s.id == id && s.enabled);
+    let live = enabled("sungrow-modbus");
+    let history = enabled("isolarcloud");
+    let meter = state.globird_configured || enabled("globird-portal");
+    let prices = state.amber_configured || enabled("amber");
+    let admin = state.admin.get();
+    let costs = admin.tariff.is_some();
+    let payback = costs && !admin.purchases.is_empty();
+    let teslamate = enabled("teslamate-mqtt") || enabled("teslamate-history");
+    let manual_cars: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_car")
+        .fetch_one(&state.pool)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let sources: Vec<&str> = state
+        .spokes
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.id)
+        .collect();
+    Ok(Json(json!({
+        "live": live,
+        "history": history,
+        "meter": meter,
+        "prices": prices,
+        "costs": costs,
+        "cars": teslamate || manual_cars > 0,
+        "payback": payback,
+        "meter_name": if meter { Some("GloBird") } else { None },
+        "sources": sources,
+    })))
+}
+
 pub async fn latest(State(state): State<AppState>) -> ApiResult {
     let mut rows = db::latest_metric_readings(&state.pool, state.plant_id).await?;
     // The same order as before the store was keyed by metric: by point id.
