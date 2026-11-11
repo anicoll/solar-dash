@@ -844,10 +844,13 @@
    * switches and the day-by-day list. Every figure for a switch mix comes from the
    * API's `savings_dollars` (one number per mix), so flipping a switch needs no request.
    * `periods` is [{ key, label, res }] with only usable answers; null when none.
+   * The returned panel also has `addPeriod({ key, label, res })`: the other chips are fetched
+   * after the first paint, and each one joins the chip row when its answer arrives.
    */
   function whatifPanel(periods) {
-    const list = (periods || []).filter((p) => usableWhatif(p.res));
+    let list = (periods || []).filter((p) => usableWhatif(p.res));
     if (!list.length) return null;
+    const ORDER = ['bill', 'd30', 'd90'];
     const state = { period: list[0].key, on: { car: true, grid_charge: true, spikes: true }, all: false };
     const body = h('div', { class: 'bill-wi' });
     const money = (v) => (v < 0 ? MINUS : '') + SD.fmt.dollars(Math.abs(v));
@@ -963,7 +966,14 @@
 
     const first = figures();
     const diff = first.shifted - first.t.globird_dollars;
+    /** Add a late period; the chips keep their fixed order and the open period stays selected. */
+    function addPeriod(p) {
+      if (!usableWhatif(p.res) || list.some((x) => x.key === p.key)) return;
+      list = list.concat(p).sort((a, b) => ORDER.indexOf(a.key) - ORDER.indexOf(b.key));
+      render();
+    }
     return {
+      addPeriod,
       title: 'Would Amber have been cheaper?',
       summary: `${plural(first.t.days, 'day', 'days')} covered`,
       fig: `${diff > 0.0049 ? '+' : ''}${amt(diff)}`,
@@ -1124,8 +1134,12 @@
       h('p', { class: 'bill-period' }, h('b', { text: periodLabel(bill) }), line ? h('br') : null, line));
   }
 
-  function build(el, bill, extras) {
-    const { compare, tariff, amber, whatif } = extras;
+  /**
+   * Draw the bill from what /api/bill/current and the tariff gave. The slow, optional parts
+   * (the GloBird check badge and the Amber panel) load afterwards and fill in place:
+   * `late` = { compare(), whatif(from, to), amber(from, to) } fetch functions, `isAlive()`.
+   */
+  function build(el, bill, tariff, late) {
     const today = SD.local().date;
     const desktop = () => desktopQuery.matches;
     const ctx = { panels: [], open: readOpen(), desktop, apply: () => applyPanels(ctx) };
@@ -1137,7 +1151,7 @@
     }
 
     // The trust badge sits at the foot of the hero; on a phone it opens the day-by-day check.
-    const check = safe(() => checkSummary(compare));
+    // It arrives after first paint, so it is attached to the hero once the compare answers.
     let checkCard = null;
     let badge = null;
     const setExpanded = () => {
@@ -1145,23 +1159,45 @@
       if (desktop()) badge.removeAttribute('aria-expanded');
       else badge.setAttribute('aria-expanded', String(checkCard.classList.contains('is-open')));
     };
-    if (check) {
-      checkCard = safe(() => renderCheckCard(check));
-      if (checkCard) {
-        badge = safe(() => renderBadge(check, () => {
-          if (desktop()) {
-            checkCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            return;
-          }
-          checkCard.classList.toggle('is-open');
-          setExpanded();
-        }));
-      }
+    function attachCheck(compare) {
+      const check = safe(() => checkSummary(compare));
+      if (!check || !hero) return;
+      const card = safe(() => renderCheckCard(check));
+      if (!card) return;
+      checkCard = card;
+      badge = safe(() => renderBadge(check, () => {
+        if (desktop()) {
+          checkCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          return;
+        }
+        checkCard.classList.toggle('is-open');
+        setExpanded();
+      }));
+      if (!badge) { checkCard = null; return; }
+      hero.append(badge);
+      heroset.append(checkCard);
+      setExpanded();
     }
 
     const grid = h('div', { class: 'bill-grid' });
-    const hero = safe(() => renderHero(bill, badge));
-    grid.append(h('div', { class: 'bill-heroset a-hero' }, hero, badge ? checkCard : null));
+    const hero = safe(() => renderHero(bill, null));
+    const heroset = h('div', { class: 'bill-heroset a-hero' }, hero);
+    grid.append(heroset);
+
+    // The Amber panel's place: a small loading card that is swapped for the panel (or removed).
+    let slot = SD.caps.prices && bill.days_elapsed > 0 && bill.so_far
+      ? h('section', { class: 'card bill-panel bill-slot', 'aria-busy': 'true' },
+        h('p', { class: 'muted bill-slot-line', role: 'status', text: 'Loading the Amber comparison' }))
+      : null;
+    let side = null;
+    function fillAmber(spec) {
+      if (!slot || !alive) return;
+      const el = spec ? safe(() => makePanel(ctx, Object.assign({ key: 'amber', area: '' }, spec))) : null;
+      if (el) slot.replaceWith(el); else slot.remove();
+      slot = null;
+      if (side && !side.children.length) side.remove();
+      ctx.apply();
+    }
 
     if (bill.days_elapsed > 0 && bill.so_far) {
       const panel = (key, area, spec) => {
@@ -1169,9 +1205,9 @@
         if (!built) return null;
         return safe(() => makePanel(ctx, Object.assign({ key, area }, built)));
       };
-      const side = h('div', { class: 'bill-side a-side' },
+      side = h('div', { class: 'bill-side a-side' },
         safe(() => tiles(bill)),
-        panel('amber', '', () => whatifPanel(whatif) || amberPanel(amber)),
+        slot,
         panel('cut', '', () => cutPanel(bill, tariff)));
       grid.append(...[
         panel('flow', 'a-flow', () => waterfall(bill)),
@@ -1190,6 +1226,41 @@
     setExpanded();
     onQueryChange = () => { ctx.apply(); setExpanded(); };
     desktopQuery.addEventListener('change', onQueryChange);
+
+    // ---- after first paint ----
+    const last = bill.to < today ? bill.to : today;
+    const yesterday = addDays(today, -1);
+    if (late.compare) late.compare(bill.from, last).then((c) => { if (alive) attachCheck(c); });
+    if (slot) loadAmber();
+
+    /** Fill the Amber slot: the selected what-if period first, the other chips afterwards. */
+    async function loadAmber() {
+      const periods = [
+        { key: 'bill', label: 'This bill so far', from: bill.from, to: last },
+        { key: 'd30', label: 'Last 30 days', from: addDays(today, -30), to: yesterday },
+        // A 90-day answer is only worth a chip when the stored prices cover most of it.
+        { key: 'd90', label: 'Last 90 days', from: addDays(today, -90), to: yesterday, enough: 60 },
+      ];
+      const get = (p) => late.whatif(p.from, p.to).then((res) => ({
+        key: p.key, label: p.label, res: p.enough && !(res && res.totals && res.totals.days >= p.enough) ? null : res,
+      }));
+      const firstPeriod = await get(periods[0]);
+      if (!alive) return;
+      const spec = usableWhatif(firstPeriod.res) ? safe(() => whatifPanel([firstPeriod])) : null;
+      if (spec) {
+        fillAmber(spec);
+        for (const p of periods.slice(1)) {
+          const got = await get(p);
+          if (!alive) return;
+          safe(() => spec.addPeriod(got));
+        }
+        return;
+      }
+      // The bill period has no usable answer: look at the other periods and the plain comparison.
+      const [rest1, rest2, amber] = await Promise.all([get(periods[1]), get(periods[2]), late.amber(bill.from, last)]);
+      if (!alive) return;
+      fillAmber(safe(() => whatifPanel([firstPeriod, rest1, rest2])) || safe(() => amberPanel(amber)));
+    }
   }
 
   SD.page('bill', {
@@ -1203,6 +1274,7 @@
         throw err;
       });
 
+      const tariffPromise = SD.tariff.get().catch(() => null);
       load().then(async (bill) => {
         if (!alive) return;
         el.replaceChildren();
@@ -1219,29 +1291,16 @@
               h('a', { class: 'card-link', href: '#admin', text: 'Open settings' })));
           return;
         }
-        const today = SD.local().date;
-        const last = bill.to < today ? bill.to : today;
-        // The what-if answers for each period chip. A longer range is asked for only when the
-        // stored prices cover most of it (see the 60-day rule below).
-        const whatifUrl = (from, to) => `/api/bill/amber-whatif?from=${from}&to=${to}`;
-        const yesterday = addDays(today, -1);
-        const [compare, tariff, amber, wiBill, wi30, wi90] = await Promise.all([
-          // No retailer meter source: nothing to check against, so skip the call (and the trust badge).
-          SD.caps.meter ? quiet(`/api/globird/compare?from=${bill.from}&to=${last}`) : null,
-          SD.tariff.get().catch(() => null),
-          // {configured: false} without [amber], and the panel stays out.
-          SD.caps.prices ? quiet(`/api/bill/compare-dynamic?from=${bill.from}&to=${last}`) : null,
-          SD.caps.prices ? quiet(whatifUrl(bill.from, last)) : null,
-          SD.caps.prices ? quiet(whatifUrl(addDays(today, -30), yesterday)) : null,
-          SD.caps.prices ? quiet(whatifUrl(addDays(today, -90), yesterday)) : null,
-        ]);
+        // The tariff is quick and the bill needs it; everything else loads after first paint.
+        const tariff = await tariffPromise;
         if (!alive) return;
-        const whatif = [
-          { key: 'bill', label: 'This bill so far', res: wiBill },
-          { key: 'd30', label: 'Last 30 days', res: wi30 },
-          { key: 'd90', label: 'Last 90 days', res: wi90 && wi90.totals && wi90.totals.days >= 60 ? wi90 : null },
-        ];
-        build(el, bill, { compare, tariff, amber, whatif });
+        build(el, bill, tariff, {
+          // No retailer meter source: nothing to check against, so skip the call (and the trust badge).
+          compare: SD.caps.meter ? (from, to) => quiet(`/api/globird/compare?from=${from}&to=${to}`) : null,
+          whatif: (from, to) => quiet(`/api/bill/amber-whatif?from=${from}&to=${to}`),
+          // {configured: false} without [amber], and the panel stays out.
+          amber: (from, to) => quiet(`/api/bill/compare-dynamic?from=${from}&to=${to}`),
+        });
       }).catch((err) => {
         if (!alive) return;
         el.replaceChildren(

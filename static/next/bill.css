@@ -1466,3 +1466,12 @@
 #page-bill .bill-wi-how b {
   color: var(--ink);
 }
+
+/* The Amber panel's place while its answer is on the way. */
+#page-bill .bill-slot {
+  padding: 16px 20px;
+}
+
+#page-bill .bill-slot-line {
+  margin: 0;
+}
