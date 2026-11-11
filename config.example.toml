@@ -156,6 +156,10 @@ path = "data/solar.db"
 # # site_id = "01F5A5CRKMZ5BCX9P1S4V990AM"
 # # Only change this for testing. Default: "https://api.amber.com.au/v1".
 # # base_url = "https://api.amber.com.au/v1"
+# # How far back `serve` fills in past prices, as a date. It walks back a week
+# # at a time between the 5-minute fetches and stops where Amber has no more.
+# # Never overwrites a final price. Default: two years ago.
+# # backfill_from = "2024-01-01"
 #
 # # A tariff plan can be priced from these stored prices instead of fixed
 # # windows. Plans are edited on the Admin page ("Price from live prices");

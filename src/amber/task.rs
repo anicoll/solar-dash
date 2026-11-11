@@ -6,6 +6,10 @@
 //! after it starts; before that Amber only has an estimate). Each fetch asks for the recent past, the current interval and
 //! the forecast, and saves them with the rules in [`super::store`].
 //!
+//! After each good fetch, the time left before the next one is used to
+//! backfill past prices a few weeks at a time (see [`super::backfill`]); the
+//! backfill never delays a live fetch.
+//!
 //! When something fails it waits longer each time (like the iSolarCloud sync).
 //! A 404 means the site is closed or the id is wrong, which retrying quickly
 //! cannot fix, so then it only tries once an hour.
@@ -13,11 +17,14 @@
 use std::future::Future;
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
+use super::backfill::Backfill;
 use super::client::{Client, NotFound};
 use super::probe::{SiteChoice, choose_site};
 use super::store;
@@ -59,7 +66,7 @@ fn next_fetch_at(now: i64) -> i64 {
 
 /// How long to wait after the `failures`-th failure in a row (1-based):
 /// 30 s, doubling, capped at 10 min.
-fn backoff_delay(failures: u32) -> Duration {
+pub(super) fn backoff_delay(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(16);
     (BACKOFF_START * 2u32.pow(doublings)).min(BACKOFF_CAP)
 }
@@ -147,6 +154,7 @@ pub async fn run(
     let mut site_id: Option<String> = None;
     let mut previous = STARTUP_PREVIOUS;
     let mut failures = 0u32;
+    let mut backfill = Backfill::new();
     loop {
         // Stopping in the middle of a fetch is safe: rows are saved in one
         // transaction, so there is never half a reply in the database.
@@ -180,6 +188,17 @@ pub async fn run(
                 }
                 failures = 0;
                 previous = REFRESH_PREVIOUS;
+                // Fill in history with the time left before the next live
+                // fetch. It is cut short on shutdown, like a fetch.
+                let wait = Duration::from_secs((next_fetch_at(now) - now).max(0) as u64);
+                if let Some(id) = site_id.as_deref() {
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        _ = backfill.run_cycle(&client, &pool, &config, id, Instant::now() + wait) => {}
+                    }
+                }
+                // The backfill used some of that time: wait for what is left.
+                let now = Utc::now().timestamp();
                 Duration::from_secs((next_fetch_at(now) - now).max(0) as u64)
             }
             Err(err) => {
@@ -277,6 +296,7 @@ mod tests {
         Amber {
             token: "t".to_string(),
             site_id: Some("s1".to_string()),
+            backfill_from: None,
             base_url: format!("http://{addr}/v1"),
             compare: Default::default(),
         }

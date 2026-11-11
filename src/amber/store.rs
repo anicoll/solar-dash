@@ -125,6 +125,18 @@ pub async fn prune_forecasts(pool: &SqlitePool, now: i64) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// The start time of the oldest `actual` price stored for a source, or `None`
+/// when there is none. The backfill walks back from here.
+pub async fn oldest_actual_start(pool: &SqlitePool, source: &str) -> Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT MIN(start_ts) FROM price_interval WHERE source = ? AND kind = 'actual'",
+    )
+    .bind(source)
+    .fetch_one(pool)
+    .await
+    .context("could not find the oldest stored price")
+}
+
 /// One stored interval, as the API sends it.
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct StoredPrice {
