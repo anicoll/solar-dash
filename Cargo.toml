@@ -38,6 +38,7 @@ hmac = "0.13"
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
 tokio-modbus = { version = "0.17.0", default-features = false, features = ["tcp-server"] }
+tokio = { version = "1.54.0", features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 # The release binary runs 24/7 on a small LXC, so trade build time for a smaller,

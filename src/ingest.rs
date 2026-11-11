@@ -16,8 +16,10 @@ use tracing::{debug, info, warn};
 
 use crate::config::IsolarCloud;
 use crate::db::{self, MetricReading, Point, Reading};
+use crate::hub::{Hub, HubEvent};
 use crate::isolar::client::{ApiError, Client};
 use crate::isolar::points;
+use crate::metric::Metric;
 
 const HISTORY_ENDPOINT: &str = "/openapi/getDevicePointMinuteDataList";
 const POINT_INFO_ENDPOINT: &str = "/openapi/getOpenPointInfo";
@@ -399,6 +401,29 @@ pub struct SyncStats {
     pub calls: u32,
 }
 
+/// Tells the hub that readings were just stored. Nothing is sent for an
+/// empty window.
+fn announce_readings(hub: &Hub, source: String, readings: &[MetricReading]) {
+    let (Some(from), Some(to)) = (
+        readings.iter().map(|r| r.ts).min(),
+        readings.iter().map(|r| r.ts).max(),
+    ) else {
+        return;
+    };
+    let mut metrics: Vec<Metric> = Vec::new();
+    for reading in readings {
+        if !metrics.contains(&reading.metric) {
+            metrics.push(reading.metric);
+        }
+    }
+    hub.publish(HubEvent::ReadingsStored {
+        source,
+        metrics,
+        from,
+        to,
+    });
+}
+
 /// Downloads history for `start_ts..end_ts` (end exclusive, unix seconds) in
 /// windows, saving `job`'s cursor after each one. Used by both `backfill` and
 /// the live sync. Safe to stop and run again.
@@ -406,6 +431,7 @@ pub async fn sync_range(
     client: &Client,
     pool: &SqlitePool,
     config: &IsolarCloud,
+    hub: &Hub,
     job: &str,
     start_ts: i64,
     end_ts: i64,
@@ -445,7 +471,9 @@ pub async fn sync_range(
         };
 
         let readings = to_metric_readings(&parse_history(&data, &plant.ps_key, tz, start));
-        db::upsert_metric_readings(pool, &points::source(plant.plant_id), &readings).await?;
+        let source = points::source(plant.plant_id);
+        db::upsert_metric_readings(pool, &source, &readings).await?;
+        announce_readings(hub, source, &readings);
         db::set_cursor(pool, job, window_end).await?;
         stats.rows += readings.len();
 
@@ -490,7 +518,17 @@ pub async fn backfill(
 
     warn_unmapped_points(&config.points);
     sync_points(client, pool, &config.points, &plant.ps_key).await?;
-    sync_range(client, pool, config, BACKFILL_JOB, start, end).await?;
+    // The command line has nobody listening to the hub.
+    sync_range(
+        client,
+        pool,
+        config,
+        &Hub::default(),
+        BACKFILL_JOB,
+        start,
+        end,
+    )
+    .await?;
     info!("backfill finished");
     Ok(())
 }
@@ -550,7 +588,12 @@ fn pick_live_start(live: Option<i64>, backfill: Option<i64>, midnight: i64, now_
 }
 
 /// One live sync: from the cursor up to now (rounded down to 5 minutes).
-async fn sync_once(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> Result<()> {
+async fn sync_once(
+    client: &Client,
+    pool: &SqlitePool,
+    config: &IsolarCloud,
+    hub: &Hub,
+) -> Result<()> {
     let tz = PlantSetup::from_config(config)?.tz;
     let now = db::now();
     let end = round_down_to_step(now);
@@ -562,7 +605,7 @@ async fn sync_once(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> 
     if end - start > CATCH_UP_SECS {
         info!(since = %format_local(start, tz), "cursor is far behind; catching up");
     }
-    let stats = sync_range(client, pool, config, LIVE_JOB, start, end).await?;
+    let stats = sync_range(client, pool, config, hub, LIVE_JOB, start, end).await?;
     info!(rows = stats.rows, calls = stats.calls, "sync done");
     Ok(())
 }
@@ -581,7 +624,12 @@ fn backfill_start(cursor: Option<i64>, history_from: Option<i64>) -> Option<i64>
 /// One step of `serve`'s background backfill: up to [`BACKFILL_STEP_SECS`] of
 /// history, from the backfill cursor towards where the live sync began.
 /// Does nothing once history is complete, so it is cheap to call every tick.
-async fn backfill_step(client: &Client, pool: &SqlitePool, config: &IsolarCloud) -> Result<()> {
+async fn backfill_step(
+    client: &Client,
+    pool: &SqlitePool,
+    config: &IsolarCloud,
+    hub: &Hub,
+) -> Result<()> {
     let plant = PlantSetup::from_config(config)?;
     let cursor = db::get_cursor(pool, BACKFILL_JOB).await?;
     let Some(start) = backfill_start(cursor, plant.history_from) else {
@@ -612,7 +660,7 @@ async fn backfill_step(client: &Client, pool: &SqlitePool, config: &IsolarCloud)
         to = %format_local(end, plant.tz),
         "filling in history"
     );
-    sync_range(client, pool, config, BACKFILL_JOB, start, end).await?;
+    sync_range(client, pool, config, hub, BACKFILL_JOB, start, end).await?;
     if end == until {
         info!("history is complete");
     }
@@ -626,15 +674,16 @@ async fn sync_with_relogin(
     client: &mut Client,
     pool: &SqlitePool,
     config: &IsolarCloud,
+    hub: &Hub,
 ) -> Result<()> {
     if !client.is_logged_in() {
         client.login().await?;
     }
-    match sync_once(client, pool, config).await {
+    match sync_once(client, pool, config, hub).await {
         Err(err) if err.downcast_ref::<ApiError>().is_some() => {
             warn!("iSolarCloud returned an error ({err:#}); logging in again");
             client.login().await?;
-            sync_once(client, pool, config).await
+            sync_once(client, pool, config, hub).await
         }
         other => other,
     }
@@ -672,6 +721,7 @@ pub async fn run_live_sync(
     mut client: Client,
     pool: &SqlitePool,
     config: &IsolarCloud,
+    hub: &Hub,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     // Check the config now, so mistakes fail at startup.
@@ -700,7 +750,7 @@ pub async fn run_live_sync(
         let logged_in_before = client.is_logged_in();
         tokio::select! {
             _ = &mut shutdown => break,
-            result = sync_with_relogin(&mut client, pool, config) => {
+            result = sync_with_relogin(&mut client, pool, config, hub) => {
                 // A failed tick is not fatal: try again on the next one.
                 if let Err(err) = result {
                     if !client.is_logged_in() {
@@ -731,7 +781,7 @@ pub async fn run_live_sync(
         // retried on the next tick; the cursor keeps what was saved.
         tokio::select! {
             _ = &mut shutdown => break,
-            result = backfill_step(&client, pool, config) => {
+            result = backfill_step(&client, pool, config, hub) => {
                 if let Err(err) = result {
                     warn!("backfill failed: {err:#}");
                 }
@@ -828,7 +878,7 @@ mod tests {
 
         // Nothing configured and no cursor: nothing to do, nothing saved.
         db::set_cursor(&pool, LIVE_JOB, now).await.unwrap();
-        backfill_step(&client, &pool, &offline_config(None))
+        backfill_step(&client, &pool, &offline_config(None), &Hub::default())
             .await
             .unwrap();
         assert_eq!(
@@ -840,7 +890,9 @@ mod tests {
         // most midnight today) and no call is made, which would fail here.
         db::set_cursor(&pool, BACKFILL_JOB, now).await.unwrap();
         let config = offline_config(Some("2024-01-01"));
-        backfill_step(&client, &pool, &config).await.unwrap();
+        backfill_step(&client, &pool, &config, &Hub::default())
+            .await
+            .unwrap();
         let until = db::get_cursor(&pool, BACKFILL_UNTIL_JOB).await.unwrap();
         let midnight = local_midnight(now, PlantSetup::from_config(&config).unwrap().tz);
         assert_eq!(until, midnight);
@@ -857,7 +909,7 @@ mod tests {
         let shutdown = tokio::time::sleep(Duration::from_millis(500));
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run_live_sync(client, &pool, &config, shutdown),
+            run_live_sync(client, &pool, &config, &Hub::default(), shutdown),
         )
         .await;
         pool.close().await;

@@ -48,6 +48,7 @@ use crate::config::Config;
 use crate::cost::TariffSchedule;
 use crate::ev_cost::PetrolHistory;
 use crate::ev_cost::{CostSetup, EvPrices};
+use crate::hub::{self, SourceRules, SpokeInfo};
 use crate::modbus::{Latest, LatestSettings};
 use crate::teslamate::Car;
 pub(crate) use api::ApiError;
@@ -104,6 +105,10 @@ pub struct AppState {
     backup_dir: Option<PathBuf>,
     /// How the last offsite upload went, for the admin page.
     offsite: crate::offsite::Status,
+    /// Every spoke and whether it is on, for `/api/spokes`.
+    spokes: Arc<[SpokeInfo]>,
+    /// Which source wins for a day's energy (`[sources]`).
+    rules: Arc<SourceRules>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -141,7 +146,21 @@ impl AppState {
             amber_compare: None,
             backup_dir: None,
             offsite: crate::offsite::Status::default(),
+            spokes: hub::spoke_infos(&[]).into(),
+            rules: Arc::new(SourceRules::default()),
         })
+    }
+
+    /// Sets which source wins when two can answer the same question.
+    pub fn with_source_rules(mut self, rules: SourceRules) -> Self {
+        self.rules = Arc::new(rules);
+        self
+    }
+
+    /// Records which spokes (by id) are running, for `/api/spokes`.
+    pub fn with_enabled_spokes(mut self, enabled: &[&str]) -> Self {
+        self.spokes = hub::spoke_infos(enabled).into();
+        self
     }
 
     /// Sets the folder the admin page downloads the latest backup from.
@@ -275,6 +294,7 @@ impl AppState {
         CostSetup {
             admin: self.admin.clone(),
             plant_id: self.plant_id,
+            rules: self.rules.clone(),
         }
     }
 
@@ -319,6 +339,7 @@ impl AppState {
             .with_cookie_secure(config.server.cookie_secure)
             .with_api_token(config.server.api_token.as_deref())
             .with_globird_configured(config.globird.is_some())
+            .with_source_rules(config.source_rules()?)
             .with_amber_configured(config.amber.is_some())
             .with_amber_compare(config.amber.as_ref().map(|a| a.compare.clone())))
     }
@@ -349,6 +370,7 @@ pub fn router(state: AppState) -> Router {
         .route("/next", get(next_redirect))
         .route("/static/{*path}", get(static_file))
         .route("/api/latest", get(api::latest))
+        .route("/api/spokes", get(api::spokes))
         .route("/api/live", get(api::live))
         .route("/api/live/series", get(api::live_series))
         .route("/api/inverter", get(api::inverter))
@@ -1034,6 +1056,32 @@ mod tests {
                 .unwrap();
             assert_eq!(send(&app, request).await.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[tokio::test]
+    async fn spokes_api_lists_every_spoke_and_needs_a_login() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/spokes", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/spokes", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let spokes = json["spokes"].as_array().unwrap();
+        assert_eq!(spokes.len(), 7);
+        let modbus = &spokes[0];
+        assert_eq!(modbus["id"], "sungrow-modbus");
+        assert_eq!(modbus["kind"], "source");
+        assert_eq!(
+            modbus["capabilities"],
+            serde_json::json!(["live", "meter", "settings"])
+        );
+        // A state that was never told what is running reports all spokes off.
+        assert_eq!(modbus["enabled"], false);
+        let backups = spokes.iter().find(|s| s["id"] == "backups").unwrap();
+        assert_eq!(backups["kind"], "sink");
+        assert_eq!(backups["capabilities"], serde_json::json!(["backup"]));
     }
 
     #[tokio::test]
@@ -2709,9 +2757,10 @@ mod tests {
         seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
         let now = SEP_15_START + 3 * 86_400;
         let (start, end) = (SEP_15_START + 3 * 3600, SEP_15_START + 5 * 3600);
-        let (intervals, covered) = costs::house_intervals(&pool, PLANT, tz, start, end, now)
-            .await
-            .unwrap();
+        let (intervals, covered) =
+            costs::house_intervals(&pool, PLANT, tz, start, end, now, &SourceRules::default())
+                .await
+                .unwrap();
         assert!(!intervals.is_empty());
         // The whole day is the source, so these are the day's intervals.
         assert!(intervals.iter().any(|i| i.start_ts < start));
@@ -2720,22 +2769,38 @@ mod tests {
 
         // A session across midnight loads both days; the empty one adds none.
         let night = (SEP_15_START + 86_400 - 1800, SEP_15_START + 86_400 + 1800);
-        let (_, covered) = costs::house_intervals(&pool, PLANT, tz, night.0, night.1, now)
-            .await
-            .unwrap();
+        let (_, covered) = costs::house_intervals(
+            &pool,
+            PLANT,
+            tz,
+            night.0,
+            night.1,
+            now,
+            &SourceRules::default(),
+        )
+        .await
+        .unwrap();
         assert!(covered < 0.6, "the 16th has no data, got {covered}");
 
         // Nothing stored, or no length: nothing covered.
         let later = SEP_15_START + 10 * 86_400;
-        let (intervals, covered) =
-            costs::house_intervals(&pool, PLANT, tz, later, later + 3600, now)
-                .await
-                .unwrap();
+        let (intervals, covered) = costs::house_intervals(
+            &pool,
+            PLANT,
+            tz,
+            later,
+            later + 3600,
+            now,
+            &SourceRules::default(),
+        )
+        .await
+        .unwrap();
         assert!(intervals.is_empty());
         assert_eq!(covered, 0.0);
-        let (intervals, covered) = costs::house_intervals(&pool, PLANT, tz, start, start, now)
-            .await
-            .unwrap();
+        let (intervals, covered) =
+            costs::house_intervals(&pool, PLANT, tz, start, start, now, &SourceRules::default())
+                .await
+                .unwrap();
         assert!(intervals.is_empty());
         assert_eq!(covered, 0.0);
     }

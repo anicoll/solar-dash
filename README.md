@@ -23,7 +23,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 
 ## Architecture
 
-One binary does everything. A background sync task fetches data from iSolarCloud and writes it to SQLite. If a `[modbus]` section is configured, a second task also reads live power from the inverter over the local network. An axum web server reads only from SQLite and serves an embedded static dashboard (plain HTML/CSS/JS, no build step); the web side never calls iSolarCloud directly. This keeps us well inside the API limits of 2,000 calls per hour and 100,000 per month.
+One binary does everything. A background sync task fetches data from iSolarCloud and writes it to SQLite. If a `[modbus]` section is configured, a second task also reads live power from the inverter over the local network. Each of these background jobs (and the Amber, GloBird, TeslaMate and backup jobs) is a *spoke* of a small *hub* (`src/hub/`): spokes are optional, run side by side, and tell each other what they stored over an in-process event bus. Which source wins for a day's energy is a rule (`[sources]` in the config, see docs/how-to-run.md), with defaults that match the long-standing behaviour. An axum web server reads only from SQLite and serves an embedded static dashboard (plain HTML/CSS/JS, no build step); the web side never calls iSolarCloud directly. This keeps us well inside the API limits of 2,000 calls per hour and 100,000 per month.
 
 ### Inverter settings
 
@@ -46,6 +46,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/modbus.rs` - Modbus TCP reader for live inverter data, and its poll loop
 - `src/teslamate.rs` - TeslaMate MQTT reader for the car's charge state
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
+- `src/hub/` - the hub and its spokes: the `Spoke` trait, the event bus, `run_spokes`, one thin adapter per background job (`spokes/`) and the source rules (`rules.rs`)
 - `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the admin API (`admin.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
 - `static/` - the dashboard, compiled into the binary: the new one in `next/` (served at `/`) and the previous one (`index.html`, `app.js`, `style.css`, served at `/classic`)
 - `src/amber/` - Amber Electric API client (`client.rs`), its JSON types (`models.rs`) and the `amber-probe` command (`probe.rs`)

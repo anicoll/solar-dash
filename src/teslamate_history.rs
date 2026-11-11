@@ -383,6 +383,7 @@ async fn cost_sessions(
                 session.started_at,
                 session.ended_at,
                 now,
+                &setup.rules,
             )
             .await?;
             if should_wait(coverage, session.ended_at, now) {

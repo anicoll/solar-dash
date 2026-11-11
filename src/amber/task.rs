@@ -22,6 +22,7 @@ use super::client::{Client, NotFound};
 use super::probe::{SiteChoice, choose_site};
 use super::store;
 use crate::config::Amber;
+use crate::hub::{Hub, HubEvent};
 
 /// Amber prices change every 5 minutes.
 const INTERVAL_SECS: i64 = 300;
@@ -114,10 +115,13 @@ async fn fetch_and_store(
     pool: &SqlitePool,
     site_id: &str,
     previous: u32,
+    hub: &Hub,
 ) -> Result<usize> {
     let reply = client.current_prices(site_id, previous, NEXT).await?;
     let now = Utc::now().timestamp();
-    let saved = store::save_prices(pool, &store::source_name(site_id), &reply.items, now).await?;
+    let source = store::source_name(site_id);
+    let saved = store::save_prices(pool, &source, &reply.items, now).await?;
+    hub.publish(HubEvent::PricesStored { source });
     let pruned = store::prune_forecasts(pool, now).await?;
     debug!(saved, pruned, "Amber prices stored");
     Ok(saved)
@@ -131,6 +135,7 @@ async fn fetch_and_store(
 pub async fn run(
     config: Amber,
     pool: SqlitePool,
+    hub: &Hub,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let client = Client::new(&config)?;
@@ -150,7 +155,7 @@ pub async fn run(
                     site_id = Some(resolve_site(&client, &config).await?);
                 }
                 let id = site_id.as_deref().expect("set just above");
-                fetch_and_store(&client, &pool, id, previous).await
+                fetch_and_store(&client, &pool, id, previous, hub).await
             } => result,
         };
 
@@ -278,7 +283,9 @@ mod tests {
         let config = fake_amber().await;
         let client = Client::new(&config).unwrap();
 
-        let saved = fetch_and_store(&client, &pool, "s1", 12).await.unwrap();
+        let saved = fetch_and_store(&client, &pool, "s1", 12, &Hub::default())
+            .await
+            .unwrap();
         assert_eq!(saved, 3);
         let stored = store::prices_between(&pool, Some("amber:s1"), 0, i64::MAX)
             .await
@@ -287,7 +294,7 @@ mod tests {
         // removes it; the actual and the current interval stay.
         assert_eq!(stored.len(), 2);
 
-        let err = fetch_and_store(&client, &pool, "gone", 12)
+        let err = fetch_and_store(&client, &pool, "gone", 12, &Hub::default())
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<NotFound>().is_some(), "{err:#}");
@@ -311,10 +318,13 @@ mod tests {
         let (_dir, pool) = pool().await;
         let config = fake_amber().await;
         let stop = tokio::time::sleep(Duration::from_millis(500));
-        tokio::time::timeout(Duration::from_secs(5), run(config, pool.clone(), stop))
-            .await
-            .expect("did not stop on shutdown")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run(config, pool.clone(), &Hub::default(), stop),
+        )
+        .await
+        .expect("did not stop on shutdown")
+        .unwrap();
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM price_interval")
             .fetch_one(&pool)
             .await

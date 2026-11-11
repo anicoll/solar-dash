@@ -197,6 +197,8 @@ pub const HISTORIC_COST_VERSION: u32 = 1;
 pub struct CostSetup {
     pub admin: SharedAdminData,
     pub plant_id: i64,
+    /// Which source wins for a day's energy, as for the web API.
+    pub rules: std::sync::Arc<crate::hub::SourceRules>,
 }
 
 /// The prices in cents per kWh at one moment.

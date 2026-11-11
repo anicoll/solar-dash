@@ -17,6 +17,7 @@ use super::home_mix::{self, HomeMix};
 use crate::cost::{GridSplit, TariffSchedule};
 use crate::db;
 use crate::ev_cost;
+use crate::hub::SourceRules;
 use crate::isolar::points;
 use crate::metric::Metric;
 use crate::modbus::{self, Sample};
@@ -42,17 +43,6 @@ const QUANTUM_WH: f64 = 100.0;
 /// The longest time one live sample is held (see `integrate`). Samples come
 /// every ~15 s, so a longer step means the dongle dropped out.
 pub(super) const MAX_HOLD_SECS: i64 = 120;
-/// Today, or a day with no iSolarCloud counters, needs this share covered by
-/// live samples before we use them at all. For today it is the share of the
-/// time since midnight. It stays at 0.9 there because a stricter bar would
-/// flip today between live and cloud numbers as the dongle drops out, and the
-/// cloud counters lag behind anyway.
-const MIN_LIVE_COVERAGE: f64 = 0.9;
-/// A finished day needs this share covered by live samples to be preferred
-/// over the iSolarCloud counters. Below it (but at or above
-/// [`MIN_LIVE_COVERAGE`]) the live numbers are only a fallback for a day with
-/// no cloud data, because up to 10% of the day's energy could be missing.
-const MIN_FINISHED_LIVE_COVERAGE: f64 = 0.98;
 
 /// Power metrics shown by `/api/day`: (key, metric).
 const POWER_METRICS: [(&str, Metric); 3] = [
@@ -188,6 +178,11 @@ async fn stored_series(
 /// Public liveness check. It deliberately reveals nothing about the data.
 pub async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+/// The spokes (background data sources and sinks) and whether each is on.
+pub async fn spokes(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "spokes": &*state.spokes }))
 }
 
 pub async fn latest(State(state): State<AppState>) -> ApiResult {
@@ -956,22 +951,28 @@ enum LiveCoverage {
 
 /// How well do the live samples cover this day? `covered_secs` is the seconds
 /// the samples cover, `[start, end)` is the local day and `now` is the current
-/// time. A finished day is solid at 98% of its length. Today is solid at 90%
-/// of the time since midnight, so it can use live data before it is over.
-fn live_coverage(covered_secs: i64, start: i64, end: i64, now: i64) -> LiveCoverage {
+/// time. With the default rules a finished day is solid at 98% of its length
+/// and partial from 90%. Today is solid at 90% of the time since midnight, so
+/// it can use live data before it is over. The shares come from `rules`.
+fn live_coverage(
+    covered_secs: i64,
+    start: i64,
+    end: i64,
+    now: i64,
+    rules: &SourceRules,
+) -> LiveCoverage {
+    let (finished, partial) = (rules.finished_day_coverage(), rules.partial_day_coverage());
     let share = |min: f64, len: i64| len > 0 && covered_secs as f64 >= min * len as f64;
     let day = end - start;
     if now >= end {
-        if share(MIN_FINISHED_LIVE_COVERAGE, day) {
+        if share(finished, day) {
             LiveCoverage::Solid
-        } else if share(MIN_LIVE_COVERAGE, day) {
+        } else if share(partial, day) {
             LiveCoverage::Partial
         } else {
             LiveCoverage::Thin
         }
-    } else if share(MIN_LIVE_COVERAGE, day)
-        || (start <= now && share(MIN_LIVE_COVERAGE, now - start))
-    {
+    } else if share(partial, day) || (start <= now && share(partial, now - start)) {
         LiveCoverage::Solid
     } else {
         LiveCoverage::Thin
@@ -986,7 +987,11 @@ pub(super) fn live_totals(
     start: i64,
     end: i64,
     now: i64,
+    rules: &SourceRules,
 ) -> Option<LiveTotals> {
+    if !rules.live_enabled() {
+        return None;
+    }
     // Each column is integrated alone, skipping rows where it is missing.
     let column = |get: fn(&Sample) -> Option<f64>| {
         let pairs: Vec<(i64, f64)> = samples
@@ -1004,7 +1009,7 @@ pub(super) fn live_totals(
         .iter()
         .map(|i| i.covered_secs)
         .min()?;
-    let coverage = live_coverage(covered, start, end, now);
+    let coverage = live_coverage(covered, start, end, now, rules);
     (coverage != LiveCoverage::Thin).then_some(LiveTotals {
         solid: coverage == LiveCoverage::Solid,
         pv_kwh: pv.positive_kwh,
@@ -1028,10 +1033,11 @@ pub(super) struct LiveTotals {
 }
 
 impl LiveTotals {
-    /// Use these totals rather than the cloud's? Always when solid; a partial
-    /// day only when the cloud has no data for it, so the day is not blanked.
-    pub(super) fn usable(&self, cloud_has_data: bool) -> bool {
-        self.solid || !cloud_has_data
+    /// Use these totals rather than the cloud's? By default always when
+    /// solid, and a partial day only when the cloud has no data for it, so
+    /// the day is not blanked. `rules` can change which source is preferred.
+    pub(super) fn usable(&self, rules: &SourceRules, cloud_has_data: bool) -> bool {
+        rules.live_wins(self.solid, cloud_has_data)
     }
 }
 
@@ -1210,14 +1216,24 @@ async fn day_totals_with_live(
         }
         _ => Vec::new(),
     };
-    let live = live_totals(&samples, start, end, now);
-    // A solid live day never needs the cloud; skip its queries.
-    if let Some(live) = live.as_ref().filter(|live| live.solid) {
+    let live = live_totals(&samples, start, end, now, &state.rules);
+    // A solid live day never needs the cloud (unless the rules prefer the
+    // cloud, or there is no cloud source at all); skip its queries.
+    if let Some(live) = live
+        .as_ref()
+        .filter(|live| !state.rules.cloud_needed(live.solid))
+    {
         return Ok((live_day(date, live), samples));
     }
-    let cloud = cloud_day(state, date, start, end).await?;
+    let cloud = if state.rules.cloud_enabled() {
+        cloud_day(state, date, start, end).await?
+    } else {
+        DayTotals::no_data(date, "cloud")
+    };
     match live {
-        Some(live) if live.usable(cloud.has_data()) => Ok((live_day(date, &live), samples)),
+        Some(live) if live.usable(&state.rules, cloud.has_data()) => {
+            Ok((live_day(date, &live), samples))
+        }
         _ => Ok((cloud, samples)),
     }
 }
@@ -1258,19 +1274,7 @@ async fn cloud_day(
         && !cloud_counters_rose([import_kwh, export_kwh, load_kwh])
         && !pv_kwh.is_some_and(|kwh| kwh > 0.0)
     {
-        return Ok(DayTotals {
-            date: date.to_string(),
-            source: "cloud",
-            pv_kwh: None,
-            load_kwh: None,
-            import_kwh: None,
-            export_kwh: None,
-            battery_charge_kwh: None,
-            battery_discharge_kwh: None,
-            self_consumed_kwh: None,
-            split: SplitSums::default(),
-            home: HomeMix::default(),
-        });
+        return Ok(DayTotals::no_data(date, "cloud"));
     }
     Ok(DayTotals {
         date: date.to_string(),
@@ -1289,6 +1293,23 @@ async fn cloud_day(
 }
 
 impl DayTotals {
+    /// A day with no figures, as from `source`.
+    fn no_data(date: NaiveDate, source: &'static str) -> Self {
+        DayTotals {
+            date: date.to_string(),
+            source,
+            pv_kwh: None,
+            load_kwh: None,
+            import_kwh: None,
+            export_kwh: None,
+            battery_charge_kwh: None,
+            battery_discharge_kwh: None,
+            self_consumed_kwh: None,
+            split: SplitSums::default(),
+            home: HomeMix::default(),
+        }
+    }
+
     /// Does the day have any figure at all?
     fn has_data(&self) -> bool {
         [
@@ -1744,19 +1765,20 @@ mod tests {
     #[test]
     fn live_is_used_when_coverage_is_high_enough() {
         use LiveCoverage::{Partial, Solid, Thin};
+        let rules = SourceRules::default();
         let (start, end) = (0, 86_400);
         let later = 1_000_000; // a later day: the day is finished
         // A finished day is solid from 98% (84,672 s).
-        assert_eq!(live_coverage(84_672, start, end, later), Solid);
-        assert_eq!(live_coverage(84_671, start, end, later), Partial);
-        assert_eq!(live_coverage(77_760, start, end, later), Partial); // exactly 90%
-        assert_eq!(live_coverage(77_759, start, end, later), Thin);
+        assert_eq!(live_coverage(84_672, start, end, later, &rules), Solid);
+        assert_eq!(live_coverage(84_671, start, end, later, &rules), Partial);
+        assert_eq!(live_coverage(77_760, start, end, later, &rules), Partial); // exactly 90%
+        assert_eq!(live_coverage(77_759, start, end, later, &rules), Thin);
         // Today at 06:00: 90% of the 6 hours so far is enough, and solid.
         let now = 6 * 3600;
-        assert_eq!(live_coverage(19_440, start, end, now), Solid);
-        assert_eq!(live_coverage(19_439, start, end, now), Thin);
+        assert_eq!(live_coverage(19_440, start, end, now, &rules), Solid);
+        assert_eq!(live_coverage(19_439, start, end, now, &rules), Thin);
         // A future day has nothing elapsed, so it never uses live.
-        assert_eq!(live_coverage(0, start, end, -1), Thin);
+        assert_eq!(live_coverage(0, start, end, -1, &rules), Thin);
     }
 
     /// Live totals for a day, with or without cloud data to fall back on.
@@ -1783,12 +1805,12 @@ mod tests {
     #[test]
     fn a_partial_live_day_gives_way_to_the_cloud_only_when_it_has_data() {
         // 95% live with cloud present: the cloud wins.
-        assert!(!totals(false).usable(true));
+        assert!(!totals(false).usable(&SourceRules::default(), true));
         // 95% live and no cloud: keep the live numbers, do not blank the day.
-        assert!(totals(false).usable(false));
+        assert!(totals(false).usable(&SourceRules::default(), false));
         // 99% live: live wins either way.
-        assert!(totals(true).usable(true));
-        assert!(totals(true).usable(false));
+        assert!(totals(true).usable(&SourceRules::default(), true));
+        assert!(totals(true).usable(&SourceRules::default(), false));
     }
 
     #[test]
@@ -1808,11 +1830,13 @@ mod tests {
                 .collect()
         };
         let (start, end, now) = (0, 86_400, 1_000_000);
-        let partial = live_totals(&samples(82_080), start, end, now).unwrap(); // 95%
+        let partial =
+            live_totals(&samples(82_080), start, end, now, &SourceRules::default()).unwrap(); // 95%
         assert!(!partial.solid);
-        let solid = live_totals(&samples(85_500), start, end, now).unwrap(); // 99%
+        let solid =
+            live_totals(&samples(85_500), start, end, now, &SourceRules::default()).unwrap(); // 99%
         assert!(solid.solid);
-        assert!(live_totals(&samples(70_000), start, end, now).is_none());
+        assert!(live_totals(&samples(70_000), start, end, now, &SourceRules::default()).is_none());
     }
 
     #[tokio::test]
@@ -2040,6 +2064,87 @@ mod tests {
             .unwrap();
         assert_eq!(cloud_day.source, "cloud");
         assert_eq!(cloud_day.import_kwh, Some(5.0));
+    }
+
+    /// A finished day with cloud data and live samples covering `covered_pct`
+    /// percent of it. Returns the day's source under the given rules.
+    async fn source_with_rules(covered_pct: i64, rules: SourceRules) -> &'static str {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let day = NaiveDate::parse_from_str("2026-10-19", "%Y-%m-%d").unwrap();
+        let (start, end) = day_bounds(day, ADELAIDE).unwrap();
+        db::seed_metrics(&pool, 7, &[(Metric::GridImportDayWh, start + 3600, 5000.0)]).await;
+        let covered_end = start + (end - start) * covered_pct / 100;
+        for ts in (start..covered_end).step_by(60) {
+            let sample = Sample {
+                ts,
+                pv_w: Some(0.0),
+                load_w: Some(1000.0),
+                grid_w: Some(1000.0),
+                battery_w: Some(0.0),
+                soc_pct: Some(50.0),
+            };
+            db::insert_live_sample(&pool, &sample).await.unwrap();
+        }
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate())
+            .unwrap()
+            .with_source_rules(rules);
+        let range = db::live_ts_range(&state.pool).await.unwrap();
+        day_totals(&state, day, range, end + 3600)
+            .await
+            .unwrap()
+            .source
+    }
+
+    #[tokio::test]
+    async fn source_rules_change_which_source_wins() {
+        let rules = |ids: &[&str], finished, partial| {
+            SourceRules::from_config(&crate::config::Sources {
+                daily_energy: Some(ids.iter().map(|id| id.to_string()).collect()),
+                finished_day_coverage: finished,
+                partial_day_coverage: partial,
+            })
+            .unwrap()
+        };
+        let live_first = ["sungrow-modbus", "isolarcloud"];
+        let cloud_first = ["isolarcloud", "sungrow-modbus"];
+        // Defaults: a fully covered day is live; at 95% it is only partial,
+        // so the cloud (which has data) wins.
+        assert_eq!(
+            source_with_rules(100, SourceRules::default()).await,
+            "inverter"
+        );
+        assert_eq!(source_with_rules(95, SourceRules::default()).await, "cloud");
+        // A lower finished-day bar makes 95% solid.
+        assert_eq!(
+            source_with_rules(95, rules(&live_first, Some(0.94), None)).await,
+            "inverter"
+        );
+        // A higher partial bar makes 95% thin even when it would be solid.
+        assert_eq!(
+            source_with_rules(95, rules(&live_first, Some(1.0), Some(0.97))).await,
+            "cloud"
+        );
+        // Cloud first: the cloud wins even over a fully covered live day.
+        assert_eq!(
+            source_with_rules(100, rules(&cloud_first, None, None)).await,
+            "cloud"
+        );
+        // Live only / cloud only.
+        assert_eq!(
+            source_with_rules(100, rules(&["sungrow-modbus"], None, None)).await,
+            "inverter"
+        );
+        assert_eq!(
+            source_with_rules(100, rules(&["isolarcloud"], None, None)).await,
+            "cloud"
+        );
+        // Live only, but too thin: there is no other source, so no figures.
+        let empty = source_with_rules(10, rules(&["sungrow-modbus"], None, None)).await;
+        assert_eq!(empty, "cloud");
     }
 
     fn totals_of(date: &str, pv: Option<f64>, import: Option<f64>) -> (NaiveDate, DayTotals) {
