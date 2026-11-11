@@ -2114,17 +2114,18 @@ mod tests {
         let (start, end) = day_bounds(day, ADELAIDE).unwrap();
         db::seed_metrics(&pool, 7, &[(Metric::GridImportDayWh, start + 3600, 5000.0)]).await;
         let covered_end = start + (end - start) * covered_pct / 100;
-        for ts in (start..covered_end).step_by(60) {
-            let sample = Sample {
-                ts,
-                pv_w: Some(0.0),
-                load_w: Some(1000.0),
-                grid_w: Some(1000.0),
-                battery_w: Some(0.0),
-                soc_pct: Some(50.0),
-            };
-            db::insert_live_sample(&pool, &sample).await.unwrap();
-        }
+        // One sample a minute, written in one statement: inserting them one by
+        // one made this the slowest test in the suite.
+        sqlx::query(
+            "INSERT INTO live_sample (ts, pv_w, load_w, grid_w, battery_w, soc_pct)
+             WITH RECURSIVE t(ts) AS (SELECT ?1 UNION ALL SELECT ts + 60 FROM t WHERE ts + 60 < ?2)
+             SELECT ts, 0.0, 1000.0, 1000.0, 0.0, 50.0 FROM t",
+        )
+        .bind(start)
+        .bind(covered_end)
+        .execute(&pool)
+        .await
+        .unwrap();
         let hash = super::super::hash_password("x").unwrap();
         let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate())
             .unwrap()
