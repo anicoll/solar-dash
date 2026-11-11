@@ -488,10 +488,6 @@ html[data-theme="night"] #page-today {
   font-weight: 700;
 }
 
-#page-today .today-price-note {
-  margin: 14px 0 0;
-}
-
 #page-today .today-price-sub {
   margin-top: 2px;
   font-size: 13px;
@@ -504,66 +500,168 @@ html[data-theme="night"] #page-today {
 #page-today .tone-neutral { background: var(--bar); }
 #page-today .tone-high { background: var(--peak); }
 #page-today .tone-spike { background: var(--missed); }
-#page-today .swatch[class*='tone-'],
-#page-today .pslot-dot {
+#page-today .swatch[class*='tone-'] {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 35%, transparent);
 }
 
-/* The forecast: one slot per stored interval, scrolling sideways on a phone. */
-#page-today .pslots-wrap {
+/* The timeline: 30-minute blocks, scrolling sideways on a phone. */
+#page-today .ptl-head {
+  margin-top: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+#page-today .ptl-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+#page-today .ptl-toggle {
+  display: flex;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+#page-today .ptl-toggle-btn {
+  min-height: 44px;
+  padding: 4px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+#page-today .ptl-toggle-btn[aria-pressed='true'] {
+  background: var(--ink);
+  color: var(--card);
+  font-weight: 700;
+}
+
+#page-today .ptl-wrap {
   margin: 8px -4px 0;
-  padding: 4px;
+  padding: 4px 4px 8px;
   overflow-x: auto;
   scrollbar-width: thin;
 }
 
-#page-today .pslots {
+#page-today .ptl {
   display: flex;
-  gap: 4px;
-  list-style: none;
-  margin: 0;
-  padding: 0;
+  gap: 6px;
   width: max-content;
 }
 
-#page-today .pslot {
+#page-today .ptl-block {
   box-sizing: border-box;
-  width: 58px;
-  padding: 6px 2px;
+  min-width: 72px;
+  min-height: 44px;
+  padding: 10px 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  border: 2px solid var(--line);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+#page-today .ptl-block.is-actual { opacity: 0.75; }
+#page-today .ptl-block.is-now { border-color: var(--ink); background: color-mix(in srgb, var(--ink) 10%, transparent); }
+#page-today .ptl-block.is-picked { box-shadow: 0 0 0 2px var(--ink); }
+#page-today .ptl-block:focus-visible,
+#page-today .ptl-toggle-btn:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+#page-today .ptl-time { font-size: 12px; font-weight: 600; white-space: nowrap; }
+#page-today .ptl-cents { font-size: 15px; font-weight: 700; }
+#page-today .ptl-ren { font-size: 11px; color: var(--ink-2); }
+#page-today .ptl-kind { font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); }
+
+#page-today .ptl-dot {
+  display: inline-block;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 35%, transparent);
+}
+
+/* The spike dot is square, so it does not rely on colour alone. */
+#page-today .ptl-dot.is-spike { border-radius: 5px; }
+#page-today .ptl-dot-sm { width: 10px; height: 10px; }
+#page-today .ptl-dot-sm.is-spike { border-radius: 2px; }
+#page-today .ptl-dot-empty { background: var(--line); box-shadow: none; }
+
+#page-today .ptl-detail {
+  margin-top: 8px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+#page-today .ptl-detail p { margin: 0; }
+
+#page-today .ptl-detail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+#page-today .ptl-detail-title { font-size: 15px; font-weight: 700; }
+#page-today .ptl-detail-line { font-size: 14px; }
+#page-today .ptl-detail-note { font-size: 12px; color: var(--ink-2); }
+
+#page-today .ptl-fives {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+#page-today .ptl-five {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  font-size: 13px;
+  padding: 8px 2px;
+  border-radius: 10px;
   font-variant-numeric: tabular-nums;
 }
 
-#page-today .pslot.is-now {
-  border-color: var(--ink);
-  box-shadow: 0 0 0 1px var(--ink);
-}
+#page-today .ptl-five.is-now { background: color-mix(in srgb, var(--ink) 10%, transparent); }
+#page-today .ptl-five.is-pending { opacity: 0.7; }
+#page-today .ptl-five-time { font-size: 11px; color: var(--ink-2); }
+#page-today .ptl-five-cents { font-size: 13px; font-weight: 700; }
 
-#page-today .pslot-time {
+#page-today .ptl-legend {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
   font-size: 12px;
   color: var(--ink-2);
-  white-space: nowrap;
 }
 
-#page-today .pslot-dot {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-}
-
-#page-today .pslot-cents {
-  font-weight: 700;
-}
-
-#page-today .pslot-ren {
-  font-size: 12px;
-  color: var(--ink-2);
+#page-today .ptl-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 /* ---------- coming up ---------- */
