@@ -801,7 +801,7 @@ fn default_encrypt() -> bool {
     true
 }
 
-fn default_points() -> Vec<i64> {
+pub(crate) fn default_points() -> Vec<i64> {
     vec![
         83033, 83067, 83106, 83328, 83326, 83252, 83022, 83102, 83072, 83118, 83322, 83323, 83097,
     ]

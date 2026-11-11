@@ -18,6 +18,25 @@ use crate::config::Amber;
 /// How much of an unexpected reply to quote in an error message.
 const SNIPPET_LEN: usize = 200;
 
+/// Amber answered 404: the site id is unknown, or the site is closed and no
+/// longer served. It is its own type so the price task can tell it apart from
+/// a passing failure (`err.downcast_ref::<NotFound>()`) and stop hammering.
+#[derive(Debug)]
+pub struct NotFound(pub String);
+
+impl fmt::Display for NotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Amber says {} was not found (HTTP 404): the site id is unknown, \
+             or the site is closed and Amber no longer serves it",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 /// A parsed reply plus the raw body it came from. The probe can save the raw
 /// text to use as a test fixture later.
 #[derive(Debug)]
@@ -157,10 +176,7 @@ fn check_status(
             "Amber rejected the token (HTTP 401). Check `token` in [amber]; \
              create a new one at https://app.amber.com.au/developers"
         ),
-        StatusCode::NOT_FOUND => anyhow!(
-            "Amber says {path} was not found (HTTP 404): the site id is unknown, \
-             or the site is closed and Amber no longer serves it"
-        ),
+        StatusCode::NOT_FOUND => anyhow::Error::new(NotFound(path.to_string())),
         StatusCode::TOO_MANY_REQUESTS => match retry_after {
             Some(wait) => anyhow!("Amber rate limit hit (HTTP 429); retry after {wait}"),
             None => anyhow!("Amber rate limit hit (HTTP 429); try again in a few minutes"),

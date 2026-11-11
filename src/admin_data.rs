@@ -46,6 +46,9 @@ pub struct AdminData {
     pub grid_pull_warn_kw: f64,
     /// Grid import (kW) the owner wants to stay under.
     pub grid_pull_limit_kw: f64,
+    /// Import price (c/kWh) above which the Today page calls the live price a
+    /// spike ("Peak"). At or below 0 it is "Free"; anything between is "Shoulder".
+    pub price_spike_cents: f64,
 }
 
 impl Default for AdminData {
@@ -63,12 +66,13 @@ impl Default for AdminData {
             bills: Arc::from([]),
             grid_pull_warn_kw: 12.0,
             grid_pull_limit_kw: 15.0,
+            price_spike_cents: 100.0,
         }
     }
 }
 
 /// The keys of the `setting` table. A missing key means its default.
-pub const SETTING_KEYS: [&str; 9] = [
+pub const SETTING_KEYS: [&str; 10] = [
     "petrol_cents_per_litre",
     "petrol_litres_per_100km",
     "away_cents_per_kwh",
@@ -78,6 +82,7 @@ pub const SETTING_KEYS: [&str; 9] = [
     "bill_start_day",
     "grid_pull_warn_kw",
     "grid_pull_limit_kw",
+    "price_spike_cents",
 ];
 
 /// The JSON kept in `tariff_plan.body`: the plan as in the config file, plus
@@ -324,6 +329,7 @@ pub fn apply_setting(data: &mut AdminData, key: &str, value: &Value) -> Result<(
         }
         "grid_pull_warn_kw" => data.grid_pull_warn_kw = positive()?,
         "grid_pull_limit_kw" => data.grid_pull_limit_kw = positive()?,
+        "price_spike_cents" => data.price_spike_cents = positive()?,
         _ => bail!("unknown setting {key:?}"),
     }
     Ok(())
@@ -465,6 +471,17 @@ mod tests {
         assert!(data.check_grid_pull().is_err());
         data.grid_pull_warn_kw = 15.0;
         assert!(data.check_grid_pull().is_err());
+    }
+
+    #[test]
+    fn price_spike_setting_defaults_to_100_and_must_be_positive() {
+        let mut data = AdminData::default();
+        assert_eq!(data.price_spike_cents, 100.0);
+        apply_setting(&mut data, "price_spike_cents", &json!(80.5)).unwrap();
+        assert_eq!(data.price_spike_cents, 80.5);
+        for bad in [json!(0), json!(-1), json!("100"), json!(null)] {
+            assert!(apply_setting(&mut data, "price_spike_cents", &bad).is_err());
+        }
     }
 
     async fn test_state() -> (tempfile::TempDir, AppState) {

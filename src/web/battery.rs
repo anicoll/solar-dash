@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
-use super::api::{ApiError, ApiResult, SOC_POINT, day_bounds_or_error, display_value, today};
+use super::api::{ApiError, ApiResult, day_bounds_or_error, today};
 use super::costs::{
     DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, cache_key, credit_override_kwh,
     day_intervals, is_cacheable, live_in, meter_for_day, meter_in, round2, slice_between,
@@ -28,6 +28,7 @@ use crate::cost::{self, Interval, Tariff, TariffSchedule, local_minute_of_day};
 use crate::db::{self, ChargeSession, GlobirdCostRow};
 use crate::ev_cost;
 use crate::globird::data::{Bucket, bucket_of, is_supply};
+use crate::metric::Metric;
 
 const DEFAULT_DAYS: u64 = 30;
 const MAX_DAYS: u64 = 92;
@@ -566,10 +567,10 @@ fn parse_days(text: Option<&str>) -> Result<u64, ApiError> {
     }
 }
 
-/// `(ts, value)` pairs of one point from `(point_id, ts, value)` rows.
-fn point_series(rows: &[(i64, i64, f64)], point_id: i64) -> Vec<(i64, f64)> {
+/// `(ts, value)` pairs of one metric from `(metric, ts, value)` rows.
+fn metric_series(rows: &[(Metric, i64, f64)], metric: Metric) -> Vec<(i64, f64)> {
     rows.iter()
-        .filter(|row| row.0 == point_id)
+        .filter(|row| row.0 == metric)
         .map(|row| (row.1, row.2))
         .collect()
 }
@@ -600,21 +601,18 @@ async fn compute_facts(
     let tz = state.tz;
     let range_start = day_bounds_or_error(dates[0], tz)?.0;
     let range_end = day_bounds_or_error(dates[dates.len() - 1], tz)?.1;
-    let rows = db::readings_for_points(
+    let rows = db::readings_for_metrics(
         &state.pool,
         state.plant_id,
-        &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER, SOC_POINT],
+        &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER, Metric::SocPct],
         range_start,
         range_end,
     )
     .await?;
-    let import = point_series(&rows, IMPORT_COUNTER);
-    let export = point_series(&rows, EXPORT_COUNTER);
-    let load = point_series(&rows, LOAD_COUNTER);
-    let cloud_soc: Vec<(i64, f64)> = point_series(&rows, SOC_POINT)
-        .into_iter()
-        .map(|(ts, value)| (ts, display_value(SOC_POINT, value)))
-        .collect();
+    let import = metric_series(&rows, IMPORT_COUNTER);
+    let export = metric_series(&rows, EXPORT_COUNTER);
+    let load = metric_series(&rows, LOAD_COUNTER);
+    let cloud_soc = metric_series(&rows, Metric::SocPct);
     let live_range = db::live_ts_range(&state.pool).await?;
     let meter = meter_in(&state.pool, range_start, range_end).await?;
 

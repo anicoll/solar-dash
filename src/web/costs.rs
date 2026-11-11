@@ -27,6 +27,7 @@ use crate::cost::{self, DayCost, GridSplit, Interval, Tariff, TariffSchedule};
 use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
 use crate::ev_cost::{self, CarDayTotals};
 use crate::globird::data::{self as globird_data, bucket_of, is_supply};
+use crate::metric::Metric;
 use crate::modbus::Sample;
 
 /// The whole history since Feb 2023 is about 1,000 days; this leaves room to grow.
@@ -39,9 +40,9 @@ pub(super) const MAX_GROUPED_COSTS_DAYS: u64 = 366 * 20;
 const LIVE_CHUNK_DAYS: usize = 31;
 
 /// The cloud counters (Wh, reset at local midnight) the cloud cost comes from.
-pub(super) const IMPORT_COUNTER: i64 = 83102;
-pub(super) const EXPORT_COUNTER: i64 = 83072;
-pub(super) const LOAD_COUNTER: i64 = 83118;
+pub(super) const IMPORT_COUNTER: Metric = Metric::GridImportDayWh;
+pub(super) const EXPORT_COUNTER: Metric = Metric::GridExportDayWh;
+pub(super) const LOAD_COUNTER: Metric = Metric::LoadDayWh;
 
 /// W·s in one kWh.
 const WS_PER_KWH: f64 = 3.6e6;
@@ -348,7 +349,7 @@ struct Counters {
 
 /// Reads the import, export and load counters in `[start, end)` with one query.
 async fn counters_in(pool: &SqlitePool, plant_id: i64, start: i64, end: i64) -> Result<Counters> {
-    let rows = db::readings_for_points(
+    let rows = db::readings_for_metrics(
         pool,
         plant_id,
         &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER],
@@ -356,9 +357,9 @@ async fn counters_in(pool: &SqlitePool, plant_id: i64, start: i64, end: i64) -> 
         end,
     )
     .await?;
-    let counter = |point_id: i64| -> Vec<(i64, f64)> {
+    let counter = |metric: Metric| -> Vec<(i64, f64)> {
         rows.iter()
-            .filter(|row| row.0 == point_id)
+            .filter(|row| row.0 == metric)
             .map(|row| (row.1, row.2))
             .collect()
     };

@@ -17,6 +17,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 
 use crate::cost::DayCost;
 use crate::globird::data::DayRecord;
+use crate::isolar::points;
+use crate::metric::Metric;
 use crate::modbus::{Sample, Settings};
 
 /// A measuring point (a kind of value, such as "battery power").
@@ -28,13 +30,24 @@ pub struct Point {
     pub unit: Option<String>,
 }
 
-/// One value of one point at one time.
+/// One value of one source point at one time, as iSolarCloud reports it.
+/// Ingest turns these into [`MetricReading`]s before they are stored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
     pub point_id: i64,
     /// Unix seconds, UTC.
     pub ts: i64,
     /// `None` when the API had no value for this time.
+    pub value: Option<f64>,
+}
+
+/// One value of one metric at one time, in the metric's own unit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricReading {
+    pub metric: Metric,
+    /// Unix seconds, UTC.
+    pub ts: i64,
+    /// `None` when the source had no value for this time.
     pub value: Option<f64>,
 }
 
@@ -113,17 +126,21 @@ pub async fn insert_point_if_missing(pool: &SqlitePool, point: &Point) -> Result
     Ok(())
 }
 
-/// Saves all readings in one transaction: either all of them are stored or none.
-/// Saving the same reading again just overwrites its value.
-pub async fn upsert_readings(pool: &SqlitePool, plant_id: i64, readings: &[Reading]) -> Result<()> {
+/// Saves all readings of one source in one transaction: either all of them
+/// are stored or none. Saving the same reading again just overwrites its value.
+pub async fn upsert_metric_readings(
+    pool: &SqlitePool,
+    source: &str,
+    readings: &[MetricReading],
+) -> Result<()> {
     let mut tx = pool.begin().await?;
     for r in readings {
         sqlx::query(
-            "INSERT INTO reading (plant_id, point_id, ts, value) VALUES (?, ?, ?, ?)
-             ON CONFLICT (plant_id, point_id, ts) DO UPDATE SET value = excluded.value",
+            "INSERT INTO metric_reading (source, metric, ts, value) VALUES (?, ?, ?, ?)
+             ON CONFLICT (source, metric, ts) DO UPDATE SET value = excluded.value",
         )
-        .bind(plant_id)
-        .bind(r.point_id)
+        .bind(source)
+        .bind(r.metric.name())
         .bind(r.ts)
         .bind(r.value)
         .execute(&mut *tx)
@@ -132,6 +149,23 @@ pub async fn upsert_readings(pool: &SqlitePool, plant_id: i64, readings: &[Readi
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Test helper: stores readings by metric for an iSolarCloud plant.
+/// `(metric, ts, value)` has the value in the metric's own unit.
+#[cfg(test)]
+pub async fn seed_metrics(pool: &SqlitePool, plant_id: i64, rows: &[(Metric, i64, f64)]) {
+    let readings: Vec<MetricReading> = rows
+        .iter()
+        .map(|&(metric, ts, value)| MetricReading {
+            metric,
+            ts,
+            value: Some(value),
+        })
+        .collect();
+    upsert_metric_readings(pool, &points::source(plant_id), &readings)
+        .await
+        .unwrap();
 }
 
 /// How far a sync job has got, or `None` if it has never run.
@@ -195,52 +229,33 @@ pub async fn api_calls_since(pool: &SqlitePool, since_ts: i64) -> Result<i64> {
     Ok(count)
 }
 
-/// The newest value of one point, with the point's name and unit.
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
-pub struct LatestReading {
-    pub point_id: i64,
-    pub name: Option<String>,
-    pub unit: Option<String>,
-    pub ts: i64,
-    pub value: f64,
-}
-
-/// The newest timestamp of any reading in the plant, or `None` if there are none.
-#[cfg(test)]
-pub async fn max_reading_ts(pool: &SqlitePool, plant_id: i64) -> Result<Option<i64>> {
-    // `MAX(ts) WHERE plant_id = ?` scans the whole plant, as the key is
-    // (plant_id, point_id, ts). Instead take each point's newest ts from the
-    // key, then the max of those. `MAX` gives NULL when there are none, hence `Option`.
-    let ts = sqlx::query_scalar(
-        "SELECT MAX((SELECT ts FROM reading r
-                     WHERE r.plant_id = ?1 AND r.point_id = p.point_id
-                     ORDER BY ts DESC LIMIT 1))
-         FROM point p",
-    )
-    .bind(plant_id)
-    .fetch_one(pool)
-    .await
-    .context("could not read newest timestamp")?;
-    Ok(ts)
-}
-
-/// For each point, its most recent reading that has a value.
-/// `CROSS JOIN` makes `point` the outer loop; otherwise SQLite scans the plant's readings.
-pub async fn latest_readings(pool: &SqlitePool, plant_id: i64) -> Result<Vec<LatestReading>> {
-    sqlx::query_as(
-        "SELECT p.point_id, p.name, p.unit, r.ts, r.value
-         FROM point p
-         CROSS JOIN reading r ON r.plant_id = ?1 AND r.point_id = p.point_id
-          AND r.ts = (SELECT ts FROM reading
-                      WHERE plant_id = ?1 AND point_id = p.point_id
-                        AND value IS NOT NULL
-                      ORDER BY ts DESC LIMIT 1)
-         ORDER BY p.point_id",
-    )
-    .bind(plant_id)
-    .fetch_all(pool)
-    .await
-    .context("could not read latest readings")
+/// The newest value of each metric that has one, as `(metric, ts, value)`.
+///
+/// The read helpers take the plant id and work out the `source` of its
+/// readings themselves (see `isolar::points::source`).
+pub async fn latest_metric_readings(
+    pool: &SqlitePool,
+    plant_id: i64,
+) -> Result<Vec<(Metric, i64, f64)>> {
+    let source = points::source(plant_id);
+    let mut out = Vec::new();
+    // One lookup per metric, each answered from the (source, metric, ts) key.
+    for metric in Metric::ALL {
+        let newest: Option<(i64, f64)> = sqlx::query_as(
+            "SELECT ts, value FROM metric_reading
+             WHERE source = ? AND metric = ? AND value IS NOT NULL
+             ORDER BY ts DESC LIMIT 1",
+        )
+        .bind(&source)
+        .bind(metric.name())
+        .fetch_optional(pool)
+        .await
+        .context("could not read latest readings")?;
+        if let Some((ts, value)) = newest {
+            out.push((metric, ts, value));
+        }
+    }
+    Ok(out)
 }
 
 /// Name and unit of a point, or `None` if the point is unknown.
@@ -255,22 +270,23 @@ pub async fn point_info(
         .context("could not read point")
 }
 
-/// The `(ts, value)` pairs of one point with `from <= ts < to`, oldest first.
-/// Rows without a value are left out.
+/// The `(ts, value)` pairs of one metric with `from <= ts < to`, oldest first,
+/// in the metric's own unit. Rows without a value are left out.
 pub async fn readings_in_range(
     pool: &SqlitePool,
     plant_id: i64,
-    point_id: i64,
+    metric: Metric,
     from: i64,
     to: i64,
 ) -> Result<Vec<(i64, f64)>> {
+    let source = points::source(plant_id);
     sqlx::query_as(
-        "SELECT ts, value FROM reading
-         WHERE plant_id = ? AND point_id = ? AND ts >= ? AND ts < ? AND value IS NOT NULL
+        "SELECT ts, value FROM metric_reading
+         WHERE source = ? AND metric = ? AND ts >= ? AND ts < ? AND value IS NOT NULL
          ORDER BY ts",
     )
-    .bind(plant_id)
-    .bind(point_id)
+    .bind(&source)
+    .bind(metric.name())
     .bind(from)
     .bind(to)
     .fetch_all(pool)
@@ -278,51 +294,57 @@ pub async fn readings_in_range(
     .context("could not read readings")
 }
 
-/// The `(point_id, ts, value)` rows of several points with `from <= ts < to`,
-/// ordered by point and then time. One query for all of them, so a long range
-/// does not cost a query per day. Rows without a value are left out.
-pub async fn readings_for_points(
+/// The `(metric, ts, value)` rows of several metrics with `from <= ts < to`,
+/// ordered by metric name and then time. One query for all of them, so a long
+/// range does not cost a query per day. Rows without a value are left out.
+pub async fn readings_for_metrics(
     pool: &SqlitePool,
     plant_id: i64,
-    point_ids: &[i64],
+    metrics: &[Metric],
     from: i64,
     to: i64,
-) -> Result<Vec<(i64, i64, f64)>> {
-    // `QueryBuilder` adds the `?` for each point id, so no value is pasted into the SQL.
+) -> Result<Vec<(Metric, i64, f64)>> {
+    let source = points::source(plant_id);
+    // `QueryBuilder` adds the `?` for each metric, so no value is pasted into the SQL.
     let mut query =
-        sqlx::QueryBuilder::new("SELECT point_id, ts, value FROM reading WHERE plant_id = ");
-    query.push_bind(plant_id).push(" AND point_id IN (");
-    let mut ids = query.separated(", ");
-    for point_id in point_ids {
-        ids.push_bind(point_id);
+        sqlx::QueryBuilder::new("SELECT metric, ts, value FROM metric_reading WHERE source = ");
+    query.push_bind(&source).push(" AND metric IN (");
+    let mut names = query.separated(", ");
+    for metric in metrics {
+        names.push_bind(metric.name());
     }
     query
         .push(") AND ts >= ")
         .push_bind(from)
         .push(" AND ts < ")
         .push_bind(to)
-        .push(" AND value IS NOT NULL ORDER BY point_id, ts");
-    query
+        .push(" AND value IS NOT NULL ORDER BY metric, ts");
+    let rows: Vec<(String, i64, f64)> = query
         .build_query_as()
         .fetch_all(pool)
         .await
-        .context("could not read readings")
+        .context("could not read readings")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(name, ts, value)| Some((Metric::from_name(&name)?, ts, value)))
+        .collect())
 }
 
-/// The largest value of one point with `from <= ts < to`, or `None` if there is none.
+/// The largest value of one metric with `from <= ts < to`, or `None` if there is none.
 pub async fn max_value_in_range(
     pool: &SqlitePool,
     plant_id: i64,
-    point_id: i64,
+    metric: Metric,
     from: i64,
     to: i64,
 ) -> Result<Option<f64>> {
+    let source = points::source(plant_id);
     let max = sqlx::query_scalar(
-        "SELECT MAX(value) FROM reading
-         WHERE plant_id = ? AND point_id = ? AND ts >= ? AND ts < ?",
+        "SELECT MAX(value) FROM metric_reading
+         WHERE source = ? AND metric = ? AND ts >= ? AND ts < ?",
     )
-    .bind(plant_id)
-    .bind(point_id)
+    .bind(&source)
+    .bind(metric.name())
     .bind(from)
     .bind(to)
     .fetch_one(pool)
@@ -532,22 +554,24 @@ pub async fn live_ts_range(pool: &SqlitePool) -> Result<Option<(i64, i64)>> {
     Ok(min.zip(max))
 }
 
-/// The oldest reading of any of `point_ids`, or `None` if there is none.
+/// The oldest reading of any of `metrics`, or `None` if there is none.
 pub async fn first_reading_ts(
     pool: &SqlitePool,
     plant_id: i64,
-    point_ids: &[i64],
+    metrics: &[Metric],
 ) -> Result<Option<i64>> {
+    let source = points::source(plant_id);
     let mut first: Option<i64> = None;
-    // One lookup per point, each answered from the (plant, point, ts) key.
-    for &point_id in point_ids {
-        let ts: Option<i64> =
-            sqlx::query_scalar("SELECT MIN(ts) FROM reading WHERE plant_id = ? AND point_id = ?")
-                .bind(plant_id)
-                .bind(point_id)
-                .fetch_one(pool)
-                .await
-                .context("could not read the first reading")?;
+    // One lookup per metric, each answered from the (source, metric, ts) key.
+    for &metric in metrics {
+        let ts: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(ts) FROM metric_reading WHERE source = ? AND metric = ?",
+        )
+        .bind(&source)
+        .bind(metric.name())
+        .fetch_one(pool)
+        .await
+        .context("could not read the first reading")?;
         first = match (first, ts) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1546,11 +1570,11 @@ mod tests {
         }
     }
 
-    fn reading(point_id: i64, ts: i64, value: f64) -> Reading {
-        Reading {
-            point_id,
+    fn metric_reading(ts: i64, value: Option<f64>) -> MetricReading {
+        MetricReading {
+            metric: Metric::PvW,
             ts,
-            value: Some(value),
+            value,
         }
     }
 
@@ -1562,12 +1586,85 @@ mod tests {
              ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session',
               'ev_odometer_daily', 'globird_cost', 'globird_usage', 'globird_interval',
               'tm_car', 'tm_drive_daily', 'tm_charge', 'manual_car', 'fuel_fill',
-              'tm_car_owned', 'daily_battery')",
+              'tm_car_owned', 'daily_battery', 'metric_reading')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 17);
+        assert_eq!(tables.len(), 18);
+    }
+
+    /// Migration 0019 copies `reading` into `metric_reading` in SQL. It has its
+    /// own copy of the point mapping, so this checks it against `isolar::points`.
+    #[tokio::test]
+    async fn migration_copies_mapped_readings_into_metric_reading() {
+        let (_dir, pool) = test_db().await;
+        // Go back to just before 0019: forget it ran and drop its table.
+        sqlx::query("DROP TABLE metric_reading")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 19")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Every mapped point for two plants, a point the mapping does not
+        // know, and a reading with no value. The value is the point id / 1000.
+        let unknown = 99_999;
+        let mut ids: Vec<i64> = points::POINTS.iter().map(|p| p.point_id).collect();
+        ids.push(unknown);
+        for &id in &ids {
+            upsert_point(&pool, &point(id)).await.unwrap();
+            for plant in [7, 8] {
+                for (ts, value) in [(100, Some(id as f64 / 1000.0)), (200, None)] {
+                    sqlx::query(
+                        "INSERT INTO reading (plant_id, point_id, ts, value) VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(plant)
+                    .bind(id)
+                    .bind(ts)
+                    .bind(value)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+
+        migrate(&pool).await.unwrap();
+
+        // 13 mapped points x 2 plants x 2 readings; the unknown point is left out.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metric_reading")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 13 * 2 * 2);
+        for map in points::POINTS {
+            for plant in [7, 8] {
+                let rows = readings_in_range(&pool, plant, map.metric, 0, 1000)
+                    .await
+                    .unwrap();
+                // The NULL at 200 is skipped by the reader; the value at 100 is scaled.
+                assert_eq!(rows.len(), 1, "{}", map.metric.name());
+                assert_eq!(rows[0].0, 100);
+                let want = map.point_id as f64 / 1000.0 * map.scale;
+                assert!((rows[0].1 - want).abs() < 1e-9, "{}", map.metric.name());
+            }
+        }
+        // The NULL value was copied as NULL, not dropped.
+        let nulls: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM metric_reading WHERE value IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(nulls, 13 * 2);
+        // The old table is untouched.
+        let old: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reading")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(old, 14 * 2 * 2);
     }
 
     #[tokio::test]
@@ -1724,25 +1821,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_readings_is_idempotent_and_updates() {
+    async fn upsert_metric_readings_is_idempotent_and_updates() {
         let (_dir, pool) = test_db().await;
-        upsert_point(&pool, &point(1)).await.unwrap();
-
-        let first = [reading(1, 100, 1.5), reading(1, 200, 2.5)];
-        upsert_readings(&pool, 7, &first).await.unwrap();
-        upsert_readings(&pool, 7, &first).await.unwrap();
-
-        // Same key (plant 7, point 1, ts 100) with a new value.
-        upsert_readings(&pool, 7, &[reading(1, 100, 9.0)])
+        let first = [
+            metric_reading(100, Some(1.5)),
+            metric_reading(200, Some(2.5)),
+        ];
+        upsert_metric_readings(&pool, "isolarcloud:7", &first)
+            .await
+            .unwrap();
+        upsert_metric_readings(&pool, "isolarcloud:7", &first)
             .await
             .unwrap();
 
-        let rows: Vec<(i64, Option<f64>)> =
-            sqlx::query_as("SELECT ts, value FROM reading ORDER BY ts")
+        // Same key (a source, pv_w, ts 100) with a new value; another source is separate.
+        upsert_metric_readings(&pool, "isolarcloud:7", &[metric_reading(100, Some(9.0))])
+            .await
+            .unwrap();
+        upsert_metric_readings(&pool, "isolarcloud:8", &[metric_reading(100, Some(7.0))])
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, i64, Option<f64>)> =
+            sqlx::query_as("SELECT source, ts, value FROM metric_reading ORDER BY source, ts")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(rows, vec![(100, Some(9.0)), (200, Some(2.5))]);
+        assert_eq!(
+            rows,
+            vec![
+                ("isolarcloud:7".to_string(), 100, Some(9.0)),
+                ("isolarcloud:7".to_string(), 200, Some(2.5)),
+                ("isolarcloud:8".to_string(), 100, Some(7.0)),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1767,14 +1879,6 @@ mod tests {
                 .unwrap();
         assert_eq!(names.len(), 2);
         assert_eq!(names[0].as_deref(), Some("Real name"));
-    }
-
-    #[tokio::test]
-    async fn reading_needs_a_known_point() {
-        let (_dir, pool) = test_db().await;
-        // Foreign keys are on, so point 99 must exist first.
-        let result = upsert_readings(&pool, 7, &[reading(99, 100, 1.0)]).await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1824,62 +1928,74 @@ mod tests {
     #[tokio::test]
     async fn range_queries_read_back_readings() {
         let (_dir, pool) = test_db().await;
-        upsert_point(&pool, &point(1)).await.unwrap();
-        let null_reading = Reading {
-            point_id: 1,
-            ts: 300,
-            value: None,
-        };
-        let rows = [reading(1, 100, 1.0), reading(1, 200, 5.0), null_reading];
-        upsert_readings(&pool, 7, &rows).await.unwrap();
+        let rows = [
+            metric_reading(100, Some(1.0)),
+            metric_reading(200, Some(5.0)),
+            metric_reading(300, None),
+        ];
+        upsert_metric_readings(&pool, &points::source(7), &rows)
+            .await
+            .unwrap();
+        // Another source's reading must not leak in.
+        upsert_metric_readings(
+            &pool,
+            &points::source(8),
+            &[metric_reading(150, Some(99.0))],
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(max_reading_ts(&pool, 7).await.unwrap(), Some(300));
-        assert_eq!(max_reading_ts(&pool, 8).await.unwrap(), None);
         // The end is exclusive and NULL values are skipped.
-        let got = readings_in_range(&pool, 7, 1, 100, 300).await.unwrap();
+        let got = readings_in_range(&pool, 7, Metric::PvW, 100, 300)
+            .await
+            .unwrap();
         assert_eq!(got, vec![(100, 1.0), (200, 5.0)]);
+        let max = |from, to| max_value_in_range(&pool, 7, Metric::PvW, from, to);
+        assert_eq!(max(0, 1000).await.unwrap(), Some(5.0));
+        assert_eq!(max(0, 100).await.unwrap(), None);
         assert_eq!(
-            max_value_in_range(&pool, 7, 1, 0, 1000).await.unwrap(),
-            Some(5.0)
+            first_reading_ts(&pool, 7, &[Metric::LoadW, Metric::PvW])
+                .await
+                .unwrap(),
+            Some(100)
         );
-        assert_eq!(max_value_in_range(&pool, 7, 1, 0, 100).await.unwrap(), None);
-
-        // The newest reading that has a value is 200, not the NULL at 300.
-        let latest = latest_readings(&pool, 7).await.unwrap();
-        assert_eq!(latest.len(), 1);
-        assert_eq!((latest[0].ts, latest[0].value), (200, 5.0));
-        assert_eq!(latest[0].name.as_deref(), Some("Power"));
+        assert_eq!(
+            first_reading_ts(&pool, 7, &[Metric::LoadW]).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
-    async fn newest_queries_span_several_points() {
+    async fn several_metrics_are_read_in_one_query() {
         let (_dir, pool) = test_db().await;
-        for id in 1..=3 {
-            upsert_point(&pool, &point(id)).await.unwrap();
-        }
-        let null_reading = Reading {
-            point_id: 2,
-            ts: 500,
-            value: None,
+        let at = |metric, ts, value| MetricReading {
+            metric,
+            ts,
+            value: Some(value),
         };
         let rows = [
-            reading(1, 100, 1.0),
-            reading(1, 400, 2.0),
-            reading(2, 200, 3.0),
-            null_reading,
-            reading(3, 300, 4.0),
+            at(Metric::PvW, 100, 1.0),
+            at(Metric::LoadW, 100, 2.0),
+            at(Metric::SocPct, 100, 67.4),
+            at(Metric::SocPct, 400, 60.0),
+            at(Metric::GridW, 100, 3.0),
         ];
-        upsert_readings(&pool, 7, &rows).await.unwrap();
-        // Another plant's newer reading must not leak in.
-        upsert_readings(&pool, 8, &[reading(1, 900, 9.0)])
+        upsert_metric_readings(&pool, &points::source(7), &rows)
             .await
             .unwrap();
+        let got = readings_for_metrics(&pool, 7, &[Metric::PvW, Metric::SocPct], 0, 300)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![(Metric::PvW, 100, 1.0), (Metric::SocPct, 100, 67.4)]
+        );
 
-        // The newest ts is on point 2 (a NULL value), not the last point.
-        assert_eq!(max_reading_ts(&pool, 7).await.unwrap(), Some(500));
-        let latest = latest_readings(&pool, 7).await.unwrap();
-        let got: Vec<_> = latest.iter().map(|l| (l.point_id, l.ts, l.value)).collect();
-        assert_eq!(got, vec![(1, 400, 2.0), (2, 200, 3.0), (3, 300, 4.0)]);
+        // The newest value of each metric with data; the other source has none.
+        let latest = latest_metric_readings(&pool, 7).await.unwrap();
+        assert_eq!(latest.len(), 4);
+        assert!(latest.contains(&(Metric::SocPct, 400, 60.0)));
+        assert!(latest_metric_readings(&pool, 8).await.unwrap().is_empty());
     }
 
     fn sample(ts: i64, pv_w: f64) -> Sample {

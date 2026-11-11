@@ -10,8 +10,8 @@
   // A longer gap between inverter minutes breaks the line.
   const LIVE_GAP_SECS = 3 * 60;
 
-  // Points shown on the Now tab (see config.example.toml).
-  const P_PV = 83033, P_LOAD = 83106, P_SOC = 83252;
+  // Metrics shown on the Now tab (the names /api/latest reports).
+  const M_PV = 'pv_w', M_LOAD = 'load_w', M_SOC = 'soc_pct';
 
   // ---------- small helpers ----------
 
@@ -760,22 +760,22 @@
   }
 
   function renderCloudTiles(latest) {
-    const byId = {};
-    for (const p of latest.points) byId[p.point_id] = p;
-    const watt = (id) => {
-      const p = byId[id];
+    const byMetric = {};
+    for (const p of latest.points) byMetric[p.metric] = p;
+    const watt = (metric) => {
+      const p = byMetric[metric];
       if (!p || p.value == null) return null;
       return p.unit === 'kW' ? p.value * 1000 : p.value;
     };
-    const pv = watt(P_PV), load = watt(P_LOAD);
-    const soc = byId[P_SOC] && byId[P_SOC].value;
+    const pv = watt(M_PV), load = watt(M_LOAD);
+    const soc = byMetric[M_SOC] && byMetric[M_SOC].value;
     $('live-tiles').replaceChildren(
       powerTile('Solar', pv == null ? '–' : kw(pv), 'kW', '--c-pv'),
       powerTile('Home', load == null ? '–' : kw(load), 'kW', '--c-load'),
       powerTile('Battery charge', soc == null ? '–' : String(Math.round(soc)), '%', '--c-battery',
         soc == null ? null : socBar(soc)),
     );
-    const ts = Math.max(0, ...[P_PV, P_LOAD, P_SOC].map((id) => (byId[id] ? byId[id].ts : 0)));
+    const ts = Math.max(0, ...[M_PV, M_LOAD, M_SOC].map((m) => (byMetric[m] ? byMetric[m].ts : 0)));
     setStatus(ts
       ? `From iSolarCloud · updated ${ageText(Date.now() / 1000 - ts)} (${fmtLong.format(new Date(ts * 1000))})`
       : 'No readings yet', true);

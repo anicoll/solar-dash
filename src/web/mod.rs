@@ -12,6 +12,7 @@ mod globird;
 mod home_mix;
 mod payback;
 mod petrol;
+mod prices;
 
 pub(crate) use costs::house_intervals;
 
@@ -368,6 +369,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/backup", get(admin::backup_info))
         .route("/api/admin/backup/download", get(admin::backup_download))
         .route("/api/series", get(api::series))
+        .route("/api/prices", get(prices::prices))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
         .route("/api/battery", get(battery::battery))
@@ -633,7 +635,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::db::{self, Point, Reading};
+    use crate::db::{self, Point};
+    use crate::metric::Metric;
     use crate::modbus::Sample;
     use crate::teslamate::CarState;
 
@@ -647,6 +650,11 @@ mod tests {
     }
 
     /// Like `test_app`, but also gives back the pool, for seeding more rows.
+    /// The source's id for [`Metric::PvW`], for the tests of the point-id API.
+    fn pv_point_id() -> i64 {
+        crate::isolar::points::for_metric(Metric::PvW).point_id
+    }
+
     async fn test_app_with_pool() -> (tempfile::TempDir, Router, SqlitePool) {
         test_app_with_options(true).await
     }
@@ -656,21 +664,18 @@ mod tests {
         let pool = db::open(dir.path().join("test.db").to_str().unwrap())
             .await
             .unwrap();
+        // The point's name and unit still come from the `point` table.
         let point = Point {
-            point_id: 83033,
+            point_id: pv_point_id(),
             code: None,
             name: Some("Plant power".to_string()),
             unit: Some("W".to_string()),
         };
         db::upsert_point(&pool, &point).await.unwrap();
-        let readings: Vec<Reading> = (0..3)
-            .map(|i| Reading {
-                point_id: 83033,
-                ts: 1_800_000_000 + i * 300,
-                value: Some(1000.0 + i as f64),
-            })
+        let readings: Vec<_> = (0..3)
+            .map(|i| (Metric::PvW, 1_800_000_000 + i * 300, 1000.0 + i as f64))
             .collect();
-        db::upsert_readings(&pool, PLANT, &readings).await.unwrap();
+        db::seed_metrics(&pool, PLANT, &readings).await;
 
         let hash = hash_password(PASSWORD).unwrap();
         let tz = chrono_tz::Australia::Adelaide;
@@ -1017,7 +1022,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let point = &json["points"][0];
-        assert_eq!(point["point_id"], 83033);
+        assert_eq!(point["metric"], "pv_w");
+        assert_eq!(point["point_id"], pv_point_id());
         assert_eq!(point["name"], "Plant power");
         assert_eq!(point["unit"], "W");
         assert_eq!(point["ts"], 1_800_000_600);
@@ -1317,8 +1323,12 @@ mod tests {
         let bad = [
             "/api/series",
             "/api/series?points=abc&from=1&to=2",
-            "/api/series?points=83033&from=2&to=1",
-            "/api/series?points=83033&from=0&to=2678401",
+            "/api/series?metrics=nope&from=1&to=2",
+            "/api/series?metrics=&from=1&to=2",
+            "/api/series?metrics=pv_w&points=1&from=1&to=2",
+            "/api/series?metrics=pv_w&from=2&to=1",
+            &format!("/api/series?points={}&from=2&to=1", pv_point_id()),
+            &format!("/api/series?points={}&from=0&to=2678401", pv_point_id()),
             "/api/series?points=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21&from=1&to=2",
             "/api/daily?from=2026-01-01&to=2027-12-31",
             "/api/day?date=yesterday",
@@ -1329,14 +1339,101 @@ mod tests {
             assert!(body_json(response).await["error"].is_string(), "{uri}");
         }
 
-        let uri = "/api/series?points=83033&from=1800000000&to=1800000300";
+        // By metric name.
+        let uri = "/api/series?metrics=pv_w,load_w&from=1800000000&to=1800000300";
         let response = send(&app, get_request(uri, Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
+        assert!(json.get("deprecated").is_none());
         let series = &json["series"][0];
-        assert_eq!(series["point_id"], 83033);
+        assert_eq!(series["metric"], "pv_w");
         assert_eq!(series["data"].as_array().unwrap().len(), 2);
         assert_eq!(series["data"][1][1], 1001.0);
+        // A metric with no readings is an empty series, not an error.
+        assert_eq!(json["series"][1]["metric"], "load_w");
+        assert_eq!(json["series"][1]["data"], serde_json::json!([]));
+
+        // By point id: still accepted for one release, and says it is deprecated.
+        let uri = format!(
+            "/api/series?points={}&from=1800000000&to=1800000300",
+            pv_point_id()
+        );
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(json["deprecated"].is_string());
+        let series = &json["series"][0];
+        assert_eq!(series["point_id"], pv_point_id());
+        assert_eq!(series["metric"], "pv_w");
+        assert_eq!(series["data"].as_array().unwrap().len(), 2);
+        assert_eq!(series["data"][1][1], 1001.0);
+    }
+
+    #[tokio::test]
+    async fn prices_are_grouped_by_channel_with_the_current_one() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        let now = chrono::Utc::now().timestamp();
+        let slot = now - now % 300;
+        let row = |channel: &str, start: i64, cents: f64, kind: &str| {
+            let pool = pool.clone();
+            let channel = channel.to_string();
+            let kind = kind.to_string();
+            async move {
+                sqlx::query(
+                    "INSERT INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, 5.0, ?, 0)",
+                )
+                .bind(channel)
+                .bind(start)
+                .bind(start + 300)
+                .bind(cents)
+                .bind(kind)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        row("general", slot - 300, 20.0, "actual").await;
+        row("general", slot, 25.5, "current").await;
+        row("general", slot + 300, 30.0, "forecast").await;
+        row("feed_in", slot, -3.0, "current").await;
+
+        // Prices need the login like the other /api routes.
+        let uri = format!("/api/prices?from={}&to={}", slot - 600, slot + 900);
+        let response = send(&app, get_request(&uri, None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let general = json["channels"]["general"].as_array().unwrap();
+        assert_eq!(general.len(), 3);
+        assert_eq!(general[0]["kind"], "actual");
+        assert_eq!(general[0]["start"], slot - 300);
+        assert_eq!(general[2]["cents"], 30.0);
+        assert_eq!(general[1]["spot_cents"], 5.0);
+        assert_eq!(json["channels"]["feed_in"][0]["cents"], -3.0);
+        assert_eq!(json["now"]["general"]["cents"], 25.5);
+        assert_eq!(json["now"]["general"]["kind"], "current");
+        assert_eq!(json["spike_cents"], 100.0);
+        assert_eq!(json["now"]["feed_in"]["cents"], -3.0);
+        assert!(json["now"].get("controlled_load").is_none());
+        // An unknown source has nothing, in the range or right now.
+        // A range with nothing in it still gives `now`; an unknown source is empty.
+        let uri = "/api/prices?from=0&to=10&source=amber:other";
+        let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+        assert_eq!(json["channels"], serde_json::json!({}));
+        assert_eq!(json["now"], serde_json::json!({}));
+
+        for bad in [
+            "/api/prices",
+            "/api/prices?from=2&to=1",
+            "/api/prices?from=0&to=2678401",
+            "/api/prices?from=a&to=1",
+        ] {
+            let response = send(&app, get_request(bad, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 
     #[tokio::test]
@@ -2207,16 +2304,6 @@ mod tests {
         let pool = db::open(dir.path().join("test.db").to_str().unwrap())
             .await
             .unwrap();
-        // Readings need their points to exist first.
-        for point_id in [83102, 83072, 83118, 83323] {
-            let point = Point {
-                point_id,
-                code: None,
-                name: None,
-                unit: Some("Wh".to_string()),
-            };
-            db::upsert_point(&pool, &point).await.unwrap();
-        }
         let app = costs_router(&pool, flat_tariff());
         (dir, app, pool)
     }
@@ -2325,16 +2412,16 @@ mod tests {
         // Import 1 kWh, export 2 kWh and load 4 kWh, each reached by 01:00 and
         // then flat. A neighbouring day without data is left out.
         let mut readings = Vec::new();
-        for (point_id, wh) in [(83102, 1000.0), (83072, 2000.0), (83118, 4000.0)] {
+        for (metric, wh) in [
+            (Metric::GridImportDayWh, 1000.0),
+            (Metric::GridExportDayWh, 2000.0),
+            (Metric::LoadDayWh, 4000.0),
+        ] {
             for ts in [SEP_15_START + 3600, SEP_15_START + 3900] {
-                readings.push(Reading {
-                    point_id,
-                    ts,
-                    value: Some(wh),
-                });
+                readings.push((metric, ts, wh));
             }
         }
-        db::upsert_readings(&pool, PLANT, &readings).await.unwrap();
+        db::seed_metrics(&pool, PLANT, &readings).await;
 
         let uri = "/api/costs?from=2026-09-14&to=2026-09-16";
         let response = send(&app, get_request(uri, Some(&cookie))).await;
@@ -2400,12 +2487,8 @@ mod tests {
             db::insert_live_sample(&pool, &sample).await.unwrap();
         }
         // Cloud numbers for the same day must be ignored.
-        let reading = Reading {
-            point_id: 83102,
-            ts: SEP_15_START + 3600,
-            value: Some(99_000.0),
-        };
-        db::upsert_readings(&pool, PLANT, &[reading]).await.unwrap();
+        let reading = (Metric::GridImportDayWh, SEP_15_START + 3600, 99_000.0);
+        db::seed_metrics(&pool, PLANT, &[reading]).await;
 
         let uri = "/api/costs?from=2026-09-15&to=2026-09-15";
         let response = send(&app, get_request(uri, Some(&cookie))).await;
@@ -2425,16 +2508,16 @@ mod tests {
     /// load four times that, all at each offset (seconds after `day_start`).
     async fn seed_counters(pool: &SqlitePool, day_start: i64, offsets: &[i64], import_wh: f64) {
         let mut readings = Vec::new();
-        for (point_id, factor) in [(83102, 1.0), (83072, 2.0), (83118, 4.0)] {
+        for (metric, factor) in [
+            (Metric::GridImportDayWh, 1.0),
+            (Metric::GridExportDayWh, 2.0),
+            (Metric::LoadDayWh, 4.0),
+        ] {
             for offset in offsets {
-                readings.push(Reading {
-                    point_id,
-                    ts: day_start + offset,
-                    value: Some(import_wh * factor),
-                });
+                readings.push((metric, day_start + offset, import_wh * factor));
             }
         }
-        db::upsert_readings(pool, PLANT, &readings).await.unwrap();
+        db::seed_metrics(pool, PLANT, &readings).await;
     }
 
     #[tokio::test]
@@ -2518,7 +2601,7 @@ mod tests {
 
         // Wipe the source data and give today new numbers. The finished day
         // can only be answered from the cache; today must be worked out again.
-        sqlx::query("DELETE FROM reading")
+        sqlx::query("DELETE FROM metric_reading")
             .execute(&pool)
             .await
             .unwrap();
@@ -2546,7 +2629,7 @@ mod tests {
         // The row was replaced, not added.
         assert_eq!(stored_days(&pool).await, 1);
         // And the original tariff does not see the replaced row as its own.
-        sqlx::query("DELETE FROM reading")
+        sqlx::query("DELETE FROM metric_reading")
             .execute(&pool)
             .await
             .unwrap();
@@ -3189,12 +3272,14 @@ mod tests {
         // One finished day saving 85 c (see `costs_for_a_cloud_day`), with
         // 11.5 kWh discharged.
         seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
-        let discharge = [3600, LAST_READING].map(|offset| Reading {
-            point_id: 83323,
-            ts: SEP_15_START + offset,
-            value: Some(11_500.0),
+        let discharge = [3600, LAST_READING].map(|offset| {
+            (
+                Metric::BatteryDischargeDayWh,
+                SEP_15_START + offset,
+                11_500.0,
+            )
         });
-        db::upsert_readings(&pool, PLANT, &discharge).await.unwrap();
+        db::seed_metrics(&pool, PLANT, &discharge).await;
         let with_battery = |date: &str, cost: f64, kwh: f64| Purchase {
             battery_kwh: Some(kwh),
             ..solar_purchase(date, cost)
@@ -3803,15 +3888,6 @@ mod tests {
 
         // No plan yet: only the new cost is known. Import 1 kWh and export
         // 2 kWh on 15 September (100 + 30 - 10 = 120 c).
-        for point_id in [83102, 83072, 83118] {
-            let point = Point {
-                point_id,
-                code: None,
-                name: None,
-                unit: Some("Wh".to_string()),
-            };
-            db::upsert_point(&pool, &point).await.unwrap();
-        }
         seed_counters(&pool, SEP_15_START, &[3600, 3900], 1000.0).await;
         let (status, json) = admin_send(&app, "POST", preview, &cookie, PLAN).await;
         assert_eq!(status, StatusCode::OK);

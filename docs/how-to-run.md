@@ -207,9 +207,9 @@ answers 401). Times are unix seconds (UTC), dates are local dates in your
 | Endpoint | Returns |
 | --- | --- |
 | `GET /healthz` | `{"ok":true}` (public) |
-| `GET /api/latest` | The newest value of every point, with its name and unit |
-| `GET /api/series?points=83033,83106&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per point. At most 20 points and 31 days |
-| `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w` |
+| `GET /api/latest` | The newest value of every metric that has one, as `{"points":[{metric,unit,ts,value,name,point_id},...]}`. `metric` is the [metric name](#metric-names) (`pv_w`, `soc_pct`, ...). `point_id` is deprecated (see below) |
+| `GET /api/series?metrics=pv_w,load_w&from=<unix>&to=<unix>` | Raw `[ts, value]` pairs per metric, as `{"series":[{metric,data,...}]}`. At most 20 metrics and 31 days. `points=<id>,<id>` (numeric iSolarCloud point ids) is deprecated: it still works for one more release, and the answer then has a `deprecated` note. Use `metrics` or `points`, not both |
+| `GET /api/day?date=YYYY-MM-DD` | One local day (default today), with its `start` and `end` as unix seconds: PV, load and battery % plus grid and battery power worked out from the energy counters. Every series has a `key` such as `pv_w` or `grid_import_w`, and the stored ones also a `metric` |
 | `GET /api/live` | `{"sample": {ts,pv_w,load_w,grid_w,battery_w,soc_pct}, "car": {...}, "grid_pull": {...}}`. `sample` is from Modbus, or `null` if there is none or it is over 5 minutes old. `car` is the Tesla's charge state from TeslaMate (see [TeslaMate](#teslamate-optional)), or `null` if that is off or nothing has arrived yet. `grid_pull` is for watching the main breaker: `now_w` (grid import now in W, 0 while exporting, `null` without a fresh sample), `peak_today_w` and `peak_today_at` (the highest import since local midnight and when, unix seconds; both `null` if nothing was imported), `warn_w` and `limit_w` (the `grid_pull_warn_kw` and `grid_pull_limit_kw` settings in W) and `volts` (always `null` for now: the poller does not read the grid voltage) |
 | `GET /api/live/series?from=<unix>&to=<unix>` | Modbus samples averaged per minute: `{"data":[[ts,pv_w,load_w,grid_w,battery_w,soc_pct],...]}`. At most 2 days |
 | `GET /api/ev/sessions?from=<unix>&to=<unix>` | The Tesla's charging sessions that overlap the range, oldest first: `{"sessions":[{id,started_at,ended_at,energy_added_kwh,energy_used_kwh,start_soc_pct,end_soc_pct,max_power_kw,geofence,solar_kwh,battery_kwh,grid_kwh,cost,solar_value,coverage},...]}`. A session still charging has `ended_at` `null` and counts as running until now. `energy_used_kwh` is taken from the wall, `energy_added_kwh` reaches the battery. The last six fields (kWh by source, dollars, and the share 0 to 1 of the session the inverter samples cover) are `null` without a `[tariff]`, away from home (geofence not "Home") or with no energy. At most 400 days. Empty without a `[teslamate]` section |
@@ -264,6 +264,26 @@ Then open <http://127.0.0.1:8081/>. The copy is only read and written by
 that run, so the live database is never touched. (The data sources in the copy
 of `config.toml` are still contacted unless you remove the `[modbus]`,
 `[teslamate]` and `[globird]` sections from it.)
+
+
+### Metric names
+
+Readings are named by what they mean, not by the id the data source uses. All
+values are in the metric's own unit.
+
+| Metric | Unit | What it is |
+| --- | --- | --- |
+| `pv_w` | W | Solar power (the plant's figure) |
+| `pv_dc_w` | W | Solar power on the DC side |
+| `load_w` | W | Home load |
+| `grid_w` | W | Grid power (positive importing, negative exporting) |
+| `battery_w` | W | Battery power |
+| `soc_pct` | % | Battery charge |
+| `pv_day_wh`, `load_day_wh`, `grid_import_day_wh`, `grid_export_day_wh`, `battery_charge_day_wh`, `battery_discharge_day_wh`, `self_consumed_day_wh` | Wh | Energy so far today; each resets to 0 at local midnight |
+
+The `point_id` fields in `/api/latest` and `/api/day`, and `points=` on
+`/api/series`, are the iSolarCloud point ids. They are deprecated and will be
+removed in the next release: use `metric` and `metrics`.
 
 ## Local Modbus (optional)
 
@@ -699,7 +719,17 @@ before sharing it.
 
 Amber Electric has an official price API. solar-dash can call it with
 `amber-probe`, which only reads: it prints your sites, the current prices and
-whether usage exists. Nothing is stored and `serve` does not use it yet.
+whether usage exists. Nothing is stored by the probe.
+
+With an `[amber]` section `serve` also keeps the prices in the database: it
+fetches when it starts and then every 5 minutes (a few seconds after each
+5-minute mark), saving the last day, the current price and the next 8 hours of
+forecast in the `price_interval` table, and deleting forecasts more than 2 days
+old. It only reads from Amber. If Amber answers 404 (the site is closed or
+`site_id` is wrong) it logs that clearly and tries again once an hour. Other
+errors are retried with a growing wait (30 seconds up to 10 minutes). The
+prices are available as `GET /api/prices?from=&to=` (unix seconds, at most 31
+days).
 
 1. Create an API token in the Amber app (Developers). Add it to `config.toml`
    (see `config.example.toml`). The token is a secret stored in plain text, so
@@ -931,8 +961,15 @@ command instead.
 To check progress:
 
 ```sh
-sqlite3 data/solar.db "select count(*), datetime(min(ts),'unixepoch'), datetime(max(ts),'unixepoch') from reading"
+sqlite3 data/solar.db "select count(*), datetime(min(ts),'unixepoch'), datetime(max(ts),'unixepoch') from metric_reading"
 ```
+
+Readings are stored by what they mean (`metric`, such as `pv_w`) and where they
+came from (`source`, such as `isolarcloud:1234567`) in the `metric_reading`
+table. The first start after an upgrade copies the old `reading` table into it
+(a minute or so on a long history). The old table is no longer written but is
+kept for one more release in case you need to go back; the database file is
+bigger by about the size of the copy until it is dropped.
 
 ## Exploring the API
 
