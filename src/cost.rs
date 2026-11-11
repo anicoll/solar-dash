@@ -554,7 +554,7 @@ pub struct DayCost {
 }
 
 /// Grid energy in kWh split by tariff band. See [`grid_split`].
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GridSplit {
     pub import_free_kwh: f64,
     pub import_shoulder_kwh: f64,

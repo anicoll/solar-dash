@@ -1,16 +1,16 @@
 //! `GET /api/prices`: stored electricity prices (see `amber::store`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::{Days, NaiveDate, Utc};
-use chrono_tz::Tz;
+use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
 use super::api::{ApiError, ApiResult, day_bounds_or_error, parse_date, today};
+use super::day_cache;
 use crate::amber::store::{self, StoredPrice};
 use crate::cost::{Interval, PriceSpan};
 
@@ -94,7 +94,7 @@ pub struct DailyParams {
 }
 
 /// What the buy price did on one local day.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DayPriceStats {
     /// The local day, `YYYY-MM-DD`.
     pub date: String,
@@ -286,38 +286,101 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
         return Err(ApiError::bad_request("the range can be at most 400 days"));
     }
     let tz = state.tz;
-    let (range_start, _) = day_bounds_or_error(from, tz)?;
-    let (_, range_end) = day_bounds_or_error(to, tz)?;
-    let (today_start, _) = day_bounds_or_error(today(tz), tz)?;
+    let today_date = today(tz);
     let spike_cents = state.admin.get().price_spike_cents;
+    let dates: Vec<NaiveDate> = from.iter_days().take_while(|d| *d <= to).collect();
 
-    let prices = store::known_general_prices(
-        &state.pool,
-        AMBER_PREFIX,
-        range_start,
-        range_end,
-        today_start,
-    )
-    .await?;
-    // Usage is only needed when there is a price to weight.
-    let mut usage = if prices.is_empty() {
-        Vec::new()
-    } else {
-        super::house_intervals(
+    // Finished days that are stored for these prices and settings are not
+    // worked out again, and their samples are not read.
+    let mut keys = Vec::new();
+    for &date in dates.iter().filter(|d| **d < today_date) {
+        let (start, end) = day_bounds_or_error(date, tz)?;
+        let fingerprint =
+            store::day_prices_fingerprint(&state.pool, AMBER_PREFIX, start, end, false).await?;
+        keys.push((
+            date,
+            format!(
+                "{STATS_VERSION}|{tz}|spike={}|{:?}|prices:{fingerprint}",
+                spike_cents.to_bits(),
+                state.rules
+            ),
+        ));
+    }
+    let mut stored: HashMap<NaiveDate, Option<StoredDay>> =
+        day_cache::load(&state.pool, STATS_KIND, &keys).await?;
+    let missing: Vec<NaiveDate> = dates
+        .iter()
+        .copied()
+        .filter(|d| !stored.contains_key(d))
+        .collect();
+
+    let mut to_store: Vec<(NaiveDate, String, Option<StoredDay>)> = Vec::new();
+    let key_of: HashMap<NaiveDate, &String> = keys.iter().map(|(d, k)| (*d, k)).collect();
+    let (today_start, _) = day_bounds_or_error(today_date, tz)?;
+    // Each run of consecutive missing days is loaded on its own, so a stored
+    // day in the middle of the range is not read again.
+    for run in missing.chunk_by(|a, b| a.succ_opt() == Some(*b)) {
+        // Every interval lies inside its own day (see `live_intervals`), so
+        // the days before the run are not needed.
+        let (range_start, _) = day_bounds_or_error(run[0], tz)?;
+        let (_, range_end) = day_bounds_or_error(run[run.len() - 1], tz)?;
+        let prices = store::known_general_prices(
             &state.pool,
-            state.plant_id,
-            tz,
+            AMBER_PREFIX,
             range_start,
             range_end,
-            Utc::now().timestamp(),
-            &state.rules,
+            today_start,
         )
-        .await?
-        .0
-    };
-    usage.sort_by_key(|i| i.start_ts);
+        .await?;
+        // Usage is only needed when there is a price to weight.
+        let mut usage = Vec::new();
+        let mut cacheable_usage: HashMap<NaiveDate, bool> = HashMap::new();
+        if !prices.is_empty() {
+            let by_day = super::costs::house_intervals_by_day(
+                &state.pool,
+                state.plant_id,
+                tz,
+                range_start,
+                range_end,
+                Utc::now().timestamp(),
+                &state.rules,
+            )
+            .await?;
+            for day in by_day {
+                cacheable_usage.insert(day.date, day.cacheable);
+                usage.extend(day.intervals);
+            }
+        }
+        usage.sort_by_key(|i| i.start_ts);
+        for &date in run {
+            let (start, end) = day_bounds_or_error(date, tz)?;
+            let day =
+                day_stats(date, start, end, &prices, &usage, spike_cents).map(|stats| StoredDay {
+                    stats,
+                    import_kwh: import_total(&usage, start, end),
+                });
+            // A day without prices stays without them; a priced day is only
+            // final once its usage is (a later backfill could add to it).
+            let final_usage = day.is_none() || cacheable_usage.get(&date).copied().unwrap_or(false);
+            if let (Some(key), true) = (key_of.get(&date), final_usage) {
+                to_store.push((date, (*key).clone(), day.clone()));
+            }
+            stored.insert(date, day);
+        }
+    }
+    let rows: Vec<(NaiveDate, String, &Option<StoredDay>)> = to_store
+        .iter()
+        .map(|(date, key, day)| (*date, key.clone(), day))
+        .collect();
+    day_cache::save(&state.pool, STATS_KIND, &rows).await?;
 
-    let (days, import_kwh) = days_in_range(from, to, tz, &prices, &usage, spike_cents)?;
+    let (mut days, mut import_kwh) = (Vec::new(), Vec::new());
+    for date in &dates {
+        if let Some(Some(day)) = stored.remove(date) {
+            days.push(day.stats);
+            import_kwh.push(day.import_kwh);
+        }
+    }
     let summary = summarise(&days, &import_kwh);
     Ok(Json(json!({
         "spike_cents": spike_cents,
@@ -326,12 +389,26 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
     })))
 }
 
+/// The `daily_cache` kind for a day's price stats.
+const STATS_KIND: &str = "price_stats";
+
+/// Bump when the stats, or how they are worked out, change.
+const STATS_VERSION: u32 = 1;
+
+/// A finished day's stats and its total import, as stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredDay {
+    stats: DayPriceStats,
+    import_kwh: f64,
+}
+
 /// The stats of every local day from `from` to `to` that has prices, and
 /// each one's total import.
+#[cfg(test)]
 fn days_in_range(
     from: NaiveDate,
     to: NaiveDate,
-    tz: Tz,
+    tz: chrono_tz::Tz,
     prices: &[PriceSpan],
     usage: &[Interval],
     spike_cents: f64,
@@ -345,7 +422,7 @@ fn days_in_range(
             import_kwh.push(import_total(usage, start, end));
         }
         date = date
-            .checked_add_days(Days::new(1))
+            .checked_add_days(chrono::Days::new(1))
             .ok_or_else(|| ApiError::bad_request("date is out of range"))?;
     }
     Ok((days, import_kwh))

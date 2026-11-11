@@ -2,11 +2,13 @@
 //! embedded static files. It only reads from SQLite and never calls iSolarCloud.
 
 mod admin;
+mod amber_days;
 mod api;
 mod auth;
 mod battery;
 mod bill;
 mod costs;
+mod day_cache;
 mod fuel;
 mod globird;
 mod home_mix;
@@ -2862,6 +2864,127 @@ mod tests {
             0.0
         );
         assert!(json["assumptions"].as_array().unwrap().len() > 5);
+    }
+
+    /// The per-day caches must not change an answer: the same request gives
+    /// the same JSON on the first call (worked out and stored), on the second
+    /// (read back) and after the stored days are deleted (worked out again).
+    #[tokio::test]
+    async fn stored_days_answer_exactly_like_worked_out_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = hash_password(PASSWORD).unwrap();
+        let compare = crate::config::AmberCompare {
+            fee_cents_per_day: 20.0,
+            ..Default::default()
+        };
+        let state = AppState::new(
+            pool.clone(),
+            PLANT,
+            chrono_tz::Australia::Adelaide,
+            &hash,
+            Key::generate(),
+        )
+        .unwrap()
+        .with_tariff(Some(flat_tariff()))
+        .with_amber_compare(Some(compare));
+        let app = router(state.clone());
+        let cookie = log_in(&app).await;
+        // Three days of one live sample a minute with a load and grid use
+        // that change through the day, and prices that go negative and spike.
+        for day in 0..3 {
+            let start = SEP_15_START + day * 86_400;
+            for i in 0..1440 {
+                let ts = start + i * 60;
+                let sample = Sample {
+                    grid_w: Some(((i * 37 + day * 11) % 3000) as f64 - 500.0),
+                    load_w: Some(300.0 + ((i * 53) % 1700) as f64),
+                    soc_pct: Some(20.0 + (i % 60) as f64),
+                    ..live_sample(ts)
+                };
+                db::insert_live_sample(&pool, &sample).await.unwrap();
+            }
+            for i in 0..288 {
+                let at = start + i * 300;
+                let general = [-8.0, 0.0, 12.5, 31.0, 47.25, 160.0][((i * 7 + day) % 6) as usize];
+                for (channel, cents) in [("general", general), ("feed_in", -general / 3.0)] {
+                    sqlx::query(
+                        "INSERT INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, NULL, 'actual', 1, NULL, NULL)",
+                    )
+                    .bind(channel)
+                    .bind(at)
+                    .bind(at + 300)
+                    .bind(cents)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+        let uris = [
+            "/api/bill/compare-dynamic?from=2026-09-15&to=2026-09-17",
+            "/api/bill/amber-whatif?from=2026-09-15&to=2026-09-17",
+            "/api/prices/daily?from=2026-09-15&to=2026-09-17",
+        ];
+        let mut first = Vec::new();
+        for uri in uris {
+            first.push(body_json(send(&app, get_request(uri, Some(&cookie))).await).await);
+        }
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM daily_cache")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(stored >= 6, "the finished days are stored, got {stored}");
+        assert!(first[1]["totals"]["days"].as_u64().unwrap() >= 3);
+        for round in ["stored", "recomputed"] {
+            if round == "recomputed" {
+                sqlx::query("DELETE FROM daily_cache")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            for (uri, before) in uris.iter().zip(&first) {
+                let again = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+                assert_eq!(&again, before, "{round}: {uri}");
+            }
+        }
+
+        // The bill's tariff split and the battery discharge too.
+        let schedule = flat_tariff();
+        let dates: Vec<chrono::NaiveDate> = ["2026-09-15", "2026-09-16", "2026-09-17"]
+            .iter()
+            .map(|d| d.parse().unwrap())
+            .collect();
+        sqlx::query("DELETE FROM daily_cache")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let split = costs::grid_splits(&state, &schedule, &dates).await.unwrap();
+        let discharge = api::battery_discharge_by_date(&state, &dates)
+            .await
+            .unwrap();
+        assert_eq!(split.len(), 3);
+        assert_eq!(
+            costs::grid_splits(&state, &schedule, &dates).await.unwrap(),
+            split
+        );
+        assert_eq!(
+            api::battery_discharge_by_date(&state, &dates)
+                .await
+                .unwrap(),
+            discharge
+        );
+
+        // A corrected price makes the stored day be worked out again.
+        sqlx::query("UPDATE price_interval SET cents = cents + 10000, fetched_at = 2 WHERE start_ts = ? AND channel = 'general'")
+            .bind(SEP_15_START + 600)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let changed = body_json(send(&app, get_request(uris[0], Some(&cookie))).await).await;
+        assert_ne!(changed["days"], first[0]["days"]);
     }
 
     #[tokio::test]
