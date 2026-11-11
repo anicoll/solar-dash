@@ -671,7 +671,7 @@ pub struct DayPrices {
 }
 
 /// The span covering `ts`, if any. `spans` must be sorted by start.
-fn span_at(spans: &[PriceSpan], ts: i64) -> Option<f64> {
+pub(crate) fn span_at(spans: &[PriceSpan], ts: i64) -> Option<f64> {
     // The last span that starts at or before `ts`; it covers `ts` only if it
     // has not ended yet.
     let next = spans.partition_point(|s| s.start_ts <= ts);

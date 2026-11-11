@@ -651,7 +651,7 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
 
 /// A day needs at least this share of its minutes covered by stored import
 /// prices to be compared. Below it the day is skipped, not guessed.
-const MIN_PRICE_COVERAGE: f64 = 0.98;
+pub(super) const MIN_PRICE_COVERAGE: f64 = 0.98;
 
 /// The longest range one comparison may ask for.
 const MAX_COMPARE_DAYS: u64 = 92;
@@ -708,7 +708,7 @@ fn compare_totals(
 /// from stored Amber prices. Its own windows are all 0 c, so only a missing
 /// price (at most 2% of a compared day) falls back to that, and
 /// `fallback_minutes` says how much.
-fn hypothetical_tariff(compare: &config::AmberCompare) -> Result<Tariff, ApiError> {
+pub(super) fn hypothetical_tariff(compare: &config::AmberCompare) -> Result<Tariff, ApiError> {
     let plan = config::Tariff {
         name: None,
         supply_cents_per_day: compare.supply_cents_per_day,
@@ -725,6 +725,40 @@ fn hypothetical_tariff(compare: &config::AmberCompare) -> Result<Tariff, ApiErro
         }),
     };
     Ok(Tariff::from_config(&plan)?)
+}
+
+/// The range a comparison covers: `from` and `to` as asked (the current bill
+/// period so far when both are missing, at most [`MAX_COMPARE_DAYS`] days), and
+/// the finished days in it. Today is never included, it is not finished.
+pub(super) fn compare_dates(
+    state: &AppState,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<(NaiveDate, NaiveDate, Vec<NaiveDate>), ApiError> {
+    let data = state.admin.get();
+    let today = today(state.tz);
+    let (from, to) = match (from, to) {
+        (None, None) => {
+            let period = current_period(today, data.bill_start_day, &data.bills);
+            (period.from, (today - Days::new(1)).min(period.to))
+        }
+        _ => {
+            let to = to
+                .map(str::to_string)
+                .unwrap_or_else(|| (today - Days::new(1)).to_string());
+            let (from, count) =
+                super::api::date_range(from, Some(&to), state.tz, MAX_COMPARE_DAYS, 30)?;
+            (from, from + Days::new(count - 1))
+        }
+    };
+    let last = to.min(today - Days::new(1));
+    let dates: Vec<NaiveDate> = from.iter_days().take_while(|d| *d <= last).collect();
+    if dates.len() as u64 > MAX_COMPARE_DAYS {
+        return Err(ApiError::bad_request(format!(
+            "the range can be at most {MAX_COMPARE_DAYS} days"
+        )));
+    }
+    Ok((from, to, dates))
 }
 
 /// `GET /api/bill/compare-dynamic?from=&to=`: what the home's own energy
@@ -745,36 +779,7 @@ pub async fn compare_dynamic(
     let (Some(compare), Some(schedule)) = (&state.amber_compare, &state.admin.get().tariff) else {
         return Ok(Json(json!({ "configured": false })));
     };
-    let data = state.admin.get();
-    let today = today(state.tz);
-    let (from, to) = match (&params.from, &params.to) {
-        (None, None) => {
-            let period = current_period(today, data.bill_start_day, &data.bills);
-            (period.from, (today - Days::new(1)).min(period.to))
-        }
-        _ => {
-            let to = params
-                .to
-                .clone()
-                .unwrap_or_else(|| (today - Days::new(1)).to_string());
-            let (from, count) = super::api::date_range(
-                params.from.as_deref(),
-                Some(&to),
-                state.tz,
-                MAX_COMPARE_DAYS,
-                30,
-            )?;
-            (from, from + Days::new(count - 1))
-        }
-    };
-    // Today is not finished, so it is never compared.
-    let last = to.min(today - Days::new(1));
-    let dates: Vec<NaiveDate> = from.iter_days().take_while(|d| *d <= last).collect();
-    if dates.len() as u64 > MAX_COMPARE_DAYS {
-        return Err(ApiError::bad_request(format!(
-            "the range can be at most {MAX_COMPARE_DAYS} days"
-        )));
-    }
+    let (from, to, dates) = compare_dates(&state, params.from.as_deref(), params.to.as_deref())?;
     let hypothetical = hypothetical_tariff(compare)?;
     let compared = compare_days(&state, schedule, &hypothetical, &dates).await?;
     let rows: Vec<_> = compared
