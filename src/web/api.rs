@@ -35,6 +35,8 @@ pub(super) const DEFAULT_DAILY_DAYS: u64 = 30;
 const DEFAULT_SUMMARY_DAYS: u64 = 365;
 /// The longest time one counter step is spread over (see `derive_power`).
 pub(super) const MAX_SPREAD_SECS: i64 = 30 * 60;
+/// The size of one step of an iSolarCloud daily counter, in Wh.
+const QUANTUM_WH: f64 = 100.0;
 /// The longest time one live sample is held (see `integrate`). Samples come
 /// every ~15 s, so a longer step means the dongle dropped out.
 pub(super) const MAX_HOLD_SECS: i64 = 120;
@@ -762,6 +764,11 @@ pub(super) struct Spread {
 /// the counter last moved, at most [`MAX_SPREAD_SECS`]. The spans never
 /// overlap, so the energies add up to the counter's total rise.
 ///
+/// A rise of more than one 100 Wh step after a quiet spell is different: only
+/// the first 100 Wh can have built up during the quiet spell. The rest came in
+/// the last reading gap (for example a car starting to charge), so it is spread
+/// over that gap only. Such a step gives two spreads.
+///
 /// A drop is the counter resetting at midnight: it adds no energy and
 /// counting starts again from the new value.
 pub(super) fn spread_steps(counter: &[(i64, f64)]) -> Vec<Spread> {
@@ -771,18 +778,33 @@ pub(super) fn spread_steps(counter: &[(i64, f64)]) -> Vec<Spread> {
     let mut steps = Vec::new();
     // When the counter last moved, and its value then.
     let (mut last_ts, mut last_value) = (first_ts, first_value);
+    // The time of the reading before this one.
+    let mut prev_ts = first_ts;
 
     for &(ts, value) in &counter[1..] {
         if value > last_value {
-            steps.push(Spread {
-                start: last_ts.max(ts - MAX_SPREAD_SECS),
-                end: ts,
-                wh: value - last_value,
-            });
+            let start = last_ts.max(ts - MAX_SPREAD_SECS);
+            let wh = value - last_value;
+            if wh > QUANTUM_WH && start < prev_ts {
+                // One quantum over the quiet spell, the rest over the last gap.
+                steps.push(Spread {
+                    start,
+                    end: prev_ts,
+                    wh: QUANTUM_WH,
+                });
+                steps.push(Spread {
+                    start: prev_ts,
+                    end: ts,
+                    wh: wh - QUANTUM_WH,
+                });
+            } else {
+                steps.push(Spread { start, end: ts, wh });
+            }
         }
         if value != last_value {
             (last_ts, last_value) = (ts, value);
         }
+        prev_ts = ts;
     }
     steps
 }
@@ -1491,6 +1513,50 @@ mod tests {
         let power = derive_power(&counter);
         assert!(power[..6].iter().all(|row| row.1 == 0.0));
         assert!(power[6..].iter().all(|row| row.1 == 200.0));
+    }
+
+    #[test]
+    fn big_step_after_quiet_spell_goes_to_the_last_reading() {
+        // Still since 10:40, then +1400 Wh at 11:05, readings every 5 minutes.
+        let t = |h: i64, m: i64| h * 3600 + m * 60;
+        let mut counter = vec![(t(10, 30), 900.0), (t(10, 35), 900.0)];
+        counter.extend((0..5).map(|i| (t(10, 40) + i * 300, 1000.0)));
+        counter.push((t(11, 5), 2400.0));
+        let steps = spread_steps(&counter);
+        // steps[0] is the move to 1000 at 10:40.
+        assert_eq!(
+            steps[1..],
+            [
+                Spread {
+                    start: t(10, 40),
+                    end: t(11, 0),
+                    wh: 100.0
+                },
+                Spread {
+                    start: t(11, 0),
+                    end: t(11, 5),
+                    wh: 1300.0
+                },
+            ]
+        );
+        // The energy still adds up to the counter's rise.
+        let total: f64 = steps.iter().map(|s| s.wh).sum();
+        assert_eq!(total, 1500.0);
+        // Power rows: 300 W up to 11:00, then 15.6 kW for the last row.
+        let power = derive_power(&counter);
+        assert_eq!(power.last(), Some(&(t(11, 5), 1300.0 * 3600.0 / 300.0)));
+        assert_eq!(power[power.len() - 2], (t(11, 0), 300.0));
+        // A big step with no quiet spell (the counter moved at the reading
+        // before) is not split.
+        let counter = [(0, 0.0), (300, 100.0), (600, 600.0)];
+        assert_eq!(
+            spread_steps(&counter)[1..],
+            [Spread {
+                start: 300,
+                end: 600,
+                wh: 500.0
+            }]
+        );
     }
 
     #[test]

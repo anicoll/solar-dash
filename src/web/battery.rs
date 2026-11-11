@@ -578,7 +578,7 @@ fn point_series(rows: &[(i64, i64, f64)], point_id: i64) -> Vec<(i64, f64)> {
 /// by the old rules are worked out again. The cost cache key is part of the
 /// key too, so a change to how a day's intervals come out (which bumps
 /// `COST_CACHE_VERSION`) also clears these.
-const BATTERY_CACHE_VERSION: u32 = 2;
+const BATTERY_CACHE_VERSION: u32 = 3;
 
 /// What stored [`DayFacts`] are tagged with: they only count while the time
 /// zone and the plan for that day are unchanged.
