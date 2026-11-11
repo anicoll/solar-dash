@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let spokes = json["spokes"].as_array().unwrap();
-        assert_eq!(spokes.len(), 7);
+        assert_eq!(spokes.len(), 8);
         let modbus = &spokes[0];
         assert_eq!(modbus["id"], "sungrow-modbus");
         assert_eq!(modbus["kind"], "source");

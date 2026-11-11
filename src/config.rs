@@ -33,6 +33,9 @@ pub struct Config {
     /// Amber Electric API token, used by `amber-probe`. `None` (no `[amber]`
     /// section) means it is off.
     pub amber: Option<Amber>,
+    /// Publishes live readings to Home Assistant over MQTT. `None` (no
+    /// `[home_assistant]` section) means nothing is published.
+    pub home_assistant: Option<HomeAssistant>,
     /// Electricity prices, used to work out costs and savings. `None` (no
     /// `[tariff]` section) means cost features are off.
     pub tariff: Option<Tariff>,
@@ -507,6 +510,116 @@ impl fmt::Debug for Globird {
             .field("sync_time", &self.sync_time)
             .finish()
     }
+}
+
+/// The `[home_assistant]` section: where to publish, and what to call things.
+/// solar-dash only publishes here; it never listens for commands.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeAssistant {
+    /// IP address or host name of the MQTT broker Home Assistant uses. This
+    /// may be the same broker as `[teslamate]`'s. No default.
+    pub mqtt_host: String,
+    #[serde(default = "default_mqtt_port")]
+    pub mqtt_port: u16,
+    /// Broker login. Give both or neither.
+    pub mqtt_username: Option<String>,
+    pub mqtt_password: Option<String>,
+    /// Home Assistant's MQTT discovery prefix (its default is "homeassistant").
+    #[serde(default = "default_ha_discovery_prefix")]
+    pub discovery_prefix: String,
+    /// The start of solar-dash's own topics: `<base_topic>/status`,
+    /// `<base_topic>/live` and so on.
+    #[serde(default = "default_ha_base_topic")]
+    pub base_topic: String,
+    /// The name of the device that groups the sensors in Home Assistant.
+    #[serde(default = "default_ha_device_name")]
+    pub device_name: String,
+    /// At most one state message per this many seconds. The inverter is read
+    /// every 15 s, so the default publishes every reading.
+    #[serde(default = "default_ha_min_interval")]
+    pub min_interval_secs: u64,
+}
+
+impl HomeAssistant {
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.mqtt_host.trim().is_empty(),
+            "mqtt_host in [home_assistant] must not be empty"
+        );
+        anyhow::ensure!(
+            self.mqtt_port != 0,
+            "mqtt_port in [home_assistant] must not be 0"
+        );
+        anyhow::ensure!(
+            self.mqtt_username.is_some() == self.mqtt_password.is_some(),
+            "[home_assistant] needs both mqtt_username and mqtt_password, or neither"
+        );
+        anyhow::ensure!(
+            !self.device_name.trim().is_empty(),
+            "device_name in [home_assistant] must not be empty"
+        );
+        anyhow::ensure!(
+            self.min_interval_secs >= 1,
+            "min_interval_secs in [home_assistant] must be at least 1"
+        );
+        for (name, topic) in [
+            ("discovery_prefix", &self.discovery_prefix),
+            ("base_topic", &self.base_topic),
+        ] {
+            // `+` and `#` are MQTT wildcards, which cannot be part of a topic
+            // we publish to; a leading or trailing `/` makes empty levels.
+            anyhow::ensure!(
+                !topic.is_empty()
+                    && !topic.starts_with('/')
+                    && !topic.ends_with('/')
+                    && !topic.contains(['+', '#', ' '])
+                    && !topic.contains("//"),
+                "{name} in [home_assistant] must be a plain topic like \"solar-dash\" \
+                 (no spaces, `+`, `#` or empty levels)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Hides the broker password, like the other secrets in this file.
+impl fmt::Debug for HomeAssistant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HomeAssistant")
+            .field("mqtt_host", &self.mqtt_host)
+            .field("mqtt_port", &self.mqtt_port)
+            .field("mqtt_username", &self.mqtt_username)
+            .field(
+                "mqtt_password",
+                &self.mqtt_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("discovery_prefix", &self.discovery_prefix)
+            .field("base_topic", &self.base_topic)
+            .field("device_name", &self.device_name)
+            .field("min_interval_secs", &self.min_interval_secs)
+            .finish()
+    }
+}
+
+fn default_mqtt_port() -> u16 {
+    1883
+}
+
+fn default_ha_discovery_prefix() -> String {
+    "homeassistant".to_string()
+}
+
+fn default_ha_base_topic() -> String {
+    "solar-dash".to_string()
+}
+
+fn default_ha_device_name() -> String {
+    "solar-dash".to_string()
+}
+
+fn default_ha_min_interval() -> u64 {
+    15
 }
 
 /// Amber Electric's API; see config.example.toml.
@@ -1017,6 +1130,11 @@ impl Config {
                 .check()
                 .with_context(|| format!("invalid config file {}", path.display()))?;
         }
+        if let Some(home_assistant) = &config.home_assistant {
+            home_assistant
+                .check()
+                .with_context(|| format!("invalid config file {}", path.display()))?;
+        }
         if let Some(globird) = &config.globird {
             globird
                 .check()
@@ -1335,6 +1453,58 @@ mod tests {
         assert!(!text.contains("psk_supersecret"));
         assert!(text.contains("<redacted>"));
         assert!(text.contains("01ABC"));
+    }
+
+    fn parse_ha(extra: &str) -> HomeAssistant {
+        let text = format!("{MINIMAL}\n[home_assistant]\nmqtt_host = \"broker\"\n{extra}");
+        toml::from_str::<Config>(&text)
+            .unwrap()
+            .home_assistant
+            .unwrap()
+    }
+
+    #[test]
+    fn home_assistant_is_off_without_a_section() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(cfg.home_assistant.is_none());
+    }
+
+    #[test]
+    fn home_assistant_defaults_apply() {
+        let ha = parse_ha("");
+        assert_eq!(ha.mqtt_host, "broker");
+        assert_eq!(ha.mqtt_port, 1883);
+        assert_eq!(ha.mqtt_username, None);
+        assert_eq!(ha.discovery_prefix, "homeassistant");
+        assert_eq!(ha.base_topic, "solar-dash");
+        assert_eq!(ha.device_name, "solar-dash");
+        assert_eq!(ha.min_interval_secs, 15);
+        assert!(ha.check().is_ok());
+    }
+
+    #[test]
+    fn home_assistant_section_needs_a_host() {
+        let text = format!("{MINIMAL}\n[home_assistant]\nmqtt_port = 1883\n");
+        assert!(toml::from_str::<Config>(&text).is_err());
+    }
+
+    #[test]
+    fn home_assistant_is_validated() {
+        let bad = |extra: &str| parse_ha(extra).check().unwrap_err().to_string();
+        assert!(bad("mqtt_username = \"u\"").contains("both"));
+        assert!(bad("mqtt_port = 0").contains("mqtt_port"));
+        assert!(bad("min_interval_secs = 0").contains("min_interval_secs"));
+        assert!(bad("device_name = \" \"").contains("device_name"));
+        for topic in ["", "/x", "x/", "a//b", "a/+", "a/#", "a b"] {
+            assert!(
+                bad(&format!("base_topic = \"{topic}\"")).contains("base_topic"),
+                "{topic:?}"
+            );
+        }
+        assert!(bad("discovery_prefix = \"#\"").contains("discovery_prefix"));
+        let ok =
+            parse_ha("mqtt_username = \"u\"\nmqtt_password = \"p\"\nbase_topic = \"home/solar\"");
+        assert!(ok.check().is_ok());
     }
 
     #[test]

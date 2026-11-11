@@ -603,6 +603,61 @@ not encrypted, which is fine on a home network.
 If the database cannot be reached, a warning is logged and the next run tries
 again; `serve` keeps running.
 
+## Home Assistant (optional)
+
+solar-dash can publish its live readings to [Home Assistant](https://www.home-assistant.io/)
+over MQTT, using Home Assistant's MQTT discovery, so the sensors appear on
+their own with no YAML. It only **publishes**: it never subscribes to a
+command topic and never controls the inverter or anything else. The one topic
+it listens to is Home Assistant's own birth message (`homeassistant/status`),
+so it can send the sensor configs again when Home Assistant restarts. Without
+a `[home_assistant]` section nothing is published and no task runs.
+
+1. In Home Assistant, set up the MQTT integration against a broker (such as
+   Mosquitto). The broker can be the same one TeslaMate uses: just repeat its
+   host and port in `[home_assistant]`.
+2. Add the section to `config.toml` and restart `serve`:
+
+   ```toml
+   [home_assistant]
+   mqtt_host = "192.168.1.70"
+   # mqtt_port = 1883
+   # mqtt_username = "mqtt-user"       # give both or neither
+   # mqtt_password = "mqtt-password"
+   # discovery_prefix = "homeassistant" # Home Assistant's discovery prefix
+   # base_topic = "solar-dash"          # solar-dash's own topics
+   # device_name = "solar-dash"         # the device that groups the sensors
+   # min_interval_secs = 15             # at most one state message per this many seconds
+   ```
+
+3. In Home Assistant a **solar-dash** device appears (Settings, Devices) with
+   these sensors. All come from one JSON message per inverter sample on
+   `<base_topic>/live` (not retained), so by default they update every 15 s:
+
+   | Sensor | Unit | Meaning |
+   |---|---|---|
+   | Solar power | W | Solar generation |
+   | Home load | W | House consumption |
+   | Grid power | W | **Positive = importing from the grid, negative = exporting** |
+   | Battery power | W | **Positive = charging, negative = discharging** |
+   | Battery state of charge | % | 0 to 100 |
+   | Grid import | W | Import only, never negative (0 while exporting) |
+   | Grid export | W | Export only, never negative (0 while importing) |
+
+   These are solar-dash's own sign conventions (the same as `/api/live`), not
+   the inverter's register signs. A value the inverter did not report shows
+   as unknown in Home Assistant.
+
+Topics: configs are retained at
+`<discovery_prefix>/sensor/<node_id>/<object_id>/config` (`node_id` is the
+device name in lower case with other characters replaced by `_`), and
+`<base_topic>/status` says `online` (retained) while solar-dash runs. The MQTT
+last will sets it to `offline` if solar-dash disappears, which makes the
+sensors unavailable in Home Assistant. If the broker is down, solar-dash logs
+it once, keeps retrying with a growing pause, and carries on with everything
+else. The spoke shows as `home-assistant-mqtt` in `/api/spokes` and in the
+`sources` of `/api/capabilities`.
+
 ## GloBird (optional)
 
 solar-dash can log in to your GloBird Energy customer portal
