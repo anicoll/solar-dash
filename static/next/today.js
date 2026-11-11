@@ -682,9 +682,21 @@
 
   /* ---------------------------------------------------------------- price now */
 
-  /** How far ahead the forecast strip looks. */
+  /** How far ahead the forecast slots look. */
   const PRICE_AHEAD_S = 6 * 3600;
+  /** The prices are re-fetched this long after each 5-minute boundary (the server fetches at +15 s). */
+  const PRICE_REFRESH_AFTER_S = 20;
   const PRICE_BAND_NAME = { free: 'Free', shoulder: 'Shoulder', peak: 'Peak' };
+  /** Amber's own labels, and the colour tone each one uses. */
+  const PRICE_DESCRIPTORS = {
+    extremelyLow: { name: 'Extremely low', tone: 'cheap' },
+    veryLow: { name: 'Very low', tone: 'cheap' },
+    low: { name: 'Low', tone: 'low' },
+    neutral: { name: 'Neutral', tone: 'neutral' },
+    high: { name: 'High', tone: 'high' },
+    spike: { name: 'Spike', tone: 'spike' },
+  };
+  const BAND_TONE = { free: 'low', shoulder: 'neutral', peak: 'high' };
 
   /** The same three bands as the engine: 0 or less is Free, above the spike level is Peak, the rest Shoulder. */
   function priceBand(cents, spike) {
@@ -692,32 +704,47 @@
     return cents > spike ? 'peak' : 'shoulder';
   }
 
-  /** The stored interval of one channel that covers `ts`, if any. */
+  /** How a row is named and coloured: Amber's descriptor when it has one, else our band. */
+  function priceLook(row, spike) {
+    const d = row.descriptor && PRICE_DESCRIPTORS[row.descriptor];
+    if (d) return d;
+    const band = priceBand(row.cents, spike);
+    return { name: PRICE_BAND_NAME[band], tone: BAND_TONE[band] };
+  }
+
+  /** Fallback when the API sent no `now`: the newest-starting stored interval that covers `ts`. */
   function priceAt(rows, ts) {
-    return (rows || []).find((r) => r.start <= ts && ts < r.end) || null;
+    let best = null;
+    for (const r of rows || []) if (r.start <= ts && ts < r.end && (!best || r.start > best.start)) best = r;
+    return best;
   }
 
-  /** The next six hours as runs of one band: [{ band, from, to }, ...] in seconds, with band null for a gap. */
-  function priceRuns(rows, from, spike) {
-    const to = from + PRICE_AHEAD_S;
-    const runs = [];
-    let at = from;
-    const push = (band, end) => {
-      if (end <= at) return;
-      const last = runs[runs.length - 1];
-      if (last && last.band === band) last.to = end;
-      else runs.push({ band, from: at, to: end });
-      at = end;
-    };
-    for (const r of (rows || []).filter((x) => x.end > from && x.start < to).sort((a, b) => a.start - b.start)) {
-      if (r.start > at) push(null, Math.min(r.start, to));
-      push(priceBand(r.cents, spike), Math.min(r.end, to));
+  /**
+   * The slots to show: rows that start from `from` to `to`, oldest first, with no overlaps. A longer
+   * row is dropped when a shorter one starts inside it, and a row that starts before the last kept
+   * one ends is dropped too.
+   */
+  function priceSlots(rows, from, to) {
+    const list = (rows || []).filter((r) => r.start >= from && r.start < to && r.end > r.start)
+      .sort((a, b) => a.start - b.start);
+    const out = [];
+    for (const r of list) {
+      if (list.some((o) => o !== r && o.start > r.start && o.start < r.end && o.end - o.start < r.end - r.start)) continue;
+      const last = out[out.length - 1];
+      if (last && r.start < last.end) continue;
+      out.push(r);
     }
-    push(null, to);
-    return runs;
+    return out;
   }
 
-  /** "Price now": the live import and feed-in price, and a six-hour forecast strip drawn like the day ribbon. */
+  /** What the customer gets for exporting: Amber's feed-in is negative when paid, so flip it. */
+  function sellText(cents) {
+    const earned = -cents;
+    if (Math.abs(earned) < 0.05) return '0c';
+    return earned > 0 ? SD.fmt.cents(earned) : `-${SD.fmt.cents(-earned)}`;
+  }
+
+  /** "Price now": the live buy and sell price, and Amber-style slots for the next six hours. */
   function priceSection() {
     const el = h('section', { class: 'card today-price', 'aria-labelledby': 'today-price-h', hidden: true });
     return {
@@ -726,54 +753,48 @@
         const prices = SD.caps.prices ? data.prices : null; // no price source: the card stays hidden
         const nowTs = Math.floor(Date.now() / 1000);
         const channels = (prices && prices.channels) || {};
-        const buy = priceAt(channels.general, nowTs);
+        const nowRows = (prices && prices.now) || {};
+        const buy = nowRows.general || priceAt(channels.general, nowTs);
         // No price source, no data, or only old data (the source stopped): hide the whole card.
-        el.hidden = !buy;
-        if (!buy) return;
+        el.hidden = !buy || buy.end <= nowTs;
+        if (el.hidden) return;
         const spike = prices.spike_cents > 0 ? prices.spike_cents : 100;
-        const sell = priceAt(channels.feed_in, nowTs);
-        const band = priceBand(buy.cents, spike);
+        const sell = nowRows.feed_in || priceAt(channels.feed_in, nowTs);
+        const look = priceLook(buy, spike);
 
         const buyFig = h('div', { class: 'today-fig' },
           h('div', { class: 'label', text: 'Buying' }),
           h('div', { class: 'fig fig-md', text: `${SD.fmt.cents(buy.cents)} a kWh` }),
-          h('div', { class: 'today-price-band' }, h('b', { class: `swatch band-${band}` }), ` ${PRICE_BAND_NAME[band]}`));
+          h('div', { class: 'today-price-band' }, h('b', { class: `swatch tone-${look.tone}` }), ` ${look.name}`),
+          buy.renewables != null ? h('div', { class: 'today-price-sub', text: `${Math.round(buy.renewables)}% renewables` }) : null);
         const sellFig = sell ? h('div', { class: 'today-fig' },
-          h('div', { class: 'label', text: 'Feed-in' }),
-          h('div', { class: 'fig fig-md', text: `${SD.fmt.cents(sell.cents)} a kWh` })) : null;
+          h('div', { class: 'label', text: 'Selling' }),
+          h('div', { class: 'fig fig-md', text: `${sellText(sell.cents)} a kWh` }),
+          sell.cents > 0 ? h('div', { class: 'today-price-sub', text: 'you pay to export' }) : null) : null;
 
-        // The strip: one block per run of the same band, as wide as its share of the six hours.
-        const runs = priceRuns(channels.general, nowTs, spike);
-        const strip = h('div', { class: 'ribbon-strip' });
+        const slots = priceSlots(channels.general, buy.start, nowTs + PRICE_AHEAD_S);
+        if (!slots.length || slots[0].start !== buy.start) slots.unshift(buy);
+        const row = h('ol', { class: 'pslots' });
         const words = [];
-        for (const run of runs) {
-          const share = (run.to - run.from) / PRICE_AHEAD_S;
-          const fits = share >= 0.22 && run.band;
-          strip.append(h('div', {
-            class: `ribbon-seg ${run.band ? `band-${run.band}` : 'is-gap'}${fits ? '' : ' is-bare'}`,
-            style: `flex: 0 0 ${(share * 100).toFixed(3)}%`,
-            text: fits ? PRICE_BAND_NAME[run.band] : '',
-          }));
-          if (run.band) words.push(`${PRICE_BAND_NAME[run.band]} from ${SD.fmt.time(run.from)} to ${SD.fmt.time(run.to)}`);
-        }
-        const axis = h('div', { class: 'ribbon-axis is-short', 'aria-hidden': 'true' });
-        for (let i = 0; i <= 3; i++) {
-          const tick = h('span', { text: i === 0 ? 'Now' : SD.fmt.time(nowTs + (PRICE_AHEAD_S * i) / 3) });
-          if (i === 0) tick.style.left = '0';
-          else if (i === 3) tick.style.right = '0';
-          else { tick.style.left = `${(i / 3) * 100}%`; tick.style.transform = 'translateX(-50%)'; }
-          axis.append(tick);
-        }
-        const ribbon = h('div', { class: 'ribbon', role: 'img',
-          'aria-label': `Forecast price bands for the next 6 hours. ${words.join('. ')}.` }, strip, axis);
+        slots.forEach((r) => {
+          const cur = r.start === buy.start;
+          const l = priceLook(r, spike);
+          const time = cur ? 'Now' : SD.fmt.time(r.start);
+          words.push(`${time}: ${SD.fmt.cents(r.cents, { round: true })}, ${l.name}`);
+          row.append(h('li', { class: `pslot${cur ? ' is-now' : ''}`, 'aria-current': cur ? 'true' : null },
+            h('span', { class: 'pslot-time', text: time }),
+            h('b', { class: `pslot-dot tone-${l.tone}`, title: l.name }),
+            h('span', { class: 'pslot-cents', text: SD.fmt.cents(r.cents, { round: true }) }),
+            h('span', { class: 'pslot-ren', text: r.renewables != null ? `${Math.round(r.renewables)}%` : ' ' })));
+        });
 
         fill(el,
           h('div', { class: 'card-head' },
             h('h2', { class: 'section-title', id: 'today-price-h', text: 'Price now' }),
-            h('span', { class: 'label', text: `Free \u2264 0c \u00b7 Peak > ${SD.fmt.cents(spike)}` })),
+            h('span', { class: 'label', text: 'c/kWh' })),
           h('div', { class: 'today-figs today-price-figs' }, buyFig, sellFig),
-          h('p', { class: 'card-sub today-price-note', text: 'Forecast, next 6 hours' }),
-          h('div', { class: 'today-price-ribbon' }, ribbon));
+          h('p', { class: 'card-sub today-price-note', text: 'Next 6 hours · renewables % below' }),
+          h('div', { class: 'pslots-wrap', role: 'group', tabindex: '0', 'aria-label': `Forecast prices. ${words.slice(0, 12).join('. ')}.` }, row));
       },
     };
   }
@@ -990,11 +1011,16 @@
 
   const ok = (p) => p.catch(() => null);
 
+  /** The stored prices: a little history so the interval we are in is always there, and the forecast beyond 6 hours. */
+  function refreshPrices() {
+    const nowTs = Math.floor(Date.now() / 1000);
+    return ok(SD.fetchJSON(`/api/prices?from=${nowTs - 900}&to=${nowTs + PRICE_AHEAD_S + 1800}`));
+  }
+
   /** Fetches the slower data and redraws everything. */
   async function refreshSlow() {
     const today = SD.local().date;
     const tomorrow = SD.local(Date.now() / 1000 + 86400).date;
-    const nowTs = Math.floor(Date.now() / 1000);
     // Without a plan (no costs) nothing cost-shaped is asked for; without a price source, no prices.
     // `none` stands in for a call that is skipped.
     const none = Promise.resolve(null);
@@ -1006,8 +1032,7 @@
       ok(SD.fetchJSON(`/api/daily?from=${today}&to=${today}`)),
       loadSamples(today),
       caps.costs ? ok(SD.fetchJSON('/api/battery?days=31')) : none,
-      // A little history so the interval we are in is always there, and the forecast beyond the strip.
-      caps.prices ? ok(SD.fetchJSON(`/api/prices?from=${nowTs - 900}&to=${nowTs + PRICE_AHEAD_S + 1800}`)) : none,
+      caps.prices ? refreshPrices() : none,
     ]);
     if (!view) return;
     data.tariff = tariff;
@@ -1066,6 +1091,22 @@
       }) : () => {};
       refreshSlow().catch(() => {});
       view.timers.push(setInterval(() => refreshSlow().catch(() => {}), SLOW_MS));
+      // The interval's price settles ~15 s after each 5-minute boundary, so the prices (only) are
+      // fetched again just after that, instead of on a timer that started at page load.
+      if (SD.caps.prices) {
+        const arm = () => {
+          const now = Date.now() / 1000;
+          const next = Math.floor(now / 300) * 300 + PRICE_REFRESH_AFTER_S;
+          const at = next > now ? next : next + 300;
+          view.timers.push(setTimeout(async () => {
+            if (!view) return;
+            arm();
+            const p = await refreshPrices();
+            if (view && p) { data.prices = p; view.sections.price.update(); }
+          }, (at - now) * 1000));
+        };
+        arm();
+      }
       // Inside the credit window the bought total matters, so the samples are fetched every minute.
       view.timers.push(setInterval(async () => {
         const win = windowNow();

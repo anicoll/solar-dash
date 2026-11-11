@@ -492,13 +492,78 @@ html[data-theme="night"] #page-today {
   margin: 14px 0 0;
 }
 
-#page-today .today-price-ribbon {
+#page-today .today-price-sub {
   margin-top: 2px;
+  font-size: 13px;
+  color: var(--ink-2);
 }
 
-/* A stretch with no price data: an empty track, not a band. */
-#page-today .ribbon-seg.is-gap {
-  background: var(--today-track);
+/* Price tones: Amber's descriptors (or our bands) as colours. Always shown with a word or a number. */
+#page-today .tone-cheap { background: var(--battery); }
+#page-today .tone-low { background: var(--sun); }
+#page-today .tone-neutral { background: var(--bar); }
+#page-today .tone-high { background: var(--peak); }
+#page-today .tone-spike { background: var(--missed); }
+#page-today .swatch[class*='tone-'],
+#page-today .pslot-dot {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 35%, transparent);
+}
+
+/* The forecast: one slot per stored interval, scrolling sideways on a phone. */
+#page-today .pslots-wrap {
+  margin: 8px -4px 0;
+  padding: 4px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+#page-today .pslots {
+  display: flex;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  width: max-content;
+}
+
+#page-today .pslot {
+  box-sizing: border-box;
+  width: 58px;
+  padding: 6px 2px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+#page-today .pslot.is-now {
+  border-color: var(--ink);
+  box-shadow: 0 0 0 1px var(--ink);
+}
+
+#page-today .pslot-time {
+  font-size: 12px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+#page-today .pslot-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+}
+
+#page-today .pslot-cents {
+  font-weight: 700;
+}
+
+#page-today .pslot-ren {
+  font-size: 12px;
+  color: var(--ink-2);
 }
 
 /* ---------- coming up ---------- */
