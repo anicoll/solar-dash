@@ -96,6 +96,9 @@ pub struct AppState {
     admin: SharedAdminData,
     /// Whether the config has a `[globird]` section.
     globird_configured: bool,
+    /// Whether the config has an `[amber]` section. Dynamic-price screens
+    /// stay hidden without it.
+    amber_configured: bool,
     /// Where the nightly backups are, for the admin page's download.
     backup_dir: Option<PathBuf>,
     /// How the last offsite upload went, for the admin page.
@@ -135,6 +138,7 @@ impl AppState {
             car: Car::default(),
             admin: SharedAdminData::new(AdminData::default()),
             globird_configured: false,
+            amber_configured: false,
             backup_dir: None,
             offsite: crate::offsite::Status::default(),
             spokes: hub::spoke_infos(&[]).into(),
@@ -239,6 +243,12 @@ impl AppState {
         self
     }
 
+    /// Records whether an `[amber]` section is configured.
+    pub fn with_amber_configured(mut self, configured: bool) -> Self {
+        self.amber_configured = configured;
+        self
+    }
+
     /// Sets the past bills (oldest first) whose totals replace our estimate.
     pub fn with_bills(self, bills: Vec<PastBill>) -> Self {
         self.edit_admin(|d| d.bills = bills.into())
@@ -308,7 +318,8 @@ impl AppState {
         Ok(state
             .with_cookie_secure(config.server.cookie_secure)
             .with_api_token(config.server.api_token.as_deref())
-            .with_globird_configured(config.globird.is_some()))
+            .with_globird_configured(config.globird.is_some())
+            .with_amber_configured(config.amber.is_some()))
     }
 }
 
@@ -2507,6 +2518,91 @@ mod tests {
             })
         );
         assert_eq!(json["group"], "day");
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_plan_prices_a_cloud_day_from_stored_prices_and_recosts_late_changes() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+        }
+        let text = "[tariff]\nsupply_cents_per_day = 100.0\ndefault_import_cents = 25.0\n\
+                    default_export_cents = 5.0\n[tariff.dynamic]\nsource = \"amber\"\n\
+                    fee_cents_per_day = 10.0\n";
+        let w: Wrapper = toml::from_str(text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let app = costs_router(&pool, TariffSchedule::from_config(&w.tariff, &[]).unwrap());
+        let cookie = log_in(&app).await;
+        // 1 kWh imported and 2 kWh exported by 01:00; readings at the end of
+        // the day too, so the finished day may be stored.
+        let mut readings = Vec::new();
+        for (metric, wh) in [
+            (Metric::GridImportDayWh, 1000.0),
+            (Metric::GridExportDayWh, 2000.0),
+            (Metric::LoadDayWh, 4000.0),
+        ] {
+            for ts in [SEP_15_START + 3600, SEP_15_START + 86_400 - 300] {
+                readings.push((metric, ts, wh));
+            }
+        }
+        db::seed_metrics(&pool, PLANT, &readings).await;
+        // A day of 5-minute prices: import 50 c, feed-in -10 c (so 10 c is
+        // earned). Forecast rows must be ignored: one at 999 c.
+        let save_day = |import: f64, fetched_at: i64| {
+            let pool = pool.clone();
+            async move {
+                for i in 0..288 {
+                    let start = SEP_15_START + i * 300;
+                    for (channel, cents) in [("general", import), ("feed_in", -10.0)] {
+                        sqlx::query(
+                            "INSERT OR REPLACE INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, NULL, 'actual', ?)",
+                        )
+                        .bind(channel)
+                        .bind(start)
+                        .bind(start + 300)
+                        .bind(cents)
+                        .bind(fetched_at)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
+        };
+        save_day(50.0, 1).await;
+        sqlx::query(
+            "INSERT INTO price_interval VALUES ('amber:s1', 'general', ?, ?, 999.0, NULL, 'forecast', 1)",
+        )
+        .bind(SEP_15_START + 86_400)
+        .bind(SEP_15_START + 86_700)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let uri = "/api/costs?from=2026-09-15&to=2026-09-15";
+        let actual = |json: &Value| json["days"][0]["actual"].as_f64().unwrap();
+        let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+        // 100 supply + 10 fee + 1 kWh * 50 - 2 kWh * 10 = 140 c.
+        assert_eq!(actual(&json), 1.40);
+        assert_eq!(json["days"][0]["supply"], 1.1);
+
+        // The finished day was stored, tagged with a fingerprint of its prices.
+        let (stored_key,): (String,) = sqlx::query_as("SELECT tariff_key FROM daily_cost")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(stored_key.contains("|prices:288") || stored_key.contains("|prices:576"));
+        // The same prices again are read from the stored cost, unchanged.
+        let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+        assert_eq!(actual(&json), 1.40);
+
+        // A corrected price arrives later: the day is costed again.
+        save_day(60.0, 2).await;
+        let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+        assert_eq!(actual(&json), 1.50);
     }
 
     #[tokio::test]
