@@ -630,7 +630,7 @@ changes the portal. Without a `[globird]` section nothing changes.
 ### What the sync does
 
 About 30 seconds after `serve` starts, and then every day at `sync_time`
-(local time, in the `[isolarcloud]` time zone), it logs in, lists your
+(local time, in the site time zone (`[site] timezone`)), it logs in, lists your
 services and syncs each electricity service that has a smart meter. Gas
 services and services with only a Basic meter are skipped.
 
@@ -759,7 +759,7 @@ It prints three sections, and carries on to the next if one fails:
   the active-from and closed-on dates when Amber gives them. With one site it
   is used automatically; with several, set `site_id` to the one you want.
 - **Current prices**: the previous 12 and next 12 intervals as a table, with
-  times in the `[isolarcloud]` timezone, the kind (actual, current or
+  times in the site time zone (`[site] timezone`), the kind (actual, current or
   forecast), channel (general, feedIn or controlledLoad), `perKwh`,
   `spotPerKwh` and the interval length. Prices are cents per kWh including GST.
 - **Usage**: whether metered usage exists for the last 7 days, as a count of
@@ -892,7 +892,7 @@ curl -b cookies.txt -X PUT -H 'Content-Type: text/csv' --data-binary @bills.csv 
 
 ## Spokes and source rules
 
-Inside, each outside system the dashboard talks to is a **spoke**: a background job that only runs when its config section is present and that only logs its own errors, so one failing spoke never stops the others or the dashboard. The ids are `sungrow-modbus` (`[modbus]`), `isolarcloud` (always on), `globird-portal` (`[globird]`), `teslamate-mqtt` (`[teslamate]`), `teslamate-history` (`database_url` in `[teslamate]`), `amber` (`[amber]`) and `backups` (always on; they end at once when `backup_keep = 0`). At startup the log says which are on (`spokes: sungrow-modbus, isolarcloud, ...`), and `GET /api/spokes` (same login as the other `/api` routes) returns `{"spokes": [{"id", "kind", "capabilities", "enabled"}]}`.
+Inside, each outside system the dashboard talks to is a **spoke**: a background job that only runs when its config section is present and that only logs its own errors, so one failing spoke never stops the others or the dashboard. The ids are `sungrow-modbus` (`[modbus]`), `isolarcloud` (`[isolarcloud]`, optional), `globird-portal` (`[globird]`), `teslamate-mqtt` (`[teslamate]`), `teslamate-history` (`database_url` in `[teslamate]`), `amber` (`[amber]`) and `backups` (always on; they end at once when `backup_keep = 0`). At startup the log says which are on (`spokes: sungrow-modbus, isolarcloud, ...`), and `GET /api/spokes` (same login as the other `/api` routes) returns `{"spokes": [{"id", "kind", "capabilities", "enabled"}]}`.
 
 When two sources can answer the same question, the optional `[sources]` section says which one wins:
 
@@ -903,7 +903,7 @@ finished_day_coverage = 0.98
 partial_day_coverage = 0.9
 ```
 
-These values are the defaults, so leaving the section out changes nothing. A day's energy comes from the live Modbus samples when they cover at least `finished_day_coverage` of a finished day (or `partial_day_coverage` of today); a day covered by at least `partial_day_coverage` but less than `finished_day_coverage` uses them only if iSolarCloud has nothing for it. Listing `"isolarcloud"` first makes the cloud counters win whenever they have data, and listing only one id means the other is never used. An unknown id is an error at startup that names the valid ids. The same rule decides the intervals the costs, battery and bill pages use.
+These values are the defaults, so leaving the section out changes nothing. A day's energy comes from the live Modbus samples when they cover at least `finished_day_coverage` of a finished day (or `partial_day_coverage` of today); a day covered by at least `partial_day_coverage` but less than `finished_day_coverage` uses them only if iSolarCloud has nothing for it. Listing `"isolarcloud"` first makes the cloud counters win whenever they have data, and listing only one id means the other is never used. A source that is not configured simply never has data (startup logs a warning if `daily_energy` names one). An unknown id is an error at startup that names the valid ids. The same rule decides the intervals the costs, battery and bill pages use.
 
 ## Where the settings live
 

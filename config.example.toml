@@ -1,6 +1,14 @@
 # Copy this file to config.toml and fill in your own values.
 # config.toml is gitignored, so your secrets stay out of git.
 
+# The site's time zone (IANA name). It decides where a day ends. Optional:
+# if unset, `timezone` in [isolarcloud] is used (older configs), else
+# "Australia/Adelaide".
+[site]
+timezone = "Australia/Adelaide"
+
+# Optional. Leave this whole section out to run without iSolarCloud (for
+# example with only [modbus]); the cloud sync is then simply off.
 [isolarcloud]
 # API gateway for your region. The default is the Australian gateway.
 gateway = "https://augateway.isolarcloud.com"
@@ -20,7 +28,8 @@ password = "your-password"
 # Which plant to sync. Run login-test to list your plants. If unset and you
 # have exactly one plant, it is used.
 # plant_id = 1234567
-# The plant's time zone (IANA name). History timestamps are in this zone.
+# The plant's time zone (IANA name). Prefer [site] timezone above; this is
+# only used when [site] has none.
 # timezone = "Australia/Adelaide"
 # The day your inverter was connected. `serve` fills in the 5-minute history
 # from this day in the background, a few days at a time.
@@ -63,7 +72,7 @@ bind = "127.0.0.1:8080"
 # Optional section; defaults shown.
 [database]
 path = "data/solar.db"
-# `serve` copies the database once a day (03:30 in the [isolarcloud] timezone,
+# `serve` copies the database once a day (03:30 in the site time zone ([site] timezone),
 # and at startup if today's copy is missing) to <backup_dir>/solar-YYYY-MM-DD.db
 # and keeps the newest `backup_keep` files. Default for backup_dir: a `backups`
 # folder next to the database file. The user running solar-dash must be able to
@@ -129,7 +138,7 @@ path = "data/solar.db"
 # [globird]
 # email = "you@example.com"
 # password = "your-portal-password"
-# # Local time ("HH:MM", in the [isolarcloud] timezone) of the daily sync.
+# # Local time ("HH:MM", in the site time zone ([site] timezone)) of the daily sync.
 # # GloBird's data lags a day or more, so mid-morning is a good time.
 # # Default: "09:00".
 # sync_time = "09:00"

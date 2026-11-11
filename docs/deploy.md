@@ -147,7 +147,7 @@ nano /etc/solar-dash/config.toml
 
 Fill in:
 
-- `[isolarcloud]`: `gateway`, `appkey`, `access_key`, `rsa_public_key`,
+- `[isolarcloud]` (optional; leave it out to run without iSolarCloud): `gateway`, `appkey`, `access_key`, `rsa_public_key`,
   `encrypt`, `username` and `password` (see [how-to-run.md](how-to-run.md)).
 - `plant_id`: your plant id (uncomment the line). If you do not know it, run
   `/opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml login-test`.
@@ -353,7 +353,7 @@ instead.
 ## 8. Backups and restore
 
 There are two nightly backups. `serve` makes its own: at startup (if today's is
-missing) and then every day at 03:30 in the `[isolarcloud]` timezone, it writes
+missing) and then every day at 03:30 in the site time zone (`[site] timezone`), it writes
 `/var/lib/solar-dash/backups/solar-YYYY-MM-DD.db` (a `backups` folder next to
 the database; change it with `backup_dir` in `[database]`) and keeps the newest
 14 (`backup_keep`; `0` turns it off). The folder is inside `/var/lib/solar-dash`,

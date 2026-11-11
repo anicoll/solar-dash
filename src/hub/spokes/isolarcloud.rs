@@ -9,8 +9,8 @@ pub const META: SpokeMeta = SpokeMeta {
     offers: &[Capability::Live, Capability::History],
 };
 
-/// The iSolarCloud live sync and background backfill. It is not optional:
-/// `[isolarcloud]` is required config.
+/// The iSolarCloud live sync and background backfill. It only starts when the
+/// config has an `[isolarcloud]` section.
 pub struct IsolarCloudSpoke {
     client: Client,
     config: IsolarCloud,
