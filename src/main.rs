@@ -23,7 +23,7 @@ mod web;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use clap::{Parser, Subcommand};
@@ -204,8 +204,17 @@ async fn run_serve(config: Config) -> Result<()> {
     // Settings that no retry can fix fail here, before anything starts. The
     // login itself happens in the live sync, which retries with backoff: the
     // dashboard and Modbus data do not need iSolarCloud to be up.
-    ingest::check_sync_config(&config.isolarcloud)?;
-    let client = Client::new(config.isolarcloud.clone())?;
+    let client = match &config.isolarcloud {
+        Some(cloud) => {
+            ingest::check_sync_config(cloud)?;
+            Some(Client::new(cloud.clone())?)
+        }
+        None => {
+            info!("no [isolarcloud] section: the iSolarCloud sync is off");
+            None
+        }
+    };
+    warn_unconfigured_sources(&config);
 
     // A mistake in the offsite settings that no retry can fix fails at
     // startup too.
@@ -273,15 +282,36 @@ fn hash_password_command() -> Result<()> {
     Ok(())
 }
 
+/// Warns when `[sources] daily_energy` names a source that is not configured.
+/// That source simply never has data, so this is not an error.
+fn warn_unconfigured_sources(config: &Config) {
+    let Some(ids) = &config.sources.daily_energy else {
+        return;
+    };
+    for id in ids {
+        let configured = match id.as_str() {
+            "sungrow-modbus" => config.modbus.is_some(),
+            "isolarcloud" => config.isolarcloud.is_some(),
+            _ => true,
+        };
+        if !configured {
+            warn!(
+                "[sources] daily_energy lists {id:?}, but it is not configured; it will never have data"
+            );
+        }
+    }
+}
+
 /// Opens the database, logs in and downloads history starting at `from`.
 async fn run_backfill(config: Config, from: &str) -> Result<()> {
     // Check the date first, so a typo fails before any network call.
     let from = NaiveDate::parse_from_str(from, "%Y-%m-%d")
         .with_context(|| format!("--from must look like 2024-01-01, got {from:?}"))?;
+    let cloud = config.require_isolarcloud("backfill")?;
     let pool = db::open(&config.database.path).await?;
-    let mut client = Client::new(config.isolarcloud.clone())?;
+    let mut client = Client::new(cloud.clone())?;
     client.login().await?;
-    ingest::backfill(&client, &pool, &config.isolarcloud, from).await
+    ingest::backfill(&client, &pool, cloud, from).await
 }
 
 /// Logs in, calls one endpoint and prints its `result_data` as pretty JSON.
@@ -293,7 +323,7 @@ async fn api_call(config: Config, path: &str, params: Option<&str>) -> Result<()
         bail!("params must be a JSON object, e.g. '{{\"curPage\":1}}'");
     }
 
-    let mut client = Client::new(config.isolarcloud)?;
+    let mut client = Client::new(config.require_isolarcloud("api")?.clone())?;
     client.login().await?;
     let data = client.call(&with_leading_slash(path), params).await?;
     println!("{}", serde_json::to_string_pretty(&data)?);
@@ -311,6 +341,7 @@ fn with_leading_slash(path: &str) -> String {
 
 /// Logs in to the GloBird portal and writes a redacted dump of its endpoints.
 async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
+    let tz: Tz = config.timezone()?;
     let globird = config.globird.context(
         "globird-probe needs a [globird] section in config.toml (see config.example.toml)",
     )?;
@@ -318,27 +349,16 @@ async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
     if !(1..=366).contains(&days) {
         bail!("--days must be between 1 and 366, got {days}");
     }
-    // Local dates use the same time zone as the iSolarCloud plant.
-    let tz: Tz = config
-        .isolarcloud
-        .timezone
-        .parse()
-        .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.isolarcloud.timezone))?;
     let client = globird::client::Client::new(globird)?;
     globird::probe::run(client, tz, days, out).await
 }
 
 /// Prints what the Amber API returns for the configured site.
 async fn amber_probe(config: Config, json: Option<&Path>) -> Result<()> {
+    let tz: Tz = config.timezone()?;
     let amber = config
         .amber
         .context("amber-probe needs an [amber] section in config.toml (see config.example.toml)")?;
-    // Times are shown in the same time zone as the iSolarCloud plant.
-    let tz: Tz = config
-        .isolarcloud
-        .timezone
-        .parse()
-        .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.isolarcloud.timezone))?;
     amber::probe::run(&amber, tz, json).await
 }
 
@@ -420,8 +440,9 @@ async fn print_settings(reader: &mut modbus::Reader) {
 
 /// Logs in, lists the plants and prints a short summary.
 async fn login_test(config: Config) -> Result<()> {
-    let config_plant_id = config.isolarcloud.plant_id;
-    let mut client = Client::new(config.isolarcloud)?;
+    let cloud = config.require_isolarcloud("login-test")?.clone();
+    let config_plant_id = cloud.plant_id;
+    let mut client = Client::new(cloud)?;
     client.login().await?;
     let plants = client.plants().await?;
 

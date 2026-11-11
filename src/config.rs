@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub isolarcloud: IsolarCloud,
+    /// The iSolarCloud account. `None` (no `[isolarcloud]` section) means the
+    /// cloud sync is off; Modbus, tariffs and the rest still work.
+    pub isolarcloud: Option<IsolarCloud>,
+    /// Site-wide settings that do not belong to one data source. Optional.
+    pub site: Option<Site>,
     // `#[serde(default)]` makes the whole section optional: if it is missing,
     // `Default::default()` is used (see the `impl Default` blocks below).
     #[serde(default)]
@@ -45,6 +49,15 @@ pub struct Config {
     /// without it the defaults give the long-standing behaviour.
     #[serde(default)]
     pub sources: Sources,
+}
+
+/// The `[site]` section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Site {
+    /// The site's time zone (an IANA name). It decides where a day ends.
+    /// Wins over `timezone` in `[isolarcloud]`.
+    pub timezone: Option<String>,
 }
 
 /// The `[sources]` section; see `hub::rules` for what the settings mean.
@@ -937,6 +950,33 @@ fn default_offsite_keep() -> usize {
 }
 
 impl Config {
+    /// The site's time zone: `[site] timezone`, else `[isolarcloud] timezone`
+    /// (older configs), else the default.
+    pub fn timezone(&self) -> Result<chrono_tz::Tz> {
+        let name = self
+            .site
+            .as_ref()
+            .and_then(|site| site.timezone.clone())
+            .or_else(|| {
+                self.isolarcloud
+                    .as_ref()
+                    .map(|cloud| cloud.timezone.clone())
+            })
+            .unwrap_or_else(default_timezone);
+        name.parse()
+            .map_err(|_| anyhow::anyhow!("unknown timezone {name:?} in config.toml"))
+    }
+
+    /// The `[isolarcloud]` section, or a clear error for commands that need it.
+    pub fn require_isolarcloud(&self, command: &str) -> Result<&IsolarCloud> {
+        self.isolarcloud.as_ref().with_context(|| {
+            format!(
+                "{command} needs an [isolarcloud] section in the config \
+                 (see config.example.toml)"
+            )
+        })
+    }
+
     /// The rules from `[sources]`, with the defaults filled in.
     pub fn source_rules(&self) -> Result<crate::hub::SourceRules> {
         crate::hub::SourceRules::from_config(&self.sources)
@@ -1038,21 +1078,27 @@ mod tests {
     #[test]
     fn example_config_parses() {
         let cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
-        assert_eq!(cfg.isolarcloud.appkey, "YOUR_APPKEY");
+        assert_eq!(cfg.isolarcloud.as_ref().unwrap().appkey, "YOUR_APPKEY");
     }
 
     #[test]
     fn defaults_apply_when_sections_omitted() {
         let cfg: Config = toml::from_str(MINIMAL).unwrap();
-        assert_eq!(cfg.isolarcloud.gateway, "https://augateway.isolarcloud.com");
-        assert!(cfg.isolarcloud.encrypt);
+        assert_eq!(
+            cfg.isolarcloud.as_ref().unwrap().gateway,
+            "https://augateway.isolarcloud.com"
+        );
+        assert!(cfg.isolarcloud.as_ref().unwrap().encrypt);
         assert_eq!(cfg.server.bind, "127.0.0.1:8080");
         assert_eq!(cfg.database.path, "data/solar.db");
         assert_eq!(cfg.database.backup_dir(), PathBuf::from("data/backups"));
         assert_eq!(cfg.database.backup_keep, 14);
-        assert_eq!(cfg.isolarcloud.timezone, "Australia/Adelaide");
-        assert_eq!(cfg.isolarcloud.points.len(), 13);
-        assert!(cfg.isolarcloud.points.contains(&83252));
+        assert_eq!(
+            cfg.isolarcloud.as_ref().unwrap().timezone,
+            "Australia/Adelaide"
+        );
+        assert_eq!(cfg.isolarcloud.as_ref().unwrap().points.len(), 13);
+        assert!(cfg.isolarcloud.as_ref().unwrap().points.contains(&83252));
     }
 
     const OFFSITE: &str = "[database.offsite]\naccount_id = \"abc123\"\nbucket = \"b\"\n\
@@ -1831,5 +1877,56 @@ mod tests {
     fn missing_file_gives_helpful_error() {
         let err = Config::load(Path::new("does-not-exist.toml")).unwrap_err();
         assert!(format!("{err:#}").contains("config.example.toml"));
+    }
+
+    const CLOUD_TZ: &str = r#"
+        [isolarcloud]
+        appkey = "k"
+        access_key = "s"
+        rsa_public_key = "r"
+        username = "u"
+        password = "p"
+        timezone = "Australia/Perth"
+    "#;
+
+    #[test]
+    fn isolarcloud_section_is_optional_and_site_sets_the_timezone() {
+        let cfg: Config = toml::from_str("[site]\ntimezone = \"Australia/Sydney\"\n").unwrap();
+        assert!(cfg.isolarcloud.is_none());
+        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Sydney);
+    }
+
+    #[test]
+    fn old_config_keeps_the_isolarcloud_timezone() {
+        let cfg: Config = toml::from_str(CLOUD_TZ).unwrap();
+        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Perth);
+    }
+
+    #[test]
+    fn site_timezone_wins_over_isolarcloud() {
+        let text = format!("{CLOUD_TZ}\n[site]\ntimezone = \"Australia/Sydney\"\n");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Sydney);
+    }
+
+    #[test]
+    fn no_timezone_anywhere_gives_the_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Adelaide);
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Adelaide);
+    }
+
+    #[test]
+    fn bad_timezone_is_an_error() {
+        let cfg: Config = toml::from_str("[site]\ntimezone = \"Mars/Base\"\n").unwrap();
+        assert!(cfg.timezone().is_err());
+    }
+
+    #[test]
+    fn cloud_commands_get_a_clear_error_without_the_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let err = cfg.require_isolarcloud("backfill").unwrap_err().to_string();
+        assert!(err.contains("needs an [isolarcloud] section"), "{err}");
     }
 }

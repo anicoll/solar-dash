@@ -28,25 +28,25 @@ pub const ALL: [SpokeMeta; 7] = [
 ];
 
 /// The spokes this config turns on. A spoke with no config section is left
-/// out, so it never starts. The iSolarCloud sync and the backups are always
-/// on, as before (backups end at once when `backup_keep` is 0).
+/// out, so it never starts. The backups are always on (they end at once when
+/// `backup_keep` is 0).
 ///
-/// `client` and `offsite` are made by the caller because making them can
-/// fail, and `serve` checks those settings at a fixed point at startup.
+/// `client` (present with `[isolarcloud]`) and `offsite` are made by the
+/// caller because making them can fail, and `serve` checks those settings at
+/// a fixed point at startup.
 pub fn build(
     config: &Config,
     state: &AppState,
-    client: Client,
+    client: Option<Client>,
     offsite: Option<Offsite>,
 ) -> Vec<Box<dyn Spoke>> {
     let mut spokes: Vec<Box<dyn Spoke>> = Vec::new();
     if let Some(modbus) = config.modbus.clone() {
         spokes.push(Box::new(sungrow_modbus::SungrowModbus::new(modbus, state)));
     }
-    spokes.push(Box::new(isolarcloud::IsolarCloudSpoke::new(
-        client,
-        config.isolarcloud.clone(),
-    )));
+    if let (Some(client), Some(cloud)) = (client, config.isolarcloud.clone()) {
+        spokes.push(Box::new(isolarcloud::IsolarCloudSpoke::new(client, cloud)));
+    }
     if let Some(globird) = config.globird.clone() {
         spokes.push(Box::new(globird_portal::GlobirdPortal::new(globird)));
     }
@@ -98,5 +98,26 @@ mod tests {
             ]
         );
         assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
+    }
+
+    #[tokio::test]
+    async fn no_isolarcloud_section_means_no_isolarcloud_spoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = crate::web::hash_password("pw").unwrap();
+        let state = AppState::new(
+            pool,
+            0,
+            chrono_tz::Australia::Adelaide,
+            &hash,
+            axum_extra::extract::cookie::Key::generate(),
+        )
+        .unwrap();
+        let config: Config = toml::from_str("[site]\ntimezone = \"Australia/Perth\"\n").unwrap();
+        let spokes = build(&config, &state, None, None);
+        let ids: Vec<_> = spokes.iter().map(|spoke| spoke.id()).collect();
+        assert_eq!(ids, ["backups"]);
     }
 }
