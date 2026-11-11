@@ -315,10 +315,14 @@ fn feed_in_windows(sums: &[BandSum; 4], rates: &ExportRates) -> Vec<FeedInWindow
 }
 
 /// How a day went for the zero-import credit: `None` when its plan has no
-/// such credit, else "earned" (some credit paid) or "missed".
-fn credit_status(plan_has_credit: bool, credit_cents: f64) -> Option<&'static str> {
+/// such credit, else "earned" (some credit paid) or "missed". A day without
+/// all its data is "incomplete": we cannot tell whether it earned the credit.
+fn credit_status(plan_has_credit: bool, complete: bool, credit_cents: f64) -> Option<&'static str> {
     if !plan_has_credit {
         return None;
+    }
+    if !complete {
+        return Some("incomplete");
     }
     Some(if credit_cents > 0.0 {
         "earned"
@@ -327,7 +331,8 @@ fn credit_status(plan_has_credit: bool, credit_cents: f64) -> Option<&'static st
     })
 }
 
-/// One complete day in the `daily` series.
+/// One finished day in the `daily` series. An `incomplete` one (data missing)
+/// is listed but not counted in the sums or the projection.
 #[derive(Debug, PartialEq, Serialize)]
 struct DailyEntry {
     date: String,
@@ -335,6 +340,7 @@ struct DailyEntry {
     without_system_dollars: f64,
     credit: Option<&'static str>,
     source: &'static str,
+    incomplete: bool,
 }
 
 /// A finished bill period in the `previous` field: the sums of its days that
@@ -443,14 +449,14 @@ fn periods_before(
 }
 
 /// Sums each of `periods` from `costed` (any days, in any order; a day counts
-/// in the period whose dates contain it).
+/// in the period whose dates contain it). Days with missing data are left out.
 fn sum_periods(periods: &[Period], costed: &[CostedDay]) -> Vec<PeriodSums> {
     periods
         .iter()
         .map(|p| {
             let days: Vec<CostedDay> = costed
                 .iter()
-                .filter(|d| p.from <= d.date && d.date <= p.to)
+                .filter(|d| d.complete && p.from <= d.date && d.date <= p.to)
                 .cloned()
                 .collect();
             PeriodSums::of(&days)
@@ -483,8 +489,9 @@ fn dollars(cents: f64) -> f64 {
     round2(cents / 100.0)
 }
 
-/// `GET /api/bill/current`. Only complete days count (today is left out), so
-/// the figures do not move during the day. The bands cover the days that have
+/// `GET /api/bill/current`. Only complete days count: today is left out, so
+/// the figures do not move during the day, and so is a finished day that is
+/// missing data (it is listed in `daily` as incomplete). The bands cover the days that have
 /// interval data; a day with only a past bill's figures adds to the dollar
 /// totals but not to the bands.
 pub async fn current(State(state): State<AppState>) -> ApiResult {
@@ -508,7 +515,10 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
 
     let live_range = db::live_ts_range(&state.pool).await?;
     let now = db::now();
-    let sums = PeriodSums::of(&costed);
+    // Days with missing data are listed but kept out of every sum.
+    let complete: Vec<CostedDay> = costed.iter().filter(|d| d.complete).cloned().collect();
+    let incomplete_days = (costed.len() - complete.len()) as i64;
+    let sums = PeriodSums::of(&complete);
     let mut bands = [BandSum::default(); 3];
     let mut feed_in = [BandSum::default(); 4];
     let mut free_value_cents = 0.0;
@@ -516,16 +526,20 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
     let mut daily = Vec::with_capacity(costed.len());
     let mut uses_globird = false;
     for day in &costed {
-        uses_globird |= day.source == SOURCE_GLOBIRD || day.source == SOURCE_BILL;
         let has_credit = schedule.for_date(day.date).credit_cents().is_some();
-        credit_possible += u32::from(has_credit);
         daily.push(DailyEntry {
             date: day.date.to_string(),
             total_dollars: dollars(day.cost.actual_cents),
             without_system_dollars: dollars(day.cost.baseline_cents),
-            credit: credit_status(has_credit, day.cost.zero_import_credit_cents),
+            credit: credit_status(has_credit, day.complete, day.cost.zero_import_credit_cents),
             source: day.source,
+            incomplete: !day.complete,
         });
+        if !day.complete {
+            continue;
+        }
+        uses_globird |= day.source == SOURCE_GLOBIRD || day.source == SOURCE_BILL;
+        credit_possible += u32::from(has_credit);
         let (start, end) = day_bounds_or_error(day.date, state.tz)?;
         let live = live_in(&state.pool, live_range, start, end).await?;
         if let Some(split) = day_grid_split(&state, schedule, day.date, &live, now).await? {
@@ -540,7 +554,7 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
     let (projected, projected_without) = project(&sums, days_total, supply_per_day);
     // Rates and window times are the last complete day's plan (today's when
     // there is none yet).
-    let rate_day = costed.last().map_or(today, |day| day.date);
+    let rate_day = complete.last().map_or(today, |day| day.date);
     let rate_plan = schedule.for_date(rate_day);
     let band_cents = [
         0.0,
@@ -584,7 +598,7 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
     let (projected_low, projected_high) = projection_range(
         projected,
         sums.actual_cents,
-        days_total - days_elapsed,
+        days_total - days_elapsed + incomplete_days,
         past_sums.last(),
     );
     let history: Vec<HistoryEntry> = history.iter().map(HistoryEntry::from).collect();
@@ -939,10 +953,13 @@ mod tests {
 
     #[test]
     fn credit_status_needs_a_credit_in_the_plan() {
-        assert_eq!(credit_status(false, 0.0), None);
-        assert_eq!(credit_status(false, 100.0), None);
-        assert_eq!(credit_status(true, 100.0), Some("earned"));
-        assert_eq!(credit_status(true, 0.0), Some("missed"));
+        assert_eq!(credit_status(false, true, 0.0), None);
+        assert_eq!(credit_status(false, true, 100.0), None);
+        assert_eq!(credit_status(true, true, 100.0), Some("earned"));
+        assert_eq!(credit_status(true, true, 0.0), Some("missed"));
+        // A day with data missing is neither earned nor missed.
+        assert_eq!(credit_status(true, false, 0.0), Some("incomplete"));
+        assert_eq!(credit_status(false, false, 0.0), None);
     }
 
     fn day_cost(actual: f64, credit: f64) -> DayCost {
@@ -960,8 +977,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn incomplete_days_are_left_out_of_sums_and_projection() {
+        let mut short = costed("2026-11-03", 50.0, 0.0);
+        short.complete = false;
+        let days = [
+            costed("2026-11-01", 100.0, 100.0),
+            costed("2026-11-02", 100.0, 100.0),
+            short,
+        ];
+        let period = Period {
+            from: date("2026-11-01"),
+            to: date("2026-11-30"),
+            source: PeriodSource::Month,
+        };
+        let sums = &sum_periods(&[period], &days)[0];
+        assert_eq!((sums.days, sums.credit_days), (2, 2));
+        assert_eq!(sums.actual_cents, 200.0);
+        // 30 days at the two complete days' average (not 3 days, one cheap).
+        let (projected, _) = project(sums, 30, 100.0);
+        assert_eq!(projected, 3000.0);
+    }
+
     fn costed(day: &str, actual: f64, credit: f64) -> CostedDay {
         CostedDay {
+            complete: true,
             date: date(day),
             source: "inverter",
             cost: day_cost(actual, credit),

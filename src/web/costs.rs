@@ -789,6 +789,10 @@ pub(super) struct CostedDay {
     /// put a real bill in. Stored rows are never "globird" or "bill".
     pub source: &'static str,
     pub cost: DayCost,
+    /// Whether the day has all its data (see [`is_cacheable`]), or a bill.
+    /// Stored rows and bills are complete by definition. A day the inverter or
+    /// the sync missed part of is not.
+    pub complete: bool,
 }
 
 /// The `source` text of a stored row, or `None` for text we do not know (then
@@ -807,8 +811,10 @@ fn known_source(text: &str) -> Option<&'static str> {
 /// window to finish. Version 3: cloud readings are moved 5 minutes earlier
 /// (see [`CLOUD_LAG_SECS`]). Version 4: live days are topped up from the
 /// inverter's grid totals (see [`top_up_from_meter`]). Old rows are replaced
-/// by date as days are recomputed.
-const COST_CACHE_VERSION: u32 = 4;
+/// by date as days are recomputed. Version 5: a big step of a cloud counter is
+/// spread over the last reading gap, not smeared back up to 30 minutes (see
+/// `spread_steps`).
+const COST_CACHE_VERSION: u32 = 5;
 
 /// What stored costs are tagged with. The time zone is in it too, because
 /// moving it moves where every local day starts.
@@ -898,7 +904,13 @@ async fn compute_days(
                 .max();
             let cacheable = is_cacheable(date, today, source, live_solid, newest_counter_ts, end);
             let cost = cost::day_cost(tariff, state.tz, &intervals);
-            days.push((CostedDay { date, source, cost }, cacheable));
+            let day = CostedDay {
+                date,
+                source,
+                cost,
+                complete: cacheable,
+            };
+            days.push((day, cacheable));
         }
     }
     Ok(days)
@@ -945,6 +957,7 @@ async fn costed_days_on(
                     date,
                     source,
                     cost: row.cost,
+                    complete: true,
                 },
             );
         }
@@ -1175,6 +1188,7 @@ pub(super) async fn billed_days(
             if let Ok(i) = costed.binary_search_by_key(&date, |day| day.date) {
                 costed[i].cost = apply_bill(&costed[i].cost, &bill);
                 costed[i].source = SOURCE_GLOBIRD;
+                costed[i].complete = true;
             }
         }
     }
@@ -1188,7 +1202,16 @@ pub(super) async fn billed_days(
         costed.into_iter().map(|day| (day.date, day)).collect();
     for (date, cost) in bill_days {
         let source = SOURCE_BILL;
-        by_date.insert(date, CostedDay { date, source, cost });
+        let complete = true;
+        by_date.insert(
+            date,
+            CostedDay {
+                date,
+                source,
+                cost,
+                complete,
+            },
+        );
     }
     Ok(by_date
         .into_values()
@@ -1269,21 +1292,25 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
 
     let days: Vec<CostDay> = costed
         .iter()
-        .map(|CostedDay { date, source, cost }| CostDay {
-            date: date.to_string(),
-            source,
-            actual: dollars(cost.actual_cents),
-            baseline: dollars(cost.baseline_cents),
-            savings: dollars(cost.savings_cents),
-            import_kwh: round2(cost.import_kwh),
-            export_kwh: round2(cost.export_kwh),
-            load_kwh: round2(cost.load_kwh),
-            credit: dollars(cost.zero_import_credit_cents),
-            supply: dollars(cost.supply_cents),
-            import: dollars(cost.import_cents),
-            feed_in: dollars(cost.export_cents),
-            cars: cars_in(&date.to_string()),
-        })
+        .map(
+            |CostedDay {
+                 date, source, cost, ..
+             }| CostDay {
+                date: date.to_string(),
+                source,
+                actual: dollars(cost.actual_cents),
+                baseline: dollars(cost.baseline_cents),
+                savings: dollars(cost.savings_cents),
+                import_kwh: round2(cost.import_kwh),
+                export_kwh: round2(cost.export_kwh),
+                load_kwh: round2(cost.load_kwh),
+                credit: dollars(cost.zero_import_credit_cents),
+                supply: dollars(cost.supply_cents),
+                import: dollars(cost.import_cents),
+                feed_in: dollars(cost.export_cents),
+                cars: cars_in(&date.to_string()),
+            },
+        )
         .collect();
     Ok(Json(json!({
         "configured": true,
@@ -1722,6 +1749,7 @@ mod tests {
     fn day_cost_of(date_text: &str, credit_cents: f64) -> CostedDay {
         let actual = 100.0 + 40.0 - 25.0 - credit_cents;
         CostedDay {
+            complete: true,
             date: date(date_text),
             source: "cloud",
             cost: DayCost {

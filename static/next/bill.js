@@ -654,7 +654,8 @@
         const v = Number(d.total_dollars);
         const bar = h('span', { class: `bill-b ${v >= 0 ? 'is-pos' : 'is-neg'}`, style: `height: ${Math.max(2, (Math.abs(v) / top) * HALF_PX).toFixed(1)}px` });
         if (v >= 0) up = bar; else down = bar;
-        dot = d.credit === 'earned' ? 'earned' : d.credit === 'missed' ? 'missed' : 'none';
+        dot = d.credit === 'earned' ? 'earned' : d.credit === 'missed' ? 'missed' : d.credit === 'incomplete' ? 'future' : 'none';
+        if (d.incomplete) { up = h('span', { class: 'bill-b is-future', title: 'No full data' }); down = null; }
       } else {
         up = h('span', { class: 'bill-b is-future' });
         dot = isToday ? 'tonight' : anyCredit ? 'future' : 'none';
