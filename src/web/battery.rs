@@ -1042,7 +1042,7 @@ mod tests {
             9999
         ));
         assert!(car_charging_during(
-            &[session(1500, Some(3000), None)],
+            &[session(1500, Some(3000), home)],
             from,
             to,
             9999
@@ -1069,6 +1069,13 @@ mod tests {
         ));
         assert!(!car_charging_during(
             &[session(2000, Some(3000), home)],
+            from,
+            to,
+            9999
+        ));
+        // No geofence (a public charger) counts as away too.
+        assert!(!car_charging_during(
+            &[session(500, Some(1500), None)],
             from,
             to,
             9999
