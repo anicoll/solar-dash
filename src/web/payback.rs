@@ -197,43 +197,31 @@ fn projected_payback(net: f64, rate: f64, price_rise_percent: f64, today: NaiveD
     }
 }
 
-/// What one day's prices and export look like, for valuing a battery's discharge.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct DayExport {
-    /// The day's peak import rate in cents.
-    peak_cents: f64,
-    /// kWh sent to the grid that day.
-    export_kwh: f64,
-    /// The day's average feed-in price in cents per kWh (0 if nothing exported).
-    export_cents: f64,
-}
-
-/// Dollars a battery adds on one day, a rough estimate. The discharge beyond
-/// what the batteries owned before it could supply (`BATTERY_USABLE` of their
-/// capacity) is the "extra". Extra discharge that was exported earned only the
-/// feed-in price, not the peak import price it would have avoided at home. We
-/// cannot tell battery export from solar export, so we take the day's export
-/// as the most the extra could have exported: that part (up to the whole
-/// extra) is valued at the day's average feed-in price, the rest at the peak
-/// import price. Never negative.
-fn added_savings(discharge_kwh: f64, owned_kwh: f64, day: DayExport) -> f64 {
-    let extra = (discharge_kwh - BATTERY_USABLE * owned_kwh).max(0.0);
-    let exported = extra.min(day.export_kwh.max(0.0));
-    ((extra - exported) * day.peak_cents + exported * day.export_cents) / 100.0
+/// Dollars a battery adds on one day: the discharge beyond what the batteries
+/// owned before it could supply (`BATTERY_USABLE` of their capacity), priced
+/// at the day's peak import rate in cents. Never negative.
+///
+/// This is a rough, high estimate: extra discharge that went to the grid in
+/// the evening earned only the feed-in price, not the peak price. A day's
+/// total export cannot tell battery export from solar export (on a sunny day
+/// solar exports far more than the battery holds), so it is not used here;
+/// splitting it properly needs the evening export per day.
+fn added_savings(discharge_kwh: f64, owned_kwh: f64, peak_cents: f64) -> f64 {
+    (discharge_kwh - BATTERY_USABLE * owned_kwh).max(0.0) * peak_cents / 100.0
 }
 
 /// What a battery added on each day from `from` that has a discharge figure,
-/// in dollars. `day_export` gives a day's prices and export. Days without a
+/// in dollars. `peak_cents` gives a day's peak import rate. Days without a
 /// figure are left out, so they add nothing.
 fn estimated_added(
     discharge: &BTreeMap<NaiveDate, f64>,
     from: NaiveDate,
     owned_kwh: f64,
-    day_export: impl Fn(NaiveDate) -> DayExport,
+    peak_cents: impl Fn(NaiveDate) -> f64,
 ) -> BTreeMap<NaiveDate, f64> {
     discharge
         .range(from..)
-        .map(|(&date, &kwh)| (date, added_savings(kwh, owned_kwh, day_export(date))))
+        .map(|(&date, &kwh)| (date, added_savings(kwh, owned_kwh, peak_cents(date))))
         .collect()
 }
 
@@ -410,15 +398,10 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
     // From the first purchase until today (but not unreasonably far back).
     let start = first.date.max(today - Days::new(MAX_PAYBACK_DAYS));
     let dates: Vec<NaiveDate> = start.iter_days().take_while(|d| *d <= today).collect();
-    let costed = billed_days(&state, tariff, &dates).await?;
-    let days: Vec<DaySavings> = costed
-        .iter()
+    let days: Vec<DaySavings> = billed_days(&state, tariff, &dates)
+        .await?
+        .into_iter()
         .map(|d| (d.date, d.cost.savings_cents / 100.0))
-        .collect();
-    // Each day's export and feed-in credit, to value exported discharge.
-    let exports: BTreeMap<NaiveDate, (f64, f64)> = costed
-        .iter()
-        .map(|d| (d.date, (d.cost.export_kwh, d.cost.export_cents)))
         .collect();
 
     let total_cost: f64 = data.purchases.iter().map(|p| p.cost_dollars).sum();
@@ -462,16 +445,7 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
             }
             let owned = battery_owned_before(&data.purchases, i);
             Some(estimated_added(&discharge, p.date, owned, |date| {
-                let (export_kwh, export_cents) = exports.get(&date).copied().unwrap_or((0.0, 0.0));
-                DayExport {
-                    peak_cents: tariff.for_date(date).peak_import_cents(),
-                    export_kwh,
-                    export_cents: if export_kwh > 0.0 {
-                        export_cents / export_kwh
-                    } else {
-                        0.0
-                    },
-                }
+                tariff.for_date(date).peak_import_cents()
             }))
         })
         .collect();
@@ -714,36 +688,11 @@ mod tests {
     #[test]
     fn a_battery_adds_only_the_discharge_beyond_what_was_owned() {
         // 10 kWh owned supplies 9.5; 12 kWh discharged leaves 2.5 at 50 c.
-        assert!((added_savings(12.0, 10.0, no_export(50.0)) - 1.25).abs() < 1e-9);
+        assert!((added_savings(12.0, 10.0, 50.0) - 1.25).abs() < 1e-9);
         // Less than the old battery could supply: nothing, never negative.
-        assert_eq!(added_savings(9.0, 10.0, no_export(50.0)), 0.0);
+        assert_eq!(added_savings(9.0, 10.0, 50.0), 0.0);
         // With no battery before, all of it counts.
-        assert!((added_savings(4.0, 0.0, no_export(25.0)) - 1.0).abs() < 1e-9);
-    }
-
-    fn no_export(peak_cents: f64) -> DayExport {
-        DayExport {
-            peak_cents,
-            export_kwh: 0.0,
-            export_cents: 0.0,
-        }
-    }
-
-    #[test]
-    fn extra_discharge_that_was_exported_earns_the_feed_in_price() {
-        // Extra is 2.5 kWh. 1 kWh exported at 10 c, the other 1.5 at 50 c.
-        let day = DayExport {
-            peak_cents: 50.0,
-            export_kwh: 1.0,
-            export_cents: 10.0,
-        };
-        assert!((added_savings(12.0, 10.0, day) - (1.5 * 0.5 + 0.1)).abs() < 1e-9);
-        // More export than extra: all the extra is valued at feed-in.
-        let day = DayExport {
-            export_kwh: 8.0,
-            ..day
-        };
-        assert!((added_savings(12.0, 10.0, day) - 0.25).abs() < 1e-9);
+        assert!((added_savings(4.0, 0.0, 25.0) - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -756,7 +705,7 @@ mod tests {
         ]
         .into();
         // Peak 40 c before the 3rd, 80 c from then on.
-        let peak = |d: NaiveDate| no_export(if d < date("2025-10-03") { 40.0 } else { 80.0 });
+        let peak = |d: NaiveDate| if d < date("2025-10-03") { 40.0 } else { 80.0 };
         let added = estimated_added(&discharge, date("2025-10-01"), 10.0, peak);
         let got: Vec<(NaiveDate, f64)> = added.into_iter().collect();
         assert_eq!(got.len(), 2);
