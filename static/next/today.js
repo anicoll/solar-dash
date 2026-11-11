@@ -447,6 +447,11 @@
         const head = h('div', { class: 'card-head' },
           h('h2', { class: 'section-title', id: 'today-now-h', text: 'Right now' }),
           h('span', { class: 'card-sub', text: data.tariff ? bandLabel(SD.local().minute) : null }));
+        // No live source at all (not just a quiet moment): say so, and let the day cards below carry the page.
+        if (!SD.caps.live) {
+          el.replaceChildren(head, h('p', { class: 'muted today-gap', text: 'No live source configured. The figures below come from the latest day data.' }));
+          return;
+        }
         if (!sample) {
           el.replaceChildren(head, h('p', { class: 'muted today-gap', text: 'No live reading from the inverter right now.' }));
           return;
@@ -718,7 +723,7 @@
     return {
       el,
       update() {
-        const prices = data.prices;
+        const prices = SD.caps.prices ? data.prices : null; // no price source: the card stays hidden
         const nowTs = Math.floor(Date.now() / 1000);
         const channels = (prices && prices.channels) || {};
         const buy = priceAt(channels.general, nowTs);
@@ -972,10 +977,12 @@
   async function loadSamples(today) {
     const now = SD.local();
     const start = Math.floor(Date.now() / 1000) - now.minute * 60 - now.sec;
-    try {
-      const live = await SD.fetchJSON(`/api/live/series?from=${start}&to=${Math.floor(Date.now() / 1000)}`);
-      if (live.data && live.data.length) return toSamples(live.data);
-    } catch (err) { /* fall through to the cloud series */ }
+    if (SD.caps.live) {
+      try {
+        const live = await SD.fetchJSON(`/api/live/series?from=${start}&to=${Math.floor(Date.now() / 1000)}`);
+        if (live.data && live.data.length) return toSamples(live.data);
+      } catch (err) { /* fall through to the cloud series */ }
+    }
     try {
       return cloudSamples(await SD.fetchJSON(`/api/day?date=${today}`));
     } catch (err) { return null; }
@@ -988,15 +995,19 @@
     const today = SD.local().date;
     const tomorrow = SD.local(Date.now() / 1000 + 86400).date;
     const nowTs = Math.floor(Date.now() / 1000);
+    // Without a plan (no costs) nothing cost-shaped is asked for; without a price source, no prices.
+    // `none` stands in for a call that is skipped.
+    const none = Promise.resolve(null);
+    const caps = SD.caps;
     const [tariff, tomorrowT, costs, daily, samples, battery, prices] = await Promise.all([
-      ok(SD.tariff.get()),
-      ok(SD.tariff.get(tomorrow)),
-      ok(SD.fetchJSON(`/api/costs?from=${today}&to=${today}`)),
+      caps.costs ? ok(SD.tariff.get()) : none,
+      caps.costs ? ok(SD.tariff.get(tomorrow)) : none,
+      caps.costs ? ok(SD.fetchJSON(`/api/costs?from=${today}&to=${today}`)) : none,
       ok(SD.fetchJSON(`/api/daily?from=${today}&to=${today}`)),
       loadSamples(today),
-      ok(SD.fetchJSON('/api/battery?days=31')),
+      caps.costs ? ok(SD.fetchJSON('/api/battery?days=31')) : none,
       // A little history so the interval we are in is always there, and the forecast beyond the strip.
-      ok(SD.fetchJSON(`/api/prices?from=${nowTs - 900}&to=${nowTs + PRICE_AHEAD_S + 1800}`)),
+      caps.prices ? ok(SD.fetchJSON(`/api/prices?from=${nowTs - 900}&to=${nowTs + PRICE_AHEAD_S + 1800}`)) : none,
     ]);
     if (!view) return;
     data.tariff = tariff;
@@ -1048,10 +1059,11 @@
       mq.addEventListener('change', onResize);
       view.stopMq = () => mq.removeEventListener('change', onResize);
 
-      view.unsub = SD.live.subscribe((live) => {
+      // No live source: do not poll /api/live (it would only ever be empty).
+      view.unsub = SD.caps.live ? SD.live.subscribe((live) => {
         data.live = live;
         if (data.tariff !== undefined) updateAll();
-      });
+      }) : () => {};
       refreshSlow().catch(() => {});
       view.timers.push(setInterval(() => refreshSlow().catch(() => {}), SLOW_MS));
       // Inside the credit window the bought total matters, so the samples are fetched every minute.

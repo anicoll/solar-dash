@@ -241,9 +241,9 @@
   /* ---------------------------------------------------------------- page */
 
   function render(pb) {
-    if (!pb.configured || !pb.purchases.length) {
+    if (!pb || !pb.configured || !(pb.purchases || []).length) {
       return [h('header', { class: 'page-head' }, h('h1', { class: 'pb-title', text: 'Payback' })),
-        note('Add a plan and at least one purchase in Admin to see when the system pays for itself.')];
+        note('Add a plan and a system purchase in Admin to see when it pays for itself.')];
     }
     const names = joinNames(pb.purchases.map((p) => p.name));
     const head = h('header', { class: 'page-head pb-head' },
