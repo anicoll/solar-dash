@@ -38,7 +38,7 @@ fn by_channel(rows: Vec<StoredPrice>) -> BTreeMap<String, Vec<StoredPrice>> {
     grouped
 }
 
-/// `{"channels":{"general":[{start,end,cents,spot_cents,kind},...],"feed_in":[...]},"now":{"general":{...}}}`.
+/// `{"spike_cents":100,"channels":{"general":[{start,end,cents,spot_cents,kind},...],"feed_in":[...]},"now":{"general":{...}}}`.
 ///
 /// `from` and `to` are unix seconds, at most 31 days apart; intervals that
 /// start in `[from, to)` are returned, oldest first, grouped by channel
@@ -68,5 +68,11 @@ pub async fn prices(
     for row in current {
         now.entry(row.channel.clone()).or_insert(row);
     }
-    Ok(Json(json!({ "channels": by_channel(rows), "now": now })))
+    // The Today page colours the live price with this (the `price_spike_cents` setting).
+    let spike_cents = state.admin.get().price_spike_cents;
+    Ok(Json(json!({
+        "channels": by_channel(rows),
+        "now": now,
+        "spike_cents": spike_cents,
+    })))
 }
