@@ -22,8 +22,9 @@ use super::api::{
     date_range, day_bounds, day_bounds_or_error, live_totals, spread_steps, today,
 };
 use super::battery::local_time;
+use crate::amber::store as amber_store;
 use crate::bills::{self, Metered, PastBill};
-use crate::cost::{self, DayCost, GridSplit, Interval, Tariff, TariffSchedule};
+use crate::cost::{self, DayCost, DayPrices, GridSplit, Interval, Tariff, TariffSchedule};
 use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
 use crate::ev_cost::{self, CarDayTotals};
 use crate::globird::data::{self as globird_data, bucket_of, is_supply};
@@ -497,8 +498,12 @@ pub(super) async fn day_grid_split(
         load: &counters.load,
         meter: &meter,
     };
-    Ok(day_intervals(&day, now)
-        .map(|(_, intervals, _)| cost::grid_split(schedule.for_date(date), state.tz, &intervals)))
+    let tariff = schedule.for_date(date);
+    let prices = plan_day_prices(state, tariff, date, today(state.tz)).await?;
+    let spike_cents = state.admin.get().price_spike_cents;
+    Ok(day_intervals(&day, now).map(|(_, intervals, _)| {
+        cost::grid_split_priced(tariff, state.tz, &intervals, prices.as_ref(), spike_cents)
+    }))
 }
 
 /// The rows of a list sorted by time that fall in `[start, end)`.
@@ -872,6 +877,43 @@ pub(super) fn cache_key(tz: Tz, tariff: &Tariff) -> String {
     format!("{COST_CACHE_VERSION}|{tz}|{}", tariff.key())
 }
 
+/// The stored prices to cost one day with, or `None` for a plan that is not
+/// dynamic (which does no query at all). `include_current` is true for today
+/// and later, where the interval under way counts as known; for a finished
+/// day only final `actual` prices are used. Forecasts are never used.
+pub(super) async fn plan_day_prices(
+    state: &AppState,
+    tariff: &Tariff,
+    date: NaiveDate,
+    today: NaiveDate,
+) -> Result<Option<DayPrices>, ApiError> {
+    let Some(source) = tariff.dynamic_source() else {
+        return Ok(None);
+    };
+    let (start, end) = day_bounds_or_error(date, state.tz)?;
+    let prices = amber_store::day_prices(&state.pool, source, start, end, date >= today).await?;
+    Ok(Some(prices))
+}
+
+/// What a dynamic plan's stored day cost is tagged with: the plan's key plus
+/// a fingerprint of that day's price rows, so a late or corrected price makes
+/// the day be costed again. Static plans use [`cache_key`] alone, unchanged.
+async fn dynamic_day_key(
+    state: &AppState,
+    tariff: &Tariff,
+    source: &str,
+    date: NaiveDate,
+    today: NaiveDate,
+) -> Result<String, ApiError> {
+    let (start, end) = day_bounds_or_error(date, state.tz)?;
+    let fingerprint =
+        amber_store::day_prices_fingerprint(&state.pool, source, start, end, date >= today).await?;
+    Ok(format!(
+        "{}|prices:{fingerprint}",
+        cache_key(state.tz, tariff)
+    ))
+}
+
 /// May this day's cost be stored for good? Only a finished day with all its
 /// data: it is before `today`, and either it used the inverter with good
 /// coverage (`live_solid`; a partial live day is kept out so a cloud backfill
@@ -954,7 +996,9 @@ async fn compute_days(
                 .max();
             let cacheable = is_cacheable(date, today, source, live_solid, newest_counter_ts, end);
             let credit = credit_override_kwh(tariff, state.tz, date, source, day.meter);
-            let cost = cost::day_cost_with_window_import(tariff, state.tz, &intervals, credit);
+            let prices = plan_day_prices(state, tariff, date, today).await?;
+            let cost =
+                cost::day_cost_priced(tariff, state.tz, &intervals, prices.as_ref(), credit).cost;
             let day = CostedDay {
                 date,
                 source,
@@ -996,8 +1040,22 @@ async fn costed_days_on(
         return Ok(Vec::new());
     };
     let key = cache_key(state.tz, tariff);
-    let stored =
-        db::daily_costs_in_range(&state.pool, &first.to_string(), &last.to_string(), &key).await?;
+    let today = today(state.tz);
+    // A static plan has one key for every day. A dynamic plan's key also
+    // carries each day's price fingerprint, so it is worked out per day.
+    let mut day_keys: HashMap<String, String> = HashMap::new();
+    let mut stored = Vec::new();
+    if let Some(source) = tariff.dynamic_source() {
+        for &date in dates {
+            let day_key = dynamic_day_key(state, tariff, source, date, today).await?;
+            let text = date.to_string();
+            stored.extend(db::daily_costs_in_range(&state.pool, &text, &text, &day_key).await?);
+            day_keys.insert(text, day_key);
+        }
+    } else {
+        stored = db::daily_costs_in_range(&state.pool, &first.to_string(), &last.to_string(), &key)
+            .await?;
+    }
     let mut by_date: HashMap<String, CostedDay> = HashMap::new();
     for row in stored {
         let parsed = (NaiveDate::from_str(&row.date), known_source(&row.source));
@@ -1019,7 +1077,6 @@ async fn costed_days_on(
         .copied()
         .filter(|date| !by_date.contains_key(&date.to_string()))
         .collect();
-    let today = today(state.tz);
     let mut to_store = Vec::new();
     for run in consecutive_runs(&missing) {
         for (day, cacheable) in compute_days(state, tariff, run, today).await? {
@@ -1033,7 +1090,14 @@ async fn costed_days_on(
             by_date.insert(day.date.to_string(), day);
         }
     }
-    db::save_daily_costs(&state.pool, &to_store, &key).await?;
+    if tariff.dynamic_source().is_some() {
+        for day in &to_store {
+            let day_key = day_keys.get(&day.date).unwrap_or(&key);
+            db::save_daily_costs(&state.pool, std::slice::from_ref(day), day_key).await?;
+        }
+    } else {
+        db::save_daily_costs(&state.pool, &to_store, &key).await?;
+    }
 
     // Back in date order, which `HashMap` does not keep.
     Ok(dates

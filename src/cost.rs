@@ -79,8 +79,17 @@ pub struct Tariff {
     export: Vec<PricedWindow>,
     zero_import_credit: Option<ZeroImportCredit>,
     export_tier: Option<ExportTier>,
+    dynamic: Option<Dynamic>,
     /// Identifies these exact rates; see [`Tariff::key`].
     key: String,
+}
+
+/// The settings of a plan priced from stored live prices.
+#[derive(Debug, Clone)]
+struct Dynamic {
+    source: String,
+    fee_cents_per_day: f64,
+    feed_in_paid_when_negative: bool,
 }
 
 fn windows_of(list: &[PricedWindow]) -> Vec<(u32, u32, f64)> {
@@ -125,6 +134,26 @@ impl Tariff {
             })
             .transpose()
             .context("invalid zero_import_credit in [tariff]")?;
+        let dynamic = cfg
+            .dynamic
+            .as_ref()
+            .map(|d| {
+                anyhow::ensure!(
+                    !d.source.trim().is_empty(),
+                    "source in the dynamic prices must not be empty"
+                );
+                anyhow::ensure!(
+                    d.fee_cents_per_day.is_finite(),
+                    "fee_cents_per_day in the dynamic prices must be a number"
+                );
+                Ok::<_, anyhow::Error>(Dynamic {
+                    source: d.source.trim().to_string(),
+                    fee_cents_per_day: d.fee_cents_per_day,
+                    feed_in_paid_when_negative: d.feed_in_paid_when_negative,
+                })
+            })
+            .transpose()
+            .context("invalid dynamic prices in [tariff]")?;
         Ok(Self {
             supply_cents_per_day: cfg.supply_cents_per_day,
             default_import_cents: cfg.default_import_cents,
@@ -136,6 +165,7 @@ impl Tariff {
                 first_kwh: t.first_kwh_per_day,
                 cents: t.cents,
             }),
+            dynamic,
             key: serde_json::to_string(cfg).context("could not describe the [tariff] section")?,
         })
     }
@@ -145,6 +175,18 @@ impl Tariff {
     /// costs are tagged with it, so editing config.toml makes them stale.
     pub fn key(&self) -> &str {
         &self.key
+    }
+
+    /// The price source prefix when this plan is priced from stored live
+    /// prices; `None` for an ordinary (static) plan.
+    pub fn dynamic_source(&self) -> Option<&str> {
+        self.dynamic.as_ref().map(|d| d.source.as_str())
+    }
+
+    /// The fixed charge for one day: the supply charge plus a dynamic plan's
+    /// retailer fee (nothing is added for a static plan).
+    fn daily_supply_cents(&self) -> f64 {
+        self.supply_cents_per_day + self.dynamic.as_ref().map_or(0.0, |d| d.fee_cents_per_day)
     }
 
     /// The zero-import credit window as (start, end) minutes since local
@@ -227,9 +269,16 @@ impl Tariff {
     /// Cents earned for exporting `kwh` at this local time, after
     /// `already_kwh` earlier the same local day (for the daily export tier).
     pub fn export_value_cents(&self, minute_of_day: u32, already_kwh: f64, kwh: f64) -> f64 {
+        self.export_value_at_rate(already_kwh, kwh, self.export_cents_at(minute_of_day))
+    }
+
+    /// Like [`Tariff::export_value_cents`], but the part outside the daily
+    /// tier is paid `rest_cents` instead of the time-of-day rate. A dynamic
+    /// plan passes the live feed-in price here, so the tier still applies.
+    fn export_value_at_rate(&self, already_kwh: f64, kwh: f64, rest_cents: f64) -> f64 {
         let (tier_kwh, rest_kwh) = self.split_export_tier(already_kwh, kwh);
         let tier_cents = self.export_tier.map_or(0.0, |t| t.cents);
-        tier_kwh * tier_cents + rest_kwh * self.export_cents_at(minute_of_day)
+        tier_kwh * tier_cents + rest_kwh * rest_cents
     }
 
     /// The import price averaged over the 24 hours of a day, in cents per kWh.
@@ -546,12 +595,34 @@ fn interval_minute(tz: Tz, iv: &Interval) -> u32 {
 /// Export inside the daily `export_tier` is counted in `export_tier_kwh`
 /// (splitting an interval that crosses the threshold); only the rest is
 /// classified by time of day.
+#[cfg(test)]
 pub fn grid_split(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> GridSplit {
+    grid_split_priced(tariff, tz, intervals, None, 0.0)
+}
+
+/// Like [`grid_split`], but with stored `prices` an interval whose price is
+/// known is banded by that price: import by [`live_import_band`] against
+/// `spike_cents`, feed-in as `Other` when it earns nothing or less, `Super`
+/// above `spike_cents`, otherwise `Peak`. Intervals without a price row use
+/// the plan's windows, as [`day_cost_priced`] does. With `None` this is
+/// exactly [`grid_split`].
+pub fn grid_split_priced(
+    tariff: &Tariff,
+    tz: Tz,
+    intervals: &[Interval],
+    prices: Option<&DayPrices>,
+    spike_cents: f64,
+) -> GridSplit {
     let mut split = GridSplit::default();
     let mut exported = 0.0;
     for iv in in_time_order(tariff, intervals).iter() {
         let minute = interval_minute(tz, iv);
-        match tariff.import_band_at(minute) {
+        let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
+        let import_band = match prices.and_then(|p| span_at(&p.general, mid)) {
+            Some(cents) => live_import_band(cents, spike_cents),
+            None => tariff.import_band_at(minute),
+        };
+        match import_band {
             ImportBand::Free => split.import_free_kwh += iv.import_kwh,
             ImportBand::Shoulder => split.import_shoulder_kwh += iv.import_kwh,
             ImportBand::Peak => split.import_peak_kwh += iv.import_kwh,
@@ -559,13 +630,100 @@ pub fn grid_split(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> GridSplit 
         let (tier_kwh, rest_kwh) = tariff.split_export_tier(exported, iv.export_kwh);
         exported += iv.export_kwh;
         split.export_tier_kwh += tier_kwh;
-        match tariff.export_band_at(minute) {
+        let export_band = match prices.and_then(|p| span_at(&p.feed_in, mid)) {
+            Some(stored) => {
+                let earning = tariff.feed_in_earning(stored);
+                if earning <= 0.0 {
+                    ExportBand::Other
+                } else if earning > spike_cents {
+                    ExportBand::Super
+                } else {
+                    ExportBand::Peak
+                }
+            }
+            None => tariff.export_band_at(minute),
+        };
+        match export_band {
             ExportBand::Super => split.export_super_kwh += rest_kwh,
             ExportBand::Peak => split.export_peak_kwh += rest_kwh,
             ExportBand::Other => split.export_other_kwh += rest_kwh,
         }
     }
     split
+}
+
+/// One stored price: c/kWh including GST over `[start_ts, end_ts)`, as the
+/// source gave it (a feed-in price has not had its sign changed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriceSpan {
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub cents: f64,
+}
+
+/// The stored prices for one local day: import (`general`) and `feed_in`
+/// spans, sorted by start. The caller decides which rows go in: finished
+/// `actual` prices, plus `current` for today, and never `forecast`.
+#[derive(Debug, Clone, Default)]
+pub struct DayPrices {
+    pub(crate) general: Vec<PriceSpan>,
+    pub(crate) feed_in: Vec<PriceSpan>,
+}
+
+/// The span covering `ts`, if any. `spans` must be sorted by start.
+fn span_at(spans: &[PriceSpan], ts: i64) -> Option<f64> {
+    // The last span that starts at or before `ts`; it covers `ts` only if it
+    // has not ended yet.
+    let next = spans.partition_point(|s| s.start_ts <= ts);
+    let span = spans.get(next.checked_sub(1)?)?;
+    (ts < span.end_ts).then_some(span.cents)
+}
+
+impl DayPrices {
+    pub fn new(mut general: Vec<PriceSpan>, mut feed_in: Vec<PriceSpan>) -> Self {
+        // Two sources under one prefix can price the same start; keep one.
+        for spans in [&mut general, &mut feed_in] {
+            spans.sort_by_key(|s| s.start_ts);
+            spans.dedup_by_key(|s| s.start_ts);
+        }
+        Self { general, feed_in }
+    }
+}
+
+/// A day's cost from stored prices, and how much of it had to fall back to
+/// the plan's own windows because no price row covered the time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PricedDayCost {
+    pub cost: DayCost,
+    /// Minutes of energy intervals priced from the plan's windows, because
+    /// the import or the feed-in price was missing. 0 means every interval
+    /// was priced from stored prices.
+    pub fallback_minutes: u32,
+}
+
+/// The band of an import price when prices come from a live source: nothing
+/// to pay is `Free`, above `spike_cents` is `Peak`, anything else `Shoulder`.
+/// The same rule the Today page uses to colour the live price.
+pub fn live_import_band(cents: f64, spike_cents: f64) -> ImportBand {
+    if cents <= 0.0 {
+        ImportBand::Free
+    } else if cents > spike_cents {
+        ImportBand::Peak
+    } else {
+        ImportBand::Shoulder
+    }
+}
+
+impl Tariff {
+    /// What a stored feed-in price earns, in cents per kWh (positive means
+    /// money in). Follows the plan's `feed_in_paid_when_negative` setting.
+    fn feed_in_earning(&self, stored_cents: f64) -> f64 {
+        match &self.dynamic {
+            Some(d) if !d.feed_in_paid_when_negative => stored_cents,
+            // Flip the sign. Written as a subtraction so 0 stays 0, not -0.
+            _ => 0.0 - stored_cents,
+        }
+    }
 }
 
 /// Local minutes since midnight for a unix time. We price an interval at its
@@ -598,13 +756,29 @@ pub fn day_cost_with_window_import(
     intervals: &[Interval],
     window_import_override_kwh: Option<f64>,
 ) -> DayCost {
+    day_cost_priced(tariff, tz, intervals, None, window_import_override_kwh).cost
+}
+
+/// The one costing loop. With `prices` of `None` every interval is priced
+/// from the plan's windows, exactly as a static plan always was. With prices,
+/// an interval takes the stored general price (import) and feed-in price
+/// (export) that cover its midpoint, and falls back to the windows for
+/// whichever one is missing. The credit, the export tier and the supply
+/// charge come from the plan either way.
+pub fn day_cost_priced(
+    tariff: &Tariff,
+    tz: Tz,
+    intervals: &[Interval],
+    prices: Option<&DayPrices>,
+    window_import_override_kwh: Option<f64>,
+) -> PricedDayCost {
     let mut cost = DayCost {
         import_kwh: 0.0,
         export_kwh: 0.0,
         load_kwh: 0.0,
         import_cents: 0.0,
         export_cents: 0.0,
-        supply_cents: tariff.supply_cents_per_day,
+        supply_cents: tariff.daily_supply_cents(),
         zero_import_credit_cents: 0.0,
         actual_cents: 0.0,
         baseline_cents: 0.0,
@@ -619,16 +793,28 @@ pub fn day_cost_with_window_import(
     let mut baseline_import_cents = 0.0;
     // Export so far today, for the daily export tier.
     let mut exported = 0.0;
+    let mut fallback_secs = 0_i64;
 
     for iv in in_time_order(tariff, intervals).iter() {
         let minute = interval_minute(tz, iv);
-        let import_price = tariff.import_cents_at(minute);
+        let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
+        let live_import = prices.and_then(|p| span_at(&p.general, mid));
+        let live_export = prices.and_then(|p| span_at(&p.feed_in, mid));
+        if prices.is_some() && (live_import.is_none() || live_export.is_none()) {
+            fallback_secs += (iv.end_ts - iv.start_ts).max(0);
+        }
+        let import_price = live_import.unwrap_or_else(|| tariff.import_cents_at(minute));
 
         cost.import_kwh += iv.import_kwh;
         cost.export_kwh += iv.export_kwh;
         cost.load_kwh += iv.load_kwh;
         cost.import_cents += iv.import_kwh * import_price;
-        cost.export_cents += tariff.export_value_cents(minute, exported, iv.export_kwh);
+        cost.export_cents += match live_export {
+            Some(stored) => {
+                tariff.export_value_at_rate(exported, iv.export_kwh, tariff.feed_in_earning(stored))
+            }
+            None => tariff.export_value_cents(minute, exported, iv.export_kwh),
+        };
         exported += iv.export_kwh;
         baseline_import_cents += iv.load_kwh * import_price;
 
@@ -653,7 +839,10 @@ pub fn day_cost_with_window_import(
         cost.supply_cents + cost.import_cents - cost.export_cents - cost.zero_import_credit_cents;
     cost.baseline_cents = cost.supply_cents + baseline_import_cents;
     cost.savings_cents = cost.baseline_cents - cost.actual_cents;
-    cost
+    PricedDayCost {
+        cost,
+        fallback_minutes: (fallback_secs / 60) as u32,
+    }
 }
 
 #[cfg(test)]
@@ -1397,5 +1586,188 @@ mod tests {
         };
         assert!(close(cost_on("2026-06-30"), 14.0 * 15.0 + 6.0 * 5.0));
         assert!(close(cost_on("2026-07-01"), 20.0 * 5.0));
+    }
+
+    /// A flat plan with an export tier and a credit, optionally dynamic.
+    fn plan_with(dynamic: &str) -> Tariff {
+        tariff(&format!(
+            r#"
+            [tariff]
+            supply_cents_per_day = 100.0
+            default_import_cents = 30.0
+            default_export_cents = 5.0
+            import = [{{ from = "00:00", to = "01:00", cents = 10.0 }}]
+            zero_import_credit = {{ from = "23:00", to = "23:59", max_kwh = 1.0, credit_cents = 50.0 }}
+            {dynamic}
+            "#
+        ))
+    }
+
+    /// Two 5-minute intervals from midnight on 1 Sep 2026 (Adelaide, UTC+9:30).
+    fn two_intervals() -> (i64, Vec<Interval>) {
+        let midnight = ADELAIDE
+            .with_ymd_and_hms(2026, 9, 1, 0, 0, 0)
+            .unwrap()
+            .timestamp();
+        let iv = |i: i64| Interval {
+            start_ts: midnight + i * 300,
+            end_ts: midnight + (i + 1) * 300,
+            import_kwh: 2.0,
+            export_kwh: 1.0,
+            load_kwh: 3.0,
+        };
+        (midnight, vec![iv(0), iv(1)])
+    }
+
+    fn span(start_ts: i64, cents: f64) -> PriceSpan {
+        PriceSpan {
+            start_ts,
+            end_ts: start_ts + 300,
+            cents,
+        }
+    }
+
+    const DYNAMIC: &str = "[tariff.dynamic]\nsource = \"amber\"\nfee_cents_per_day = 20.0\n";
+
+    #[test]
+    fn without_prices_the_static_path_is_unchanged() {
+        let t = plan_with("");
+        let (_, ivs) = two_intervals();
+        let plain = day_cost_with_window_import(&t, ADELAIDE, &ivs, None);
+        let priced = day_cost_priced(&t, ADELAIDE, &ivs, None, None);
+        assert_eq!(priced.cost, plain);
+        assert_eq!(priced.fallback_minutes, 0);
+        // Golden numbers: 2 x 2 kWh at the 10c window, 2 x 1 kWh at 5c.
+        assert_eq!(plain.import_cents, 40.0);
+        assert_eq!(plain.export_cents, 10.0);
+        assert_eq!(plain.supply_cents, 100.0);
+    }
+
+    #[test]
+    fn a_dynamic_day_is_priced_from_the_rows() {
+        let t = plan_with(DYNAMIC);
+        let (m, ivs) = two_intervals();
+        let prices = DayPrices::new(
+            vec![span(m, 40.0), span(m + 300, 20.0)],
+            vec![span(m, -8.0), span(m + 300, -2.0)],
+        );
+        let r = day_cost_priced(&t, ADELAIDE, &ivs, Some(&prices), None);
+        // Import: 2 kWh at 40c and at 20c. Feed-in: 1 kWh at +8c and +2c.
+        assert_eq!(r.cost.import_cents, 120.0);
+        assert_eq!(r.cost.export_cents, 10.0);
+        // The retailer fee is added to the supply charge.
+        assert_eq!(r.cost.supply_cents, 120.0);
+        assert_eq!(r.fallback_minutes, 0);
+        // The baseline (no solar or battery) uses the same live prices.
+        assert_eq!(r.cost.baseline_cents, 120.0 + 3.0 * 40.0 + 3.0 * 20.0);
+    }
+
+    #[test]
+    fn missing_rows_fall_back_to_the_windows_and_are_counted() {
+        let t = plan_with(DYNAMIC);
+        let (m, ivs) = two_intervals();
+        // Only the first interval has prices; the second uses the plan's
+        // 10c import window and 5c default export.
+        let prices = DayPrices::new(vec![span(m, 40.0)], vec![span(m, -8.0)]);
+        let r = day_cost_priced(&t, ADELAIDE, &ivs, Some(&prices), None);
+        assert_eq!(r.cost.import_cents, 2.0 * 40.0 + 2.0 * 10.0);
+        assert_eq!(r.cost.export_cents, 8.0 + 5.0);
+        assert_eq!(r.fallback_minutes, 5);
+        // No rows at all: everything falls back.
+        let none = day_cost_priced(&t, ADELAIDE, &ivs, Some(&DayPrices::default()), None);
+        assert_eq!(none.fallback_minutes, 10);
+        assert_eq!(none.cost.import_cents, 40.0);
+    }
+
+    #[test]
+    fn the_sign_setting_decides_what_a_feed_in_price_means() {
+        let (m, ivs) = two_intervals();
+        let prices = DayPrices::new(
+            vec![span(m, 10.0), span(m + 300, 10.0)],
+            vec![span(m, -8.0), span(m + 300, 3.0)],
+        );
+        let flipped = plan_with(DYNAMIC);
+        let r = day_cost_priced(&flipped, ADELAIDE, &ivs, Some(&prices), None);
+        // -8 earns 8 and +3 costs 3.
+        assert_eq!(r.cost.export_cents, 8.0 - 3.0);
+
+        let as_is = plan_with(&format!("{DYNAMIC}feed_in_paid_when_negative = false\n"));
+        let r = day_cost_priced(&as_is, ADELAIDE, &ivs, Some(&prices), None);
+        assert_eq!(r.cost.export_cents, -8.0 + 3.0);
+    }
+
+    #[test]
+    fn the_export_tier_still_applies_on_a_dynamic_plan() {
+        let t = plan_with(&format!(
+            "{DYNAMIC}\n[tariff.export_tier]\nfirst_kwh_per_day = 1.0\ncents = 12.0\n"
+        ));
+        let (m, ivs) = two_intervals();
+        let prices = DayPrices::new(
+            vec![span(m, 10.0), span(m + 300, 10.0)],
+            vec![span(m, -8.0), span(m + 300, -2.0)],
+        );
+        let r = day_cost_priced(&t, ADELAIDE, &ivs, Some(&prices), None);
+        // The first exported kWh earns the tier's 12c; the second the live 2c.
+        assert_eq!(r.cost.export_cents, 12.0 + 2.0);
+    }
+
+    #[test]
+    fn a_dynamic_plan_still_earns_the_credit() {
+        let t = plan_with(DYNAMIC);
+        let late = ADELAIDE
+            .with_ymd_and_hms(2026, 9, 1, 23, 40, 0)
+            .unwrap()
+            .timestamp();
+        let iv = Interval {
+            start_ts: late,
+            end_ts: late + 1140,
+            import_kwh: 0.0,
+            export_kwh: 0.0,
+            load_kwh: 0.1,
+        };
+        let r = day_cost_priced(&t, ADELAIDE, &[iv], Some(&DayPrices::default()), None);
+        assert_eq!(r.cost.zero_import_credit_cents, 50.0);
+    }
+
+    #[test]
+    fn live_prices_band_by_the_spike_setting() {
+        assert_eq!(live_import_band(-1.0, 100.0), ImportBand::Free);
+        assert_eq!(live_import_band(0.0, 100.0), ImportBand::Free);
+        assert_eq!(live_import_band(100.0, 100.0), ImportBand::Shoulder);
+        assert_eq!(live_import_band(100.1, 100.0), ImportBand::Peak);
+        let t = plan_with(DYNAMIC);
+        let (m, ivs) = two_intervals();
+        let prices = DayPrices::new(
+            vec![span(m, 0.0), span(m + 300, 150.0)],
+            vec![span(m, -8.0), span(m + 300, 3.0)],
+        );
+        let split = grid_split_priced(&t, ADELAIDE, &ivs, Some(&prices), 100.0);
+        assert_eq!(split.import_free_kwh, 2.0);
+        assert_eq!(split.import_peak_kwh, 2.0);
+        assert_eq!(split.export_peak_kwh, 1.0);
+        assert_eq!(split.export_other_kwh, 1.0);
+        // Without prices it is the plain split.
+        assert_eq!(
+            grid_split_priced(&t, ADELAIDE, &ivs, None, 100.0),
+            grid_split(&t, ADELAIDE, &ivs)
+        );
+    }
+
+    #[test]
+    fn a_static_plan_keeps_its_stored_json_and_key() {
+        let t = plan_with("");
+        // Written out in full: this is the key every static plan had before
+        // dynamic prices existed, so stored costs stay valid.
+        assert_eq!(
+            t.key(),
+            r#"{"supply_cents_per_day":100.0,"default_import_cents":30.0,"import":[{"from":"00:00","to":"01:00","cents":10.0}],"default_export_cents":5.0,"export":[],"zero_import_credit":{"from":"23:00","to":"23:59","max_kwh":1.0,"credit_cents":50.0}}"#
+        );
+        assert!(!t.key().contains("dynamic"));
+        // A dynamic plan has its own key, so its costs are kept apart.
+        assert!(
+            plan_with(DYNAMIC)
+                .key()
+                .contains(r#""dynamic":{"source":"amber""#)
+        );
     }
 }

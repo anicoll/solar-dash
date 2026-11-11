@@ -10,6 +10,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 
 use super::models::{ChannelType, IntervalKind, PriceInterval};
+use crate::cost::{DayPrices, PriceSpan};
 
 /// Forecast rows that ended more than this long ago are deleted. Normally an
 /// actual price replaces them; this clears the ones that never were.
@@ -159,6 +160,77 @@ pub async fn prices_at(
     .context("could not read the current prices")
 }
 
+// Both queries below keep the same rows ("known" prices): finished `actual`
+// ones, plus `current` (the interval under way) when `include_current`.
+// Forecasts are never used: they are guesses, not what was charged.
+
+/// The import and feed-in prices of one local day `[start, end)` for costing,
+/// from every source whose name starts with `source_prefix`.
+pub async fn day_prices(
+    pool: &SqlitePool,
+    source_prefix: &str,
+    start: i64,
+    end: i64,
+    include_current: bool,
+) -> Result<DayPrices> {
+    let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as(
+        "SELECT channel, start_ts, end_ts, cents FROM price_interval
+         WHERE substr(source, 1, length(?)) = ? AND channel IN ('general', 'feed_in')
+           AND start_ts >= ? AND start_ts < ? AND (kind = 'actual' OR (? AND kind = 'current'))
+         ORDER BY start_ts, source",
+    )
+    .bind(source_prefix)
+    .bind(source_prefix)
+    .bind(start)
+    .bind(end)
+    .bind(include_current)
+    .fetch_all(pool)
+    .await
+    .context("could not read the day's prices")?;
+    let (mut general, mut feed_in) = (Vec::new(), Vec::new());
+    for (channel, start_ts, end_ts, cents) in rows {
+        let span = PriceSpan {
+            start_ts,
+            end_ts,
+            cents,
+        };
+        if channel == "general" {
+            general.push(span);
+        } else {
+            feed_in.push(span);
+        }
+    }
+    Ok(DayPrices::new(general, feed_in))
+}
+
+/// A short text that changes when the rows [`day_prices`] would return
+/// change: how many there are, the sum of their prices and the newest
+/// `fetched_at`. A stored day cost is tagged with it, so a late actual price
+/// (or a corrected one) makes the day be costed again.
+pub async fn day_prices_fingerprint(
+    pool: &SqlitePool,
+    source_prefix: &str,
+    start: i64,
+    end: i64,
+    include_current: bool,
+) -> Result<String> {
+    let (count, sum, newest): (i64, f64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(cents), 0.0), COALESCE(MAX(fetched_at), 0)
+         FROM price_interval
+         WHERE substr(source, 1, length(?)) = ? AND channel IN ('general', 'feed_in')
+           AND start_ts >= ? AND start_ts < ? AND (kind = 'actual' OR (? AND kind = 'current'))",
+    )
+    .bind(source_prefix)
+    .bind(source_prefix)
+    .bind(start)
+    .bind(end)
+    .bind(include_current)
+    .fetch_one(pool)
+    .await
+    .context("could not fingerprint the day's prices")?;
+    Ok(format!("{count}:{sum:.4}:{newest}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +359,80 @@ mod tests {
         // The end is exclusive: at 600 the next interval is current.
         assert_eq!(prices_at(&pool, None, 600).await.unwrap()[0].cents, 3.0);
         assert!(prices_at(&pool, None, 9000).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn day_prices_skip_forecasts_and_current_on_finished_days() {
+        use ChannelType::{FeedIn, General};
+        use IntervalKind::*;
+        let (_dir, pool) = pool().await;
+        let rows = [
+            interval(ActualInterval, General, 0, 10.0),
+            interval(CurrentInterval, General, 300, 20.0),
+            interval(ForecastInterval, General, 600, 30.0),
+            interval(ActualInterval, FeedIn, 0, -4.0),
+        ];
+        save_prices(&pool, "amber:s", &rows, 5).await.unwrap();
+        // Another provider's rows are not matched by the prefix.
+        let other = [interval(ActualInterval, General, 900, 99.0)];
+        save_prices(&pool, "other:s", &other, 5).await.unwrap();
+
+        let finished = day_prices(&pool, "amber", 0, 86_400, false).await.unwrap();
+        assert_eq!(finished.general.len(), 1);
+        assert_eq!(finished.feed_in.len(), 1);
+        // Today: the interval under way counts too, still never the forecast.
+        let today = day_prices(&pool, "amber", 0, 86_400, true).await.unwrap();
+        let cents: Vec<f64> = today.general.iter().map(|s| s.cents).collect();
+        assert_eq!(cents, [10.0, 20.0]);
+    }
+
+    #[tokio::test]
+    async fn the_fingerprint_changes_when_a_price_row_changes() {
+        use ChannelType::General;
+        use IntervalKind::*;
+        let (_dir, pool) = pool().await;
+        let fp = || day_prices_fingerprint(&pool, "amber", 0, 86_400, false);
+        let empty = fp().await.unwrap();
+        save_prices(
+            &pool,
+            "amber:s",
+            &[interval(ActualInterval, General, 0, 10.0)],
+            5,
+        )
+        .await
+        .unwrap();
+        let one = fp().await.unwrap();
+        assert_ne!(empty, one);
+        // A forecast is not a known price, so it does not move the fingerprint.
+        save_prices(
+            &pool,
+            "amber:s",
+            &[interval(ForecastInterval, General, 600, 7.0)],
+            6,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fp().await.unwrap(), one);
+        // A late actual adds a row.
+        save_prices(
+            &pool,
+            "amber:s",
+            &[interval(ActualInterval, General, 300, 12.0)],
+            7,
+        )
+        .await
+        .unwrap();
+        let two = fp().await.unwrap();
+        assert_ne!(two, one);
+        // A corrected price at the same time changes the sum and fetched_at.
+        save_prices(
+            &pool,
+            "amber:s",
+            &[interval(ActualInterval, General, 300, 13.0)],
+            8,
+        )
+        .await
+        .unwrap();
+        assert_ne!(fp().await.unwrap(), two);
     }
 }
