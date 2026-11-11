@@ -13,16 +13,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::AppState;
-use super::api::{ApiError, ApiResult, day_bounds_or_error};
-use super::bill::{MIN_PRICE_COVERAGE, compare_dates, hypothetical_tariff};
-use super::costs::{SOURCE_BILL, SOURCE_GLOBIRD, billed_days, compare_days, round2};
-use super::payback::Purchase;
-use crate::db;
-use crate::metric::Metric;
-use crate::whatif::{
-    ASSUMPTIONS, BatteryReading, CarSession, DEFAULT_RESERVE_PCT, DayInput, Levers,
-    SPIKE_FEED_IN_CENTS, Savings, add_battery, build_slots, replay,
-};
+use super::amber_days::amber_days;
+use super::api::ApiResult;
+use super::bill::{MIN_PRICE_COVERAGE, compare_dates};
+use super::costs::{SOURCE_BILL, SOURCE_GLOBIRD, billed_days, round2};
+use crate::whatif::{ASSUMPTIONS, Levers};
 
 #[derive(Debug, Deserialize)]
 pub struct WhatifParams {
@@ -51,24 +46,6 @@ impl WhatifParams {
             spikes: on(&self.spikes),
         }
     }
-}
-
-/// The battery capacity in kWh on `date`: the sum of the `battery_kwh` of the
-/// purchases made on or before it. 0 when there is none.
-fn battery_kwh_on(purchases: &[Purchase], date: NaiveDate) -> f64 {
-    purchases
-        .iter()
-        .filter(|p| p.date <= date)
-        .filter_map(|p| p.battery_kwh)
-        .sum()
-}
-
-/// Savings for every mix of switches, in cents.
-fn mix_savings(day: &DayInput) -> BTreeMap<String, Savings> {
-    Levers::mixes()
-        .into_iter()
-        .map(|(key, levers)| (key, replay(day, levers)))
-        .collect()
 }
 
 fn dollars(cents: f64) -> f64 {
@@ -118,8 +95,7 @@ pub async fn amber_whatif(
     };
     let selected = params.levers();
     let (from, to, dates) = compare_dates(&state, params.from.as_deref(), params.to.as_deref())?;
-    let hypothetical = hypothetical_tariff(compare)?;
-    let compared = compare_days(&state, schedule, &hypothetical, &dates).await?;
+    let amber = amber_days(&state, schedule, compare, &data.purchases, &dates).await?;
     let billed: BTreeMap<NaiveDate, (&'static str, f64)> = billed_days(&state, schedule, &dates)
         .await?
         .into_iter()
@@ -130,58 +106,26 @@ pub async fn amber_whatif(
     let mut skipped = 0;
     let mut sums = Totals::default();
     let mut battery_kwh_last = 0.0;
-    for (day, hypo) in compared {
-        if hypo.coverage < MIN_PRICE_COVERAGE {
+    for day in amber {
+        if day.coverage < MIN_PRICE_COVERAGE {
             skipped += 1;
             continue;
         }
-        let (start, end) = day_bounds_or_error(day.date, state.tz)?;
-        let battery_kwh = battery_kwh_on(&data.purchases, day.date);
-        battery_kwh_last = battery_kwh;
-        let mut slots = build_slots(
-            start,
-            end,
-            &hypo.intervals,
-            &hypo.prices,
-            compare.feed_in_paid_when_negative,
-        );
-        let readings = battery_readings(&state, start, end).await?;
-        add_battery(&mut slots, start, battery_kwh, &readings);
-        let reserve_pct = reserve_pct(&state, end).await?;
-        let sessions: Vec<CarSession> = db::tm_home_sessions_started_in(&state.pool, start, end)
-            .await?
-            .into_iter()
-            .map(|s| CarSession {
-                start_ts: s.started_at,
-                end_ts: s.ended_at,
-                grid_kwh: s.grid_kwh,
-            })
-            .collect();
-        let input = DayInput {
-            start_ts: start,
-            slots,
-            battery_kwh,
-            reserve_pct,
-            sessions,
-            spike_cents: SPIKE_FEED_IN_CENTS,
-        };
-        let mixes: BTreeMap<String, f64> = mix_savings(&input)
-            .into_iter()
-            .map(|(key, savings)| (key, savings.total_cents()))
-            .collect();
+        battery_kwh_last = day.battery_kwh;
+        let mixes = &day.mixes;
         let selected_key = selected.key();
         let selected_cents = mixes.get(&selected_key).copied().unwrap_or(0.0);
 
         let (globird_cents, source) = match billed.get(&day.date) {
             Some(&(s, cents)) if s == SOURCE_GLOBIRD || s == SOURCE_BILL => (cents, "billed"),
-            _ => (day.cost.actual_cents, "estimate"),
+            _ => (day.current_cents, "estimate"),
         };
-        let amber_cents = hypo.priced.cost.actual_cents;
+        let amber_cents = day.amber_cents;
         sums.add(
             globird_cents,
             amber_cents,
             selected_cents,
-            &mixes,
+            mixes,
             source == "billed",
         );
         rows.push(json!({
@@ -189,9 +133,9 @@ pub async fn amber_whatif(
             "globird_dollars": dollars(globird_cents),
             "globird_source": source,
             "amber_dollars": dollars(amber_cents),
-            "savings_dollars": mixes_json(&mixes),
+            "savings_dollars": mixes_json(mixes),
             "selected_saving_dollars": dollars(selected_cents),
-            "car_sessions": input.sessions.len(),
+            "car_sessions": day.car_sessions,
         }));
     }
     let days = rows.len();
@@ -248,49 +192,4 @@ impl Totals {
             *self.mixes.entry(key.clone()).or_default() += cents;
         }
     }
-}
-
-/// The battery readings of a day: live readings (1-minute averages) when the
-/// inverter was recorded, else the cloud's charge level alone.
-async fn battery_readings(
-    state: &AppState,
-    start: i64,
-    end: i64,
-) -> Result<Vec<BatteryReading>, ApiError> {
-    let live = db::live_samples_in_range(&state.pool, start, end).await?;
-    if !live.is_empty() {
-        return Ok(live
-            .into_iter()
-            .map(|s| BatteryReading {
-                ts: s.ts,
-                battery_w: s.battery_w,
-                soc_pct: s.soc_pct,
-            })
-            .collect());
-    }
-    let cloud =
-        db::readings_in_range(&state.pool, state.plant_id, Metric::SocPct, start, end).await?;
-    Ok(cloud
-        .into_iter()
-        .map(|(ts, pct)| BatteryReading {
-            ts,
-            battery_w: None,
-            soc_pct: Some(pct),
-        })
-        .collect())
-}
-
-/// The battery reserve in force at the end of the day: the higher of the
-/// inverter's backup reserve and minimum charge settings, else 10%.
-async fn reserve_pct(state: &AppState, day_end: i64) -> Result<f64, ApiError> {
-    let settings = db::inverter_settings_before(&state.pool, day_end).await?;
-    Ok(settings
-        .and_then(|s| {
-            let reserve = s.backup_reserve_pct.map(f64::from);
-            [reserve, s.min_soc_pct]
-                .into_iter()
-                .flatten()
-                .reduce(f64::max)
-        })
-        .unwrap_or(DEFAULT_RESERVE_PCT))
 }

@@ -22,6 +22,7 @@ use super::api::{
     date_range, day_bounds, day_bounds_or_error, live_totals, spread_steps, today,
 };
 use super::battery::local_time;
+use super::day_cache;
 use crate::amber::store as amber_store;
 use crate::bills::{self, Metered, PastBill};
 use crate::cost::{self, DayCost, DayPrices, GridSplit, Interval, Tariff, TariffSchedule};
@@ -427,18 +428,50 @@ pub(crate) async fn house_intervals(
     now: i64,
     rules: &SourceRules,
 ) -> Result<(Vec<Interval>, f64)> {
+    if end <= start {
+        return Ok((Vec::new(), 0.0));
+    }
+    let days = house_intervals_by_day(pool, plant_id, tz, start, end, now, rules).await?;
+    let intervals: Vec<Interval> = days.into_iter().flat_map(|day| day.intervals).collect();
+    let covered = ev_cost::coverage(&intervals, start, end);
+    Ok((intervals, covered))
+}
+
+/// One local day's house intervals, as [`house_intervals_by_day`] finds them.
+pub(super) struct HouseDay {
+    pub date: NaiveDate,
+    pub intervals: Vec<Interval>,
+    /// May the day's figures be stored for good (see [`is_cacheable`])?
+    pub cacheable: bool,
+}
+
+/// The house intervals of every local day that the time `[start, end)`
+/// touches and that has data, day by day, the way [`house_intervals`] returns
+/// them. Whole days are loaded. A day with no data is left out.
+pub(super) async fn house_intervals_by_day(
+    pool: &SqlitePool,
+    plant_id: i64,
+    tz: Tz,
+    start: i64,
+    end: i64,
+    now: i64,
+    rules: &SourceRules,
+) -> Result<Vec<HouseDay>> {
     let local_date = |ts: i64| {
         DateTime::from_timestamp(ts, 0)
             .map(|t| t.with_timezone(&tz).date_naive())
             .context("time is out of range")
     };
     if end <= start {
-        return Ok((Vec::new(), 0.0));
+        return Ok(Vec::new());
     }
     let (first, last) = (local_date(start)?, local_date(end - 1)?);
+    let today = local_date(now)?;
+    let mut dates = Vec::new();
     let mut bounds = Vec::new();
     let mut date = first;
     while date <= last {
+        dates.push(date);
         bounds.push(day_bounds(date, tz).context("date is out of range")?);
         date = date.succ_opt().context("date is out of range")?;
     }
@@ -449,8 +482,8 @@ pub(crate) async fn house_intervals(
     let live = live_in(pool, live_range, range_start, range_end).await?;
     let meter = meter_in(pool, range_start, range_end).await?;
 
-    let mut intervals = Vec::new();
-    for &(day_start, day_end) in &bounds {
+    let mut days = Vec::new();
+    for (&date, &(day_start, day_end)) in dates.iter().zip(&bounds) {
         let day = DayData {
             start: day_start,
             end: day_end,
@@ -461,12 +494,21 @@ pub(crate) async fn house_intervals(
             meter: meter_for_day(&meter, day_start, day_end),
             rules,
         };
-        if let Some((_, day_intervals, _)) = day_intervals(&day, now) {
-            intervals.extend(day_intervals);
+        if let Some((source, intervals, live_solid)) = day_intervals(&day, now) {
+            let newest_counter_ts = [day.import, day.export, day.load]
+                .iter()
+                .filter_map(|c| c.last().map(|r| r.0))
+                .max();
+            let cacheable =
+                is_cacheable(date, today, source, live_solid, newest_counter_ts, day_end);
+            days.push(HouseDay {
+                date,
+                intervals,
+                cacheable,
+            });
         }
     }
-    let covered = ev_cost::coverage(&intervals, start, end);
-    Ok((intervals, covered))
+    Ok(days)
 }
 
 /// One day's grid energy split by tariff band, priced on the plan in effect
@@ -487,6 +529,20 @@ pub(super) async fn day_grid_split(
     live: &[Sample],
     now: i64,
 ) -> Result<Option<GridSplit>, ApiError> {
+    Ok(day_grid_split_checked(state, schedule, date, live, now)
+        .await?
+        .map(|(split, _)| split))
+}
+
+/// [`day_grid_split`], and whether the split may be stored for good (the same
+/// test as the stored day costs, see [`is_cacheable`]).
+async fn day_grid_split_checked(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    date: NaiveDate,
+    live: &[Sample],
+    now: i64,
+) -> Result<Option<(GridSplit, bool)>, ApiError> {
     let (start, end) = day_bounds_or_error(date, state.tz)?;
     let rules = &state.rules;
     let skip_cloud = !rules.cloud_enabled()
@@ -508,11 +564,85 @@ pub(super) async fn day_grid_split(
         rules,
     };
     let tariff = schedule.for_date(date);
-    let prices = plan_day_prices(state, tariff, date, today(state.tz)).await?;
+    let today = today(state.tz);
+    let prices = plan_day_prices(state, tariff, date, today).await?;
     let spike_cents = state.admin.get().price_spike_cents;
-    Ok(day_intervals(&day, now).map(|(_, intervals, _)| {
-        cost::grid_split_priced(tariff, state.tz, &intervals, prices.as_ref(), spike_cents)
-    }))
+    Ok(
+        day_intervals(&day, now).map(|(source, intervals, live_solid)| {
+            let newest_counter_ts = [day.import, day.export, day.load]
+                .iter()
+                .filter_map(|c| c.last().map(|r| r.0))
+                .max();
+            let cacheable = is_cacheable(date, today, source, live_solid, newest_counter_ts, end);
+            let split =
+                cost::grid_split_priced(tariff, state.tz, &intervals, prices.as_ref(), spike_cents);
+            (split, cacheable)
+        }),
+    )
+}
+
+/// The `daily_cache` kind for [`grid_splits`].
+const GRID_SPLIT_KIND: &str = "grid_split";
+
+/// Bump when [`day_grid_split`]'s result would change for the same inputs.
+const GRID_SPLIT_VERSION: u32 = 1;
+
+/// The tariff split of each of `dates` that has interval data, for the bill's
+/// band totals. A finished day comes from the `daily_cache` table when it is
+/// stored for the plan, prices and settings it would be worked out from now;
+/// only the rest read their samples, and the finished ones are stored.
+pub(super) async fn grid_splits(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    dates: &[NaiveDate],
+) -> Result<HashMap<NaiveDate, GridSplit>, ApiError> {
+    let today = today(state.tz);
+    let spike_cents = state.admin.get().price_spike_cents;
+    let mut keys = Vec::with_capacity(dates.len());
+    for &date in dates {
+        let tariff = schedule.for_date(date);
+        let mut key = format!(
+            "{GRID_SPLIT_VERSION}|{}|spike={}|{:?}",
+            cache_key(state.tz, tariff),
+            spike_cents.to_bits(),
+            state.rules
+        );
+        if let Some(source) = tariff.dynamic_source() {
+            let (start, end) = day_bounds_or_error(date, state.tz)?;
+            let fingerprint =
+                amber_store::day_prices_fingerprint(&state.pool, source, start, end, date >= today)
+                    .await?;
+            key.push_str(&format!("|prices:{fingerprint}"));
+        }
+        keys.push((date, key));
+    }
+    let mut found: HashMap<NaiveDate, GridSplit> =
+        day_cache::load(&state.pool, GRID_SPLIT_KIND, &keys).await?;
+
+    let live_range = db::live_ts_range(&state.pool).await?;
+    let now = db::now();
+    let mut to_store = Vec::new();
+    for (date, key) in &keys {
+        if found.contains_key(date) {
+            continue;
+        }
+        let (start, end) = day_bounds_or_error(*date, state.tz)?;
+        let live = live_in(&state.pool, live_range, start, end).await?;
+        if let Some((split, cacheable)) =
+            day_grid_split_checked(state, schedule, *date, &live, now).await?
+        {
+            if cacheable {
+                to_store.push((*date, key.clone(), split));
+            }
+            found.insert(*date, split);
+        }
+    }
+    let rows: Vec<(NaiveDate, String, &GridSplit)> = to_store
+        .iter()
+        .map(|(date, key, split)| (*date, key.clone(), split))
+        .collect();
+    day_cache::save(&state.pool, GRID_SPLIT_KIND, &rows).await?;
+    Ok(found)
 }
 
 /// The rows of a list sorted by time that fall in `[start, end)`.
@@ -952,7 +1082,7 @@ pub(super) fn is_cacheable(
 
 /// Splits sorted dates into runs of consecutive days, so each run is loaded
 /// with one set of queries instead of one set per day.
-fn consecutive_runs(dates: &[NaiveDate]) -> Vec<&[NaiveDate]> {
+pub(super) fn consecutive_runs(dates: &[NaiveDate]) -> Vec<&[NaiveDate]> {
     dates.chunk_by(|a, b| a.succ_opt() == Some(*b)).collect()
 }
 

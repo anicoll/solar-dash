@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
+use super::amber_days::{AmberDay, amber_days};
 use super::api::{ApiError, ApiResult, day_bounds_or_error, today};
 use super::costs::{
-    CostedDay, SOURCE_BILL, SOURCE_GLOBIRD, billed_days, compare_days, day_grid_split, hhmm,
-    live_in, round2,
+    CostedDay, SOURCE_BILL, SOURCE_GLOBIRD, billed_days, grid_splits, hhmm, round2,
 };
 use crate::bills::PastBill;
 use crate::config;
-use crate::cost::{self, DayCost, ExportBand, GridSplit, Tariff};
+use crate::cost::{DayCost, ExportBand, GridSplit, Tariff};
 use crate::db;
 
 /// How the period's dates were chosen, as `period_source` reports it.
@@ -515,8 +515,6 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
     let days_elapsed = dates.len() as i64;
     let costed = billed_days(&state, schedule, &dates).await?;
 
-    let live_range = db::live_ts_range(&state.pool).await?;
-    let now = db::now();
     // Days with missing data are listed but kept out of every sum.
     let complete: Vec<CostedDay> = costed.iter().filter(|d| d.complete).cloned().collect();
     let incomplete_days = (costed.len() - complete.len()) as i64;
@@ -527,6 +525,9 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
     let mut credit_possible = 0u32;
     let mut daily = Vec::with_capacity(costed.len());
     let mut uses_globird = false;
+    // The tariff split of every complete day, read from the stored days where possible.
+    let complete_dates: Vec<NaiveDate> = complete.iter().map(|day| day.date).collect();
+    let splits = grid_splits(&state, schedule, &complete_dates).await?;
     for day in &costed {
         let has_credit = schedule.for_date(day.date).credit_cents().is_some();
         daily.push(DailyEntry {
@@ -542,12 +543,10 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
         }
         uses_globird |= day.source == SOURCE_GLOBIRD || day.source == SOURCE_BILL;
         credit_possible += u32::from(has_credit);
-        let (start, end) = day_bounds_or_error(day.date, state.tz)?;
-        let live = live_in(&state.pool, live_range, start, end).await?;
-        if let Some(split) = day_grid_split(&state, schedule, day.date, &live, now).await? {
+        if let Some(split) = splits.get(&day.date) {
             let tariff = schedule.for_date(day.date);
-            add_bands(&mut bands, &split, tariff, day.cost.import_cents);
-            add_feed_in(&mut feed_in, &split, tariff, day.cost.export_cents);
+            add_bands(&mut bands, split, tariff, day.cost.import_cents);
+            add_feed_in(&mut feed_in, split, tariff, day.cost.export_cents);
             free_value_cents += split.import_free_kwh * tariff.default_import_cents();
         }
     }
@@ -679,26 +678,24 @@ struct CompareSums {
     fallback_minutes: u32,
 }
 
-/// Splits (cost on the plan in force, coverage, cost on the dynamic plan)
-/// into the days to show and how many were skipped for too few prices.
-fn compare_totals(
-    days: &[(String, f64, f64, cost::PricedDayCost)],
-) -> (Vec<CompareDay>, CompareSums, u32) {
+/// Splits the days (cost on the plan in force, coverage, cost on the dynamic
+/// plan) into the days to show and how many were skipped for too few prices.
+fn compare_totals(days: &[AmberDay]) -> (Vec<CompareDay>, CompareSums, u32) {
     let mut shown = Vec::new();
     let mut sums = CompareSums::default();
     let mut skipped = 0;
-    for (date, current_cents, coverage, priced) in days {
-        if *coverage < MIN_PRICE_COVERAGE {
+    for day in days {
+        if day.coverage < MIN_PRICE_COVERAGE {
             skipped += 1;
             continue;
         }
-        sums.current_cents += current_cents;
-        sums.dynamic_cents += priced.cost.actual_cents;
-        sums.fallback_minutes += priced.fallback_minutes;
+        sums.current_cents += day.current_cents;
+        sums.dynamic_cents += day.amber_cents;
+        sums.fallback_minutes += day.fallback_minutes;
         shown.push(CompareDay {
-            date: date.clone(),
-            current_dollars: dollars(*current_cents),
-            dynamic_dollars: dollars(priced.cost.actual_cents),
+            date: day.date.to_string(),
+            current_dollars: dollars(day.current_cents),
+            dynamic_dollars: dollars(day.amber_cents),
         });
     }
     (shown, sums, skipped)
@@ -776,23 +773,12 @@ pub async fn compare_dynamic(
     State(state): State<AppState>,
     Query(params): Query<CompareParams>,
 ) -> ApiResult {
-    let (Some(compare), Some(schedule)) = (&state.amber_compare, &state.admin.get().tariff) else {
+    let data = state.admin.get();
+    let (Some(compare), Some(schedule)) = (&state.amber_compare, &data.tariff) else {
         return Ok(Json(json!({ "configured": false })));
     };
     let (from, to, dates) = compare_dates(&state, params.from.as_deref(), params.to.as_deref())?;
-    let hypothetical = hypothetical_tariff(compare)?;
-    let compared = compare_days(&state, schedule, &hypothetical, &dates).await?;
-    let rows: Vec<_> = compared
-        .into_iter()
-        .map(|(day, hypo)| {
-            (
-                day.date.to_string(),
-                day.cost.actual_cents,
-                hypo.coverage,
-                hypo.priced,
-            )
-        })
-        .collect();
+    let rows = amber_days(&state, schedule, compare, &data.purchases, &dates).await?;
     let (days, sums, skipped) = compare_totals(&rows);
     Ok(Json(json!({
         "configured": true,
@@ -1277,30 +1263,18 @@ mod tests {
 
     #[test]
     fn compare_skips_days_with_too_few_prices_and_sums_the_rest() {
-        let priced = |cents: f64, fallback_minutes| cost::PricedDayCost {
-            cost: DayCost {
-                import_kwh: 0.0,
-                export_kwh: 0.0,
-                load_kwh: 0.0,
-                import_cents: 0.0,
-                export_cents: 0.0,
-                supply_cents: 0.0,
-                zero_import_credit_cents: 0.0,
-                actual_cents: cents,
-                baseline_cents: 0.0,
-                savings_cents: 0.0,
-            },
+        let day = |date: &str, current_cents, coverage, amber_cents, fallback_minutes| AmberDay {
+            date: date.parse().unwrap(),
+            current_cents,
+            coverage,
+            amber_cents,
             fallback_minutes,
+            ..AmberDay::default()
         };
         let rows = vec![
-            ("2026-09-01".to_string(), 300.0, 1.0, priced(250.0, 0)),
-            ("2026-09-02".to_string(), 100.0, 0.5, priced(900.0, 0)),
-            (
-                "2026-09-03".to_string(),
-                200.0,
-                MIN_PRICE_COVERAGE,
-                priced(260.0, 20),
-            ),
+            day("2026-09-01", 300.0, 1.0, 250.0, 0),
+            day("2026-09-02", 100.0, 0.5, 900.0, 0),
+            day("2026-09-03", 200.0, MIN_PRICE_COVERAGE, 260.0, 20),
         ];
         let (days, sums, skipped) = compare_totals(&rows);
         assert_eq!(skipped, 1);

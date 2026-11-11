@@ -353,6 +353,28 @@ pub async fn max_value_in_range(
     Ok(max)
 }
 
+/// The time of the newest reading of `metric` in `[from, to)`, or `None`.
+pub async fn newest_reading_ts_in_range(
+    pool: &SqlitePool,
+    plant_id: i64,
+    metric: Metric,
+    from: i64,
+    to: i64,
+) -> Result<Option<i64>> {
+    let source = points::source(plant_id);
+    sqlx::query_scalar(
+        "SELECT MAX(ts) FROM metric_reading
+         WHERE source = ? AND metric = ? AND ts >= ? AND ts < ?",
+    )
+    .bind(&source)
+    .bind(metric.name())
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await
+    .context("could not read the newest reading")
+}
+
 /// Saves one live Modbus sample. A second sample with the same second
 /// replaces the first.
 pub async fn insert_live_sample(pool: &SqlitePool, sample: &Sample) -> Result<()> {
@@ -769,6 +791,67 @@ pub async fn save_daily_battery(pool: &SqlitePool, days: &[DailyBattery], now: i
         .execute(&mut *tx)
         .await
         .context("could not save battery day")?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// One stored `daily_cache` row: a finished day's figures for one `kind` of cache.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct DailyCacheRow {
+    /// Local day, `YYYY-MM-DD`.
+    pub date: String,
+    /// What the figures were worked out from; the caller compares it.
+    pub cache_key: String,
+    /// The figures as JSON.
+    pub payload: String,
+}
+
+/// The stored rows of `kind` with `from <= date <= to`, oldest first,
+/// whatever their key (the caller checks it).
+pub async fn daily_cache_in_range(
+    pool: &SqlitePool,
+    kind: &str,
+    from: &str,
+    to: &str,
+) -> Result<Vec<DailyCacheRow>> {
+    sqlx::query_as(
+        "SELECT date, cache_key, payload FROM daily_cache
+         WHERE kind = ? AND date >= ? AND date <= ? ORDER BY date",
+    )
+    .bind(kind)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .context("could not read the stored days")
+}
+
+/// Saves finished days of `kind` (replacing any row for the same date) in one
+/// transaction.
+pub async fn save_daily_cache(
+    pool: &SqlitePool,
+    kind: &str,
+    rows: &[DailyCacheRow],
+    now: i64,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for row in rows {
+        sqlx::query(
+            "INSERT OR REPLACE INTO daily_cache (kind, date, cache_key, payload, computed_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(kind)
+        .bind(&row.date)
+        .bind(&row.cache_key)
+        .bind(&row.payload)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .context("could not save the day")?;
     }
     tx.commit().await?;
     Ok(())
@@ -1616,12 +1699,12 @@ mod tests {
              ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session',
               'ev_odometer_daily', 'globird_cost', 'globird_usage', 'globird_interval',
               'tm_car', 'tm_drive_daily', 'tm_charge', 'manual_car', 'fuel_fill',
-              'tm_car_owned', 'daily_battery', 'metric_reading')",
+              'tm_car_owned', 'daily_battery', 'metric_reading', 'daily_cache')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 18);
+        assert_eq!(tables.len(), 19);
     }
 
     /// Migration 0019 copies `reading` into `metric_reading` in SQL. It has its
