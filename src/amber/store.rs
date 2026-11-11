@@ -304,7 +304,8 @@ pub async fn known_general_prices(
 }
 
 /// A short text that changes when the rows [`day_prices`] would return
-/// change: how many there are, the sum of their prices and the newest
+/// change: how many there are, the sum of their prices, the sum of their
+/// start times (a price moved in time changes it) and the newest
 /// `fetched_at`. A stored day cost is tagged with it, so a late actual price
 /// (or a corrected one) makes the day be costed again.
 pub async fn day_prices_fingerprint(
@@ -314,8 +315,9 @@ pub async fn day_prices_fingerprint(
     end: i64,
     include_current: bool,
 ) -> Result<String> {
-    let (count, sum, newest): (i64, f64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(cents), 0.0), COALESCE(MAX(fetched_at), 0)
+    let (count, sum, starts, newest): (i64, f64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(cents), 0.0), COALESCE(SUM(start_ts), 0),
+                COALESCE(MAX(fetched_at), 0)
          FROM price_interval
          WHERE substr(source, 1, length(?)) = ? AND channel IN ('general', 'feed_in')
            AND start_ts >= ? AND start_ts < ? AND (kind = 'actual' OR (? AND kind = 'current'))",
@@ -328,7 +330,7 @@ pub async fn day_prices_fingerprint(
     .fetch_one(pool)
     .await
     .context("could not fingerprint the day's prices")?;
-    Ok(format!("{count}:{sum:.4}:{newest}"))
+    Ok(format!("{count}:{sum:.4}:{starts}:{newest}"))
 }
 
 #[cfg(test)]

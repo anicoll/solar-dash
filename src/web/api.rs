@@ -1,6 +1,8 @@
 //! The JSON API: handlers, input checks and the derivation of power from
 //! the daily energy counters.
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -12,7 +14,10 @@ use serde_json::{Value, json};
 use tracing::error;
 
 use super::AppState;
-use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, round2, undo_cloud_lag};
+use super::costs::{
+    Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, is_cacheable, round2, undo_cloud_lag,
+};
+use super::day_cache;
 use super::home_mix::{self, HomeMix};
 use crate::cost::{GridSplit, TariffSchedule};
 use crate::db;
@@ -1206,20 +1211,88 @@ async fn day_max_kwh(
     Ok(max.map(|wh| wh / 1000.0))
 }
 
+/// The `daily_cache` kind for a day's battery discharge.
+const DISCHARGE_KIND: &str = "discharge";
+
+/// Bump when the discharge a day reports would change for the same readings.
+const DISCHARGE_VERSION: u32 = 1;
+
+/// The cloud counters a day's totals read, used to tell a day before any data.
+const CLOUD_DAY_METRICS: [Metric; 7] = [
+    Metric::LoadDayWh,
+    Metric::GridImportDayWh,
+    Metric::GridExportDayWh,
+    Metric::PvDayWh,
+    Metric::BatteryChargeDayWh,
+    Metric::BatteryDischargeDayWh,
+    Metric::SelfConsumedDayWh,
+];
+
+/// The time of the first stored energy reading of any kind (the live samples
+/// or a cloud counter), or `None` before any. A local day that ends at or
+/// before it has no energy data, so its figures need no queries.
+pub(super) async fn first_data_ts(state: &AppState) -> Result<Option<i64>, ApiError> {
+    let first_live = db::live_ts_range(&state.pool)
+        .await?
+        .map(|(first, _)| first);
+    let first_cloud = db::first_reading_ts(&state.pool, state.plant_id, &CLOUD_DAY_METRICS).await?;
+    Ok([first_live, first_cloud].into_iter().flatten().min())
+}
+
 /// The battery's discharge in kWh on each of `dates` that has a figure, the
 /// same one `/api/daily` reports (the live samples when they cover the day,
 /// else the cloud counter). Days without a figure are left out.
+///
+/// A finished day with all its data is stored in `daily_cache`, so only days
+/// that are not stored yet read their samples. A day that ends before the
+/// first reading of any kind has no figure and costs no query.
 pub(super) async fn battery_discharge_by_date(
     state: &AppState,
     dates: &[NaiveDate],
 ) -> Result<std::collections::BTreeMap<NaiveDate, f64>, ApiError> {
     let live_range = db::live_ts_range(&state.pool).await?;
     let now = db::now();
+    let today = today(state.tz);
+    let first_data = first_data_ts(state).await?;
+
+    let mut keys = Vec::new();
+    for &date in dates.iter().filter(|d| **d < today) {
+        keys.push((
+            date,
+            format!("{DISCHARGE_VERSION}|{}|{:?}", state.tz, state.rules),
+        ));
+    }
+    let mut stored: HashMap<NaiveDate, Option<f64>> =
+        day_cache::load(&state.pool, DISCHARGE_KIND, &keys).await?;
+
+    let mut to_store = Vec::new();
+    for &date in dates {
+        if stored.contains_key(&date) {
+            continue;
+        }
+        let (_, end) = day_bounds_or_error(date, state.tz)?;
+        // Nothing was recorded yet: every query below would come back empty.
+        if first_data.is_none_or(|first| end <= first) {
+            stored.insert(date, None);
+            continue;
+        }
+        let (totals, _, final_day) = day_totals_flagged(state, date, live_range, now).await?;
+        let discharge = totals.battery_discharge_kwh;
+        if let (true, Some((_, key))) = (final_day, keys.iter().find(|(d, _)| *d == date)) {
+            to_store.push((date, key.clone(), discharge));
+        }
+        stored.insert(date, discharge);
+    }
+    let rows: Vec<(NaiveDate, String, &Option<f64>)> = to_store
+        .iter()
+        .map(|(date, key, discharge)| (*date, key.clone(), discharge))
+        .collect();
+    day_cache::save(&state.pool, DISCHARGE_KIND, &rows).await?;
+
     let mut found = std::collections::BTreeMap::new();
     for &date in dates {
-        let (totals, _) = day_totals_with_live(state, date, live_range, now).await?;
-        if let Some(kwh) = totals.battery_discharge_kwh {
-            found.insert(date, kwh);
+        if let Some(Some(kwh)) = stored.get(&date) {
+            found.insert(date, *kwh);
         }
     }
     Ok(found)
@@ -1245,6 +1318,18 @@ async fn day_totals_with_live(
     live_range: Option<(i64, i64)>,
     now: i64,
 ) -> Result<(DayTotals, Vec<Sample>), ApiError> {
+    let (totals, samples, _) = day_totals_flagged(state, date, live_range, now).await?;
+    Ok((totals, samples))
+}
+
+/// [`day_totals_with_live`], and whether the day is final: finished, with all
+/// its data (the test of [`is_cacheable`]), so a stored copy stays right.
+async fn day_totals_flagged(
+    state: &AppState,
+    date: NaiveDate,
+    live_range: Option<(i64, i64)>,
+    now: i64,
+) -> Result<(DayTotals, Vec<Sample>, bool), ApiError> {
     // Each day gets its own [start, end), so a 23 or 25 hour day is handled correctly.
     let (start, end) = day_bounds_or_error(date, state.tz)?;
     let samples = match live_range {
@@ -1253,14 +1338,17 @@ async fn day_totals_with_live(
         }
         _ => Vec::new(),
     };
+    let today = today(state.tz);
     let live = live_totals(&samples, start, end, now, &state.rules);
+    let solid = live.as_ref().is_some_and(|l| l.solid);
     // A solid live day never needs the cloud (unless the rules prefer the
     // cloud, or there is no cloud source at all); skip its queries.
     if let Some(live) = live
         .as_ref()
         .filter(|live| !state.rules.cloud_needed(live.solid))
     {
-        return Ok((live_day(date, live), samples));
+        let final_day = is_cacheable(date, today, "inverter", solid, None, end);
+        return Ok((live_day(date, live), samples, final_day));
     }
     let cloud = if state.rules.cloud_enabled() {
         cloud_day(state, date, start, end).await?
@@ -1269,9 +1357,21 @@ async fn day_totals_with_live(
     };
     match live {
         Some(live) if live.usable(&state.rules, cloud.has_data()) => {
-            Ok((live_day(date, &live), samples))
+            let final_day = is_cacheable(date, today, "inverter", solid, None, end);
+            Ok((live_day(date, &live), samples, final_day))
         }
-        _ => Ok((cloud, samples)),
+        _ => {
+            let newest = db::newest_reading_ts_in_range(
+                &state.pool,
+                state.plant_id,
+                Metric::LoadDayWh,
+                start,
+                end,
+            )
+            .await?;
+            let final_day = is_cacheable(date, today, "cloud", solid, newest, end);
+            Ok((cloud, samples, final_day))
+        }
     }
 }
 
