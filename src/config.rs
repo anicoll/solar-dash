@@ -41,6 +41,20 @@ pub struct Config {
     pub system: System,
     /// Past bills whose real totals replace our estimate. Optional.
     pub bills: Option<Bills>,
+    /// Which source wins when two can answer the same question. Optional;
+    /// without it the defaults give the long-standing behaviour.
+    #[serde(default)]
+    pub sources: Sources,
+}
+
+/// The `[sources]` section; see `hub::rules` for what the settings mean.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sources {
+    /// Source ids for a day's energy, best first.
+    pub daily_energy: Option<Vec<String>>,
+    pub finished_day_coverage: Option<f64>,
+    pub partial_day_coverage: Option<f64>,
 }
 
 /// The `[bills]` section.
@@ -883,6 +897,11 @@ fn default_offsite_keep() -> usize {
 }
 
 impl Config {
+    /// The rules from `[sources]`, with the defaults filled in.
+    pub fn source_rules(&self) -> Result<crate::hub::SourceRules> {
+        crate::hub::SourceRules::from_config(&self.sources)
+    }
+
     /// Read and parse the config file at `path`.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| {
@@ -896,6 +915,9 @@ impl Config {
         config
             .server
             .check()
+            .with_context(|| format!("invalid config file {}", path.display()))?;
+        config
+            .source_rules()
             .with_context(|| format!("invalid config file {}", path.display()))?;
         if let Some(offsite) = &config.database.offsite {
             offsite
@@ -949,6 +971,29 @@ mod tests {
         username = "u"
         password = "hunter2"
     "#;
+
+    #[test]
+    fn sources_section_is_optional_and_checked() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        assert_eq!(cfg.source_rules().unwrap(), Default::default());
+
+        let text = format!(
+            "{MINIMAL}\n[sources]\ndaily_energy = [\"isolarcloud\"]\nfinished_day_coverage = 0.95\n"
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let rules = cfg.source_rules().unwrap();
+        assert!(!rules.live_enabled());
+        assert_eq!(rules.finished_day_coverage(), 0.95);
+
+        let text = format!("{MINIMAL}\n[sources]\ndaily_energy = [\"solarweb\"]\n");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let err = format!("{:#}", cfg.source_rules().unwrap_err());
+        assert!(err.contains("sungrow-modbus, isolarcloud"), "{err}");
+
+        // A misspelt key is an error, not silently ignored.
+        let text = format!("{MINIMAL}\n[sources]\ndaily_energies = []\n");
+        assert!(toml::from_str::<Config>(&text).is_err());
+    }
 
     #[test]
     fn example_config_parses() {

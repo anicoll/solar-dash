@@ -48,7 +48,7 @@ use crate::config::Config;
 use crate::cost::TariffSchedule;
 use crate::ev_cost::PetrolHistory;
 use crate::ev_cost::{CostSetup, EvPrices};
-use crate::hub::{self, SpokeInfo};
+use crate::hub::{self, SourceRules, SpokeInfo};
 use crate::modbus::{Latest, LatestSettings};
 use crate::teslamate::Car;
 pub(crate) use api::ApiError;
@@ -105,6 +105,8 @@ pub struct AppState {
     offsite: crate::offsite::Status,
     /// Every spoke and whether it is on, for `/api/spokes`.
     spokes: Arc<[SpokeInfo]>,
+    /// Which source wins for a day's energy (`[sources]`).
+    rules: Arc<SourceRules>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -142,7 +144,14 @@ impl AppState {
             backup_dir: None,
             offsite: crate::offsite::Status::default(),
             spokes: hub::spoke_infos(&[]).into(),
+            rules: Arc::new(SourceRules::default()),
         })
+    }
+
+    /// Sets which source wins when two can answer the same question.
+    pub fn with_source_rules(mut self, rules: SourceRules) -> Self {
+        self.rules = Arc::new(rules);
+        self
     }
 
     /// Records which spokes (by id) are running, for `/api/spokes`.
@@ -275,6 +284,7 @@ impl AppState {
         CostSetup {
             admin: self.admin.clone(),
             plant_id: self.plant_id,
+            rules: self.rules.clone(),
         }
     }
 
@@ -319,6 +329,7 @@ impl AppState {
             .with_cookie_secure(config.server.cookie_secure)
             .with_api_token(config.server.api_token.as_deref())
             .with_globird_configured(config.globird.is_some())
+            .with_source_rules(config.source_rules()?)
             .with_amber_configured(config.amber.is_some()))
     }
 }
@@ -2661,9 +2672,10 @@ mod tests {
         seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
         let now = SEP_15_START + 3 * 86_400;
         let (start, end) = (SEP_15_START + 3 * 3600, SEP_15_START + 5 * 3600);
-        let (intervals, covered) = costs::house_intervals(&pool, PLANT, tz, start, end, now)
-            .await
-            .unwrap();
+        let (intervals, covered) =
+            costs::house_intervals(&pool, PLANT, tz, start, end, now, &SourceRules::default())
+                .await
+                .unwrap();
         assert!(!intervals.is_empty());
         // The whole day is the source, so these are the day's intervals.
         assert!(intervals.iter().any(|i| i.start_ts < start));
@@ -2672,22 +2684,38 @@ mod tests {
 
         // A session across midnight loads both days; the empty one adds none.
         let night = (SEP_15_START + 86_400 - 1800, SEP_15_START + 86_400 + 1800);
-        let (_, covered) = costs::house_intervals(&pool, PLANT, tz, night.0, night.1, now)
-            .await
-            .unwrap();
+        let (_, covered) = costs::house_intervals(
+            &pool,
+            PLANT,
+            tz,
+            night.0,
+            night.1,
+            now,
+            &SourceRules::default(),
+        )
+        .await
+        .unwrap();
         assert!(covered < 0.6, "the 16th has no data, got {covered}");
 
         // Nothing stored, or no length: nothing covered.
         let later = SEP_15_START + 10 * 86_400;
-        let (intervals, covered) =
-            costs::house_intervals(&pool, PLANT, tz, later, later + 3600, now)
-                .await
-                .unwrap();
+        let (intervals, covered) = costs::house_intervals(
+            &pool,
+            PLANT,
+            tz,
+            later,
+            later + 3600,
+            now,
+            &SourceRules::default(),
+        )
+        .await
+        .unwrap();
         assert!(intervals.is_empty());
         assert_eq!(covered, 0.0);
-        let (intervals, covered) = costs::house_intervals(&pool, PLANT, tz, start, start, now)
-            .await
-            .unwrap();
+        let (intervals, covered) =
+            costs::house_intervals(&pool, PLANT, tz, start, start, now, &SourceRules::default())
+                .await
+                .unwrap();
         assert!(intervals.is_empty());
         assert_eq!(covered, 0.0);
     }

@@ -28,6 +28,7 @@ use crate::cost::{self, DayCost, DayPrices, GridSplit, Interval, Tariff, TariffS
 use crate::db::{self, GlobirdCostRow, GlobirdDayKwh};
 use crate::ev_cost::{self, CarDayTotals};
 use crate::globird::data::{self as globird_data, bucket_of, is_supply};
+use crate::hub::SourceRules;
 use crate::metric::Metric;
 use crate::modbus::Sample;
 
@@ -266,6 +267,8 @@ pub(super) struct DayData<'a> {
     /// The inverter's grid totals rows from a little before the day to a
     /// little after (see [`meter_in`]), `(ts, import_wh, export_wh)`.
     pub meter: &'a [(i64, f64, f64)],
+    /// Which source wins when both cover the day.
+    pub rules: &'a SourceRules,
 }
 
 /// The intervals of one day and where they came from, or `None` if there is
@@ -277,9 +280,10 @@ pub(super) fn day_intervals(
     day: &DayData,
     now: i64,
 ) -> Option<(&'static str, Vec<Interval>, bool)> {
-    let cloud_has_data = cloud_day_has_data(day.import, day.export, day.load);
-    if let Some(live) = live_totals(day.live, day.start, day.end, now)
-        && live.usable(cloud_has_data)
+    let cloud_has_data =
+        day.rules.cloud_enabled() && cloud_day_has_data(day.import, day.export, day.load);
+    if let Some(live) = live_totals(day.live, day.start, day.end, now, day.rules)
+        && live.usable(day.rules, cloud_has_data)
     {
         let mut intervals = live_intervals(day.live);
         top_up_from_meter(&mut intervals, day.meter);
@@ -421,6 +425,7 @@ pub(crate) async fn house_intervals(
     start: i64,
     end: i64,
     now: i64,
+    rules: &SourceRules,
 ) -> Result<(Vec<Interval>, f64)> {
     let local_date = |ts: i64| {
         DateTime::from_timestamp(ts, 0)
@@ -454,6 +459,7 @@ pub(crate) async fn house_intervals(
             export: slice_between(&counters.export, |r| r.0, day_start, day_end),
             load: slice_between(&counters.load, |r| r.0, day_start, day_end),
             meter: meter_for_day(&meter, day_start, day_end),
+            rules,
         };
         if let Some((_, day_intervals, _)) = day_intervals(&day, now) {
             intervals.extend(day_intervals);
@@ -482,8 +488,10 @@ pub(super) async fn day_grid_split(
     now: i64,
 ) -> Result<Option<GridSplit>, ApiError> {
     let (start, end) = day_bounds_or_error(date, state.tz)?;
-    let solid = live_totals(live, start, end, now).is_some_and(|l| l.solid);
-    let counters = if solid {
+    let rules = &state.rules;
+    let skip_cloud = !rules.cloud_enabled()
+        || live_totals(live, start, end, now, rules).is_some_and(|l| !rules.cloud_needed(l.solid));
+    let counters = if skip_cloud {
         Counters::default()
     } else {
         counters_in(&state.pool, state.plant_id, start, end).await?
@@ -497,6 +505,7 @@ pub(super) async fn day_grid_split(
         export: &counters.export,
         load: &counters.load,
         meter: &meter,
+        rules,
     };
     let tariff = schedule.for_date(date);
     let prices = plan_day_prices(state, tariff, date, today(state.tz)).await?;
@@ -986,6 +995,7 @@ async fn compute_days(
                 export: slice_between(&counters.export, |r| r.0, start, end),
                 load: slice_between(&counters.load, |r| r.0, start, end),
                 meter: meter_for_day(&meter, start, end),
+                rules: &state.rules,
             };
             let Some((source, intervals, live_solid)) = day_intervals(&day, now) else {
                 continue;
@@ -1687,6 +1697,7 @@ mod tests {
             export: &[],
             load: &[],
             meter: &[],
+            rules: &SourceRules::default(),
         };
         let (source, intervals, _) = day_intervals(&day, start + 2 * 86_400).unwrap();
         assert_eq!(source, "cloud");
@@ -1724,6 +1735,7 @@ mod tests {
             export: &[],
             load: &[],
             meter: &[],
+            rules: &SourceRules::default(),
         };
         assert!(day_intervals(&empty, 100_000).is_none());
         let some = DayData {
@@ -1761,6 +1773,7 @@ mod tests {
                 export: &[],
                 load: &[],
                 meter: &[],
+                rules: &SourceRules::default(),
             };
             day_intervals(&day, 1_000_000).map(|(source, _, solid)| (source, solid))
         };
@@ -1784,6 +1797,7 @@ mod tests {
             export: &zeros,
             load: &zeros,
             meter: &[],
+            rules: &SourceRules::default(),
         };
         assert!(day_intervals(&day, 1_000_000).is_none());
         // One counter rising is real data.
