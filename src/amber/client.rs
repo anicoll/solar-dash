@@ -37,6 +37,20 @@ impl fmt::Display for NotFound {
 
 impl std::error::Error for NotFound {}
 
+/// Amber refused the request itself (HTTP 400, 403 or 422), for example a date
+/// range it does not allow. The backfill uses this to tell "no more history"
+/// from a passing failure.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// A parsed reply plus the raw body it came from. The probe can save the raw
 /// text to use as a test fixture later.
 #[derive(Debug)]
@@ -95,6 +109,30 @@ impl Client {
             &[
                 ("previous", previous.to_string()),
                 ("next", next.to_string()),
+            ],
+        )
+        .await
+    }
+
+    /// `GET /sites/{id}/prices?startDate&endDate&resolution`: the prices from
+    /// `start` to `end` (both inclusive, site-local dates), for every channel,
+    /// as the same intervals `prices/current` returns. `resolution` is the
+    /// interval length in minutes, 5 or 30. Amber limits how long the range
+    /// may be, so callers ask a week at a time.
+    pub async fn prices_between(
+        &self,
+        site_id: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        resolution: u32,
+    ) -> Result<Reply<PriceInterval>> {
+        let path = format!("/sites/{site_id}/prices");
+        self.get(
+            &path,
+            &[
+                ("startDate", start.format("%Y-%m-%d").to_string()),
+                ("endDate", end.format("%Y-%m-%d").to_string()),
+                ("resolution", resolution.to_string()),
             ],
         )
         .await
@@ -181,6 +219,12 @@ fn check_status(
             Some(wait) => anyhow!("Amber rate limit hit (HTTP 429); retry after {wait}"),
             None => anyhow!("Amber rate limit hit (HTTP 429); try again in a few minutes"),
         },
+        StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::UNPROCESSABLE_ENTITY => {
+            anyhow::Error::new(Refused(format!(
+                "Amber {path} failed: HTTP {status}: {}",
+                snippet(body)
+            )))
+        }
         _ => anyhow!("Amber {path} failed: HTTP {status}: {}", snippet(body)),
     })
 }
@@ -267,6 +311,18 @@ mod tests {
                 }),
             )
             .route(
+                "/v1/sites/s1/prices",
+                get(|query: axum::extract::RawQuery| async move {
+                    match query.0.as_deref() {
+                        Some("startDate=2021-05-01&endDate=2021-05-07&resolution=5") => {
+                            (AxumStatus::OK, include_str!("testdata/prices_current.json"))
+                        }
+                        Some(_) => (AxumStatus::BAD_REQUEST, "range not allowed"),
+                        None => (AxumStatus::BAD_REQUEST, "bad query"),
+                    }
+                }),
+            )
+            .route(
                 "/v1/sites/busy/usage",
                 get(|| async {
                     (
@@ -286,6 +342,7 @@ mod tests {
         Amber {
             token: token.to_string(),
             site_id: None,
+            backfill_from: None,
             base_url,
             compare: Default::default(),
         }
@@ -306,6 +363,18 @@ mod tests {
         let day = |d| NaiveDate::from_ymd_opt(2021, 5, d).unwrap();
         let usage = client.usage("s1", day(1), day(7)).await.unwrap();
         assert_eq!(usage.items.len(), 2);
+
+        let past = client
+            .prices_between("s1", day(1), day(7), 5)
+            .await
+            .unwrap();
+        assert_eq!(past.items.len(), 3);
+        // A range Amber refuses is a `Refused` error, not a generic one.
+        let err = client
+            .prices_between("s1", day(1), day(30), 5)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<Refused>().is_some(), "{err:#}");
 
         let err = client.usage("busy", day(1), day(7)).await.unwrap_err();
         assert!(err.to_string().contains("retry after 42"), "{err}");

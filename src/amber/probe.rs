@@ -23,6 +23,13 @@ const PRICE_WINDOW: u32 = 12;
 /// start and end date.
 const USAGE_DAYS: u64 = 7;
 
+/// Weeks of past prices to try, as a label and how many days ago the week
+/// ends. One recent and one old, to show how far back Amber serves a site.
+const PAST_PRICE_PROBES: [(&str, u64); 2] = [("A month ago", 30), ("A year ago", 365)];
+
+/// Days in each past-prices probe week.
+const PAST_PRICE_DAYS: u64 = 7;
+
 /// What to do about the site after reading `/sites`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SiteChoice {
@@ -218,6 +225,23 @@ pub async fn run(config: &Amber, tz: Tz, json_out: Option<&std::path::Path>) -> 
         }
 
         let end: NaiveDate = Utc::now().with_timezone(&tz).date_naive();
+        println!("\n== Past prices for {site_id} (how far back does the API go?) ==");
+        for (label, days_ago) in PAST_PRICE_PROBES {
+            let past_end = end - Days::new(days_ago);
+            let past_start = past_end - Days::new(PAST_PRICE_DAYS - 1);
+            let line = match client
+                .prices_between(&site_id, past_start, past_end, 30)
+                .await
+            {
+                Ok(reply) => {
+                    saved.insert(format!("prices_{days_ago}_days_ago"), raw_value(&reply.raw));
+                    format!("{} intervals", reply.items.len())
+                }
+                Err(err) => format!("failed: {err:#}"),
+            };
+            println!("{label} ({past_start} to {past_end}): {line}");
+        }
+
         let start = end - Days::new(USAGE_DAYS - 1);
         println!("\n== Usage for {site_id}, {start} to {end} ==");
         match client.usage(&site_id, start, end).await {

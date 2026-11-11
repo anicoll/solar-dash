@@ -517,6 +517,9 @@ pub struct Amber {
     /// Which site (meter) to use. Optional: with exactly one site on the
     /// account that one is used.
     pub site_id: Option<String>,
+    /// How far back `serve` fills in past prices (a `YYYY-MM-DD` date).
+    /// Optional: the default is two years back.
+    pub backfill_from: Option<chrono::NaiveDate>,
     #[serde(default = "default_amber_base_url")]
     pub base_url: String,
     /// The made-up plan behind the Bill page's "What would Amber cost?".
@@ -1286,6 +1289,13 @@ mod tests {
         };
         assert!(parse("site_id = \"01ABC\"").check().is_ok());
         assert!(parse("site_id = \"\"").check().is_err());
+        assert_eq!(parse("").backfill_from, None);
+        assert_eq!(
+            parse("backfill_from = \"2024-03-01\"").backfill_from,
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 1)
+        );
+        let bad_date = format!("{MINIMAL}\n[amber]\ntoken = \"t\"\nbackfill_from = \"soon\"\n");
+        assert!(toml::from_str::<Config>(&bad_date).is_err());
         assert!(parse("base_url = \"not a url\"").check().is_err());
         assert!(parse("base_url = \"ftp://x\"").check().is_err());
         assert!(
@@ -1317,6 +1327,7 @@ mod tests {
         let amber = Amber {
             token: "psk_supersecret".into(),
             site_id: Some("01ABC".into()),
+            backfill_from: None,
             base_url: default_amber_base_url(),
             compare: AmberCompare::default(),
         };
