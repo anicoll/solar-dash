@@ -72,7 +72,11 @@ pub fn build(
         spokes.push(Box::new(amber::AmberPrices::new(amber)));
     }
     if let Some(home_assistant) = config.home_assistant.clone() {
-        spokes.push(Box::new(ha_mqtt::HomeAssistantMqtt::new(home_assistant)));
+        spokes.push(Box::new(ha_mqtt::HomeAssistantMqtt::new(
+            home_assistant,
+            state,
+            config.amber.is_some(),
+        )));
     }
     spokes.push(Box::new(backups::Backups::new(
         config.database.backup_dir(),

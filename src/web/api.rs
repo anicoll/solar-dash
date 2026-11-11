@@ -100,6 +100,10 @@ impl ApiError {
         }
     }
 
+    pub(super) fn message(&self) -> &str {
+        &self.message
+    }
+
     pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -1601,6 +1605,36 @@ const DAILY_METRICS: [Metric; 7] = [
     Metric::BatteryDischargeDayWh,
     Metric::SelfConsumedDayWh,
 ];
+
+/// One local day's energy in kWh, for the Home Assistant feed. A field is
+/// `None` when that day has no data for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DayEnergy {
+    pub pv_kwh: Option<f64>,
+    pub load_kwh: Option<f64>,
+    pub import_kwh: Option<f64>,
+    pub export_kwh: Option<f64>,
+    pub battery_charge_kwh: Option<f64>,
+    pub battery_discharge_kwh: Option<f64>,
+}
+
+/// The same totals `/api/daily` (and so the Today page) shows for `date`:
+/// `day_totals_with_live` is the one function behind both, so the two can
+/// never disagree.
+pub async fn day_energy(state: &AppState, date: NaiveDate) -> anyhow::Result<DayEnergy> {
+    let live_range = db::live_ts_range(&state.pool).await?;
+    let (totals, _) = day_totals_with_live(state, date, live_range, db::now())
+        .await
+        .map_err(|err| anyhow::anyhow!("could not work out the day's totals: {}", err.message()))?;
+    Ok(DayEnergy {
+        pv_kwh: totals.pv_kwh,
+        load_kwh: totals.load_kwh,
+        import_kwh: totals.import_kwh,
+        export_kwh: totals.export_kwh,
+        battery_charge_kwh: totals.battery_charge_kwh,
+        battery_discharge_kwh: totals.battery_discharge_kwh,
+    })
+}
 
 pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyParams>) -> ApiResult {
     let group = Group::parse(params.group.as_deref())?;

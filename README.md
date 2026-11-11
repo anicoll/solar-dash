@@ -14,7 +14,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Dashboard UI (a home page with Now and History (Day, Month, Year), plus Money, Payback and Cars views; ECharts from cdnjs)
 - [x] Local Modbus reader (`modbus-test`) for live power from the inverter
 - [x] `serve` polls Modbus when configured and stores live samples (`/api/live`, `/api/live/series`)
-- [x] `serve` publishes live readings to Home Assistant over MQTT discovery when `[home_assistant]` is configured (see docs/how-to-run.md)
+- [x] `serve` publishes live readings to Home Assistant over MQTT discovery when `[home_assistant]` is configured: live power, today's energy (for the Energy dashboard), today's cost and, with Amber, the current prices (see docs/how-to-run.md)
 - [x] `serve` follows the Tesla's charge state from TeslaMate over MQTT when configured (`/api/live`)
 - [x] `/api/ev/cars` gives each TeslaMate car's details (trim, paint, wheels), home charging per plan, and a petrol comparison car; set the `compare_cars` and `petrol_grade` settings, for example `{"3": "Hyundai i30 Sedan N", "Y": "Toyota RAV4 GX 2WD"}` and `Unleaded 91` (kept in the database; see "Where the settings live" in `docs/how-to-run.md`)
 - [x] GloBird portal probe (`globird-probe`) to learn the response shapes (unofficial API)

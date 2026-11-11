@@ -129,7 +129,8 @@ path = "data/solar.db"
 # password, so keep this file private; it is never logged.
 # database_url = "postgres://solar_dash:change-me@192.168.1.70:5432/teslamate"
 
-# Optional: publish live readings to Home Assistant over MQTT discovery
+# Optional: publish live readings, today's energy and cost (and, with [amber],
+# the current prices) to Home Assistant over MQTT discovery
 # (publish only: solar-dash never listens for commands). The broker can be
 # the same one as [teslamate]'s. Without this section nothing is published.
 # See "Home Assistant" in docs/how-to-run.md.
