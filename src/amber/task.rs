@@ -162,12 +162,22 @@ pub async fn run(
         let now = Utc::now().timestamp();
         let wait = match result {
             Ok(saved) => {
-                if failures > 0 {
-                    info!("Amber prices are back");
+                // The first good fetch is logged at info, so a normal log shows
+                // the task is working. The 5-minute refreshes after it stay at
+                // debug to keep the log quiet.
+                let first = previous == STARTUP_PREVIOUS;
+                if first {
+                    info!(
+                        site = site_id.as_deref().unwrap_or(""),
+                        saved, "Amber prices fetched; refreshing every 5 minutes"
+                    );
+                } else if failures > 0 {
+                    info!(saved, "Amber prices are back");
+                } else {
+                    debug!(saved, "Amber prices updated");
                 }
                 failures = 0;
                 previous = REFRESH_PREVIOUS;
-                debug!(saved, "Amber prices updated");
                 Duration::from_secs((next_fetch_at(now) - now).max(0) as u64)
             }
             Err(err) => {
