@@ -10,6 +10,7 @@ mod fuel_log;
 mod globird;
 mod ingest;
 mod isolar;
+mod metric;
 mod modbus;
 mod offsite;
 mod petrol_prices;
