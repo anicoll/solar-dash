@@ -837,7 +837,7 @@ pub(super) fn compare_dates(
     let today = today(state.tz);
     let (from, to) = match (from, to) {
         (None, None) => {
-            let period = period_containing(today, &PeriodRule::of(data), &data.bills);
+            let period = period_containing(today, &PeriodRule::of(&data), &data.bills);
             (period.from, (today - Days::new(1)).min(period.to))
         }
         _ => {
@@ -984,7 +984,7 @@ mod tests {
         assert_eq!(case("2026-09-29"), s("2026-09-02", "2026-09-29"));
         assert_eq!(case("2026-09-01"), s("2026-08-05", "2026-09-01"));
         assert_eq!(case("2026-11-12"), s("2026-10-28", "2026-11-24"));
-        assert_eq!(case("2025-01-01"), s("2024-12-31", "2025-01-27"));
+        assert_eq!(case("2025-01-01"), s("2024-12-25", "2025-01-21"));
         // Past bills do not matter once an anchor is set.
         let bills = [bill("2026-08-01", "2026-08-31")];
         let p = period_containing(date("2026-11-12"), &rule, &bills);
@@ -996,8 +996,8 @@ mod tests {
         let rule = rolling("2026-09-02", 28);
         let now = period_containing(date("2026-11-12"), &rule, &[]);
         let before = periods_before(&now, 2, &rule, &[]);
-        assert_eq!(before[0].from, date("2026-09-30"));
-        assert_eq!(before[1].from, date("2026-10-28") - Days::new(28));
+        assert_eq!(before[0].from, date("2026-09-02"));
+        assert_eq!(before[1].from, date("2026-09-30"));
         assert_eq!(before[1].to, date("2026-10-27"));
     }
 
@@ -1328,7 +1328,7 @@ mod tests {
     #[test]
     fn periods_before_walk_back_one_period_at_a_time() {
         let current = period_containing(date("2026-11-10"), &day(5), &[]);
-        let before = periods_before(&current, 3, Some(5), &[]);
+        let before = periods_before(&current, 3, &day(5), &[]);
         let spans: Vec<_> = before
             .iter()
             .map(|p| (p.from.to_string(), p.to.to_string()))
@@ -1341,13 +1341,13 @@ mod tests {
                 ("2026-10-05".to_string(), "2026-11-04".to_string()),
             ]
         );
-        assert!(periods_before(&current, 0, Some(5), &[]).is_empty());
+        assert!(periods_before(&current, 0, &day(5), &[]).is_empty());
     }
 
     #[test]
     fn periods_are_summed_from_their_own_days() {
         let current = period_containing(date("2026-11-10"), &day(5), &[]);
-        let before = periods_before(&current, 2, Some(5), &[]);
+        let before = periods_before(&current, 2, &day(5), &[]);
         let days = [
             costed("2026-09-20", 500.0, 0.0),
             costed("2026-10-04", 300.0, 100.0),
