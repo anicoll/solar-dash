@@ -16,6 +16,7 @@ use super::api::{ApiError, ApiResult, day_bounds_or_error, first_data_ts, parse_
 use super::costs::{
     CostedDay, SOURCE_BILL, SOURCE_GLOBIRD, billed_days, grid_splits, hhmm, round2,
 };
+use crate::admin_data::AdminData;
 use crate::bills::PastBill;
 use crate::config;
 use crate::cost::{DayCost, ExportBand, GridSplit, Tariff};
@@ -27,6 +28,9 @@ use crate::db;
 enum PeriodSource {
     /// The admin setting `bill_start_day`.
     Setting,
+    /// The admin settings `bill_anchor_date` and `bill_length_days`: rolling
+    /// periods of a fixed length that do not follow the calendar.
+    Anchor,
     /// Rolled forward from the most recent past bill.
     LastBill,
     /// The calendar month.
@@ -47,6 +51,28 @@ impl Period {
     }
 }
 
+/// The admin settings that decide the period dates. Gathered in one value so
+/// every caller (and the tests) passes the same thing to [`period_containing`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct PeriodRule {
+    /// Day of the month (1 to 28) a monthly period starts on.
+    start_day: Option<u32>,
+    /// The first day of any real bill and the length of each bill in days.
+    /// Wins over `start_day`.
+    anchor: Option<(NaiveDate, u32)>,
+}
+
+impl PeriodRule {
+    fn of(data: &AdminData) -> Self {
+        PeriodRule {
+            start_day: data.bill_start_day,
+            anchor: data
+                .bill_anchor_date
+                .map(|date| (date, data.bill_length_days)),
+        }
+    }
+}
+
 /// The shortest last bill, in days, that is still used to roll a period
 /// forward. A retailer's final bill can be a few days long, and rolling by
 /// that would make every later period just as short.
@@ -55,6 +81,9 @@ const MIN_ROLLING_BILL_DAYS: i64 = 25;
 /// The bill period that contains `date` (today for the live bill, any earlier
 /// day to step back through past bills).
 ///
+/// 0. With an anchor, periods are `anchor + k * length` days for any whole
+///    number `k` (before the anchor too), so a retailer whose periods start on
+///    a different day each month is followed exactly.
 /// 1. With `start_day` (1 to 28) the period starts on that day of a month and
 ///    runs to the day before the next one.
 /// 2. Else the most recent bill that ended before `today` (`bills` is oldest
@@ -62,8 +91,20 @@ const MIN_ROLLING_BILL_DAYS: i64 = 25;
 ///    rolled forward by that length until it contains `today`. A bill shorter
 ///    than [`MIN_ROLLING_BILL_DAYS`] (such as a final bill) is not used.
 /// 3. Else the calendar month.
-fn period_containing(today: NaiveDate, start_day: Option<u32>, bills: &[PastBill]) -> Period {
-    if let Some(day) = start_day.filter(|d| (1..=28).contains(d)) {
+fn period_containing(today: NaiveDate, rule: &PeriodRule, bills: &[PastBill]) -> Period {
+    if let Some((anchor, length)) = rule.anchor.filter(|(_, length)| *length > 0) {
+        let length = i64::from(length);
+        // `div_euclid` rounds down, so days before the anchor land in an
+        // earlier period instead of being cut short at zero.
+        let k = (today - anchor).num_days().div_euclid(length);
+        let from = anchor + chrono::Duration::days(k * length);
+        return Period {
+            from,
+            to: from + Days::new(length as u64 - 1),
+            source: PeriodSource::Anchor,
+        };
+    }
+    if let Some(day) = rule.start_day.filter(|d| (1..=28).contains(d)) {
         // Days 1 to 28 exist in every month, so building the date cannot fail.
         let this_month = today.with_day(day).unwrap_or(today);
         let from = if today.day() >= day {
@@ -437,13 +478,13 @@ const HISTORY_PERIODS: usize = 6;
 fn periods_before(
     period: &Period,
     count: usize,
-    start_day: Option<u32>,
+    rule: &PeriodRule,
     bills: &[PastBill],
 ) -> Vec<Period> {
     let mut out = Vec::with_capacity(count);
     let mut next_from = period.from;
     for _ in 0..count {
-        let before = period_containing(next_from - Days::new(1), start_day, bills);
+        let before = period_containing(next_from - Days::new(1), rule, bills);
         next_from = before.from;
         out.push(before);
     }
@@ -541,13 +582,13 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
         }
         None => today,
     };
-    let period = period_containing(wanted, data.bill_start_day, &data.bills);
+    let rule = PeriodRule::of(&data);
+    let period = period_containing(wanted, &rule, &data.bills);
     // A period that ended before today is finished: nothing is left to project.
     let finished = period.to < today;
     let next_date = finished.then(|| period.to + Days::new(1));
     let first_day = first_data_day(&state, &data.bills).await?;
-    let before_period =
-        period_containing(period.from - Days::new(1), data.bill_start_day, &data.bills);
+    let before_period = period_containing(period.from - Days::new(1), &rule, &data.bills);
     let prev_date = first_day
         .filter(|first| before_period.to >= *first)
         .map(|_| period.from - Days::new(1));
@@ -630,7 +671,7 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
         })
         .collect();
     // The last six periods in one pass over the costs, oldest first.
-    let before = periods_before(&period, HISTORY_PERIODS, data.bill_start_day, &data.bills);
+    let before = periods_before(&period, HISTORY_PERIODS, &rule, &data.bills);
     let past_dates: Vec<NaiveDate> = before.first().map_or_else(Vec::new, |first| {
         first
             .from
@@ -796,7 +837,7 @@ pub(super) fn compare_dates(
     let today = today(state.tz);
     let (from, to) = match (from, to) {
         (None, None) => {
-            let period = period_containing(today, data.bill_start_day, &data.bills);
+            let period = period_containing(today, &PeriodRule::of(data), &data.bills);
             (period.from, (today - Days::new(1)).min(period.to))
         }
         _ => {
@@ -883,6 +924,20 @@ mod tests {
         }
     }
 
+    fn day(start_day: u32) -> PeriodRule {
+        PeriodRule {
+            start_day: Some(start_day),
+            anchor: None,
+        }
+    }
+
+    fn rolling(anchor: &str, length: u32) -> PeriodRule {
+        PeriodRule {
+            start_day: Some(15),
+            anchor: Some((date(anchor), length)),
+        }
+    }
+
     fn span(period: Period) -> (String, String, PeriodSource) {
         (
             period.from.to_string(),
@@ -894,7 +949,7 @@ mod tests {
     #[test]
     fn setting_starts_on_that_day_of_this_or_last_month() {
         // On or after the start day: this month's start.
-        let p = period_containing(date("2026-10-28"), Some(15), &[]);
+        let p = period_containing(date("2026-10-28"), &day(15), &[]);
         assert_eq!(
             span(p),
             (
@@ -904,33 +959,61 @@ mod tests {
             )
         );
         assert_eq!(p.days_total(), 31);
-        let p = period_containing(date("2026-10-15"), Some(15), &[]);
+        let p = period_containing(date("2026-10-15"), &day(15), &[]);
         assert_eq!(p.from, date("2026-10-15"));
         // Before it: last month's start.
-        let p = period_containing(date("2026-10-14"), Some(15), &[]);
+        let p = period_containing(date("2026-10-14"), &day(15), &[]);
         assert_eq!((p.from, p.to), (date("2026-09-15"), date("2026-10-14")));
         // Across a year end.
-        let p = period_containing(date("2027-01-03"), Some(15), &[]);
+        let p = period_containing(date("2027-01-03"), &day(15), &[]);
         assert_eq!((p.from, p.to), (date("2026-12-15"), date("2027-01-14")));
         // The setting wins over a bill.
         let bills = [bill("2026-09-01", "2026-09-30")];
-        let p = period_containing(date("2026-10-28"), Some(1), &bills);
+        let p = period_containing(date("2026-10-28"), &day(1), &bills);
         assert_eq!(p.source, PeriodSource::Setting);
     }
 
     #[test]
+    fn anchor_rolls_in_blocks_both_ways_and_wins_over_start_day() {
+        let rule = rolling("2026-09-02", 28);
+        let anchor = PeriodSource::Anchor;
+        let case = |d: &str| span(period_containing(date(d), &rule, &[]));
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string(), anchor);
+        assert_eq!(case("2026-09-30"), s("2026-09-30", "2026-10-27"));
+        assert_eq!(case("2026-09-02"), s("2026-09-02", "2026-09-29"));
+        assert_eq!(case("2026-09-29"), s("2026-09-02", "2026-09-29"));
+        assert_eq!(case("2026-09-01"), s("2026-08-05", "2026-09-01"));
+        assert_eq!(case("2026-11-12"), s("2026-10-28", "2026-11-24"));
+        assert_eq!(case("2025-01-01"), s("2024-12-31", "2025-01-27"));
+        // Past bills do not matter once an anchor is set.
+        let bills = [bill("2026-08-01", "2026-08-31")];
+        let p = period_containing(date("2026-11-12"), &rule, &bills);
+        assert_eq!(p.from, date("2026-10-28"));
+    }
+
+    #[test]
+    fn anchor_periods_before_step_back_by_the_length() {
+        let rule = rolling("2026-09-02", 28);
+        let now = period_containing(date("2026-11-12"), &rule, &[]);
+        let before = periods_before(&now, 2, &rule, &[]);
+        assert_eq!(before[0].from, date("2026-09-30"));
+        assert_eq!(before[1].from, date("2026-10-28") - Days::new(28));
+        assert_eq!(before[1].to, date("2026-10-27"));
+    }
+
+    #[test]
     fn setting_handles_the_28th_and_february() {
-        let p = period_containing(date("2027-02-10"), Some(28), &[]);
+        let p = period_containing(date("2027-02-10"), &day(28), &[]);
         assert_eq!((p.from, p.to), (date("2027-01-28"), date("2027-02-27")));
-        let p = period_containing(date("2027-02-28"), Some(28), &[]);
+        let p = period_containing(date("2027-02-28"), &day(28), &[]);
         assert_eq!((p.from, p.to), (date("2027-02-28"), date("2027-03-27")));
         assert_eq!(p.days_total(), 28);
         // Leap year: February has 29 days.
-        let p = period_containing(date("2028-03-01"), Some(28), &[]);
+        let p = period_containing(date("2028-03-01"), &day(28), &[]);
         assert_eq!((p.from, p.to), (date("2028-02-28"), date("2028-03-27")));
         assert_eq!(p.days_total(), 29);
         // Start day 1 is the calendar month.
-        let p = period_containing(date("2027-02-14"), Some(1), &[]);
+        let p = period_containing(date("2027-02-14"), &day(1), &[]);
         assert_eq!((p.from, p.to), (date("2027-02-01"), date("2027-02-28")));
     }
 
@@ -938,7 +1021,7 @@ mod tests {
     fn short_last_bill_falls_back_to_the_calendar_month() {
         // A 7 day final bill is not used for rolling.
         let bills = [bill("2026-05-19", "2026-05-25")];
-        let p = period_containing(date("2026-11-10"), None, &bills);
+        let p = period_containing(date("2026-11-10"), &PeriodRule::default(), &bills);
         assert_eq!(
             span(p),
             (
@@ -949,17 +1032,17 @@ mod tests {
         );
         // 24 days is too short, 25 is the shortest that still rolls.
         let bills = [bill("2026-09-01", "2026-09-24")];
-        let p = period_containing(date("2026-10-10"), None, &bills);
+        let p = period_containing(date("2026-10-10"), &PeriodRule::default(), &bills);
         assert_eq!(p.source, PeriodSource::Month);
         let bills = [bill("2026-09-01", "2026-09-25")];
-        let p = period_containing(date("2026-10-10"), None, &bills);
+        let p = period_containing(date("2026-10-10"), &PeriodRule::default(), &bills);
         assert_eq!(p.source, PeriodSource::LastBill);
     }
 
     #[test]
     fn a_28_day_last_bill_still_rolls() {
         let bills = [bill("2026-09-01", "2026-09-28")];
-        let p = period_containing(date("2026-10-10"), None, &bills);
+        let p = period_containing(date("2026-10-10"), &PeriodRule::default(), &bills);
         assert_eq!(
             span(p),
             (
@@ -974,7 +1057,7 @@ mod tests {
     fn last_bill_rolls_forward_by_its_length() {
         // A 31 day bill ending 2026-09-14: the next period starts 09-15.
         let bills = [bill("2026-08-15", "2026-09-14")];
-        let p = period_containing(date("2026-10-10"), None, &bills);
+        let p = period_containing(date("2026-10-10"), &PeriodRule::default(), &bills);
         assert_eq!(
             span(p),
             (
@@ -984,7 +1067,7 @@ mod tests {
             )
         );
         // Past the end of that one, it rolls to the next.
-        let p = period_containing(date("2026-10-28"), None, &bills);
+        let p = period_containing(date("2026-10-28"), &PeriodRule::default(), &bills);
         assert_eq!((p.from, p.to), (date("2026-10-16"), date("2026-11-15")));
         assert_eq!(p.days_total(), 31);
         // The most recent bill is used, and one that ends today is not "past".
@@ -992,15 +1075,15 @@ mod tests {
             bill("2026-08-15", "2026-09-14"),
             bill("2026-09-15", "2026-10-14"),
         ];
-        let p = period_containing(date("2026-10-15"), None, &bills);
+        let p = period_containing(date("2026-10-15"), &PeriodRule::default(), &bills);
         assert_eq!(p.from, date("2026-10-15"));
-        let p = period_containing(date("2026-10-14"), None, &bills);
+        let p = period_containing(date("2026-10-14"), &PeriodRule::default(), &bills);
         assert_eq!(p.from, date("2026-09-15"));
     }
 
     #[test]
     fn without_a_setting_or_bill_it_is_the_calendar_month() {
-        let p = period_containing(date("2026-10-28"), None, &[]);
+        let p = period_containing(date("2026-10-28"), &PeriodRule::default(), &[]);
         assert_eq!(
             span(p),
             (
@@ -1009,7 +1092,7 @@ mod tests {
                 PeriodSource::Month
             )
         );
-        let p = period_containing(date("2028-02-29"), None, &[]);
+        let p = period_containing(date("2028-02-29"), &PeriodRule::default(), &[]);
         assert_eq!((p.from, p.to), (date("2028-02-01"), date("2028-02-29")));
         assert_eq!(p.days_total(), 29);
     }
@@ -1244,7 +1327,7 @@ mod tests {
 
     #[test]
     fn periods_before_walk_back_one_period_at_a_time() {
-        let current = period_containing(date("2026-11-10"), Some(5), &[]);
+        let current = period_containing(date("2026-11-10"), &day(5), &[]);
         let before = periods_before(&current, 3, Some(5), &[]);
         let spans: Vec<_> = before
             .iter()
@@ -1263,7 +1346,7 @@ mod tests {
 
     #[test]
     fn periods_are_summed_from_their_own_days() {
-        let current = period_containing(date("2026-11-10"), Some(5), &[]);
+        let current = period_containing(date("2026-11-10"), &day(5), &[]);
         let before = periods_before(&current, 2, Some(5), &[]);
         let days = [
             costed("2026-09-20", 500.0, 0.0),

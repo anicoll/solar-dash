@@ -40,6 +40,14 @@ pub struct AdminData {
     /// Day of the month (1 to 28) a bill period starts on; `None` works the
     /// period out from the last bill instead (see `web::bill`).
     pub bill_start_day: Option<u32>,
+    /// The first day of any one real bill. When set, bill periods roll in
+    /// blocks of `bill_length_days` from it (both ways) and this wins over
+    /// `bill_start_day`. For retailers whose periods start on a different
+    /// day each month.
+    pub bill_anchor_date: Option<NaiveDate>,
+    /// How many days each rolling bill lasts (7 to 92); used with
+    /// `bill_anchor_date` only.
+    pub bill_length_days: u32,
     /// The past bills, oldest first; empty when there are none.
     pub bills: Arc<[PastBill]>,
     /// Grid import (kW) from which the Today page warns about the main breaker.
@@ -63,6 +71,8 @@ impl Default for AdminData {
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
             bill_start_day: None,
+            bill_anchor_date: None,
+            bill_length_days: DEFAULT_BILL_LENGTH_DAYS,
             bills: Arc::from([]),
             grid_pull_warn_kw: 12.0,
             grid_pull_limit_kw: 15.0,
@@ -71,8 +81,11 @@ impl Default for AdminData {
     }
 }
 
+/// How long a rolling bill lasts when only the anchor date is set.
+pub const DEFAULT_BILL_LENGTH_DAYS: u32 = 28;
+
 /// The keys of the `setting` table. A missing key means its default.
-pub const SETTING_KEYS: [&str; 10] = [
+pub const SETTING_KEYS: [&str; 12] = [
     "petrol_cents_per_litre",
     "petrol_litres_per_100km",
     "away_cents_per_kwh",
@@ -80,6 +93,8 @@ pub const SETTING_KEYS: [&str; 10] = [
     "petrol_grade",
     "price_rise_percent",
     "bill_start_day",
+    "bill_anchor_date",
+    "bill_length_days",
     "grid_pull_warn_kw",
     "grid_pull_limit_kw",
     "price_spike_cents",
@@ -327,6 +342,30 @@ pub fn apply_setting(data: &mut AdminData, key: &str, value: &Value) -> Result<(
                 Some(day as u32)
             };
         }
+        "bill_anchor_date" => {
+            // Optional: null turns the rolling period off.
+            data.bill_anchor_date = if value.is_null() {
+                None
+            } else {
+                let date = value
+                    .as_str()
+                    .and_then(|text| NaiveDate::parse_from_str(text, "%Y-%m-%d").ok())
+                    .with_context(|| format!("{key} must be a date as YYYY-MM-DD"))?;
+                Some(date)
+            };
+        }
+        "bill_length_days" => {
+            // Optional: null puts back the default.
+            data.bill_length_days = if value.is_null() {
+                DEFAULT_BILL_LENGTH_DAYS
+            } else {
+                value
+                    .as_u64()
+                    .filter(|d| (7..=92).contains(d))
+                    .with_context(|| format!("{key} must be a whole number between 7 and 92"))?
+                    as u32
+            };
+        }
         "grid_pull_warn_kw" => data.grid_pull_warn_kw = positive()?,
         "grid_pull_limit_kw" => data.grid_pull_limit_kw = positive()?,
         "price_spike_cents" => data.price_spike_cents = positive()?,
@@ -570,5 +609,44 @@ mod tests {
         let after = TariffSchedule::from_plans(&[(None, back)]).unwrap();
         let day = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         assert_eq!(before.for_date(day).key(), after.for_date(day).key());
+    }
+
+    #[test]
+    fn rolling_bill_settings_are_validated() {
+        let mut data = AdminData::default();
+        assert_eq!((data.bill_anchor_date, data.bill_length_days), (None, 28));
+        apply_setting(&mut data, "bill_anchor_date", &json!("2026-09-02")).unwrap();
+        apply_setting(&mut data, "bill_length_days", &json!(30)).unwrap();
+        assert_eq!(data.bill_anchor_date, NaiveDate::from_ymd_opt(2026, 9, 2));
+        assert_eq!(data.bill_length_days, 30);
+        for bad in [
+            json!("2026-02-30"),
+            json!("02/09/2026"),
+            json!(5),
+            json!(""),
+        ] {
+            assert!(
+                apply_setting(&mut data, "bill_anchor_date", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        for bad in [
+            json!(6),
+            json!(93),
+            json!(0),
+            json!(-7),
+            json!(28.5),
+            json!("28"),
+        ] {
+            assert!(
+                apply_setting(&mut data, "bill_length_days", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        // Rejected values change nothing, and null puts the defaults back.
+        assert_eq!(data.bill_length_days, 30);
+        apply_setting(&mut data, "bill_anchor_date", &Value::Null).unwrap();
+        apply_setting(&mut data, "bill_length_days", &Value::Null).unwrap();
+        assert_eq!((data.bill_anchor_date, data.bill_length_days), (None, 28));
     }
 }

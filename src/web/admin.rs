@@ -194,6 +194,8 @@ fn setting_defaults() -> Value {
         "petrol_grade": d.petrol_grade,
         "price_rise_percent": d.price_rise_percent,
         "bill_start_day": d.bill_start_day,
+        "bill_anchor_date": d.bill_anchor_date,
+        "bill_length_days": d.bill_length_days,
         "grid_pull_warn_kw": d.grid_pull_warn_kw,
         "grid_pull_limit_kw": d.grid_pull_limit_kw,
         "price_spike_cents": d.price_spike_cents,
