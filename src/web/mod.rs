@@ -1020,6 +1020,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let point = &json["points"][0];
+        assert_eq!(point["metric"], "pv_w");
         assert_eq!(point["point_id"], pv_point_id());
         assert_eq!(point["name"], "Plant power");
         assert_eq!(point["unit"], "W");
@@ -1320,6 +1321,10 @@ mod tests {
         let bad = [
             "/api/series",
             "/api/series?points=abc&from=1&to=2",
+            "/api/series?metrics=nope&from=1&to=2",
+            "/api/series?metrics=&from=1&to=2",
+            "/api/series?metrics=pv_w&points=1&from=1&to=2",
+            "/api/series?metrics=pv_w&from=2&to=1",
             &format!("/api/series?points={}&from=2&to=1", pv_point_id()),
             &format!("/api/series?points={}&from=0&to=2678401", pv_point_id()),
             "/api/series?points=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21&from=1&to=2",
@@ -1332,6 +1337,21 @@ mod tests {
             assert!(body_json(response).await["error"].is_string(), "{uri}");
         }
 
+        // By metric name.
+        let uri = "/api/series?metrics=pv_w,load_w&from=1800000000&to=1800000300";
+        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(json.get("deprecated").is_none());
+        let series = &json["series"][0];
+        assert_eq!(series["metric"], "pv_w");
+        assert_eq!(series["data"].as_array().unwrap().len(), 2);
+        assert_eq!(series["data"][1][1], 1001.0);
+        // A metric with no readings is an empty series, not an error.
+        assert_eq!(json["series"][1]["metric"], "load_w");
+        assert_eq!(json["series"][1]["data"], serde_json::json!([]));
+
+        // By point id: still accepted for one release, and says it is deprecated.
         let uri = format!(
             "/api/series?points={}&from=1800000000&to=1800000300",
             pv_point_id()
@@ -1339,8 +1359,10 @@ mod tests {
         let response = send(&app, get_request(&uri, Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
+        assert!(json["deprecated"].is_string());
         let series = &json["series"][0];
         assert_eq!(series["point_id"], pv_point_id());
+        assert_eq!(series["metric"], "pv_w");
         assert_eq!(series["data"].as_array().unwrap().len(), 2);
         assert_eq!(series["data"][1][1], 1001.0);
     }
