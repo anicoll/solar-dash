@@ -9,6 +9,7 @@ mod db;
 mod ev_cost;
 mod fuel_log;
 mod globird;
+mod hub;
 mod ingest;
 mod isolar;
 mod metric;
@@ -28,7 +29,7 @@ use chrono_tz::Tz;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
@@ -206,115 +207,44 @@ async fn run_serve(config: Config) -> Result<()> {
     ingest::check_sync_config(&config.isolarcloud)?;
     let client = Client::new(config.isolarcloud.clone())?;
 
-    info!(address = %config.server.bind, "web server started");
-    // The Modbus poller only runs if there is a [modbus] section. Otherwise
-    // this future finishes at once, which `try_join!` is happy with.
-    let latest = state.latest();
-    let latest_settings = state.latest_settings();
-    let poll_modbus = async {
-        match config.modbus.clone() {
-            Some(modbus) => {
-                modbus::run_poll(modbus, &pool, latest, latest_settings, shutdown_signal()).await
-            }
-            None => Ok(()),
-        }
-    };
-    // The TeslaMate reader works the same way: it only runs if there is a
-    // [teslamate] section, and its errors are only logged. It saves charging
-    // sessions and the odometer, so it gets the pool and the time zone.
-    let car = state.car();
-    let tz = state.tz();
-    let follow_car = async {
-        if let Some(teslamate) = config.teslamate.clone()
-            && let Err(err) =
-                teslamate::run(teslamate, car, pool.clone(), tz, shutdown_signal()).await
-        {
-            error!("TeslaMate reader stopped: {err:#}; the dashboard keeps running");
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    // The GloBird sync also only runs with a [globird] section and only logs
-    // its errors. It needs the same time zone as everything else for "today".
-    let sync_globird = async {
-        if let Some(globird) = config.globird.clone()
-            && let Err(err) = globird::sync::run(globird, pool.clone(), tz, shutdown_signal()).await
-        {
-            error!("GloBird sync stopped: {err:#}; the dashboard keeps running");
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    // The Amber price task only runs with an [amber] section and only logs
-    // its errors. It is read-only: it never changes anything at Amber.
-    let fetch_prices = async {
-        if let Some(amber) = config.amber.clone()
-            && let Err(err) = amber::task::run(amber, pool.clone(), shutdown_signal()).await
-        {
-            error!("Amber price task stopped: {err:#}; the dashboard keeps running");
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    // The TeslaMate history sync needs `database_url` in [teslamate]; without
-    // it this finishes at once. It does not log the URL, which has a password.
-    let costing = state.cost_setup();
-    let sync_teslamate_history = async {
-        if let Some(url) = config
-            .teslamate
-            .as_ref()
-            .and_then(|teslamate| teslamate.database_url.clone())
-            && let Err(err) =
-                teslamate_history::run(url, pool.clone(), tz, costing, shutdown_signal()).await
-        {
-            error!("TeslaMate history sync stopped: {err:#}; the dashboard keeps running");
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    // Nightly database backups; they only log their errors too. A mistake in
-    // the offsite settings that no retry can fix fails at startup instead.
+    // A mistake in the offsite settings that no retry can fix fails at
+    // startup too.
     let offsite = config
         .database
         .offsite
         .as_ref()
         .map(|settings| offsite::Offsite::new(settings, offsite_status))
         .transpose()?;
-    let backups = async {
-        if let Err(err) = backup::run(
-            pool.clone(),
-            config.database.backup_dir(),
-            config.database.backup_keep,
-            tz,
-            offsite,
-            shutdown_signal(),
-        )
-        .await
-        {
-            error!("database backups stopped: {err:#}; the dashboard keeps running");
-        }
-        Ok::<(), anyhow::Error>(())
+
+    // Each background job is a spoke (see `hub`). Build them from the config,
+    // then run them all next to the web server.
+    let tz = state.tz();
+    let spokes = hub::spokes::build(&config, &state, client, offsite);
+    let ids: Vec<&str> = spokes.iter().map(|spoke| spoke.id()).collect();
+    info!("spokes: {}", ids.join(", "));
+    let state = state.with_enabled_spokes(&ids);
+
+    // One Ctrl+C fires the shutdown signal that every spoke waits on.
+    let (trigger, shutdown) = hub::shutdown_channel();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        trigger.fire();
+    });
+    let ctx = hub::SpokeContext {
+        pool,
+        tz,
+        shutdown,
+        hub: hub::Hub::default(),
     };
-    // The live sync must never take the others down: if it fails for a
-    // fatal reason (say a database error) we log it and keep serving.
-    let live_sync = async {
-        if let Err(err) =
-            ingest::run_live_sync(client, &pool, &config.isolarcloud, shutdown_signal()).await
-        {
-            error!("live sync stopped: {err:#}; the dashboard keeps running");
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    // Run all eight until Ctrl+C. `try_join!` polls them together on this
-    // task and returns early if one fails (neither the live sync, the
-    // Modbus poller, the TeslaMate reader, the GloBird sync, the
-    // Amber price task, the TeslaMate history sync nor the backups does: their errors are only logged). Each gets its own `ctrl_c` future; one Ctrl+C wakes them all.
-    tokio::try_join!(
-        live_sync,
-        web::serve(listener, state, shutdown_signal()),
-        poll_modbus,
-        follow_car,
-        sync_globird,
-        sync_teslamate_history,
-        backups,
-        fetch_prices,
-    )?;
+
+    info!(address = %config.server.bind, "web server started");
+    // Run until Ctrl+C. `try_join!` polls both on this task and returns early
+    // if the web server fails. The spokes never fail the whole: their errors
+    // are only logged.
+    tokio::try_join!(web::serve(listener, state, shutdown_signal()), async {
+        hub::run_spokes(spokes, ctx).await;
+        Ok(())
+    })?;
     Ok(())
 }
 

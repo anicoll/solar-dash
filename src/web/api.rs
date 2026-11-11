@@ -190,6 +190,11 @@ pub async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
+/// The spokes (background data sources and sinks) and whether each is on.
+pub async fn spokes(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "spokes": &*state.spokes }))
+}
+
 pub async fn latest(State(state): State<AppState>) -> ApiResult {
     let mut rows = db::latest_metric_readings(&state.pool, state.plant_id).await?;
     // The same order as before the store was keyed by metric: by point id.
