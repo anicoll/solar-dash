@@ -125,6 +125,18 @@ pub async fn prune_forecasts(pool: &SqlitePool, now: i64) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// The start time of the oldest `actual` price stored for a source, or `None`
+/// when there is none. The backfill walks back from here.
+pub async fn oldest_actual_start(pool: &SqlitePool, source: &str) -> Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT MIN(start_ts) FROM price_interval WHERE source = ? AND kind = 'actual'",
+    )
+    .bind(source)
+    .fetch_one(pool)
+    .await
+    .context("could not find the oldest stored price")
+}
+
 /// One stored interval, as the API sends it.
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct StoredPrice {
@@ -230,6 +242,48 @@ pub async fn day_prices(
         }
     }
     Ok(DayPrices::new(general, feed_in))
+}
+
+/// The `general` (buy) prices that start in `[start, end)`, oldest first, for
+/// the daily stats. Finished `actual` rows only, plus `current` rows that
+/// start at or after `current_from` (the start of today, so the interval
+/// under way counts today and a stale `current` row never counts on an older
+/// day). Forecasts are never read. Rows are skipped when another site's source
+/// already gave the same start time, so a second site does not double count.
+pub async fn known_general_prices(
+    pool: &SqlitePool,
+    source_prefix: &str,
+    start: i64,
+    end: i64,
+    current_from: i64,
+) -> Result<Vec<PriceSpan>> {
+    let rows: Vec<(i64, i64, f64)> = sqlx::query_as(
+        "SELECT start_ts, end_ts, cents FROM price_interval
+         WHERE substr(source, 1, length(?)) = ? AND channel = 'general'
+           AND start_ts >= ? AND start_ts < ?
+           AND (kind = 'actual' OR (kind = 'current' AND start_ts >= ?))
+         ORDER BY start_ts, source",
+    )
+    .bind(source_prefix)
+    .bind(source_prefix)
+    .bind(start)
+    .bind(end)
+    .bind(current_from)
+    .fetch_all(pool)
+    .await
+    .context("could not read the known general prices")?;
+    let mut spans: Vec<PriceSpan> = Vec::with_capacity(rows.len());
+    for (start_ts, end_ts, cents) in rows {
+        if spans.last().is_some_and(|last| last.start_ts == start_ts) {
+            continue;
+        }
+        spans.push(PriceSpan {
+            start_ts,
+            end_ts,
+            cents,
+        });
+    }
+    Ok(spans)
 }
 
 /// A short text that changes when the rows [`day_prices`] would return

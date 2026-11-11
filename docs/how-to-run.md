@@ -731,6 +731,17 @@ errors are retried with a growing wait (30 seconds up to 10 minutes). The
 prices are available as `GET /api/prices?from=&to=` (unix seconds, at most 31
 days).
 
+After the first good fetch `serve` also backfills past prices. Starting from
+the oldest stored final price (or yesterday), it asks Amber for a week at a
+time (`GET /sites/{id}/prices?startDate&endDate&resolution=5`), going back to
+`backfill_from` in `[amber]` (a `YYYY-MM-DD` date; default two years ago). It
+does a few weeks per 5-minute cycle with a 2 second pause between requests, so
+the live fetch is never held up, and it never overwrites a final price. When
+Amber returns nothing older, or says the range is not allowed (a closed site
+may not serve old prices), it logs the date reached once at info and remembers
+it, so it does not ask again. Delete the `amber-backfill-done:...` row from
+`sync_state` to make it try again.
+
 1. Create an API token in the Amber app (Developers). Add it to `config.toml`
    (see `config.example.toml`). The token is a secret stored in plain text, so
    keep the file's mode at 600:
@@ -753,7 +764,7 @@ days).
    sudo -u solar-dash /opt/solar-dash/solar-dash --config /etc/solar-dash/config.toml amber-probe --json /tmp/amber-probe.json
    ```
 
-It prints three sections, and carries on to the next if one fails:
+It prints four sections, and carries on to the next if one fails:
 
 - **Sites**: id, NMI, status (`pending`, `active` or `closed`), network, and
   the active-from and closed-on dates when Amber gives them. With one site it
@@ -762,6 +773,9 @@ It prints three sections, and carries on to the next if one fails:
   times in the site time zone (`[site] timezone`), the kind (actual, current or
   forecast), channel (general, feedIn or controlledLoad), `perKwh`,
   `spotPerKwh` and the interval length. Prices are cents per kWh including GST.
+- **Past prices**: whether a week 30 days ago and a week a year ago come back,
+  as a count of intervals, so you can see how far back the API goes for your
+  site.
 - **Usage**: whether metered usage exists for the last 7 days, as a count of
   intervals per channel.
 
