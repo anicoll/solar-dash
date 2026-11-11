@@ -164,7 +164,8 @@ path = "data/solar.db"
 # # source = "amber"               # matches the start of the stored source name
 # # fee_cents_per_day = 0.0        # retailer fee, added to supply_cents_per_day
 # # feed_in_paid_when_negative = true  # Amber reports a NEGATIVE feed-in price
-# #                                # when you are paid; set false if yours is positive
+# #                                # when you are paid (confirmed); set false only for a source that
+# # # reports it positive
 # # The plan's own windows only fill gaps where no price was stored.
 #
 # # The Bill page's "What would Amber cost?" prices your own usage on a made-up

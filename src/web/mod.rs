@@ -1592,7 +1592,7 @@ mod tests {
             let kind = kind.to_string();
             async move {
                 sqlx::query(
-                    "INSERT INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, 5.0, ?, 0)",
+                    "INSERT INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, 5.0, ?, 0, NULL, NULL)",
                 )
                 .bind(channel)
                 .bind(start)
@@ -2722,7 +2722,7 @@ mod tests {
                     let start = SEP_15_START + i * 300;
                     for (channel, cents) in [("general", import), ("feed_in", -10.0)] {
                         sqlx::query(
-                            "INSERT OR REPLACE INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, NULL, 'actual', ?)",
+                            "INSERT OR REPLACE INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, NULL, 'actual', ?, NULL, NULL)",
                         )
                         .bind(channel)
                         .bind(start)
@@ -2738,7 +2738,7 @@ mod tests {
         };
         save_day(50.0, 1).await;
         sqlx::query(
-            "INSERT INTO price_interval VALUES ('amber:s1', 'general', ?, ?, 999.0, NULL, 'forecast', 1)",
+            "INSERT INTO price_interval VALUES ('amber:s1', 'general', ?, ?, 999.0, NULL, 'forecast', 1, NULL, NULL)",
         )
         .bind(SEP_15_START + 86_400)
         .bind(SEP_15_START + 86_700)
@@ -2816,7 +2816,7 @@ mod tests {
             let start = SEP_15_START + i * 300;
             for (channel, cents) in [("general", 50.0), ("feed_in", -10.0)] {
                 sqlx::query(
-                    "INSERT INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, NULL, 'actual', 1)",
+                    "INSERT INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, NULL, 'actual', 1, NULL, NULL)",
                 )
                 .bind(channel)
                 .bind(start)

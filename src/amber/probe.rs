@@ -120,8 +120,8 @@ fn feed_in_note(prices: &[PriceInterval]) -> String {
     let positive = feed_in.iter().filter(|v| **v > 0.0).count();
     format!(
         "feedIn perKwh is printed exactly as the API returned it: {} rows, {negative} negative, \
-         {positive} positive. Compare with the Amber app to confirm which sign means \"you are \
-         paid\"; the code does not assume one yet.",
+         {positive} positive. Amber's convention: negative means you are paid, positive means \
+         you pay to export.",
         feed_in.len(),
     )
 }

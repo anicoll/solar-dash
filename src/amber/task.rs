@@ -1,9 +1,9 @@
 //! The Amber price task: a loop inside `serve` that keeps `price_interval` up
 //! to date. Read-only: it only calls `GET /sites` and `GET .../prices/current`.
 //!
-//! It fetches once at startup, then every 5 minutes, a few seconds after each
-//! 5-minute boundary (Amber publishes the new interval's price just after the
-//! boundary). Each fetch asks for the recent past, the current interval and
+//! It fetches once at startup, then every 5 minutes, 15 seconds after each
+//! 5-minute boundary (the current interval's price settles about 15 seconds
+//! after it starts; before that Amber only has an estimate). Each fetch asks for the recent past, the current interval and
 //! the forecast, and saves them with the rules in [`super::store`].
 //!
 //! When something fails it waits longer each time (like the iSolarCloud sync).
@@ -26,8 +26,10 @@ use crate::hub::{Hub, HubEvent};
 
 /// Amber prices change every 5 minutes.
 const INTERVAL_SECS: i64 = 300;
-/// How long after the boundary to ask, so the new price is already published.
-const OFFSET_SECS: i64 = 5;
+/// How long after the boundary to ask. The current interval's price settles
+/// about 15 seconds after the interval starts; asking earlier stores the
+/// pre-settlement estimate.
+const OFFSET_SECS: i64 = 15;
 /// The first fetch after startup asks for a day of history (288 x 5 minutes),
 /// to fill the gap since the last run.
 const STARTUP_PREVIOUS: u32 = 288;
@@ -44,8 +46,8 @@ const BACKOFF_CAP: Duration = Duration::from_secs(10 * 60);
 const HOURLY: Duration = Duration::from_secs(3600);
 
 /// The unix time of the next fetch after `now`: the next 5-minute boundary
-/// plus [`OFFSET_SECS`]. At 12:00:03 that is 12:00:05, at 12:00:05 it is
-/// 12:05:05.
+/// plus [`OFFSET_SECS`]. At 12:00:03 that is 12:00:15, at 12:00:15 it is
+/// 12:05:15.
 fn next_fetch_at(now: i64) -> i64 {
     let this_slot = now.div_euclid(INTERVAL_SECS) * INTERVAL_SECS + OFFSET_SECS;
     if this_slot > now {
@@ -216,19 +218,20 @@ mod tests {
     use axum::routing::get;
 
     #[test]
-    fn fetches_five_seconds_after_each_five_minute_boundary() {
+    fn fetches_fifteen_seconds_after_each_five_minute_boundary() {
         let base = 1_800_000_000; // a multiple of 300, so a 5-minute boundary
-        assert_eq!(next_fetch_at(base), base + 5);
-        assert_eq!(next_fetch_at(base + 3), base + 5);
-        // At or after the +5 mark, wait for the next boundary.
-        assert_eq!(next_fetch_at(base + 5), base + 305);
-        assert_eq!(next_fetch_at(base + 299), base + 305);
-        assert_eq!(next_fetch_at(base - 1), base + 5);
+        assert_eq!(OFFSET_SECS, 15);
+        assert_eq!(next_fetch_at(base), base + 15);
+        assert_eq!(next_fetch_at(base + 3), base + 15);
+        // At or after the +15 mark, wait for the next boundary.
+        assert_eq!(next_fetch_at(base + 15), base + 315);
+        assert_eq!(next_fetch_at(base + 299), base + 315);
+        assert_eq!(next_fetch_at(base - 1), base + 15);
         // Always in the future, and never more than 5 minutes away.
         for now in base..base + 900 {
             let next = next_fetch_at(now);
             assert!(next > now && next - now <= 300, "{now}");
-            assert_eq!((next - 5) % 300, 0);
+            assert_eq!((next - OFFSET_SECS) % 300, 0);
         }
     }
 

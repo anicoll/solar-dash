@@ -45,7 +45,9 @@ fn by_channel(rows: Vec<StoredPrice>) -> BTreeMap<String, Vec<StoredPrice>> {
 /// (`general`, `feed_in`, `controlled_load`). `kind` is `actual`, `current`
 /// or `forecast`. `now` has the interval each channel is in right now, whatever
 /// the range, and is `{}` when there is none. Prices are c/kWh including GST,
-/// as the source gave them: the feed-in sign is not changed.
+/// as the source gave them: the feed-in sign is not changed
+/// (negative means the customer is paid; the UI flips it for display).
+/// Rows also carry Amber's `descriptor` and `renewables` when known.
 pub async fn prices(
     State(state): State<AppState>,
     Query(params): Query<PricesParams>,

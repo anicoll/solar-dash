@@ -770,10 +770,10 @@ The probe is how we confirm two things before building on Amber:
 - **Closed sites**: whether a closed site still returns prices (the probe
   prints Amber's answer, such as a 404, instead of failing).
 - **The feed-in sign**: `feedIn` rows are printed with `perKwh` exactly as the
-  API returned it, with a count of negative and positive values. Compare them
-  with the Amber app to see whether a positive number means you are paid or
-  you pay. The code does not assume a convention yet; this section will be
-  updated once it is confirmed.
+  API returned it, with a count of negative and positive values. Amber's
+  convention is confirmed: a negative `feedIn` price means you are paid, and a
+  positive one means you pay to export. The Today page shows it flipped (a
+  paid 14c reads as "14c"); the stored value stays as Amber gave it.
 
 `--json FILE` also saves the raw replies (mode 600). They contain your NMI, so
 check the file before sharing it; with the NMI removed they make good test
