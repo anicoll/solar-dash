@@ -196,6 +196,8 @@
 
     const f = {
       bill_start_day: dec('bill_start_day', { step: '1', min: '1', max: '28', inputMode: 'numeric' }),
+      bill_anchor_date: inp('date', { value: shown('bill_anchor_date') }),
+      bill_length_days: dec('bill_length_days', { step: '1', min: '7', max: '92', inputMode: 'numeric', placeholder: String(def.bill_length_days) }),
       grid_pull_warn_kw: dec('grid_pull_warn_kw'),
       grid_pull_limit_kw: dec('grid_pull_limit_kw'),
       price_spike_cents: dec('price_spike_cents'),
@@ -205,13 +207,31 @@
       price_rise_percent: dec('price_rise_percent', { max: '20' }),
       petrol_grade: inp('text', { value: shown('petrol_grade'), autocomplete: 'off' }),
     };
+    // The period is either monthly (a day number) or rolling (a start date and a length).
+    const mode = document.createElement('select');
+    mode.append(new Option('Monthly on a set day', 'monthly'), new Option('Rolling, fixed length', 'rolling'));
+    mode.value = set.bill_anchor_date ? 'rolling' : 'monthly';
+    const dayField = field('Bills start on day (1 to 28)', f.bill_start_day, 'Leave empty to work it out from the last bill.');
+    const anchorField = field('A bill started on', f.bill_anchor_date, 'The first day of any one of your bills.');
+    const lengthField = field('Each bill lasts (days)', f.bill_length_days, `7 to 92. Default ${def.bill_length_days}.`);
+    const showMode = () => {
+      const rolling = mode.value === 'rolling';
+      dayField.hidden = rolling;
+      anchorField.hidden = !rolling;
+      lengthField.hidden = !rolling;
+    };
+    mode.addEventListener('change', showMode);
+    showMode();
     const cars = document.createElement('textarea');
     cars.rows = 3;
     cars.value = carsToText(set.compare_cars);
     cars.placeholder = 'Model 3 = Toyota Corolla';
 
     boxes.settings.replaceChildren(form([
-      field('Bill period starts on day (1 to 28)', f.bill_start_day, 'Default: worked out from the last bill, else the calendar month. Leave empty for the default.'),
+      field('Bill period', mode),
+      dayField,
+      anchorField,
+      lengthField,
       field('Grid pull warning (kW)', f.grid_pull_warn_kw, hint('grid_pull_warn_kw')),
       field('Grid pull limit (kW)', f.grid_pull_limit_kw, `${hint('grid_pull_limit_kw')} The main breaker is 63 A.`),
       field('Peak price from (c/kWh)', f.price_spike_cents, `${hint('price_spike_cents')} The Today page calls a live price above this Peak, 0 or less Free, and the rest Shoulder.`),
@@ -223,9 +243,15 @@
       field('Petrol car to compare with each car', cars, 'One per line, as "Tesla model = petrol car". Leave empty for none.'),
     ], 'Save settings', async (msg) => {
       const payload = {};
-      for (const key of ['petrol_cents_per_litre', 'petrol_litres_per_100km', 'away_cents_per_kwh', 'price_rise_percent', 'bill_start_day', 'grid_pull_warn_kw', 'grid_pull_limit_kw', 'price_spike_cents']) {
+      for (const key of ['petrol_cents_per_litre', 'petrol_litres_per_100km', 'away_cents_per_kwh', 'price_rise_percent', 'grid_pull_warn_kw', 'grid_pull_limit_kw', 'price_spike_cents']) {
         payload[key] = numOrNull(f[key].value);
       }
+      // Only the chosen mode's settings are kept; the other mode's are cleared.
+      const rolling = mode.value === 'rolling';
+      if (rolling && !f.bill_anchor_date.value) throw new Error('Pick the date a bill started on.');
+      payload.bill_start_day = rolling ? null : numOrNull(f.bill_start_day.value);
+      payload.bill_anchor_date = rolling ? f.bill_anchor_date.value : null;
+      payload.bill_length_days = rolling ? numOrNull(f.bill_length_days.value) : null;
       payload.petrol_grade = f.petrol_grade.value.trim() || null;
       payload.compare_cars = textToCars(cars.value);
       await call('PUT', '/api/admin/settings', payload);
