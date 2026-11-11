@@ -16,6 +16,7 @@ use super::api::{ApiError, ApiResult, day_bounds_or_error, today};
 use super::costs::{
     CostedDay, SOURCE_BILL, SOURCE_GLOBIRD, billed_days, grid_splits, hhmm, round2,
 };
+use crate::admin_data::{AdminData, BillCycle};
 use crate::bills::PastBill;
 use crate::config;
 use crate::cost::{DayCost, ExportBand, GridSplit, Tariff};
@@ -25,6 +26,9 @@ use crate::db;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PeriodSource {
+    /// The admin settings `bill_cycle_start` and `bill_cycle_days`: a rolling
+    /// cycle of whole days, such as GloBird's 28-day bills.
+    Cycle,
     /// The admin setting `bill_start_day`.
     Setting,
     /// Rolled forward from the most recent past bill.
@@ -52,17 +56,49 @@ impl Period {
 /// that would make every later period just as short.
 const MIN_ROLLING_BILL_DAYS: i64 = 25;
 
+/// The admin settings that choose the bill dates.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct PeriodRule {
+    /// A known bill start and the length of every bill, in days.
+    pub cycle: Option<BillCycle>,
+    /// Day of the month (1 to 28) a period starts on.
+    pub start_day: Option<u32>,
+}
+
+impl PeriodRule {
+    pub(super) fn of(data: &AdminData) -> Self {
+        Self {
+            cycle: data.bill_cycle(),
+            start_day: data.bill_start_day,
+        }
+    }
+}
+
 /// The bill period that contains `today`.
 ///
-/// 1. With `start_day` (1 to 28) the period starts on that day of a month and
+/// 0. With a cycle the periods are `days` long, back to back, and one of
+///    them starts on `start` (which may be before or after `today`).
+/// 1. Else with `start_day` (1 to 28) the period starts on that day of a month and
 ///    runs to the day before the next one.
 /// 2. Else the most recent bill that ended before `today` (`bills` is oldest
 ///    first): the period starts the day after it ended and is as long as it,
 ///    rolled forward by that length until it contains `today`. A bill shorter
 ///    than [`MIN_ROLLING_BILL_DAYS`] (such as a final bill) is not used.
 /// 3. Else the calendar month.
-fn current_period(today: NaiveDate, start_day: Option<u32>, bills: &[PastBill]) -> Period {
-    if let Some(day) = start_day.filter(|d| (1..=28).contains(d)) {
+fn current_period(today: NaiveDate, rule: PeriodRule, bills: &[PastBill]) -> Period {
+    if let Some(cycle) = rule.cycle.filter(|c| c.days > 0) {
+        let length = i64::from(cycle.days);
+        // Whole cycles from the known start to the one holding `today`;
+        // negative when `today` is before it.
+        let cycles = (today - cycle.start).num_days().div_euclid(length);
+        let from = cycle.start + chrono::Duration::days(cycles * length);
+        return Period {
+            from,
+            to: from + chrono::Duration::days(length - 1),
+            source: PeriodSource::Cycle,
+        };
+    }
+    if let Some(day) = rule.start_day.filter(|d| (1..=28).contains(d)) {
         // Days 1 to 28 exist in every month, so building the date cannot fail.
         let this_month = today.with_day(day).unwrap_or(today);
         let from = if today.day() >= day {
@@ -436,13 +472,13 @@ const HISTORY_PERIODS: usize = 6;
 fn periods_before(
     period: &Period,
     count: usize,
-    start_day: Option<u32>,
+    rule: PeriodRule,
     bills: &[PastBill],
 ) -> Vec<Period> {
     let mut out = Vec::with_capacity(count);
     let mut next_from = period.from;
     for _ in 0..count {
-        let before = current_period(next_from - Days::new(1), start_day, bills);
+        let before = current_period(next_from - Days::new(1), rule, bills);
         next_from = before.from;
         out.push(before);
     }
@@ -502,7 +538,7 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
         return Ok(Json(json!({ "configured": false })));
     };
     let today = today(state.tz);
-    let period = current_period(today, data.bill_start_day, &data.bills);
+    let period = current_period(today, PeriodRule::of(&data), &data.bills);
     let days_total = period.days_total();
 
     // Complete days: from the period start to yesterday, and never past its end.
@@ -577,7 +613,7 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
         })
         .collect();
     // The last six periods in one pass over the costs, oldest first.
-    let before = periods_before(&period, HISTORY_PERIODS, data.bill_start_day, &data.bills);
+    let before = periods_before(&period, HISTORY_PERIODS, PeriodRule::of(&data), &data.bills);
     let past_dates: Vec<NaiveDate> = before.first().map_or_else(Vec::new, |first| {
         first
             .from
@@ -736,7 +772,7 @@ pub(super) fn compare_dates(
     let today = today(state.tz);
     let (from, to) = match (from, to) {
         (None, None) => {
-            let period = current_period(today, data.bill_start_day, &data.bills);
+            let period = current_period(today, PeriodRule::of(&data), &data.bills);
             (period.from, (today - Days::new(1)).min(period.to))
         }
         _ => {
@@ -823,6 +859,74 @@ mod tests {
         }
     }
 
+    fn by_day(start_day: Option<u32>) -> PeriodRule {
+        PeriodRule {
+            cycle: None,
+            start_day,
+        }
+    }
+
+    fn cycle(start: &str, days: u32) -> PeriodRule {
+        PeriodRule {
+            cycle: Some(BillCycle {
+                start: date(start),
+                days,
+            }),
+            start_day: None,
+        }
+    }
+
+    #[test]
+    fn a_cycle_rolls_whole_periods_from_a_known_start() {
+        // A GloBird bill from 2 Sep, 28 days: 2 Sep to 29 Sep, then 30 Sep on.
+        let rule = cycle("2026-09-02", 28);
+        let p = current_period(date("2026-09-02"), rule, &[]);
+        assert_eq!(
+            span(p),
+            (
+                "2026-09-02".into(),
+                "2026-09-29".into(),
+                PeriodSource::Cycle
+            )
+        );
+        assert_eq!(p.days_total(), 28);
+        let p = current_period(date("2026-09-30"), rule, &[]);
+        assert_eq!((p.from, p.to), (date("2026-09-30"), date("2026-10-27")));
+        let p = current_period(date("2026-11-12"), rule, &[]);
+        assert_eq!((p.from, p.to), (date("2026-10-28"), date("2026-11-24")));
+        // Before the known start the cycle runs backwards.
+        let p = current_period(date("2026-09-01"), rule, &[]);
+        assert_eq!((p.from, p.to), (date("2026-08-05"), date("2026-09-01")));
+        // A start in the future works the same.
+        let p = current_period(date("2026-11-12"), cycle("2027-01-20", 28), &[]);
+        assert_eq!((p.from, p.to), (date("2026-10-28"), date("2026-11-24")));
+        // Other lengths too.
+        let p = current_period(date("2026-09-30"), cycle("2026-09-02", 29), &[]);
+        assert_eq!((p.from, p.to), (date("2026-09-02"), date("2026-09-30")));
+    }
+
+    #[test]
+    fn a_cycle_wins_over_the_start_day_and_bills() {
+        let rule = PeriodRule {
+            start_day: Some(15),
+            ..cycle("2026-09-02", 28)
+        };
+        let bills = [bill("2026-09-01", "2026-09-30")];
+        let p = current_period(date("2026-10-28"), rule, &bills);
+        assert_eq!(p.source, PeriodSource::Cycle);
+        assert_eq!(p.from, date("2026-10-28"));
+        // Earlier periods are earlier cycles.
+        let before = periods_before(&p, 2, rule, &bills);
+        let spans: Vec<_> = before.iter().map(|p| (p.from, p.to)).collect();
+        assert_eq!(
+            spans,
+            [
+                (date("2026-09-02"), date("2026-09-29")),
+                (date("2026-09-30"), date("2026-10-27")),
+            ]
+        );
+    }
+
     fn span(period: Period) -> (String, String, PeriodSource) {
         (
             period.from.to_string(),
@@ -834,7 +938,7 @@ mod tests {
     #[test]
     fn setting_starts_on_that_day_of_this_or_last_month() {
         // On or after the start day: this month's start.
-        let p = current_period(date("2026-10-28"), Some(15), &[]);
+        let p = current_period(date("2026-10-28"), by_day(Some(15)), &[]);
         assert_eq!(
             span(p),
             (
@@ -844,33 +948,33 @@ mod tests {
             )
         );
         assert_eq!(p.days_total(), 31);
-        let p = current_period(date("2026-10-15"), Some(15), &[]);
+        let p = current_period(date("2026-10-15"), by_day(Some(15)), &[]);
         assert_eq!(p.from, date("2026-10-15"));
         // Before it: last month's start.
-        let p = current_period(date("2026-10-14"), Some(15), &[]);
+        let p = current_period(date("2026-10-14"), by_day(Some(15)), &[]);
         assert_eq!((p.from, p.to), (date("2026-09-15"), date("2026-10-14")));
         // Across a year end.
-        let p = current_period(date("2027-01-03"), Some(15), &[]);
+        let p = current_period(date("2027-01-03"), by_day(Some(15)), &[]);
         assert_eq!((p.from, p.to), (date("2026-12-15"), date("2027-01-14")));
         // The setting wins over a bill.
         let bills = [bill("2026-09-01", "2026-09-30")];
-        let p = current_period(date("2026-10-28"), Some(1), &bills);
+        let p = current_period(date("2026-10-28"), by_day(Some(1)), &bills);
         assert_eq!(p.source, PeriodSource::Setting);
     }
 
     #[test]
     fn setting_handles_the_28th_and_february() {
-        let p = current_period(date("2027-02-10"), Some(28), &[]);
+        let p = current_period(date("2027-02-10"), by_day(Some(28)), &[]);
         assert_eq!((p.from, p.to), (date("2027-01-28"), date("2027-02-27")));
-        let p = current_period(date("2027-02-28"), Some(28), &[]);
+        let p = current_period(date("2027-02-28"), by_day(Some(28)), &[]);
         assert_eq!((p.from, p.to), (date("2027-02-28"), date("2027-03-27")));
         assert_eq!(p.days_total(), 28);
         // Leap year: February has 29 days.
-        let p = current_period(date("2028-03-01"), Some(28), &[]);
+        let p = current_period(date("2028-03-01"), by_day(Some(28)), &[]);
         assert_eq!((p.from, p.to), (date("2028-02-28"), date("2028-03-27")));
         assert_eq!(p.days_total(), 29);
         // Start day 1 is the calendar month.
-        let p = current_period(date("2027-02-14"), Some(1), &[]);
+        let p = current_period(date("2027-02-14"), by_day(Some(1)), &[]);
         assert_eq!((p.from, p.to), (date("2027-02-01"), date("2027-02-28")));
     }
 
@@ -878,7 +982,7 @@ mod tests {
     fn short_last_bill_falls_back_to_the_calendar_month() {
         // A 7 day final bill is not used for rolling.
         let bills = [bill("2026-05-19", "2026-05-25")];
-        let p = current_period(date("2026-11-10"), None, &bills);
+        let p = current_period(date("2026-11-10"), by_day(None), &bills);
         assert_eq!(
             span(p),
             (
@@ -889,17 +993,17 @@ mod tests {
         );
         // 24 days is too short, 25 is the shortest that still rolls.
         let bills = [bill("2026-09-01", "2026-09-24")];
-        let p = current_period(date("2026-10-10"), None, &bills);
+        let p = current_period(date("2026-10-10"), by_day(None), &bills);
         assert_eq!(p.source, PeriodSource::Month);
         let bills = [bill("2026-09-01", "2026-09-25")];
-        let p = current_period(date("2026-10-10"), None, &bills);
+        let p = current_period(date("2026-10-10"), by_day(None), &bills);
         assert_eq!(p.source, PeriodSource::LastBill);
     }
 
     #[test]
     fn a_28_day_last_bill_still_rolls() {
         let bills = [bill("2026-09-01", "2026-09-28")];
-        let p = current_period(date("2026-10-10"), None, &bills);
+        let p = current_period(date("2026-10-10"), by_day(None), &bills);
         assert_eq!(
             span(p),
             (
@@ -914,7 +1018,7 @@ mod tests {
     fn last_bill_rolls_forward_by_its_length() {
         // A 31 day bill ending 2026-09-14: the next period starts 09-15.
         let bills = [bill("2026-08-15", "2026-09-14")];
-        let p = current_period(date("2026-10-10"), None, &bills);
+        let p = current_period(date("2026-10-10"), by_day(None), &bills);
         assert_eq!(
             span(p),
             (
@@ -924,7 +1028,7 @@ mod tests {
             )
         );
         // Past the end of that one, it rolls to the next.
-        let p = current_period(date("2026-10-28"), None, &bills);
+        let p = current_period(date("2026-10-28"), by_day(None), &bills);
         assert_eq!((p.from, p.to), (date("2026-10-16"), date("2026-11-15")));
         assert_eq!(p.days_total(), 31);
         // The most recent bill is used, and one that ends today is not "past".
@@ -932,15 +1036,15 @@ mod tests {
             bill("2026-08-15", "2026-09-14"),
             bill("2026-09-15", "2026-10-14"),
         ];
-        let p = current_period(date("2026-10-15"), None, &bills);
+        let p = current_period(date("2026-10-15"), by_day(None), &bills);
         assert_eq!(p.from, date("2026-10-15"));
-        let p = current_period(date("2026-10-14"), None, &bills);
+        let p = current_period(date("2026-10-14"), by_day(None), &bills);
         assert_eq!(p.from, date("2026-09-15"));
     }
 
     #[test]
     fn without_a_setting_or_bill_it_is_the_calendar_month() {
-        let p = current_period(date("2026-10-28"), None, &[]);
+        let p = current_period(date("2026-10-28"), by_day(None), &[]);
         assert_eq!(
             span(p),
             (
@@ -949,7 +1053,7 @@ mod tests {
                 PeriodSource::Month
             )
         );
-        let p = current_period(date("2028-02-29"), None, &[]);
+        let p = current_period(date("2028-02-29"), by_day(None), &[]);
         assert_eq!((p.from, p.to), (date("2028-02-01"), date("2028-02-29")));
         assert_eq!(p.days_total(), 29);
     }
@@ -1184,8 +1288,8 @@ mod tests {
 
     #[test]
     fn periods_before_walk_back_one_period_at_a_time() {
-        let current = current_period(date("2026-11-10"), Some(5), &[]);
-        let before = periods_before(&current, 3, Some(5), &[]);
+        let current = current_period(date("2026-11-10"), by_day(Some(5)), &[]);
+        let before = periods_before(&current, 3, by_day(Some(5)), &[]);
         let spans: Vec<_> = before
             .iter()
             .map(|p| (p.from.to_string(), p.to.to_string()))
@@ -1198,13 +1302,13 @@ mod tests {
                 ("2026-10-05".to_string(), "2026-11-04".to_string()),
             ]
         );
-        assert!(periods_before(&current, 0, Some(5), &[]).is_empty());
+        assert!(periods_before(&current, 0, by_day(Some(5)), &[]).is_empty());
     }
 
     #[test]
     fn periods_are_summed_from_their_own_days() {
-        let current = current_period(date("2026-11-10"), Some(5), &[]);
-        let before = periods_before(&current, 2, Some(5), &[]);
+        let current = current_period(date("2026-11-10"), by_day(Some(5)), &[]);
+        let before = periods_before(&current, 2, by_day(Some(5)), &[]);
         let days = [
             costed("2026-09-20", 500.0, 0.0),
             costed("2026-10-04", 300.0, 100.0),

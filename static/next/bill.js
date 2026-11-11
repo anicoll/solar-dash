@@ -1145,9 +1145,9 @@
     const ctx = { panels: [], open: readOpen(), desktop, apply: () => applyPanels(ctx) };
 
     el.append(renderHead(bill));
-    if (bill.period_source && bill.period_source !== 'setting') {
+    if (bill.period_source && bill.period_source !== 'setting' && bill.period_source !== 'cycle') {
       el.append(h('p', { class: 'bill-guess' }, 'Bill dates are a guess. ',
-        h('a', { class: 'bill-link', href: '#admin', text: 'Set your bill start day in Settings.' })));
+        h('a', { class: 'bill-link', href: '#admin', text: 'Set your bill dates in Settings.' })));
     }
 
     // The trust badge sits at the foot of the hero; on a phone it opens the day-by-day check.

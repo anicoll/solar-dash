@@ -40,6 +40,11 @@ pub struct AdminData {
     /// Day of the month (1 to 28) a bill period starts on; `None` works the
     /// period out from the last bill instead (see `web::bill`).
     pub bill_start_day: Option<u32>,
+    /// The first day of any one bill in a rolling cycle (such as GloBird's
+    /// 28-day bills). When set it wins over `bill_start_day`.
+    pub bill_cycle_start: Option<NaiveDate>,
+    /// How many days each bill in the cycle covers.
+    pub bill_cycle_days: u32,
     /// The past bills, oldest first; empty when there are none.
     pub bills: Arc<[PastBill]>,
     /// Grid import (kW) from which the Today page warns about the main breaker.
@@ -63,6 +68,8 @@ impl Default for AdminData {
             purchases: Arc::from([]),
             price_rise_percent: 3.0,
             bill_start_day: None,
+            bill_cycle_start: None,
+            bill_cycle_days: 28,
             bills: Arc::from([]),
             grid_pull_warn_kw: 12.0,
             grid_pull_limit_kw: 15.0,
@@ -72,7 +79,7 @@ impl Default for AdminData {
 }
 
 /// The keys of the `setting` table. A missing key means its default.
-pub const SETTING_KEYS: [&str; 10] = [
+pub const SETTING_KEYS: [&str; 12] = [
     "petrol_cents_per_litre",
     "petrol_litres_per_100km",
     "away_cents_per_kwh",
@@ -80,6 +87,8 @@ pub const SETTING_KEYS: [&str; 10] = [
     "petrol_grade",
     "price_rise_percent",
     "bill_start_day",
+    "bill_cycle_start",
+    "bill_cycle_days",
     "grid_pull_warn_kw",
     "grid_pull_limit_kw",
     "price_spike_cents",
@@ -259,7 +268,26 @@ pub(crate) async fn load_bills(conn: &mut SqliteConnection) -> Result<Vec<PastBi
     Ok(bills)
 }
 
+/// A rolling bill cycle: back-to-back bills of `days` days, one of which
+/// starts on `start`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BillCycle {
+    pub start: NaiveDate,
+    pub days: u32,
+}
+
+/// The shortest and longest bill a cycle may have, in days.
+pub const BILL_CYCLE_DAYS: std::ops::RangeInclusive<u64> = 7..=92;
+
 impl AdminData {
+    /// The rolling bill cycle, when a start day for it is set.
+    pub fn bill_cycle(&self) -> Option<BillCycle> {
+        self.bill_cycle_start.map(|start| BillCycle {
+            start,
+            days: self.bill_cycle_days,
+        })
+    }
+
     /// The warning level must be below the limit.
     fn check_grid_pull(&self) -> Result<()> {
         anyhow::ensure!(
@@ -326,6 +354,33 @@ pub fn apply_setting(data: &mut AdminData, key: &str, value: &Value) -> Result<(
                     .with_context(|| format!("{key} must be a whole number between 1 and 28"))?;
                 Some(day as u32)
             };
+        }
+        "bill_cycle_start" => {
+            // Optional: null turns the cycle off.
+            data.bill_cycle_start = if value.is_null() {
+                None
+            } else {
+                let text = value
+                    .as_str()
+                    .with_context(|| format!("{key} must be a date as YYYY-MM-DD"))?;
+                Some(
+                    parse_date(text)
+                        .with_context(|| format!("{key} must be a date as YYYY-MM-DD"))?,
+                )
+            };
+        }
+        "bill_cycle_days" => {
+            let days = value
+                .as_u64()
+                .filter(|d| BILL_CYCLE_DAYS.contains(d))
+                .with_context(|| {
+                    format!(
+                        "{key} must be a whole number between {} and {}",
+                        BILL_CYCLE_DAYS.start(),
+                        BILL_CYCLE_DAYS.end()
+                    )
+                })?;
+            data.bill_cycle_days = days as u32;
         }
         "grid_pull_warn_kw" => data.grid_pull_warn_kw = positive()?,
         "grid_pull_limit_kw" => data.grid_pull_limit_kw = positive()?,
@@ -471,6 +526,36 @@ mod tests {
         assert!(data.check_grid_pull().is_err());
         data.grid_pull_warn_kw = 15.0;
         assert!(data.check_grid_pull().is_err());
+    }
+
+    #[test]
+    fn bill_cycle_settings_need_a_date_and_a_length_of_7_to_92_days() {
+        let mut data = AdminData::default();
+        assert_eq!((data.bill_cycle(), data.bill_cycle_days), (None, 28));
+        apply_setting(&mut data, "bill_cycle_start", &json!("2026-09-02")).unwrap();
+        assert_eq!(
+            data.bill_cycle(),
+            Some(BillCycle {
+                start: NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(),
+                days: 28
+            })
+        );
+        apply_setting(&mut data, "bill_cycle_days", &json!(30)).unwrap();
+        assert_eq!(data.bill_cycle().map(|c| c.days), Some(30));
+        for bad in [json!("2026-13-01"), json!("2 Sep"), json!(20260902)] {
+            assert!(
+                apply_setting(&mut data, "bill_cycle_start", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        for bad in [json!(6), json!(93), json!(28.5), json!("28"), json!(null)] {
+            assert!(
+                apply_setting(&mut data, "bill_cycle_days", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        apply_setting(&mut data, "bill_cycle_start", &json!(null)).unwrap();
+        assert_eq!(data.bill_cycle(), None);
     }
 
     #[test]

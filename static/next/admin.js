@@ -195,6 +195,8 @@
     const dec = (key, extra) => inp('number', Object.assign({ step: '0.1', min: '0', inputMode: 'decimal', value: shown(key) }, extra));
 
     const f = {
+      bill_cycle_start: inp('date', { value: shown('bill_cycle_start') }),
+      bill_cycle_days: dec('bill_cycle_days', { step: '1', min: '7', max: '92', inputMode: 'numeric' }),
       bill_start_day: dec('bill_start_day', { step: '1', min: '1', max: '28', inputMode: 'numeric' }),
       grid_pull_warn_kw: dec('grid_pull_warn_kw'),
       grid_pull_limit_kw: dec('grid_pull_limit_kw'),
@@ -211,6 +213,8 @@
     cars.placeholder = 'Model 3 = Toyota Corolla';
 
     boxes.settings.replaceChildren(form([
+      field('Rolling bill: first day of any one bill', f.bill_cycle_start, 'For bills that run a fixed number of days, like GloBird\'s 28-day bills: the start date of any bill. Wins over the day below. Leave empty to turn it off.'),
+      field('Rolling bill: days in each bill (7 to 92)', f.bill_cycle_days, hint('bill_cycle_days')),
       field('Bill period starts on day (1 to 28)', f.bill_start_day, 'Default: worked out from the last bill, else the calendar month. Leave empty for the default.'),
       field('Grid pull warning (kW)', f.grid_pull_warn_kw, hint('grid_pull_warn_kw')),
       field('Grid pull limit (kW)', f.grid_pull_limit_kw, `${hint('grid_pull_limit_kw')} The main breaker is 63 A.`),
@@ -223,9 +227,10 @@
       field('Petrol car to compare with each car', cars, 'One per line, as "Tesla model = petrol car". Leave empty for none.'),
     ], 'Save settings', async (msg) => {
       const payload = {};
-      for (const key of ['petrol_cents_per_litre', 'petrol_litres_per_100km', 'away_cents_per_kwh', 'price_rise_percent', 'bill_start_day', 'grid_pull_warn_kw', 'grid_pull_limit_kw', 'price_spike_cents']) {
+      for (const key of ['petrol_cents_per_litre', 'petrol_litres_per_100km', 'away_cents_per_kwh', 'price_rise_percent', 'bill_start_day', 'bill_cycle_days', 'grid_pull_warn_kw', 'grid_pull_limit_kw', 'price_spike_cents']) {
         payload[key] = numOrNull(f[key].value);
       }
+      payload.bill_cycle_start = f.bill_cycle_start.value || null;
       payload.petrol_grade = f.petrol_grade.value.trim() || null;
       payload.compare_cars = textToCars(cars.value);
       await call('PUT', '/api/admin/settings', payload);
