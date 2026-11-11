@@ -39,10 +39,27 @@ const LOCKOUT_SECS: i64 = 15 * 60;
 /// Hashes a password with Argon2id. The result is a PHC string such as
 /// `$argon2id$v=19$m=19456,t=2,p=1$...` that includes a random salt.
 pub fn hash_password(password: &str) -> Result<String> {
-    let hash = Argon2::default()
+    let hash = hasher()
         .hash_password(password.as_bytes())
         .map_err(|err| anyhow!("could not hash password: {err}"))?;
     Ok(hash.to_string())
+}
+
+/// The Argon2 settings for new hashes. Checking a password reads the settings
+/// back from its hash, so the cheap test settings only ever apply to hashes
+/// that tests made themselves.
+#[cfg(not(test))]
+fn hasher() -> Argon2<'static> {
+    Argon2::default()
+}
+
+/// Tests log in hundreds of times, and the real settings (19 MiB, two passes)
+/// made password hashing a large share of the test run.
+#[cfg(test)]
+fn hasher() -> Argon2<'static> {
+    use argon2::{Algorithm, Params, Version};
+    let params = Params::new(Params::MIN_M_COST, 1, 1, None).expect("valid Argon2 params");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
 /// Checks that `hash` is a valid PHC string, so a typo fails at startup.
