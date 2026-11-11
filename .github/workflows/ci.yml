@@ -8,18 +8,52 @@ on:
 permissions:
   contents: read
 
+# A new push to the same branch or pull request replaces the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# fmt, clippy and the tests run as separate jobs, side by side, so the slowest
+# one sets the time instead of all three added up. clippy and the tests compile
+# differently anyway (check vs build), so splitting them costs little.
 jobs:
-  check:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Each job keeps its own cache, as their compiled outputs differ.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # The test job keeps the old job name, "check", so a branch rule that
+  # requires that check still finds it.
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # Line numbers only: panics still point at the line, but there is much
+      # less debug info to write and link, and the cache is smaller.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - run: cargo test --locked
 
   deny:
     runs-on: ubuntu-latest
