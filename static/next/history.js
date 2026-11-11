@@ -12,7 +12,8 @@
      /api/day, /api/live/series   the power curves of a day
      /api/daily                   energy per day (or per month or year with group=)
      /api/costs                   dollars: import, feed-in, credit, supply, total
-     /api/tariff                  price bands (through SD.tariff) */
+     /api/tariff                  price bands (through SD.tariff)
+   /api/prices/daily            Amber buy price per day, for the price panel (week, month, year) */
 (function () {
   'use strict';
 
@@ -802,11 +803,14 @@
     const grouped = r.view === 'year' ? 'month' : r.view === 'all' ? 'year' : null;
     const g = grouped ? `&group=${grouped}` : '';
     const prev = r.view === 'all' ? null : rangeOf(shift(r, -1));
-    const [energy, costs, prevEnergy, tariff] = await Promise.all([
+    // The Amber price panel: only where there is a price source and the range is days.
+    const wantPrices = SD.caps.prices && (r.view === 'week' || r.view === 'month' || r.view === 'year');
+    const [energy, costs, prevEnergy, tariff, priceDays] = await Promise.all([
       SD.fetchJSON(`/api/daily?from=${from}&to=${to}${g}`),
       quiet(SD.fetchJSON(`/api/costs?from=${from}&to=${to}${g}`)),
       prev ? quiet(SD.fetchJSON(`/api/daily?from=${prev.from}&to=${prev.fullTo < SD.local().date ? prev.fullTo : prev.to}&group=month`)) : Promise.resolve(null),
       quiet(SD.tariff.get(r.view === 'week' || r.view === 'month' ? to : undefined)),
+      wantPrices ? quiet(SD.fetchJSON(`/api/prices/daily?from=${from}&to=${to}`)) : Promise.resolve(null),
     ]);
 
     // One bar slot per day (or month, or year), in order, including days still to come.
@@ -850,7 +854,13 @@
 
     const nodes = [summaryCard(r, totals, costs && costs.totals, tariff, slots), tiles(r, totals, costs && costs.totals, prevEnergy && prevEnergy.totals, rows)];
     const box = nodes[0].querySelector('.history-chart');
-    return { nodes, redraw: () => drawBars(box, r, slots) };
+    const draws = [() => drawBars(box, r, slots)];
+    if (priceDays && priceDays.days && priceDays.days.length) {
+      const panel = pricePanel(r, priceDays);
+      nodes.push(panel.card, panel.tiles);
+      draws.push(() => drawPriceRange(panel.box, panel.days, panel.spike));
+    }
+    return { nodes, redraw: () => draws.forEach((d) => d()) };
   }
 
   /** Adds up day rows of /api/daily. */
@@ -1007,6 +1017,110 @@
         const earned = s.cost && num(s.cost.feed_in) ? `, earned ${money(s.cost.feed_in)}` : '';
         nodes.push(tipLine(`Sold ${SD.fmt.kwh(s.row.export_kwh)}${earned}`));
       }
+      return { at: (i + 0.5) / n, nodes };
+    }, { touch: false });
+  }
+
+  /* ---------------------------------------------------------------- Amber price per day */
+
+  /** The price card and its tiles for a week, month or year, from /api/prices/daily. */
+  function pricePanel(r, data) {
+    const days = data.days;
+    const spike = data.spike_cents;
+    const total = data.summary;
+    const box = SD.h('div', { class: 'history-chart' });
+    const free = days.filter((d) => d.free_minutes > 0).length;
+    const hasWeighted = days.some((d) => num(d.weighted_cents));
+    const legend = SD.h('p', { class: 'history-legend' },
+      SD.h('span', {}, SD.h('span', { class: 'history-key history-key-range', 'aria-hidden': 'true' }), 'Lowest to highest price'),
+      SD.h('span', {}, SD.h('span', { class: 'history-key history-key-free', 'aria-hidden': 'true' }), `Went to ${SD.fmt.cents(0)} or below`),
+      SD.h('span', {}, SD.h('span', { class: 'history-key history-key-dot', 'aria-hidden': 'true' }), 'Your average'),
+      days.some((d) => !num(d.weighted_cents))
+        ? SD.h('span', {}, SD.h('span', { class: 'history-key history-key-mean', 'aria-hidden': 'true' }), hasWeighted ? 'Simple average (no usage data)' : 'Simple average')
+        : null);
+    const sentence = `Each bar is a day: it spans the lowest to the highest 5-minute buy price. The dot is your average, weighted by what you bought${hasWeighted ? '' : ' (no usage data for these days, so it is the simple average)'}. Yellow days dipped to ${SD.fmt.cents(0)} or below.`;
+    const card = SD.h('section', { class: 'card history-card history-prices', 'aria-labelledby': 'history-price-h' },
+      SD.h('h2', { class: 'section-title', id: 'history-price-h', text: 'Amber buy price' }),
+      SD.h('p', { class: 'history-sentence', text: sentence }),
+      box, legend);
+
+    const tiles = SD.h('div', { class: 'history-tiles' });
+    const usage = num(total.weighted_cents);
+    tiles.append(tile('Average buy price', SD.fmt.cents(usage ? total.weighted_cents : total.mean_cents, { round: false }),
+      usage ? 'Weighted by your usage' : 'Simple average, no usage data'));
+    const hours = total.free_minutes / 60;
+    tiles.append(tile(`Hours at ${SD.fmt.cents(0)} or below`, `${hours >= 10 ? Math.round(hours) : +hours.toFixed(1)} h`,
+      `On ${free} of ${days.length} ${days.length === 1 ? 'day' : 'days'} with prices`));
+    tiles.append(tile('Highest price', SD.fmt.cents(total.max_cents, { round: false }),
+      `${SD.fmt.date(total.max_start, 'medium')}, ${SD.fmt.time(total.max_start)}`));
+    tiles.append(tile(`Spikes over ${SD.fmt.cents(spike)}`, String(total.spike_intervals),
+      total.spike_intervals ? '5-minute prices above it' : 'None in this period'));
+    return { card, tiles, box, days, spike };
+  }
+
+  /** One bar per day from its lowest to its highest buy price, and a dot for the average. */
+  function drawPriceRange(box, days, spike) {
+    const width = Math.max(box.clientWidth || 300, 200);
+    const height = width >= 560 ? 230 : 170;
+    const top = 16;
+    const axisH = 20;
+    const base = height - axisH;
+    const from = days[0].date;
+    const slots = [];
+    const byDate = new Map(days.map((d) => [d.date, d]));
+    for (let day = from; day <= days[days.length - 1].date; day = addDays(day, 1)) slots.push({ date: day, row: byDate.get(day) });
+    const n = slots.length;
+    const slotW = width / n;
+    const barW = Math.max(1.5, Math.min(slotW * 0.5, 22));
+
+    // One huge spike would flatten every other day, so the scale stops at a little over the spike level.
+    const rawMax = Math.max(...days.map((d) => d.max_cents));
+    const capMax = Math.max(100, num(spike) ? spike * 1.25 : 0);
+    const hi = Math.max(10, Math.min(rawMax, capMax));
+    const lo = Math.min(0, ...days.map((d) => d.min_cents));
+    const y = (c) => base - ((Math.max(lo, Math.min(hi, c)) - lo) / (hi - lo)) * (base - top);
+
+    const svg = S('svg', {
+      width, height, viewBox: `0 0 ${width} ${height}`, role: 'img',
+      'aria-label': `Amber buy price, one bar per day from lowest to highest, ${days.length} days with prices. Highest ${SD.fmt.cents(rawMax)}.`,
+    });
+    for (const c of [hi, 0].filter((v, i, a) => a.indexOf(v) === i)) {
+      svg.append(S('line', { x1: 0, x2: width, y1: y(c), y2: y(c), class: c === 0 ? 'history-base' : 'history-grid' }));
+      svg.append(S('text', { x: 2, y: y(c) - 3, class: 'history-axis-label' }, `${SD.fmt.cents(c)}${c === hi && rawMax > hi ? '+' : ''}`));
+    }
+    // Which x labels fit: every day of a week, then every few.
+    const every = n <= 8 ? 1 : n <= 31 ? 5 : 0;
+    slots.forEach((s, i) => {
+      const cx = slotW * i + slotW / 2;
+      const first = s.date.slice(8) === '01';
+      const text = n > 31 ? (first ? SD.fmt.date(s.date, 'short').split(' ')[1] : null)
+        : n <= 8 ? SD.fmt.date(s.date, 'medium').split(' ')[0] : (i % every === 0 ? String(+s.date.slice(8)) : null);
+      if (text) svg.append(S('text', { x: cx, y: height - 5, 'text-anchor': 'middle', class: 'history-axis-label' }, text));
+      const d = s.row;
+      if (!d) return;
+      const dipped = d.free_minutes > 0;
+      const top0 = y(d.max_cents);
+      const said = `${SD.fmt.date(s.date, 'medium')}: ${SD.fmt.cents(d.min_cents, { round: false })} to ${SD.fmt.cents(d.max_cents, { round: false })}`;
+      const parts = [
+        S('rect', { x: cx - barW / 2, y: top0, width: barW, height: Math.max(2, y(d.min_cents) - top0), rx: Math.min(3, barW / 2), class: `history-price-range${dipped ? ' is-free' : ''}` }),
+      ];
+      const avg = num(d.weighted_cents) ? d.weighted_cents : d.mean_cents;
+      const dotR = Math.max(1.2, Math.min(4.5, slotW * 0.3));
+      parts.push(S('circle', { cx, cy: y(avg), r: dotR, class: `history-price-dot${num(d.weighted_cents) ? '' : ' is-mean'}` }));
+      svg.append(S('a', { href: `#history/day/${s.date}`, 'aria-label': said, class: 'history-bar-link' },
+        S('title', {}, said), S('rect', { x: slotW * i, y: 0, width: slotW, height: height - axisH, class: 'history-hit' }), parts));
+    });
+    box.replaceChildren(svg);
+    chartTip(box, svg, base, (frac) => {
+      const i = Math.min(n - 1, Math.floor(frac * n));
+      const d = slots[i] && slots[i].row;
+      if (!d) return null;
+      const nodes = [SD.h('b', { text: SD.fmt.date(slots[i].date, 'medium') }),
+        tipLine(`Low ${SD.fmt.cents(d.min_cents, { round: false })} at ${SD.fmt.time(d.min_start)}`),
+        tipLine(`High ${SD.fmt.cents(d.max_cents, { round: false })} at ${SD.fmt.time(d.max_start)}`),
+        tipLine(num(d.weighted_cents) ? `Your average ${SD.fmt.cents(d.weighted_cents, { round: false })}` : `Simple average ${SD.fmt.cents(d.mean_cents, { round: false })}`)];
+      if (d.free_minutes > 0) nodes.push(tipLine(`${SD.fmt.cents(0)} or below for ${Math.round(d.free_minutes)} min`));
+      if (d.coverage < 0.95) nodes.push(tipLine(`Prices cover ${Math.round(d.coverage * 100)}% of the day`));
       return { at: (i + 0.5) / n, nodes };
     }, { touch: false });
   }

@@ -445,6 +445,61 @@ html[data-theme="night"] #page-history {
   margin-top: 8px;
 }
 
+/* ---------- Amber price per day ---------- */
+
+#page-history .history-price-range {
+  fill: var(--bar);
+  fill-opacity: 0.55;
+}
+
+#page-history .history-price-range.is-free {
+  fill: var(--sun);
+  fill-opacity: 1;
+  stroke: var(--sun-line);
+  stroke-width: 1;
+}
+
+#page-history .history-price-dot {
+  fill: var(--ink);
+  stroke: var(--card);
+  stroke-width: 1.5;
+}
+
+/* No usage that day, so this is the simple average: a ring, not a dot. */
+#page-history .history-price-dot.is-mean {
+  fill: var(--card);
+  stroke: var(--ink);
+}
+
+#page-history .history-key-range {
+  width: 8px;
+  height: 14px;
+  border-radius: 3px;
+  background: var(--bar);
+  opacity: 0.55;
+}
+
+#page-history .history-key-free {
+  width: 8px;
+  height: 14px;
+  border-radius: 3px;
+  background: var(--sun);
+  box-shadow: inset 0 0 0 1px var(--sun-line);
+}
+
+#page-history .history-key-dot,
+#page-history .history-key-mean {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ink);
+}
+
+#page-history .history-key-mean {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--ink);
+}
+
 /* ---------- tiles ---------- */
 
 #page-history .history-tiles {
