@@ -370,6 +370,7 @@ pub fn router(state: AppState) -> Router {
         .route("/static/{*path}", get(static_file))
         .route("/api/latest", get(api::latest))
         .route("/api/spokes", get(api::spokes))
+        .route("/api/capabilities", get(api::capabilities))
         .route("/api/live", get(api::live))
         .route("/api/live/series", get(api::live_series))
         .route("/api/inverter", get(api::inverter))
