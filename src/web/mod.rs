@@ -319,16 +319,15 @@ impl AppState {
             "serve needs password_hash in the [server] section of config.toml \
              (run `cargo run -- hash-password` to make one)",
         )?;
-        let plant_id = config
-            .isolarcloud
-            .plant_id
-            .context("serve needs plant_id in config.toml (run login-test to see your plants)")?;
-        let tz: Tz = config.isolarcloud.timezone.parse().map_err(|_| {
-            anyhow::anyhow!(
-                "unknown timezone {:?} in config.toml",
-                config.isolarcloud.timezone
-            )
-        })?;
+        // Readings are stored per plant. Without iSolarCloud there is no plant
+        // id; 0 never matches stored cloud readings, so those queries are empty.
+        let plant_id = match &config.isolarcloud {
+            Some(cloud) => cloud.plant_id.context(
+                "serve needs plant_id in config.toml (run login-test to see your plants)",
+            )?,
+            None => 0,
+        };
+        let tz = config.timezone()?;
         let secret = config.server.session_secret.as_deref().context(
             "serve needs session_secret in the [server] section of config.toml \
              (make one with `openssl rand -base64 64 | tr -d '\\n'; echo`)",
