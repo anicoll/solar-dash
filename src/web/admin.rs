@@ -195,6 +195,7 @@ fn setting_defaults() -> Value {
         "bill_start_day": d.bill_start_day,
         "grid_pull_warn_kw": d.grid_pull_warn_kw,
         "grid_pull_limit_kw": d.grid_pull_limit_kw,
+        "price_spike_cents": d.price_spike_cents,
     })
 }
 

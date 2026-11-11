@@ -198,6 +198,7 @@
       bill_start_day: dec('bill_start_day', { step: '1', min: '1', max: '28', inputMode: 'numeric' }),
       grid_pull_warn_kw: dec('grid_pull_warn_kw'),
       grid_pull_limit_kw: dec('grid_pull_limit_kw'),
+      price_spike_cents: dec('price_spike_cents'),
       petrol_cents_per_litre: dec('petrol_cents_per_litre'),
       petrol_litres_per_100km: dec('petrol_litres_per_100km'),
       away_cents_per_kwh: dec('away_cents_per_kwh'),
@@ -213,6 +214,7 @@
       field('Bill period starts on day (1 to 28)', f.bill_start_day, 'Default: worked out from the last bill, else the calendar month. Leave empty for the default.'),
       field('Grid pull warning (kW)', f.grid_pull_warn_kw, hint('grid_pull_warn_kw')),
       field('Grid pull limit (kW)', f.grid_pull_limit_kw, `${hint('grid_pull_limit_kw')} The main breaker is 63 A.`),
+      field('Peak price from (c/kWh)', f.price_spike_cents, `${hint('price_spike_cents')} The Today page calls a live price above this Peak, 0 or less Free, and the rest Shoulder.`),
       field('Petrol price before the first date (c/L)', f.petrol_cents_per_litre, hint('petrol_cents_per_litre')),
       field('Petrol car use (L per 100 km)', f.petrol_litres_per_100km, hint('petrol_litres_per_100km')),
       field('Charging away from home (c/kWh)', f.away_cents_per_kwh, hint('away_cents_per_kwh')),
@@ -221,7 +223,7 @@
       field('Petrol car to compare with each car', cars, 'One per line, as "Tesla model = petrol car". Leave empty for none.'),
     ], 'Save settings', async (msg) => {
       const payload = {};
-      for (const key of ['petrol_cents_per_litre', 'petrol_litres_per_100km', 'away_cents_per_kwh', 'price_rise_percent', 'bill_start_day', 'grid_pull_warn_kw', 'grid_pull_limit_kw']) {
+      for (const key of ['petrol_cents_per_litre', 'petrol_litres_per_100km', 'away_cents_per_kwh', 'price_rise_percent', 'bill_start_day', 'grid_pull_warn_kw', 'grid_pull_limit_kw', 'price_spike_cents']) {
         payload[key] = numOrNull(f[key].value);
       }
       payload.petrol_grade = f.petrol_grade.value.trim() || null;

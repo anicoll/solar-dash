@@ -1415,6 +1415,7 @@ mod tests {
         assert_eq!(json["channels"]["feed_in"][0]["cents"], -3.0);
         assert_eq!(json["now"]["general"]["cents"], 25.5);
         assert_eq!(json["now"]["general"]["kind"], "current");
+        assert_eq!(json["spike_cents"], 100.0);
         assert_eq!(json["now"]["feed_in"]["cents"], -3.0);
         assert!(json["now"].get("controlled_load").is_none());
         // An unknown source has nothing, in the range or right now.

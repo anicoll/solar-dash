@@ -476,6 +476,31 @@ html[data-theme="night"] #page-today {
   color: var(--ink-2);
 }
 
+/* ---------- price now ---------- */
+
+#page-today .today-price-figs {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+#page-today .today-price-band {
+  margin-top: 4px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+#page-today .today-price-note {
+  margin: 14px 0 0;
+}
+
+#page-today .today-price-ribbon {
+  margin-top: 2px;
+}
+
+/* A stretch with no price data: an empty track, not a band. */
+#page-today .ribbon-seg.is-gap {
+  background: var(--today-track);
+}
+
 /* ---------- coming up ---------- */
 
 #page-today .today-up {

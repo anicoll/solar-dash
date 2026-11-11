@@ -675,6 +675,104 @@
     return out;
   }
 
+  /* ---------------------------------------------------------------- price now */
+
+  /** How far ahead the forecast strip looks. */
+  const PRICE_AHEAD_S = 6 * 3600;
+  const PRICE_BAND_NAME = { free: 'Free', shoulder: 'Shoulder', peak: 'Peak' };
+
+  /** The same three bands as the engine: 0 or less is Free, above the spike level is Peak, the rest Shoulder. */
+  function priceBand(cents, spike) {
+    if (cents <= 0) return 'free';
+    return cents > spike ? 'peak' : 'shoulder';
+  }
+
+  /** The stored interval of one channel that covers `ts`, if any. */
+  function priceAt(rows, ts) {
+    return (rows || []).find((r) => r.start <= ts && ts < r.end) || null;
+  }
+
+  /** The next six hours as runs of one band: [{ band, from, to }, ...] in seconds, with band null for a gap. */
+  function priceRuns(rows, from, spike) {
+    const to = from + PRICE_AHEAD_S;
+    const runs = [];
+    let at = from;
+    const push = (band, end) => {
+      if (end <= at) return;
+      const last = runs[runs.length - 1];
+      if (last && last.band === band) last.to = end;
+      else runs.push({ band, from: at, to: end });
+      at = end;
+    };
+    for (const r of (rows || []).filter((x) => x.end > from && x.start < to).sort((a, b) => a.start - b.start)) {
+      if (r.start > at) push(null, Math.min(r.start, to));
+      push(priceBand(r.cents, spike), Math.min(r.end, to));
+    }
+    push(null, to);
+    return runs;
+  }
+
+  /** "Price now": the live import and feed-in price, and a six-hour forecast strip drawn like the day ribbon. */
+  function priceSection() {
+    const el = h('section', { class: 'card today-price', 'aria-labelledby': 'today-price-h', hidden: true });
+    return {
+      el,
+      update() {
+        const prices = data.prices;
+        const nowTs = Math.floor(Date.now() / 1000);
+        const channels = (prices && prices.channels) || {};
+        const buy = priceAt(channels.general, nowTs);
+        // No price source, no data, or only old data (the source stopped): hide the whole card.
+        el.hidden = !buy;
+        if (!buy) return;
+        const spike = prices.spike_cents > 0 ? prices.spike_cents : 100;
+        const sell = priceAt(channels.feed_in, nowTs);
+        const band = priceBand(buy.cents, spike);
+
+        const buyFig = h('div', { class: 'today-fig' },
+          h('div', { class: 'label', text: 'Buying' }),
+          h('div', { class: 'fig fig-md', text: `${SD.fmt.cents(buy.cents)} a kWh` }),
+          h('div', { class: 'today-price-band' }, h('b', { class: `swatch band-${band}` }), ` ${PRICE_BAND_NAME[band]}`));
+        const sellFig = sell ? h('div', { class: 'today-fig' },
+          h('div', { class: 'label', text: 'Feed-in' }),
+          h('div', { class: 'fig fig-md', text: `${SD.fmt.cents(sell.cents)} a kWh` })) : null;
+
+        // The strip: one block per run of the same band, as wide as its share of the six hours.
+        const runs = priceRuns(channels.general, nowTs, spike);
+        const strip = h('div', { class: 'ribbon-strip' });
+        const words = [];
+        for (const run of runs) {
+          const share = (run.to - run.from) / PRICE_AHEAD_S;
+          const fits = share >= 0.22 && run.band;
+          strip.append(h('div', {
+            class: `ribbon-seg ${run.band ? `band-${run.band}` : 'is-gap'}${fits ? '' : ' is-bare'}`,
+            style: `flex: 0 0 ${(share * 100).toFixed(3)}%`,
+            text: fits ? PRICE_BAND_NAME[run.band] : '',
+          }));
+          if (run.band) words.push(`${PRICE_BAND_NAME[run.band]} from ${SD.fmt.time(run.from)} to ${SD.fmt.time(run.to)}`);
+        }
+        const axis = h('div', { class: 'ribbon-axis is-short', 'aria-hidden': 'true' });
+        for (let i = 0; i <= 3; i++) {
+          const tick = h('span', { text: i === 0 ? 'Now' : SD.fmt.time(nowTs + (PRICE_AHEAD_S * i) / 3) });
+          if (i === 0) tick.style.left = '0';
+          else if (i === 3) tick.style.right = '0';
+          else { tick.style.left = `${(i / 3) * 100}%`; tick.style.transform = 'translateX(-50%)'; }
+          axis.append(tick);
+        }
+        const ribbon = h('div', { class: 'ribbon', role: 'img',
+          'aria-label': `Forecast price bands for the next 6 hours. ${words.join('. ')}.` }, strip, axis);
+
+        fill(el,
+          h('div', { class: 'card-head' },
+            h('h2', { class: 'section-title', id: 'today-price-h', text: 'Price now' }),
+            h('span', { class: 'label', text: `Free \u2264 0c \u00b7 Peak > ${SD.fmt.cents(spike)}` })),
+          h('div', { class: 'today-figs today-price-figs' }, buyFig, sellFig),
+          h('p', { class: 'card-sub today-price-note', text: 'Forecast, next 6 hours' }),
+          h('div', { class: 'today-price-ribbon' }, ribbon));
+      },
+    };
+  }
+
   /* ---------------------------------------------------------------- 6. coming up */
 
   /** The next three price changes and credit window events, today and tomorrow. */
@@ -889,13 +987,16 @@
   async function refreshSlow() {
     const today = SD.local().date;
     const tomorrow = SD.local(Date.now() / 1000 + 86400).date;
-    const [tariff, tomorrowT, costs, daily, samples, battery] = await Promise.all([
+    const nowTs = Math.floor(Date.now() / 1000);
+    const [tariff, tomorrowT, costs, daily, samples, battery, prices] = await Promise.all([
       ok(SD.tariff.get()),
       ok(SD.tariff.get(tomorrow)),
       ok(SD.fetchJSON(`/api/costs?from=${today}&to=${today}`)),
       ok(SD.fetchJSON(`/api/daily?from=${today}&to=${today}`)),
       loadSamples(today),
       ok(SD.fetchJSON('/api/battery?days=31')),
+      // A little history so the interval we are in is always there, and the forecast beyond the strip.
+      ok(SD.fetchJSON(`/api/prices?from=${nowTs - 900}&to=${nowTs + PRICE_AHEAD_S + 1800}`)),
     ]);
     if (!view) return;
     data.tariff = tariff;
@@ -904,6 +1005,7 @@
     data.daily = daily && daily.days ? daily.days[0] || null : null;
     data.samples = samples;
     data.battery = battery;
+    data.prices = prices;
     updateAll();
   }
 
@@ -921,10 +1023,10 @@
     if (wide) {
       view.el.replaceChildren(h('div', { class: 'cols cols-2-1' },
         h('div', { class: 'stack' }, s.head.el, s.window.el, s.pull.el, s.day.el, s.up.el),
-        h('div', { class: 'stack' }, s.now.el, s.credit.el, s.totals.el)));
+        h('div', { class: 'stack' }, s.now.el, s.price.el, s.credit.el, s.totals.el)));
     } else {
       view.el.replaceChildren(h('div', { class: 'stack' },
-        s.head.el, s.window.el, s.pull.el, s.now.el, s.day.el, s.up.el, s.credit.el, s.totals.el));
+        s.head.el, s.window.el, s.pull.el, s.now.el, s.price.el, s.day.el, s.up.el, s.credit.el, s.totals.el));
     }
     s.day.relayout();
   }
@@ -935,7 +1037,7 @@
         el,
         timers: [],
         sections: {
-          head: headSection(), window: windowSection(), pull: pullSection(), now: nowSection(),
+          head: headSection(), window: windowSection(), pull: pullSection(), now: nowSection(), price: priceSection(),
           day: daySection(), up: upSection(), credit: creditSection(), totals: totalsSection(),
         },
       };
