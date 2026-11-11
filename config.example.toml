@@ -157,6 +157,14 @@ path = "data/solar.db"
 # # feed_in_paid_when_negative = true  # Amber reports a NEGATIVE feed-in price
 # #                                # when you are paid; set false if yours is positive
 # # The plan's own windows only fill gaps where no price was stored.
+#
+# # The Bill page's "What would Amber cost?" prices your own usage on a made-up
+# # Amber plan from the stored prices. These are placeholders: copy the real
+# # figures from your Amber statement. Defaults are shown.
+# # [amber.compare]
+# # supply_cents_per_day = 100.0
+# # fee_cents_per_day = 0.0        # Amber's monthly fee divided by the days
+# # feed_in_paid_when_negative = true
 
 # Which source wins when two of them can answer the same question. Optional:
 # without this section the defaults below apply, which is how the dashboard

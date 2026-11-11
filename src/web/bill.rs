@@ -5,18 +5,20 @@
 //! maths lives here, only the period dates and the projection.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use chrono::{Datelike, Days, Months, NaiveDate};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
-use super::api::{ApiResult, day_bounds_or_error, today};
+use super::api::{ApiError, ApiResult, day_bounds_or_error, today};
 use super::costs::{
-    CostedDay, SOURCE_BILL, SOURCE_GLOBIRD, billed_days, day_grid_split, hhmm, live_in, round2,
+    CostedDay, SOURCE_BILL, SOURCE_GLOBIRD, billed_days, compare_days, day_grid_split, hhmm,
+    live_in, round2,
 };
 use crate::bills::PastBill;
-use crate::cost::{DayCost, ExportBand, GridSplit, Tariff};
+use crate::config;
+use crate::cost::{self, DayCost, ExportBand, GridSplit, Tariff};
 use crate::db;
 
 /// How the period's dates were chosen, as `period_source` reports it.
@@ -647,6 +649,166 @@ pub async fn current(State(state): State<AppState>) -> ApiResult {
     })))
 }
 
+/// A day needs at least this share of its minutes covered by stored import
+/// prices to be compared. Below it the day is skipped, not guessed.
+const MIN_PRICE_COVERAGE: f64 = 0.98;
+
+/// The longest range one comparison may ask for.
+const MAX_COMPARE_DAYS: u64 = 92;
+
+#[derive(Debug, Deserialize)]
+pub struct CompareParams {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// One day in the comparison, in dollars.
+#[derive(Debug, PartialEq, Serialize)]
+struct CompareDay {
+    date: String,
+    current_dollars: f64,
+    dynamic_dollars: f64,
+}
+
+/// What the days that had enough prices come to on each plan. Kept in cents
+/// until the end so rounding the days cannot make the total drift.
+#[derive(Debug, Default, PartialEq)]
+struct CompareSums {
+    current_cents: f64,
+    dynamic_cents: f64,
+    fallback_minutes: u32,
+}
+
+/// Splits (cost on the plan in force, coverage, cost on the dynamic plan)
+/// into the days to show and how many were skipped for too few prices.
+fn compare_totals(
+    days: &[(String, f64, f64, cost::PricedDayCost)],
+) -> (Vec<CompareDay>, CompareSums, u32) {
+    let mut shown = Vec::new();
+    let mut sums = CompareSums::default();
+    let mut skipped = 0;
+    for (date, current_cents, coverage, priced) in days {
+        if *coverage < MIN_PRICE_COVERAGE {
+            skipped += 1;
+            continue;
+        }
+        sums.current_cents += current_cents;
+        sums.dynamic_cents += priced.cost.actual_cents;
+        sums.fallback_minutes += priced.fallback_minutes;
+        shown.push(CompareDay {
+            date: date.clone(),
+            current_dollars: dollars(*current_cents),
+            dynamic_dollars: dollars(priced.cost.actual_cents),
+        });
+    }
+    (shown, sums, skipped)
+}
+
+/// The made-up plan for the comparison: the `[amber.compare]` charges, priced
+/// from stored Amber prices. Its own windows are all 0 c, so only a missing
+/// price (at most 2% of a compared day) falls back to that, and
+/// `fallback_minutes` says how much.
+fn hypothetical_tariff(compare: &config::AmberCompare) -> Result<Tariff, ApiError> {
+    let plan = config::Tariff {
+        name: None,
+        supply_cents_per_day: compare.supply_cents_per_day,
+        default_import_cents: 0.0,
+        import: Vec::new(),
+        default_export_cents: 0.0,
+        export: Vec::new(),
+        zero_import_credit: None,
+        export_tier: None,
+        dynamic: Some(config::DynamicPrices {
+            source: "amber".to_string(),
+            fee_cents_per_day: compare.fee_cents_per_day,
+            feed_in_paid_when_negative: compare.feed_in_paid_when_negative,
+        }),
+    };
+    Ok(Tariff::from_config(&plan)?)
+}
+
+/// `GET /api/bill/compare-dynamic?from=&to=`: what the home's own energy
+/// would have cost on an Amber plan (`[amber.compare]`, stored Amber prices)
+/// next to the plan really in force, for each complete day that has stored
+/// prices for at least 98% of its minutes. The range defaults to the current
+/// bill period so far and is at most 92 days. Without `[amber]` it answers
+/// `{"configured":false}`.
+///
+/// `{"configured":true,"from","to","assumptions":{..},"days":[{"date",
+/// "current_dollars","dynamic_dollars"}..],"totals":{"days","skipped_days",
+/// "current_dollars","dynamic_dollars","difference_dollars","fallback_minutes"}}`.
+/// `difference_dollars` is dynamic minus current: negative means Amber is cheaper.
+pub async fn compare_dynamic(
+    State(state): State<AppState>,
+    Query(params): Query<CompareParams>,
+) -> ApiResult {
+    let (Some(compare), Some(schedule)) = (&state.amber_compare, &state.admin.get().tariff) else {
+        return Ok(Json(json!({ "configured": false })));
+    };
+    let data = state.admin.get();
+    let today = today(state.tz);
+    let (from, to) = match (&params.from, &params.to) {
+        (None, None) => {
+            let period = current_period(today, data.bill_start_day, &data.bills);
+            (period.from, (today - Days::new(1)).min(period.to))
+        }
+        _ => {
+            let to = params
+                .to
+                .clone()
+                .unwrap_or_else(|| (today - Days::new(1)).to_string());
+            let (from, count) = super::api::date_range(
+                params.from.as_deref(),
+                Some(&to),
+                state.tz,
+                MAX_COMPARE_DAYS,
+                30,
+            )?;
+            (from, from + Days::new(count - 1))
+        }
+    };
+    // Today is not finished, so it is never compared.
+    let last = to.min(today - Days::new(1));
+    let dates: Vec<NaiveDate> = from.iter_days().take_while(|d| *d <= last).collect();
+    if dates.len() as u64 > MAX_COMPARE_DAYS {
+        return Err(ApiError::bad_request(format!(
+            "the range can be at most {MAX_COMPARE_DAYS} days"
+        )));
+    }
+    let hypothetical = hypothetical_tariff(compare)?;
+    let compared = compare_days(&state, schedule, &hypothetical, &dates).await?;
+    let rows: Vec<_> = compared
+        .into_iter()
+        .map(|(day, hypo)| {
+            (
+                day.date.to_string(),
+                day.cost.actual_cents,
+                hypo.coverage,
+                hypo.priced,
+            )
+        })
+        .collect();
+    let (days, sums, skipped) = compare_totals(&rows);
+    Ok(Json(json!({
+        "configured": true,
+        "from": from.to_string(),
+        "to": to.to_string(),
+        "assumptions": {
+            "supply_cents_per_day": compare.supply_cents_per_day,
+            "fee_cents_per_day": compare.fee_cents_per_day,
+        },
+        "totals": {
+            "days": days.len(),
+            "skipped_days": skipped,
+            "current_dollars": dollars(sums.current_cents),
+            "dynamic_dollars": dollars(sums.dynamic_cents),
+            "difference_dollars": dollars(sums.dynamic_cents - sums.current_cents),
+            "fallback_minutes": sums.fallback_minutes,
+        },
+        "days": days,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,5 +1268,41 @@ mod tests {
             projection_range(900.0, 1000.0, 10, Some(&empty)),
             (900.0, 900.0)
         );
+    }
+
+    #[test]
+    fn compare_skips_days_with_too_few_prices_and_sums_the_rest() {
+        let priced = |cents: f64, fallback_minutes| cost::PricedDayCost {
+            cost: DayCost {
+                import_kwh: 0.0,
+                export_kwh: 0.0,
+                load_kwh: 0.0,
+                import_cents: 0.0,
+                export_cents: 0.0,
+                supply_cents: 0.0,
+                zero_import_credit_cents: 0.0,
+                actual_cents: cents,
+                baseline_cents: 0.0,
+                savings_cents: 0.0,
+            },
+            fallback_minutes,
+        };
+        let rows = vec![
+            ("2026-09-01".to_string(), 300.0, 1.0, priced(250.0, 0)),
+            ("2026-09-02".to_string(), 100.0, 0.5, priced(900.0, 0)),
+            (
+                "2026-09-03".to_string(),
+                200.0,
+                MIN_PRICE_COVERAGE,
+                priced(260.0, 20),
+            ),
+        ];
+        let (days, sums, skipped) = compare_totals(&rows);
+        assert_eq!(skipped, 1);
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[1].dynamic_dollars, 2.6);
+        assert_eq!(sums.current_cents, 500.0);
+        assert_eq!(sums.dynamic_cents, 510.0);
+        assert_eq!(sums.fallback_minutes, 20);
     }
 }

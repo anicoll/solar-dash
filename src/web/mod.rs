@@ -99,6 +99,8 @@ pub struct AppState {
     /// Whether the config has an `[amber]` section. Dynamic-price screens
     /// stay hidden without it.
     amber_configured: bool,
+    /// The made-up plan for "What would Amber cost?"; set with `[amber]`.
+    amber_compare: Option<crate::config::AmberCompare>,
     /// Where the nightly backups are, for the admin page's download.
     backup_dir: Option<PathBuf>,
     /// How the last offsite upload went, for the admin page.
@@ -141,6 +143,7 @@ impl AppState {
             admin: SharedAdminData::new(AdminData::default()),
             globird_configured: false,
             amber_configured: false,
+            amber_compare: None,
             backup_dir: None,
             offsite: crate::offsite::Status::default(),
             spokes: hub::spoke_infos(&[]).into(),
@@ -258,6 +261,13 @@ impl AppState {
         self
     }
 
+    /// Sets the made-up Amber plan the Bill page compares against. Without it
+    /// the comparison is off.
+    pub fn with_amber_compare(mut self, compare: Option<crate::config::AmberCompare>) -> Self {
+        self.amber_compare = compare;
+        self
+    }
+
     /// Sets the past bills (oldest first) whose totals replace our estimate.
     pub fn with_bills(self, bills: Vec<PastBill>) -> Self {
         self.edit_admin(|d| d.bills = bills.into())
@@ -330,7 +340,8 @@ impl AppState {
             .with_api_token(config.server.api_token.as_deref())
             .with_globird_configured(config.globird.is_some())
             .with_source_rules(config.source_rules()?)
-            .with_amber_configured(config.amber.is_some()))
+            .with_amber_configured(config.amber.is_some())
+            .with_amber_compare(config.amber.as_ref().map(|a| a.compare.clone())))
     }
 }
 
@@ -408,6 +419,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/battery", get(battery::battery))
         .route("/api/costs", get(costs::costs))
         .route("/api/bill/current", get(bill::current))
+        .route("/api/bill/compare-dynamic", get(bill::compare_dynamic))
         .route("/api/tariff", get(costs::tariff))
         .route("/api/globird/compare", get(globird::compare))
         .route("/api/payback", get(payback::payback))
@@ -2614,6 +2626,79 @@ mod tests {
         save_day(60.0, 2).await;
         let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
         assert_eq!(actual(&json), 1.50);
+    }
+
+    #[tokio::test]
+    async fn the_amber_comparison_covers_only_days_with_enough_prices() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = hash_password(PASSWORD).unwrap();
+        let compare = crate::config::AmberCompare {
+            fee_cents_per_day: 20.0,
+            ..Default::default()
+        };
+        let state = AppState::new(
+            pool.clone(),
+            PLANT,
+            chrono_tz::Australia::Adelaide,
+            &hash,
+            Key::generate(),
+        )
+        .unwrap()
+        .with_tariff(Some(flat_tariff()));
+        // Without [amber] the comparison is off.
+        let off = router(state.clone());
+        let cookie = log_in(&off).await;
+        let uri = "/api/bill/compare-dynamic?from=2026-09-15&to=2026-09-16";
+        let json = body_json(send(&off, get_request(uri, Some(&cookie))).await).await;
+        assert_eq!(json, serde_json::json!({ "configured": false }));
+
+        let app = router(state.with_amber_compare(Some(compare)));
+        let mut readings = Vec::new();
+        for day in 0..2 {
+            let start = SEP_15_START + day * 86_400;
+            for (metric, wh) in [
+                (Metric::GridImportDayWh, 1000.0),
+                (Metric::GridExportDayWh, 2000.0),
+                (Metric::LoadDayWh, 4000.0),
+            ] {
+                for ts in [start + 3600, start + 86_400 - 300] {
+                    readings.push((metric, ts, wh));
+                }
+            }
+        }
+        db::seed_metrics(&pool, PLANT, &readings).await;
+        // The 15th has every 5-minute price; the 16th only the first half.
+        for i in 0..(288 + 144) {
+            let start = SEP_15_START + i * 300;
+            for (channel, cents) in [("general", 50.0), ("feed_in", -10.0)] {
+                sqlx::query(
+                    "INSERT INTO price_interval VALUES ('amber:s1', ?, ?, ?, ?, NULL, 'actual', 1)",
+                )
+                .bind(channel)
+                .bind(start)
+                .bind(start + 300)
+                .bind(cents)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        let json = body_json(send(&app, get_request(uri, Some(&cookie))).await).await;
+        assert_eq!(json["configured"], true);
+        // Plan in force: 100 + 25 - 10 = 115 c. Amber: 100 + 20 fee + 50 - 20 = 150 c.
+        assert_eq!(
+            json["days"],
+            serde_json::json!([{
+                "date": "2026-09-15", "current_dollars": 1.15, "dynamic_dollars": 1.5,
+            }])
+        );
+        assert_eq!(json["totals"]["days"], 1);
+        assert_eq!(json["totals"]["skipped_days"], 1);
+        assert_eq!(json["totals"]["difference_dollars"], 0.35);
+        assert_eq!(json["assumptions"]["fee_cents_per_day"], 20.0);
     }
 
     #[tokio::test]

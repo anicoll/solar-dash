@@ -962,6 +962,30 @@ async fn compute_days(
     dates: &[NaiveDate],
     today: NaiveDate,
 ) -> Result<Vec<(CostedDay, bool)>, ApiError> {
+    let days = compute_days_with(state, tariff, dates, today, None).await?;
+    Ok(days
+        .into_iter()
+        .map(|(day, cacheable, _)| (day, cacheable))
+        .collect())
+}
+
+/// The same day's energy priced on a made-up dynamic plan, from stored prices.
+pub(super) struct HypotheticalDay {
+    /// The share of the day (0 to 1) that has a stored import price.
+    pub coverage: f64,
+    pub priced: cost::PricedDayCost,
+}
+
+/// [`compute_days`], and when `hypothetical` is given also the same intervals
+/// priced on that dynamic plan using finished (actual) prices only, so both
+/// costs come from exactly the same energy.
+async fn compute_days_with(
+    state: &AppState,
+    tariff: &Tariff,
+    dates: &[NaiveDate],
+    today: NaiveDate,
+    hypothetical: Option<&Tariff>,
+) -> Result<Vec<(CostedDay, bool, Option<HypotheticalDay>)>, ApiError> {
     let mut bounds = Vec::with_capacity(dates.len());
     for &date in dates {
         bounds.push(day_bounds_or_error(date, state.tz)?);
@@ -1009,13 +1033,31 @@ async fn compute_days(
             let prices = plan_day_prices(state, tariff, date, today).await?;
             let cost =
                 cost::day_cost_priced(tariff, state.tz, &intervals, prices.as_ref(), credit).cost;
+            let hypo = match hypothetical.and_then(|h| h.dynamic_source().map(|src| (h, src))) {
+                Some((h, source)) => {
+                    let prices =
+                        amber_store::day_prices(&state.pool, source, start, end, false).await?;
+                    let covered = prices.general_covered_secs(start, end);
+                    Some(HypotheticalDay {
+                        coverage: covered as f64 / (end - start).max(1) as f64,
+                        priced: cost::day_cost_priced(
+                            h,
+                            state.tz,
+                            &intervals,
+                            Some(&prices),
+                            credit,
+                        ),
+                    })
+                }
+                None => None,
+            };
             let day = CostedDay {
                 date,
                 source,
                 cost,
                 complete: cacheable,
             };
-            days.push((day, cacheable));
+            days.push((day, cacheable, hypo));
         }
     }
     Ok(days)
@@ -1114,6 +1156,30 @@ async fn costed_days_on(
         .iter()
         .filter_map(|date| by_date.remove(&date.to_string()))
         .collect())
+}
+
+/// Each complete day in `dates` (sorted, consecutive) costed on the plan in
+/// force that day and, from the same energy, on the `hypothetical` dynamic
+/// plan. Like [`preview_days`] it does not touch the `daily_cost` table.
+pub(super) async fn compare_days(
+    state: &AppState,
+    schedule: &TariffSchedule,
+    hypothetical: &Tariff,
+    dates: &[NaiveDate],
+) -> Result<Vec<(CostedDay, HypotheticalDay)>, ApiError> {
+    let today = today(state.tz);
+    let mut out = Vec::new();
+    for run in dates.chunk_by(|a, b| std::ptr::eq(schedule.for_date(*a), schedule.for_date(*b))) {
+        let tariff = schedule.for_date(run[0]);
+        for (day, _, hypo) in
+            compute_days_with(state, tariff, run, today, Some(hypothetical)).await?
+        {
+            if let (true, Some(hypo)) = (day.complete, hypo) {
+                out.push((day, hypo));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The cost of every day in `dates` (sorted, consecutive) that has data, each

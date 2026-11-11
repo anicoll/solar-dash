@@ -506,6 +506,39 @@ pub struct Amber {
     pub site_id: Option<String>,
     #[serde(default = "default_amber_base_url")]
     pub base_url: String,
+    /// The made-up plan behind the Bill page's "What would Amber cost?".
+    #[serde(default)]
+    pub compare: AmberCompare,
+}
+
+/// What an Amber plan would charge besides energy, for the Bill page's
+/// "What would Amber cost?" estimate. The defaults are placeholders: copy the
+/// real figures from your Amber statement.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AmberCompare {
+    /// Daily supply charge in cents.
+    #[serde(default = "default_compare_supply")]
+    pub supply_cents_per_day: f64,
+    /// Amber's own daily fee in cents (its monthly fee divided by the days).
+    #[serde(default)]
+    pub fee_cents_per_day: f64,
+    /// Same meaning as `feed_in_paid_when_negative` on a dynamic plan.
+    #[serde(default = "default_true")]
+    pub feed_in_paid_when_negative: bool,
+}
+
+impl Default for AmberCompare {
+    fn default() -> Self {
+        Self {
+            supply_cents_per_day: default_compare_supply(),
+            fee_cents_per_day: 0.0,
+            feed_in_paid_when_negative: true,
+        }
+    }
+}
+
+fn default_compare_supply() -> f64 {
+    100.0
 }
 
 impl Amber {
@@ -520,6 +553,13 @@ impl Amber {
                 "site_id in [amber] must not be empty (leave it out to pick the only site)"
             );
         }
+        anyhow::ensure!(
+            self.compare.supply_cents_per_day.is_finite()
+                && self.compare.supply_cents_per_day >= 0.0
+                && self.compare.fee_cents_per_day.is_finite()
+                && self.compare.fee_cents_per_day >= 0.0,
+            "supply_cents_per_day and fee_cents_per_day in [amber.compare] must not be negative"
+        );
         crate::amber::client::check_base_url(&self.base_url).context("base_url in [amber]")
     }
 }
@@ -1212,6 +1252,18 @@ mod tests {
             ..parse("")
         };
         assert!(empty.check().is_err());
+        // [amber.compare] is optional and has documented defaults.
+        let defaults = parse("").compare;
+        assert_eq!(defaults.supply_cents_per_day, 100.0);
+        assert_eq!(defaults.fee_cents_per_day, 0.0);
+        assert!(defaults.feed_in_paid_when_negative);
+        let set = parse("[amber.compare]\nsupply_cents_per_day = 90.0\nfee_cents_per_day = 80.0\n");
+        assert_eq!(set.compare.fee_cents_per_day, 80.0);
+        assert!(
+            parse("[amber.compare]\nfee_cents_per_day = -1.0")
+                .check()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1220,6 +1272,7 @@ mod tests {
             token: "psk_supersecret".into(),
             site_id: Some("01ABC".into()),
             base_url: default_amber_base_url(),
+            compare: AmberCompare::default(),
         };
         let text = format!("{amber:?}");
         assert!(!text.contains("psk_supersecret"));

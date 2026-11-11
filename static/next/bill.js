@@ -6,6 +6,7 @@
                            series, the previous bill, past bills and cars (required)
      /api/globird/compare  our estimate against GloBird's meter, day by day
      /api/tariff           band times, through SD.tariff
+     /api/bill/compare-dynamic  "What would Amber cost?" (only with [amber] and a covered day)
    Every newer field of /api/bill/current may be missing (an older server): the part
    that needs it is left out and nothing else changes.
 
@@ -769,6 +770,42 @@
       h('td', { class: same ? 'muted' : d < 0 ? 'is-good' : 'is-bad', text: same ? 'same' : `${d > 0 ? '+' : ''}${amt(d)}` }));
   }
 
+  /* ---------------------------------------------------------------- 6b. what would Amber cost */
+
+  /**
+   * The made-up Amber plan against the plan in force, over the days that have
+   * stored Amber prices. Left out (null) without Amber or without a covered day.
+   */
+  function amberPanel(amber) {
+    const t = amber && amber.configured && amber.totals;
+    if (!t || !(t.days > 0) || !num(t.current_dollars) || !num(t.dynamic_dollars)) return null;
+    const diff = Number(t.difference_dollars);
+    const row = (name, value, cls, total) => h('tr', { class: total ? 'is-tot' : null },
+      h('th', { scope: 'row', text: name }), h('td', { class: cls || null, text: value }));
+    const table = h('table', { class: 'bill-cmp bill-amber' },
+      h('caption', { class: 'sr-only', text: 'Your bill so far on your plan and on Amber' }),
+      h('tbody', {},
+        row('Your plan', SD.fmt.dollars(t.current_dollars)),
+        row('On Amber', SD.fmt.dollars(t.dynamic_dollars)),
+        row('Difference', `${diff > 0.0049 ? '+' : ''}${amt(diff)}`, diff < -0.0049 ? 'is-good' : diff > 0.0049 ? 'is-bad' : 'muted', true)));
+    const a = amber.assumptions || {};
+    const notes = [
+      `An estimate from your own usage on ${plural(t.days, 'day', 'days')} that have Amber prices`
+        + (t.skipped_days > 0 ? ` (${plural(t.skipped_days, 'day', 'days')} left out for missing prices)` : '') + '.',
+    ];
+    if (num(a.supply_cents_per_day) && num(a.fee_cents_per_day)) {
+      notes.push(`It assumes ${a.supply_cents_per_day}c a day supply and ${a.fee_cents_per_day}c a day Amber fee; change them in [amber.compare] in the config file.`);
+    }
+    return {
+      title: 'What would Amber cost?',
+      summary: `${plural(t.days, 'day', 'days')} covered`,
+      fig: `${diff > 0.0049 ? '+' : ''}${amt(diff)}`,
+      figClass: diff < -0.0049 ? 'is-good' : diff > 0.0049 ? 'is-bad' : '',
+      collapse: true,
+      body: h('div', {}, table, h('p', { class: 'bill-note', text: notes.join(' ') })),
+    };
+  }
+
   /* ---------------------------------------------------------------- 7. past bills */
 
   function historyPanel(bill) {
@@ -921,7 +958,7 @@
   }
 
   function build(el, bill, extras) {
-    const { compare, tariff } = extras;
+    const { compare, tariff, amber } = extras;
     const today = SD.local().date;
     const desktop = () => desktopQuery.matches;
     const ctx = { panels: [], open: readOpen(), desktop, apply: () => applyPanels(ctx) };
@@ -967,6 +1004,7 @@
       };
       const side = h('div', { class: 'bill-side a-side' },
         safe(() => tiles(bill)),
+        panel('amber', '', () => amberPanel(amber)),
         panel('cut', '', () => cutPanel(bill, tariff)));
       grid.append(...[
         panel('flow', 'a-flow', () => waterfall(bill)),
@@ -1016,12 +1054,14 @@
         }
         const today = SD.local().date;
         const last = bill.to < today ? bill.to : today;
-        const [compare, tariff] = await Promise.all([
+        const [compare, tariff, amber] = await Promise.all([
           quiet(`/api/globird/compare?from=${bill.from}&to=${last}`),
           SD.tariff.get().catch(() => null),
+          // {configured: false} without [amber], and the panel stays out.
+          quiet(`/api/bill/compare-dynamic?from=${bill.from}&to=${last}`),
         ]);
         if (!alive) return;
-        build(el, bill, { compare, tariff });
+        build(el, bill, { compare, tariff, amber });
       }).catch((err) => {
         if (!alive) return;
         el.replaceChildren(
