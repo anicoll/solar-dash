@@ -1223,7 +1223,12 @@
     const grid = h('div', { class: 'bill-grid' });
     const hero = safe(() => renderHero(bill, null));
     const heroset = h('div', { class: 'bill-heroset a-hero' }, hero);
-    grid.append(heroset);
+    // Two independent columns on wide screens, so a tall panel on one side never
+    // pushes the other side down. On a phone they are `display: contents` and the
+    // panels keep their own order (see .bill-column in bill.css).
+    const left = h('div', { class: 'bill-column bill-column-l' }, heroset);
+    const right = h('div', { class: 'bill-column bill-column-r' });
+    grid.append(left, right);
 
     // The Amber panel's place: a small loading card that is swapped for the panel (or removed).
     let slot = SD.caps.prices && bill.days_elapsed > 0 && bill.so_far
@@ -1250,14 +1255,16 @@
         safe(() => tiles(bill)),
         slot,
         isPast(bill) ? null : panel('cut', '', () => cutPanel(bill, tariff)));
-      grid.append(...[
+      const lines = panel('lines', 'a-lines', () => linesPanel(bill, tariff));
+      if (lines) left.append(lines);
+      right.append(...[
         panel('flow', 'a-flow', () => waterfall(bill)),
-        panel('lines', 'a-lines', () => linesPanel(bill, tariff)),
-        panel('days', 'a-days', () => daysPanel(bill, today)),
         panel('cmp', 'a-compare', () => comparePanel(bill)),
         panel('hist', 'a-history', () => historyPanel(bill)),
         side.children.length ? side : null,
       ].filter(Boolean));
+      const days = panel('days', 'a-days', () => daysPanel(bill, today));
+      if (days) grid.append(days);
     }
     const how = safe(() => renderHow(bill));
     if (how) grid.append(how);

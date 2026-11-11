@@ -74,7 +74,19 @@
   margin-top: 12px;
 }
 
+/* On a phone the two desktop columns disappear and the panels keep this order. */
+#page-bill .bill-column { display: contents; }
+#page-bill .a-hero { order: 1; }
+#page-bill .a-flow { order: 2; }
+#page-bill .a-lines { order: 3; }
+#page-bill .a-days { order: 4; }
+#page-bill .a-compare { order: 5; }
+#page-bill .a-history { order: 6; }
+#page-bill .a-side { order: 7; }
+#page-bill .a-how { order: 8; }
+
 #page-bill .bill-grid > .card,
+#page-bill .bill-column > .card,
 #page-bill .bill-heroset > .card,
 #page-bill .bill-side > .card,
 #page-bill .bill-tiles > .card {
@@ -1132,28 +1144,28 @@
     font-size: 40px;
   }
 
+  /* Two columns that stack independently, then the full-width day chart and notes. */
   #page-bill .bill-grid {
     display: grid;
     grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
     grid-template-areas:
-      "hero flow"
-      "hero compare"
-      "lines history"
-      "lines side"
+      "left right"
       "days days"
       "how how";
-    grid-template-rows: auto 1fr auto 1fr auto auto;
     gap: 20px;
     align-items: start;
   }
 
-  #page-bill .a-hero { grid-area: hero; }
-  #page-bill .a-flow { grid-area: flow; }
-  #page-bill .a-lines { grid-area: lines; }
+  #page-bill .bill-column {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    min-width: 0;
+  }
+
+  #page-bill .bill-column-l { grid-area: left; }
+  #page-bill .bill-column-r { grid-area: right; }
   #page-bill .a-days { grid-area: days; }
-  #page-bill .a-compare { grid-area: compare; }
-  #page-bill .a-history { grid-area: history; }
-  #page-bill .a-side { grid-area: side; }
   #page-bill .a-how { grid-area: how; }
 
   #page-bill .bill-hero {
