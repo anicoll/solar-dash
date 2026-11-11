@@ -581,6 +581,9 @@ pub(crate) fn local_minute_of_day(tz: Tz, ts: i64) -> u32 {
 
 /// Cost one local day from its intervals. Each interval is priced at the local
 /// time of its midpoint. An empty slice still pays the supply charge.
+/// The app itself always calls [`day_cost_with_window_import`]; this shorter
+/// form keeps the tests readable.
+#[cfg(test)]
 pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
     day_cost_with_window_import(tariff, tz, intervals, None)
 }
