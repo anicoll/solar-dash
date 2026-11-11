@@ -633,7 +633,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::db::{self, Point, Reading};
+    use crate::db::{self, Point};
     use crate::metric::Metric;
     use crate::modbus::Sample;
     use crate::teslamate::CarState;
@@ -648,6 +648,11 @@ mod tests {
     }
 
     /// Like `test_app`, but also gives back the pool, for seeding more rows.
+    /// The source's id for [`Metric::PvW`], for the tests of the point-id API.
+    fn pv_point_id() -> i64 {
+        crate::isolar::points::for_metric(Metric::PvW).point_id
+    }
+
     async fn test_app_with_pool() -> (tempfile::TempDir, Router, SqlitePool) {
         test_app_with_options(true).await
     }
@@ -657,21 +662,18 @@ mod tests {
         let pool = db::open(dir.path().join("test.db").to_str().unwrap())
             .await
             .unwrap();
+        // The point's name and unit still come from the `point` table.
         let point = Point {
-            point_id: 83033,
+            point_id: pv_point_id(),
             code: None,
             name: Some("Plant power".to_string()),
             unit: Some("W".to_string()),
         };
         db::upsert_point(&pool, &point).await.unwrap();
-        let readings: Vec<Reading> = (0..3)
-            .map(|i| Reading {
-                point_id: 83033,
-                ts: 1_800_000_000 + i * 300,
-                value: Some(1000.0 + i as f64),
-            })
+        let readings: Vec<_> = (0..3)
+            .map(|i| (Metric::PvW, 1_800_000_000 + i * 300, 1000.0 + i as f64))
             .collect();
-        db::upsert_readings(&pool, PLANT, &readings).await.unwrap();
+        db::seed_metrics(&pool, PLANT, &readings).await;
 
         let hash = hash_password(PASSWORD).unwrap();
         let tz = chrono_tz::Australia::Adelaide;
@@ -1018,7 +1020,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let point = &json["points"][0];
-        assert_eq!(point["point_id"], 83033);
+        assert_eq!(point["point_id"], pv_point_id());
         assert_eq!(point["name"], "Plant power");
         assert_eq!(point["unit"], "W");
         assert_eq!(point["ts"], 1_800_000_600);
@@ -1318,8 +1320,8 @@ mod tests {
         let bad = [
             "/api/series",
             "/api/series?points=abc&from=1&to=2",
-            "/api/series?points=83033&from=2&to=1",
-            "/api/series?points=83033&from=0&to=2678401",
+            &format!("/api/series?points={}&from=2&to=1", pv_point_id()),
+            &format!("/api/series?points={}&from=0&to=2678401", pv_point_id()),
             "/api/series?points=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21&from=1&to=2",
             "/api/daily?from=2026-01-01&to=2027-12-31",
             "/api/day?date=yesterday",
@@ -1330,12 +1332,15 @@ mod tests {
             assert!(body_json(response).await["error"].is_string(), "{uri}");
         }
 
-        let uri = "/api/series?points=83033&from=1800000000&to=1800000300";
-        let response = send(&app, get_request(uri, Some(&cookie))).await;
+        let uri = format!(
+            "/api/series?points={}&from=1800000000&to=1800000300",
+            pv_point_id()
+        );
+        let response = send(&app, get_request(&uri, Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let series = &json["series"][0];
-        assert_eq!(series["point_id"], 83033);
+        assert_eq!(series["point_id"], pv_point_id());
         assert_eq!(series["data"].as_array().unwrap().len(), 2);
         assert_eq!(series["data"][1][1], 1001.0);
     }
@@ -2505,7 +2510,7 @@ mod tests {
 
         // Wipe the source data and give today new numbers. The finished day
         // can only be answered from the cache; today must be worked out again.
-        sqlx::query("DELETE FROM reading")
+        sqlx::query("DELETE FROM metric_reading")
             .execute(&pool)
             .await
             .unwrap();
@@ -2533,7 +2538,7 @@ mod tests {
         // The row was replaced, not added.
         assert_eq!(stored_days(&pool).await, 1);
         // And the original tariff does not see the replaced row as its own.
-        sqlx::query("DELETE FROM reading")
+        sqlx::query("DELETE FROM metric_reading")
             .execute(&pool)
             .await
             .unwrap();

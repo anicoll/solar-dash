@@ -15,7 +15,7 @@ use super::AppState;
 use super::costs::{Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, round2, undo_cloud_lag};
 use super::home_mix::{self, HomeMix};
 use crate::cost::{GridSplit, TariffSchedule};
-use crate::db::{self, LatestReading};
+use crate::db;
 use crate::ev_cost;
 use crate::isolar::points;
 use crate::metric::Metric;
@@ -60,13 +60,6 @@ const POWER_METRICS: [(&str, Metric); 3] = [
     ("load_w", Metric::LoadW),
     ("soc", Metric::SocPct),
 ];
-
-/// A stored value of a raw point id as the API shows it. A few points are
-/// stored in another unit than they are shown in (the battery charge is a
-/// fraction in iSolarCloud), which the point mapping knows.
-fn display_value(point_id: i64, value: f64) -> f64 {
-    value * points::for_point(point_id).map_or(1.0, |p| p.scale)
-}
 
 /// Daily counters (Wh) that `/api/day` turns into power:
 /// (key, counter metric, made-up id for the derived series, name).
@@ -159,30 +152,9 @@ struct Series {
     data: Vec<(i64, f64)>,
 }
 
-/// Loads one metric as a series. `point_id` in the answer is still the
-/// source's id for it, so the API does not change.
-async fn metric_series(
-    state: &AppState,
-    key: Option<&'static str>,
-    metric: Metric,
-    from: i64,
-    to: i64,
-) -> Result<Series, ApiError> {
-    let point_id = points::for_metric(metric).point_id;
-    let (name, unit) = db::point_info(&state.pool, point_id)
-        .await?
-        .unwrap_or((None, None));
-    let data = db::readings_in_range(&state.pool, state.plant_id, metric, from, to).await?;
-    Ok(Series {
-        key,
-        point_id,
-        name,
-        unit,
-        data,
-    })
-}
-
-/// Loads one stored point, named by the caller, as a series.
+/// Loads one point, named by its source id, as a series. The store is keyed
+/// by metric, so the point id is mapped to its metric first; a point with no
+/// metric has no stored readings and gives an empty series.
 async fn stored_series(
     state: &AppState,
     key: Option<&'static str>,
@@ -193,11 +165,12 @@ async fn stored_series(
     let (name, unit) = db::point_info(&state.pool, point_id)
         .await?
         .unwrap_or((None, None));
-    let data = db::point_readings_in_range(&state.pool, state.plant_id, point_id, from, to)
-        .await?
-        .into_iter()
-        .map(|(ts, value)| (ts, display_value(point_id, value)))
-        .collect();
+    let data = match points::for_point(point_id) {
+        Some(map) => {
+            db::readings_in_range(&state.pool, state.plant_id, map.metric, from, to).await?
+        }
+        None => Vec::new(),
+    };
     Ok(Series {
         key,
         point_id,
@@ -213,20 +186,24 @@ pub async fn healthz() -> Json<Value> {
 }
 
 pub async fn latest(State(state): State<AppState>) -> ApiResult {
-    let rows: Vec<LatestReading> = db::latest_readings(&state.pool, state.plant_id).await?;
-    let points: Vec<Value> = rows
-        .into_iter()
-        .map(|r| {
-            json!({
-                "point_id": r.point_id,
-                "name": r.name,
-                "unit": r.unit,
-                "ts": r.ts,
-                "value": display_value(r.point_id, r.value),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "points": points })))
+    let mut rows = db::latest_metric_readings(&state.pool, state.plant_id).await?;
+    // The same order as before the store was keyed by metric: by point id.
+    rows.sort_by_key(|(metric, _, _)| points::for_metric(*metric).point_id);
+    let mut out: Vec<Value> = Vec::new();
+    for (metric, ts, value) in rows {
+        let point_id = points::for_metric(metric).point_id;
+        let (name, unit) = db::point_info(&state.pool, point_id)
+            .await?
+            .unwrap_or((None, None));
+        out.push(json!({
+            "point_id": point_id,
+            "name": name,
+            "unit": unit,
+            "ts": ts,
+            "value": value,
+        }));
+    }
+    Ok(Json(json!({ "points": out })))
 }
 
 /// `{"sample": ..., "car": ..., "grid_pull": ...}`. The sample is the newest
@@ -1024,7 +1001,8 @@ pub async fn day(State(state): State<AppState>, Query(params): Query<DayParams>)
 
     let mut series = Vec::new();
     for (key, metric) in POWER_METRICS {
-        series.push(metric_series(&state, Some(key), metric, start, end).await?);
+        let point_id = points::for_metric(metric).point_id;
+        series.push(stored_series(&state, Some(key), point_id, start, end).await?);
     }
     for (key, counter_metric, derived_id, name) in DERIVED_METRICS {
         let counter =
@@ -1529,16 +1507,6 @@ mod tests {
         assert!(none["now_w"].is_null() && none["peak_today_w"].is_null());
         assert_eq!(none["warn_w"], 12500);
         assert!(grid_pull_json(Some(&sample(None)), None, 12.0, 15.0)["now_w"].is_null());
-    }
-
-    #[test]
-    fn soc_is_shown_as_a_percentage() {
-        let soc = points::for_metric(Metric::SocPct).point_id;
-        let pv = points::for_metric(Metric::PvW).point_id;
-        assert!((display_value(soc, 0.674) - 67.4).abs() < 1e-9);
-        assert_eq!(display_value(pv, 1500.0), 1500.0);
-        // A point we do not know is shown as stored.
-        assert_eq!(display_value(1, 0.5), 0.5);
     }
 
     #[test]
