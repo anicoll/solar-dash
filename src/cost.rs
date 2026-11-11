@@ -688,6 +688,15 @@ impl DayPrices {
         }
         Self { general, feed_in }
     }
+
+    /// Seconds of `[from, to)` that have a general (import) price: how well
+    /// a day is covered.
+    pub fn general_covered_secs(&self, from: i64, to: i64) -> i64 {
+        self.general
+            .iter()
+            .map(|s| (s.end_ts.min(to) - s.start_ts.max(from)).max(0))
+            .sum()
+    }
 }
 
 /// A day's cost from stored prices, and how much of it had to fall back to

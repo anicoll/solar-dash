@@ -260,6 +260,7 @@ mod tests {
             token: "t".to_string(),
             site_id: Some("s1".to_string()),
             base_url: format!("http://{addr}/v1"),
+            compare: Default::default(),
         }
     }
 

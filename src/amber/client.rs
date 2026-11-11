@@ -287,6 +287,7 @@ mod tests {
             token: token.to_string(),
             site_id: None,
             base_url,
+            compare: Default::default(),
         }
     }
 
