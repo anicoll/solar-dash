@@ -480,8 +480,9 @@ pub async fn series(
 /// km come from the daily odometer readings, and each session counts in the
 /// month it started. Home sessions are costed like `/api/ev/sessions` does;
 /// away sessions at `away_cents_per_kwh` (see `ev_cost::summarise`).
-/// `configured` is false, and the money fields are null, without a
-/// `petrol_cents_per_litre` in `[teslamate]`.
+/// Petrol is priced for each month from the petrol price history, like
+/// `/api/ev/cars` does. `configured` is false, and the money fields are null,
+/// without a `petrol_cents_per_litre` or any monthly petrol price.
 pub async fn ev_summary(
     State(state): State<AppState>,
     Query(params): Query<DailyParams>,
@@ -500,7 +501,9 @@ pub async fn ev_summary(
     let odometer = db::odometer_in_range(&state.pool, &from.to_string(), &to.to_string()).await?;
     let km_by_month = ev_cost::monthly_km(&odometer, &from.to_string());
 
-    let prices = state.admin.get().ev_prices;
+    let data = state.admin.get();
+    let prices = data.ev_prices;
+    let petrol = &data.petrol;
     let now = db::now();
     let mut sessions = Vec::new();
     // The query includes sessions that began before the range and are still
@@ -518,7 +521,7 @@ pub async fn ev_summary(
         let at_home = ev_cost::is_home(&session);
         let cost_cents = if !at_home {
             prices.away_cents_per_kwh.map(|cents| cents * kwh)
-        } else if prices.petrol_cents_per_litre.is_some() {
+        } else if petrol.is_configured() {
             home_session_cost(&state, &session, now)
                 .await?
                 .map(|cost| cost.cost_cents)
@@ -534,7 +537,7 @@ pub async fn ev_summary(
         });
     }
 
-    let summary = ev_cost::summarise(&prices, &km_by_month, &sessions);
+    let summary = ev_cost::summarise(&prices, petrol, &km_by_month, &sessions);
     Ok(Json(json!({
         "configured": summary.configured,
         "months": summary.months,

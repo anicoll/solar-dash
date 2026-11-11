@@ -61,9 +61,10 @@ pub fn session_energy_kwh(session: &ChargeSession) -> Option<f64> {
         .filter(|kwh| *kwh > 0.0)
 }
 
-/// Whether a session was at home: the geofence "Home", or none at all.
+/// Whether a session was at home: only the geofence "Home". No geofence
+/// counts as away (public chargers have none), like the TeslaMate history.
 pub fn is_home(session: &ChargeSession) -> bool {
-    matches!(session.geofence.as_deref(), None | Some("Home"))
+    session.geofence.as_deref() == Some("Home")
 }
 
 /// Works out one session from the live `samples` (oldest first, any range
@@ -509,7 +510,7 @@ pub struct MonthSummary {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Summary {
-    /// False when there is no petrol price: the money fields are then null.
+    /// False when there is no petrol price at all: the money fields are then null.
     pub configured: bool,
     pub months: Vec<MonthSummary>,
     pub total: Period,
@@ -524,8 +525,15 @@ fn total_cost_cents(sessions: &[&SessionEnergy]) -> Option<f64> {
     sessions.iter().map(|s| s.cost_cents).sum()
 }
 
-/// Adds up one period's `km` and `sessions`.
-fn period(prices: &EvPrices, km: f64, sessions: &[&SessionEnergy]) -> Period {
+/// Adds up one period's `km` and `sessions`. `petrol_cents` is what petrol
+/// for those km cost, in cents; `None` when its price is not known, and then
+/// the money fields stay empty.
+fn period(
+    prices: &EvPrices,
+    km: f64,
+    sessions: &[&SessionEnergy],
+    petrol_cents: Option<f64>,
+) -> Period {
     let (home, away): (Vec<_>, Vec<_>) = sessions.iter().copied().partition(|s| s.at_home);
     let kwh = |sessions: &[&SessionEnergy]| sessions.iter().map(|s| s.kwh).sum::<f64>();
     let mut period = Period {
@@ -541,7 +549,7 @@ fn period(prices: &EvPrices, km: f64, sessions: &[&SessionEnergy]) -> Period {
         ev_cents_per_km: None,
         petrol_cents_per_km: None,
     };
-    let Some(petrol_cents) = prices.petrol_cents_per_litre else {
+    let Some(petrol_cost) = petrol_cents else {
         return period;
     };
 
@@ -549,7 +557,6 @@ fn period(prices: &EvPrices, km: f64, sessions: &[&SessionEnergy]) -> Period {
     let away_cost = total_cost_cents(&away);
     let charging_cost = home_cost.map(|home| home + away_cost.unwrap_or(0.0));
     let litres = km * prices.petrol_litres_per_100km / 100.0;
-    let petrol_cost = litres * petrol_cents;
     period.home_cost = home_cost.map(|c| round2(c / 100.0));
     period.away_cost = away_cost.map(|c| round2(c / 100.0));
     period.charging_cost = charging_cost.map(|c| round2(c / 100.0));
@@ -565,9 +572,13 @@ fn period(prices: &EvPrices, km: f64, sessions: &[&SessionEnergy]) -> Period {
 
 /// Adds the sessions and km up by month, and for the whole range.
 /// `km_by_month` is from [`monthly_km`]. A month with km or sessions gets a
-/// row, oldest first. Without a petrol price the money fields are all `None`.
+/// row, oldest first. Petrol is priced per month, from the price in effect on
+/// the first day of the month ([`PetrolHistory::on`]); a month with no known
+/// price has no money fields, and nor has the total if any month with km has
+/// none.
 pub fn summarise(
     prices: &EvPrices,
+    petrol: &PetrolHistory,
     km_by_month: &BTreeMap<String, f64>,
     sessions: &[SessionEnergy],
 ) -> Summary {
@@ -578,23 +589,44 @@ pub fn summarise(
     for session in sessions {
         by_month.entry(&session.month).or_default().push(session);
     }
+    // Petrol for some km in a month, in cents, at that month's price.
+    let petrol_cents = |month: &str, km: f64| {
+        let litres = km * prices.petrol_litres_per_100km / 100.0;
+        petrol
+            .on(&format!("{month}-01"))
+            .map(|cents| litres * cents)
+    };
+    let mut total_petrol = Some(0.0);
+    for (month, km) in km_by_month {
+        // A month without a price only spoils the total if the car drove.
+        match (petrol_cents(month, *km), *km > 0.0) {
+            (Some(cents), _) => total_petrol = total_petrol.map(|sum| sum + cents),
+            (None, true) => total_petrol = None,
+            (None, false) => {}
+        }
+    }
     let months = by_month
         .into_iter()
-        .map(|(month, sessions)| MonthSummary {
-            month: month.to_string(),
-            period: period(
-                prices,
-                km_by_month.get(month).copied().unwrap_or(0.0),
-                &sessions,
-            ),
+        .map(|(month, sessions)| {
+            let km = km_by_month.get(month).copied().unwrap_or(0.0);
+            MonthSummary {
+                month: month.to_string(),
+                period: period(prices, km, &sessions, petrol_cents(month, km)),
+            }
         })
         .collect();
     let all: Vec<&SessionEnergy> = sessions.iter().collect();
     let total_km = km_by_month.values().sum();
+    // With no km at all there is nothing to price, but a price must exist.
+    let total_petrol = if petrol.is_configured() {
+        total_petrol
+    } else {
+        None
+    };
     Summary {
-        configured: prices.petrol_cents_per_litre.is_some(),
+        configured: petrol.is_configured(),
         months,
-        total: period(prices, total_km, &all),
+        total: period(prices, total_km, &all, total_petrol),
     }
 }
 
@@ -1334,6 +1366,11 @@ mod tests {
         }
     }
 
+    /// The base price of [`prices`] and no changes.
+    fn petrol() -> PetrolHistory {
+        PetrolHistory::new(Some(200.0), Vec::new())
+    }
+
     fn charge(month: &str, at_home: bool, kwh: f64, cost_cents: Option<f64>) -> SessionEnergy {
         SessionEnergy {
             month: month.to_string(),
@@ -1389,7 +1426,7 @@ mod tests {
             charge("2026-09", false, 20.0, Some(1200.0)),
             charge("2026-10", true, 12.0, Some(300.0)),
         ];
-        let summary = summarise(&prices(), &km, &sessions);
+        let summary = summarise(&prices(), &petrol(), &km, &sessions);
         assert!(summary.configured);
         assert_eq!(summary.months.len(), 2);
         let september = &summary.months[0];
@@ -1417,7 +1454,12 @@ mod tests {
     fn summary_without_a_petrol_price_has_no_money() {
         let km = BTreeMap::from([("2026-09".to_string(), 400.0)]);
         let sessions = [charge("2026-09", true, 30.0, Some(750.0))];
-        let summary = summarise(&EvPrices::default(), &km, &sessions);
+        let summary = summarise(
+            &EvPrices::default(),
+            &PetrolHistory::default(),
+            &km,
+            &sessions,
+        );
         assert!(!summary.configured);
         let total = &summary.total;
         assert_eq!((total.km, total.home_kwh), (400.0, 30.0));
@@ -1436,19 +1478,48 @@ mod tests {
     }
 
     #[test]
+    fn summary_prices_petrol_by_month() {
+        let km = BTreeMap::from([
+            ("2026-09".to_string(), 400.0),
+            ("2026-10".to_string(), 100.0),
+        ]);
+        let sessions = [charge("2026-09", true, 10.0, Some(250.0))];
+        // No base price; $2.00 from 1 Oct only. September has no price.
+        let history = PetrolHistory::new(
+            None,
+            vec![(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), 200.0)],
+        );
+        let summary = summarise(&prices(), &history, &km, &sessions);
+        assert!(summary.configured);
+        assert_eq!(summary.months[0].period.petrol_cost, None);
+        assert_eq!(summary.months[1].period.petrol_cost, Some(16.0));
+        assert_eq!(summary.total.petrol_cost, None);
+        // With a base price of $1.00 and the change to $2.00 in October.
+        let history = PetrolHistory::new(
+            Some(100.0),
+            vec![(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), 200.0)],
+        );
+        let summary = summarise(&prices(), &history, &km, &sessions);
+        assert_eq!(summary.months[0].period.petrol_cost, Some(32.0));
+        assert_eq!(summary.months[1].period.petrol_cost, Some(16.0));
+        // 32 L at $1.00 plus 8 L at $2.00.
+        assert_eq!(summary.total.petrol_cost, Some(48.0));
+    }
+
+    #[test]
     fn away_sessions_without_a_price_are_uncosted() {
         let km = BTreeMap::from([("2026-09".to_string(), 100.0)]);
         let sessions = [
             charge("2026-09", true, 10.0, Some(250.0)),
             charge("2026-09", false, 20.0, None),
         ];
-        let p = summarise(&prices(), &km, &sessions).total;
+        let p = summarise(&prices(), &petrol(), &km, &sessions).total;
         assert_eq!((p.away_kwh, p.away_cost), (20.0, None));
         // Only the home part is counted in the charging cost.
         assert_eq!(p.charging_cost, Some(2.5));
         // Without a tariff the home part cannot be costed either.
         let sessions = [charge("2026-09", true, 10.0, None)];
-        let p = summarise(&prices(), &km, &sessions).total;
+        let p = summarise(&prices(), &petrol(), &km, &sessions).total;
         assert_eq!((p.home_cost, p.charging_cost, p.saved), (None, None, None));
         assert_eq!(p.petrol_cost, Some(16.0));
     }
@@ -1457,7 +1528,7 @@ mod tests {
     fn no_km_means_no_cents_per_km() {
         let km = BTreeMap::new();
         let sessions = [charge("2026-09", true, 10.0, Some(250.0))];
-        let summary = summarise(&prices(), &km, &sessions);
+        let summary = summarise(&prices(), &petrol(), &km, &sessions);
         // A month with a charge but no km still gets a row.
         assert_eq!(summary.months.len(), 1);
         let p = &summary.total;
