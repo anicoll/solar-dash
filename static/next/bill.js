@@ -355,13 +355,42 @@
       sub ? h('p', { class: 'label', text: sub }) : null);
   }
 
+  /** True for a bill period that has ended (the server's `finished`, or a period end before today). */
+  const isPast = (bill) => bill.finished === true;
+
+  /** Open the period holding `date` (YYYY-MM-DD), or this bill when `date` is null. The hash keeps back and reload working. */
+  const openPeriod = (date) => SD.go(date ? `bill?date=${date}` : 'bill');
+
+  /** "October" for a past bill, from the month it ends in (the same name the Your bills card uses). */
+  const pastName = (bill) => `${monthLong(bill.to)}${SD.caps.meter_name ? ` ${SD.caps.meter_name}` : ''} bill`;
+
+  /**
+   * The period switcher at the top of the hero: a back button, the period's dates and a forward
+   * button. Forward is disabled on the live bill. Both are 44 px touch targets.
+   */
+  function renderSwitcher(bill) {
+    const step = (dir, date, label) => h('button', {
+      type: 'button', class: `bill-step is-${dir}`, 'aria-label': label, disabled: date ? null : true,
+      onclick: () => openPeriod(date),
+    }, dir === 'prev' ? '\u2039' : '\u203a');
+    return h('div', { class: 'bill-switch' },
+      step('prev', bill.prev_date, 'Previous bill'),
+      h('p', { class: 'bill-switch-label', 'aria-live': 'polite' }, h('b', { text: `${SD.fmt.date(bill.from, 'short')} \u2013 ${SD.fmt.date(bill.to, 'short')}` })),
+      step('next', bill.next_date, 'Next bill'));
+  }
+
   function renderHero(bill, badge) {
     const s = bill.so_far;
     const elapsed = bill.days_elapsed;
     const prev = bill.previous && num(bill.previous.total_dollars) && bill.previous.days > 0 ? bill.previous : null;
     const range = projectionRange(bill);
+    const past = isPast(bill);
+    const heading = past ? pastName(bill) : SD.caps.meter_name ? `This ${SD.caps.meter_name} bill so far` : 'This bill so far';
     const root = h('section', { class: 'card bill-hero', 'aria-labelledby': 'bill-hero-h' },
-      h('h2', { class: 'label bill-hero-h', id: 'bill-hero-h', text: SD.caps.meter_name ? `This ${SD.caps.meter_name} bill so far` : 'This bill so far' }));
+      renderSwitcher(bill),
+      h('div', { class: 'bill-hero-row' },
+        h('h2', { class: 'label bill-hero-h', id: 'bill-hero-h', text: heading }),
+        past ? h('a', { class: 'bill-link bill-back', href: '#bill', text: 'Back to this bill' }) : null));
 
     if (elapsed < 1) {
       // Nothing to add up yet: only the plan's supply charge is known.
@@ -373,7 +402,12 @@
     }
 
     root.append(h('p', { class: 'bill-amount', text: SD.fmt.dollars(s.total_dollars) }));
-    if (range) {
+    if (past) {
+      // A finished bill is not a forecast: no projection, no track.
+      root.append(h('p', { class: 'bill-verdict' },
+        `Over ${plural(bill.days_total, 'day', 'days')}`,
+        prev ? `. The bill before was ${SD.fmt.dollars(prev.total_dollars)}.` : '.'));
+    } else if (range) {
       const lo = Math.round(range[0]);
       const hi = Math.round(range[1]);
       const text = lo === hi ? `about ${whole(range[1])}` : `${whole(range[0])} to ${whole(range[1])}`;
@@ -391,7 +425,7 @@
     }
     if (num(s.without_system_dollars)) {
       stats.push(stat('No system', SD.fmt.dollars(s.without_system_dollars),
-        num(bill.projected_without_system_dollars) ? `~${whole(bill.projected_without_system_dollars)} bill` : null));
+        !past && num(bill.projected_without_system_dollars) ? `~${whole(bill.projected_without_system_dollars)} bill` : null));
     }
     if (num(s.credit_nights) && (s.credit_nights > 0 || s.credit_possible_nights > 0)) {
       const possible = num(s.credit_possible_nights) ? s.credit_possible_nights : null;
@@ -607,7 +641,7 @@
           : 'Each evening with almost no power bought in the credit window.',
       }));
     }
-    rows.push(item({ total: true, label: 'So far', amount: SD.fmt.dollars(s.total_dollars) }));
+    rows.push(item({ total: true, label: isPast(bill) ? 'Total' : 'So far', amount: SD.fmt.dollars(s.total_dollars) }));
 
     return {
       title: 'Line by line',
@@ -746,15 +780,15 @@
     const table = h('table', { class: 'bill-cmp' },
       h('caption', { class: 'sr-only', text: 'Cost per day, this bill against last bill' }),
       h('thead', {}, h('tr', {},
-        h('th', { scope: 'col', text: 'Per day' }), h('th', { scope: 'col', text: 'Last bill' }),
+        h('th', { scope: 'col', text: 'Per day' }), h('th', { scope: 'col', text: isPast(bill) ? 'Before' : 'Last bill' }),
         h('th', { scope: 'col', text: 'This bill' }), h('th', { scope: 'col', text: 'Change' }))),
       h('tbody', {}, body));
-    const notes = [`Last bill ran ${SD.fmt.date(prev.from, 'short')} to ${SD.fmt.date(prev.to, 'short')} (${plural(prev.days, 'day', 'days')}).`];
+    const notes = [`${isPast(bill) ? 'The bill before' : 'Last bill'} ran ${SD.fmt.date(prev.from, 'short')} to ${SD.fmt.date(prev.to, 'short')} (${plural(prev.days, 'day', 'days')}).`];
     if (num(prev.credit_nights) && prev.credit_nights > 0 && prev.credit_nights < prev.days) {
       notes.push(`It earned the credit on ${prev.credit_nights} of ${prev.days} evenings.`);
     }
     return {
-      title: 'Against last bill',
+      title: isPast(bill) ? 'Against the bill before' : 'Against last bill',
       summary: `${amt(nowTotal)} a day, was ${amt(lastTotal)}`,
       fig: [`${diff > 0.0049 ? '+' : ''}${amt(diff)}`, h('span', { class: 'bill-ph-u', text: '/day' })],
       figClass: diff < -0.0049 ? 'is-good' : diff > 0.0049 ? 'is-bad' : '',
@@ -786,7 +820,7 @@
     const row = (name, value, cls, total) => h('tr', { class: total ? 'is-tot' : null },
       h('th', { scope: 'row', text: name }), h('td', { class: cls || null, text: value }));
     const table = h('table', { class: 'bill-cmp bill-amber' },
-      h('caption', { class: 'sr-only', text: 'Your bill so far on your plan and on Amber' }),
+      h('caption', { class: 'sr-only', text: 'Your bill on your plan and on Amber' }),
       h('tbody', {},
         row('Your plan', SD.fmt.dollars(t.current_dollars)),
         row('On Amber', SD.fmt.dollars(t.dynamic_dollars)),
@@ -989,11 +1023,15 @@
     const past = (Array.isArray(bill.history) ? bill.history : []).filter((b) => b && num(b.total_dollars) && b.to).slice(-5);
     if (!past.length) return null;
     const range = projectionRange(bill);
+    // Each bar opens its period; the bar for the period on screen is marked and does nothing.
     const bars = past.map((b) => ({
-      mon: monthShort(b.to), name: monthLong(b.to), value: Number(b.total_dollars), without: num(b.without_system_dollars) ? Number(b.without_system_dollars) : null, proj: false,
+      mon: monthShort(b.to), name: monthLong(b.to), value: Number(b.total_dollars), without: num(b.without_system_dollars) ? Number(b.without_system_dollars) : null, proj: false, date: b.to,
     }));
-    if (range) {
-      bars.push({ mon: monthShort(bill.to), name: monthLong(bill.to), value: range[0], without: num(bill.projected_without_system_dollars) ? Number(bill.projected_without_system_dollars) : null, proj: true });
+    if (isPast(bill)) {
+      // The period on screen is finished: its bar is real money, not a projection.
+      bars.push({ mon: monthShort(bill.to), name: monthLong(bill.to), value: Number(bill.so_far.total_dollars), without: num(bill.so_far.without_system_dollars) ? Number(bill.so_far.without_system_dollars) : null, proj: false, here: true });
+    } else if (range) {
+      bars.push({ mon: monthShort(bill.to), name: monthLong(bill.to), value: range[0], without: num(bill.projected_without_system_dollars) ? Number(bill.projected_without_system_dollars) : null, proj: true, here: true });
     }
     const max = Math.max(1, ...bars.map((b) => b.value));
     const cols = { style: `grid-template-columns: repeat(${bars.length}, minmax(0, 1fr))` };
@@ -1012,12 +1050,17 @@
       fig: whole(sumPast),
       collapse: true,
       body: h('div', {},
-        h('div', Object.assign({ class: 'bill-hist', role: 'img', 'aria-label': label }, cols),
-          bars.map((b) => h('div', { class: 'bill-hcol' },
-            h('span', { class: 'bill-amt fig', text: b.proj ? `~${whole(b.value)}` : whole(b.value) }),
-            h('span', { class: `bill-hbar${b.proj ? ' is-proj' : ''}`, style: `height: ${Math.max(4, (Math.max(0, b.value) / max) * 112).toFixed(1)}px` })))),
+        h('div', Object.assign({ class: 'bill-hist', role: 'group', 'aria-label': label }, cols),
+          bars.map((b) => {
+            const kids = [
+              h('span', { class: 'bill-amt fig', text: b.proj ? `~${whole(b.value)}` : whole(b.value) }),
+              h('span', { class: `bill-hbar${b.proj ? ' is-proj' : ''}`, style: `height: ${Math.max(4, (Math.max(0, b.value) / max) * 112).toFixed(1)}px` })];
+            const said = b.proj ? `${b.name} bill, about ${whole(b.value)} projected` : `${b.name} bill, ${SD.fmt.dollars(b.value)}`;
+            if (b.here) return h('div', { class: 'bill-hcol is-here', role: 'img', 'aria-label': `${said}. Showing now.` }, kids);
+            return h('button', { type: 'button', class: 'bill-hcol bill-hbtn', 'aria-label': `Open the ${said}`, onclick: () => openPeriod(b.date) }, kids);
+          })),
         h('div', Object.assign({ class: 'bill-hlab', 'aria-hidden': 'true' }, cols),
-          bars.map((b) => h('span', {}, h('b', { text: b.mon }), b.without != null ? `vs ${b.proj ? '~' : ''}${whole(b.without)}` : ''))),
+          bars.map((b) => h('span', { class: b.here ? 'is-here' : null }, h('b', { text: b.mon }), b.without != null ? `vs ${b.proj ? '~' : ''}${whole(b.without)}` : ''))),
         h('p', { class: 'bill-note' },
           past.length > 1 ? `${monthLong(dear.to)} was the dearest at ${SD.fmt.dollars(dear.total_dollars)}. ` : '',
           h('a', { class: 'bill-link', href: '#payback', text: 'See what the system saves in Payback' }))),
@@ -1111,27 +1154,25 @@
       : 'The figures are our estimate from the meter, using your plan\'s prices.';
     const d = (title, text) => h('details', {}, h('summary', { text }), h('p', { text: title }));
     return h('div', { class: 'bill-how a-how' },
-      d('It adds up every complete day in this bill: supply, power bought, feed-in and the evening credit. Today joins once it is over and the figures are in, usually the next morning.', 'How "so far" is worked out'),
-      d('The low end and the high end are two ways of finishing the bill: carry this bill\'s average day to the end of the period, or assume the days left are like last bill\'s average day. The real bill usually lands between the two.', 'How the projection range is worked out'),
+      d('It adds up every complete day in this bill: supply, power bought, feed-in and the evening credit. Today joins once it is over and the figures are in, usually the next morning.', isPast(bill) ? 'How the total is worked out' : 'How "so far" is worked out'),
+      isPast(bill) ? null : d('The low end and the high end are two ways of finishing the bill: carry this bill\'s average day to the end of the period, or assume the days left are like last bill\'s average day. The real bill usually lands between the two.', 'How the projection range is worked out'),
       d(`${source} "Without system" is the same house load bought from the grid with no solar or battery.`, 'Where the numbers come from'));
   }
 
   /* ---------------------------------------------------------------- page */
 
-  function periodLabel(bill) {
-    return `${SD.fmt.date(bill.from, 'short')} to ${SD.fmt.date(bill.to, 'short')}`;
-  }
-
   function renderHead(bill) {
     const elapsed = num(bill.days_elapsed) ? bill.days_elapsed : 0;
     const total = num(bill.days_total) ? bill.days_total : null;
     const left = total != null ? Math.max(0, total - elapsed) : null;
-    const line = total != null
-      ? `Day ${Math.min(elapsed + 1, total)} of ${total}${left != null ? ` · closes in ${plural(left, 'day', 'days')}` : ''}`
-      : null;
+    const line = isPast(bill)
+      ? `Finished · ${plural(elapsed, 'day', 'days')}`
+      : total != null
+        ? `Day ${Math.min(elapsed + 1, total)} of ${total}${left != null ? ` · closes in ${plural(left, 'day', 'days')}` : ''}`
+        : null;
     return h('header', { class: 'page-head bill-head' },
       h('h1', { class: 'bill-title', text: 'Bill' }),
-      h('p', { class: 'bill-period' }, h('b', { text: periodLabel(bill) }), line ? h('br') : null, line));
+      h('p', { class: 'bill-period', text: line }));
   }
 
   /**
@@ -1208,7 +1249,7 @@
       side = h('div', { class: 'bill-side a-side' },
         safe(() => tiles(bill)),
         slot,
-        panel('cut', '', () => cutPanel(bill, tariff)));
+        isPast(bill) ? null : panel('cut', '', () => cutPanel(bill, tariff)));
       grid.append(...[
         panel('flow', 'a-flow', () => waterfall(bill)),
         panel('lines', 'a-lines', () => linesPanel(bill, tariff)),
@@ -1235,11 +1276,15 @@
 
     /** Fill the Amber slot: the selected what-if period first, the other chips afterwards. */
     async function loadAmber() {
+      const past = isPast(bill);
+      // A finished bill is judged over its own dates only; the rolling windows are about today.
       const periods = [
-        { key: 'bill', label: 'This bill so far', from: bill.from, to: last },
-        { key: 'd30', label: 'Last 30 days', from: addDays(today, -30), to: yesterday },
-        // A 90-day answer is only worth a chip when the stored prices cover most of it.
-        { key: 'd90', label: 'Last 90 days', from: addDays(today, -90), to: yesterday, enough: 60 },
+        { key: 'bill', label: past ? pastName(bill) : 'This bill so far', from: bill.from, to: last },
+        ...(past ? [] : [
+          { key: 'd30', label: 'Last 30 days', from: addDays(today, -30), to: yesterday },
+          // A 90-day answer is only worth a chip when the stored prices cover most of it.
+          { key: 'd90', label: 'Last 90 days', from: addDays(today, -90), to: yesterday, enough: 60 },
+        ]),
       ];
       const get = (p) => late.whatif(p.from, p.to).then((res) => ({
         key: p.key, label: p.label, res: p.enough && !(res && res.totals && res.totals.days >= p.enough) ? null : res,
@@ -1257,26 +1302,36 @@
         return;
       }
       // The bill period has no usable answer: look at the other periods and the plain comparison.
-      const [rest1, rest2, amber] = await Promise.all([get(periods[1]), get(periods[2]), late.amber(bill.from, last)]);
+      const [rest, amber] = await Promise.all([Promise.all(periods.slice(1).map(get)), late.amber(bill.from, last)]);
       if (!alive) return;
-      fillAmber(safe(() => whatifPanel([firstPeriod, rest1, rest2])) || safe(() => amberPanel(amber)));
+      fillAmber(safe(() => whatifPanel([firstPeriod, ...rest])) || safe(() => amberPanel(amber)));
     }
   }
 
+  /** The `date` in a `#bill?date=YYYY-MM-DD` hash, or null (this bill) when it is missing or malformed. */
+  function dateOf(query) {
+    const date = new URLSearchParams(query || '').get('date');
+    return date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
+  }
+
   SD.page('bill', {
-    mount(el) {
+    // The router remounts this page when only the query changes, so `date` is read once here.
+    mount(el, rest, query) {
       alive = true;
       desktopQuery = window.matchMedia('(min-width: 760px)');
       el.append(h('p', { class: 'muted bill-loading', role: 'status', text: 'Loading your bill' }));
+      const date = dateOf(query);
 
-      const load = () => SD.fetchJSON('/api/bill/current').catch((err) => {
+      const load = () => SD.fetchJSON(date ? `/api/bill/current?date=${date}` : '/api/bill/current').catch((err) => {
         if (err && err.status === 404) return { missing: true };
+        // A date the server refuses (in the future) opens this bill instead.
+        if (date && err && err.status === 400) { openPeriod(null); return { redirected: true }; }
         throw err;
       });
 
       const tariffPromise = SD.tariff.get().catch(() => null);
       load().then(async (bill) => {
-        if (!alive) return;
+        if (!alive || bill.redirected) return;
         el.replaceChildren();
         if (bill.missing) {
           el.append(

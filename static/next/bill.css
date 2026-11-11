@@ -1475,3 +1475,80 @@
 #page-bill .bill-slot-line {
   margin: 0;
 }
+
+/* ---------- period switcher and tappable bars ---------- */
+
+#page-bill .bill-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: -10px -8px 6px;
+}
+
+#page-bill .bill-switch-label {
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+  font-size: 15px;
+  color: var(--ink);
+}
+
+#page-bill .bill-step {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 26px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#page-bill .bill-step:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+#page-bill .bill-step:focus-visible,
+#page-bill .bill-hbtn:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+#page-bill .bill-hero-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+#page-bill .bill-back {
+  flex: none;
+  padding: 10px 0;
+  font-size: 14px;
+}
+
+#page-bill .bill-hbtn {
+  min-width: 44px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+#page-bill .bill-hbtn:hover .bill-hbar {
+  opacity: 0.75;
+}
+
+#page-bill .bill-hlab .is-here b {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}

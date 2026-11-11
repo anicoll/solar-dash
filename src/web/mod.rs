@@ -2575,6 +2575,86 @@ mod tests {
         assert!(json["projected_total_dollars"].is_number());
     }
 
+    /// `/api/bill/current` as JSON, for a request that must succeed.
+    async fn bill_json(app: &Router, cookie: &str, uri: &str) -> serde_json::Value {
+        let response = send(app, get_request(uri, Some(cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await
+    }
+
+    #[tokio::test]
+    async fn current_bill_steps_back_to_a_finished_period() {
+        let (_dir, app, pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        let tz = chrono_tz::Australia::Adelaide;
+        let today = api::today(tz);
+        // Data from 90 days ago, so the periods just before now have a past.
+        let first_day = today - chrono::Days::new(90);
+        let start = api::day_bounds_or_error(first_day, tz).unwrap().0;
+        seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
+
+        let current = bill_json(&app, &cookie, "/api/bill/current").await;
+        assert_eq!(current["finished"], false);
+        assert!(current["next_date"].is_null());
+        assert!(current["prev_date"].is_string());
+
+        let date = today - chrono::Days::new(35);
+        let uri = format!("/api/bill/current?date={date}");
+        let past = bill_json(&app, &cookie, &uri).await;
+        let (from, to) = (past["from"].as_str().unwrap(), past["to"].as_str().unwrap());
+        assert!(from <= date.to_string().as_str() && date.to_string().as_str() <= to);
+        assert_eq!(past["finished"], true);
+        assert_eq!(past["days_elapsed"], past["days_total"]);
+        // A finished bill's projection is its actual total.
+        assert_eq!(
+            past["projected_total_dollars"],
+            past["so_far"]["total_dollars"]
+        );
+        assert_eq!(
+            past["projected_low_dollars"],
+            past["projected_high_dollars"]
+        );
+        // The next period starts the day after this one ends.
+        let next = bill_json(
+            &app,
+            &cookie,
+            &format!(
+                "/api/bill/current?date={}",
+                past["next_date"].as_str().unwrap()
+            ),
+        )
+        .await;
+        assert_eq!(
+            next["from"].as_str().unwrap(),
+            (chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d").unwrap() + chrono::Days::new(1))
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn current_bill_has_no_earlier_period_before_the_first_data() {
+        let (_dir, app, _pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        let json = bill_json(&app, &cookie, "/api/bill/current").await;
+        assert!(json["prev_date"].is_null());
+        assert!(json["next_date"].is_null());
+    }
+
+    #[tokio::test]
+    async fn current_bill_rejects_bad_and_future_dates() {
+        let (_dir, app, _pool) = costs_app().await;
+        let cookie = log_in(&app).await;
+        let tomorrow = api::today(chrono_tz::Australia::Adelaide) + chrono::Days::new(1);
+        for uri in [
+            "/api/bill/current?date=bad".to_string(),
+            "/api/bill/current?date=2026-13-01".to_string(),
+            format!("/api/bill/current?date={tomorrow}"),
+        ] {
+            let response = send(&app, get_request(&uri, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
     #[tokio::test]
     async fn tariff_needs_a_session_and_a_tariff() {
         let (_dir, app) = test_app().await;
