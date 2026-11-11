@@ -173,6 +173,53 @@
     return res.json();
   };
 
+  /* ---------------------------------------------------------------- capabilities */
+
+  /* What this install can do, from GET /api/capabilities (which sources are running).
+     SD.caps always holds an answer: everything true until the server says otherwise, so an
+     older server without the endpoint looks exactly as it always did.
+     SD.capabilities() -> Promise<caps>, fetched once and cached. It never rejects. */
+  const ALL_TRUE = {
+    live: true, history: true, meter: true, prices: true, costs: true, cars: true, payback: true,
+    meter_name: null, sources: [],
+  };
+  SD.caps = ALL_TRUE;
+  let capsPromise = null;
+
+  SD.capabilities = function () {
+    if (!capsPromise) {
+      // A short timeout, so a hung request cannot keep the first page waiting.
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 4000);
+      capsPromise = SD.fetchJSON('/api/capabilities', { signal: ctl.signal })
+        .then((c) => {
+          if (!c || typeof c !== 'object') return ALL_TRUE;
+          // Keys the server leaves out count as true; only an explicit false hides something.
+          const merged = Object.assign({}, ALL_TRUE, c);
+          for (const k of ['live', 'history', 'meter', 'prices', 'costs', 'cars', 'payback']) merged[k] = c[k] !== false;
+          return merged;
+        })
+        .catch(() => ALL_TRUE) // 404 on an older server, or any failure: show everything
+        .then((c) => { clearTimeout(timer); SD.caps = c; return c; });
+    }
+    return capsPromise;
+  };
+
+  /* The retailer's name for wording: "GloBird" when the server says so, otherwise "your retailer".
+     SD.retailer({cap:true}) capitalises it for the start of a sentence. */
+  SD.retailer = function (opts) {
+    const name = SD.caps.meter_name || 'your retailer';
+    return opts && opts.cap ? name.charAt(0).toUpperCase() + name.slice(1) : name;
+  };
+
+  /** A calm "nothing here yet" card: a heading, one sentence and (optionally) a link. */
+  SD.emptyState = function (title, text, link) {
+    return SD.h('section', { class: 'card sd-empty' },
+      SD.h('h2', { class: 'section-title', text: title }),
+      SD.h('p', { class: 'muted', text }),
+      link ? SD.h('a', { class: 'card-link', href: link.href || '#admin', text: link.text || 'Open Admin' }) : null);
+  };
+
   /* ---------------------------------------------------------------- formatters */
 
   const num = (n) => n != null && Number.isFinite(Number(n));
@@ -517,6 +564,8 @@
     const box = document.getElementById('sd-live');
     const text = document.getElementById('sd-live-text');
     if (!box || !text) return;
+    // No live source: the pill would only ever say "No live reading", so hide it.
+    if (!SD.caps.live) { box.hidden = true; return; }
     let data = null;
     let failed = false;
     function paint() {
@@ -541,6 +590,19 @@
   const TITLES = { today: 'Today', bill: 'Bill', history: 'History', cars: 'Cars', payback: 'Payback', admin: 'Settings' };
   const pages = {};
   let current = null; // {name, rest}
+
+  // Pages that need a capability, with what to say when it is missing.
+  const GATES = {
+    bill: { cap: 'costs', title: 'No plan set up yet', text: 'Add a plan in Admin to see your bill.' },
+    cars: { cap: 'cars', title: 'No cars yet', text: 'Add a car in Admin, or connect TeslaMate.' },
+    payback: { cap: 'payback', title: 'No purchases yet', text: 'Add a plan and a system purchase in Admin to see when it pays for itself.' },
+  };
+  const gated = (name) => !!GATES[name] && SD.caps[GATES[name].cap] === false;
+
+  /** Hides the tabs of gated pages (top bar and phone bar). */
+  function applyNav() {
+    for (const a of document.querySelectorAll('[data-nav]')) a.hidden = gated(a.dataset.nav);
+  }
 
   SD.route = function () {
     const raw = decodeURIComponent(location.hash.replace(/^#/, ''));
@@ -568,7 +630,7 @@
       if (current.rest === next.rest) return;
       const page = pages[next.name];
       current = next;
-      if (page && page.update) { page.update(next.rest); return; }
+      if (page && page.update && !gated(next.name)) { page.update(next.rest); return; }
       remount(next);
       return;
     }
@@ -581,7 +643,7 @@
   function unmountCurrent() {
     const el = section(current.name);
     const page = pages[current.name];
-    try { if (page && page.unmount) page.unmount(); } catch (e) { console.error(e); }
+    try { if (page && page.unmount && !current.gated) page.unmount(); } catch (e) { console.error(e); }
     el.replaceChildren();
     el.hidden = true;
   }
@@ -597,6 +659,14 @@
     }
     const page = pages[route.name];
     if (!page) { el.append(SD.h('p', { class: 'muted', text: 'This page is not available yet.' })); return; }
+    // A page opened directly (by its hash) while its source is missing: explain, do not mount it.
+    route.gated = gated(route.name);
+    if (route.gated) {
+      const g = GATES[route.name];
+      el.append(SD.h('header', { class: 'page-head' }, SD.h('h1', { text: TITLES[route.name] })),
+        SD.emptyState(g.title, g.text, { href: '#admin', text: 'Open Admin' }));
+      return;
+    }
     try { page.mount(el, route.rest); } catch (e) {
       console.error(e);
       el.replaceChildren(SD.h('div', { class: 'card', role: 'alert' }, SD.h('p', { text: 'This page failed to load. ' + e.message })));
@@ -606,7 +676,7 @@
   function remount(route) {
     const el = section(route.name);
     const page = pages[route.name];
-    try { if (page && page.unmount) page.unmount(); } catch (e) { console.error(e); }
+    try { if (page && page.unmount && !gated(route.name)) page.unmount(); } catch (e) { console.error(e); }
     el.replaceChildren();
     mount(route);
   }
@@ -623,7 +693,11 @@
     }
     applyTheme();
     window.addEventListener('hashchange', render);
-    render();
-    startHeaderLive();
+    // Wait for the capabilities (cached, never rejects, 4 s at most) so the first paint is the right one.
+    SD.capabilities().then(() => {
+      applyNav();
+      render();
+      startHeaderLive();
+    });
   });
 })();

@@ -289,7 +289,9 @@ button {
   background: var(--card);
   border-top: 1px solid var(--line);
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* Equal columns however many tabs are showing (hidden ones take no space). */
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   padding: 6px 8px calc(8px + env(safe-area-inset-bottom));
 }
 
@@ -305,6 +307,11 @@ button {
   font-size: 12px;
   font-weight: 500;
   border-radius: 12px;
+}
+
+.tabbar a[hidden],
+.topnav a[hidden] {
+  display: none;
 }
 
 .tabbar a[aria-current="page"] {
@@ -372,6 +379,11 @@ button {
   min-height: 44px;
   display: inline-flex;
   align-items: center;
+}
+
+/* The empty-state card (SD.emptyState): a heading, one sentence, a link. */
+.sd-empty p {
+  margin: 6px 0 0;
 }
 
 /* A card that outlines itself, such as the credit window card. */
