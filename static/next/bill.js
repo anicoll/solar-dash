@@ -1,4 +1,4 @@
-/* Bill page: what this GloBird bill is so far, where it is heading, whether the
+/* Bill page: what this bill is so far, where it is heading, whether the
    numbers can be trusted, how each line is made up, and what is left to cut.
 
    Data (fetched together, none of them blocks the others):
@@ -148,7 +148,7 @@
     const odd = check.categories.filter((c) => c.bucket === 'other' && Math.abs(c.amount) >= 0.5);
     if (odd.length) {
       const names = odd.slice(0, 2).map((c) => c.category.toLowerCase()).join(' and ');
-      return `GloBird has charges we do not price, such as ${names}.`;
+      return `${SD.retailer({ cap: true })} has charges we do not price, such as ${names}.`;
     }
     const parts = [['import', 'power bought'], ['export', 'feed-in'], ['supply', 'supply'], ['credit', 'the evening credit']];
     let best = null;
@@ -165,8 +165,8 @@
   function renderBadge(check, onToggle) {
     const close = check.tier != null;
     const title = close
-      ? `Matches GloBird's meter within ${SD.fmt.cents(Math.round(check.tier * 100))}`
-      : `Our estimate is ${SD.fmt.dollars(Math.abs(check.gap))} ${check.gap < 0 ? 'under' : 'over'} GloBird's bill`;
+      ? `Matches ${SD.retailer()}'s meter within ${SD.fmt.cents(Math.round(check.tier * 100))}`
+      : `Our estimate is ${SD.fmt.dollars(Math.abs(check.gap))} ${check.gap < 0 ? 'under' : 'over'} ${SD.retailer()}'s bill`;
     const sub = close
       ? `Checked to ${SD.fmt.date(check.lastDate, 'short')}, ${check.compared} of ${plural(check.posted, 'day', 'days')}`
       : (gapReason(check) || `Over ${plural(check.compared, 'day', 'days')} checked. Tap for the day-by-day gap.`);
@@ -195,7 +195,7 @@
     const o = d.ours;
     const out = [
       h('b', { text: SD.fmt.date(d.date, 'medium') }),
-      h('span', { text: `Our estimate ${SD.fmt.dollars(o.total)}, GloBird ${SD.fmt.dollars(g.total)}` }),
+      h('span', { text: `Our estimate ${SD.fmt.dollars(o.total)}, ${SD.retailer({ cap: true })} ${SD.fmt.dollars(g.total)}` }),
       h('span', { text: `Gap ${signed(d.diff.total)}` }),
     ];
     const parts = [
@@ -245,7 +245,7 @@
     rows.forEach((d, i) => {
       const v = d.diff.total;
       const close = Math.abs(v) <= DAY_CLOSE;
-      const said = `${SD.fmt.date(d.date, 'medium')}: our estimate ${signed(v)} against GloBird`;
+      const said = `${SD.fmt.date(d.date, 'medium')}: our estimate ${signed(v)} against ${SD.retailer()}`;
       const bar = h('span', { class: `bill-check-bar${close ? ' is-close' : ''}`, style: `height: ${pct(v)}` });
       const value = rows.length <= 7 || d === biggest ? h('span', { class: 'bill-check-value', text: signed(v).replace('.00', '') }) : null;
       const col = h('button', {
@@ -270,14 +270,14 @@
 
     const far = rows.filter((d) => Math.abs(d.diff.total) > DAY_CLOSE).length;
     const summary = far === 0
-      ? `Every checked day is within ${SD.fmt.cents(DAY_CLOSE * 100)} of GloBird.`
+      ? `Every checked day is within ${SD.fmt.cents(DAY_CLOSE * 100)} of ${SD.retailer()}.`
       : `${plural(far, 'day is', 'days are')} more than ${SD.fmt.cents(DAY_CLOSE * 100)} out. The biggest gap was ${SD.fmt.dollars(Math.abs(biggest.diff.total))} ${biggest.diff.total < 0 ? 'under' : 'over'} on ${SD.fmt.date(biggest.date, 'short')}.`;
 
     return h('section', { class: 'card bill-check-card', id: 'bill-check-card', 'aria-labelledby': 'bill-check-h' },
       h('div', { class: 'card-head bill-wrap' },
         h('h2', { class: 'section-title', id: 'bill-check-h', text: 'Bill check, day by day' })),
       h('p', { class: 'bill-check-key' },
-        'Each bar is one day: our estimate minus what GloBird charged. Above the line we estimated more, below it less. ',
+        `Each bar is one day: our estimate minus what ${SD.retailer()} charged. Above the line we estimated more, below it less. `,
         h('span', { class: 'bill-check-key-band' }), ` Within ${SD.fmt.cents(DAY_CLOSE * 100)}.`),
       h('div', { class: 'bill-check-chart' }, scale,
         h('div', { class: 'bill-check-area' }, band, h('div', { class: 'bill-check-zero', 'aria-hidden': 'true' }), plot, tip)),
@@ -358,7 +358,7 @@
     const prev = bill.previous && num(bill.previous.total_dollars) && bill.previous.days > 0 ? bill.previous : null;
     const range = projectionRange(bill);
     const root = h('section', { class: 'card bill-hero', 'aria-labelledby': 'bill-hero-h' },
-      h('h2', { class: 'label bill-hero-h', id: 'bill-hero-h', text: 'This GloBird bill so far' }));
+      h('h2', { class: 'label bill-hero-h', id: 'bill-hero-h', text: SD.caps.meter_name ? `This ${SD.caps.meter_name} bill so far` : 'This bill so far' }));
 
     if (elapsed < 1) {
       // Nothing to add up yet: only the plan's supply charge is known.
@@ -830,7 +830,7 @@
         ? ` Without the system each would have been about ${whole(Math.min(...bars.filter((b) => b.without != null).map((b) => b.without)))} to ${whole(Math.max(...bars.filter((b) => b.without != null).map((b) => b.without)))}.` : '');
 
     return {
-      title: 'Your GloBird bills',
+      title: SD.caps.meter_name ? `Your ${SD.caps.meter_name} bills` : 'Your bills',
       summary: `${plural(past.length, 'bill', 'bills')}${withSum != null ? `, ~${whole(withSum)} without the system` : ''}`,
       fig: whole(sumPast),
       collapse: true,
@@ -929,8 +929,8 @@
   /* ---------------------------------------------------------------- 10. how this is worked out */
 
   function renderHow(bill) {
-    const source = bill.uses_globird_figures
-      ? 'Days GloBird has posted use its own billed amounts. Newer days use our meter readings and your plan\'s prices until GloBird catches up.'
+    const source = SD.caps.meter && bill.uses_globird_figures
+      ? `Days ${SD.retailer()} has posted use its own billed amounts. Newer days use our meter readings and your plan's prices until ${SD.retailer()} catches up.`
       : 'The figures are our estimate from the meter, using your plan\'s prices.';
     const d = (title, text) => h('details', {}, h('summary', { text }), h('p', { text: title }));
     return h('div', { class: 'bill-how a-how' },
@@ -1055,10 +1055,11 @@
         const today = SD.local().date;
         const last = bill.to < today ? bill.to : today;
         const [compare, tariff, amber] = await Promise.all([
-          quiet(`/api/globird/compare?from=${bill.from}&to=${last}`),
+          // No retailer meter source: nothing to check against, so skip the call (and the trust badge).
+          SD.caps.meter ? quiet(`/api/globird/compare?from=${bill.from}&to=${last}`) : null,
           SD.tariff.get().catch(() => null),
           // {configured: false} without [amber], and the panel stays out.
-          quiet(`/api/bill/compare-dynamic?from=${bill.from}&to=${last}`),
+          SD.caps.prices ? quiet(`/api/bill/compare-dynamic?from=${bill.from}&to=${last}`) : null,
         ]);
         if (!alive) return;
         build(el, bill, { compare, tariff, amber });

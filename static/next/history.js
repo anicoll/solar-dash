@@ -474,8 +474,8 @@
       SD.h('td', { colspan: cols, text: money(c.actual) }));
     const billed = c.source === 'globird' || c.source === 'bill';
     const note = billed
-      ? 'kWh. The money figures are what GloBird billed for this day.'
-      : 'kWh. The money figures are our estimate until GloBird has this day.';
+      ? 'kWh. The money figures are what ' + SD.retailer() + ' billed for this day.'
+      : 'kWh. The money figures are our estimate until ' + SD.retailer() + ' has this day.';
     return SD.h('section', { class: 'card history-card', 'aria-labelledby': 'history-band-h' },
       SD.h('h2', { class: 'section-title', id: 'history-band-h', text: 'By price band' }),
       SD.h('table', { class: 'history-table' }, SD.h('thead', {}, head), SD.h('tbody', {}, rows, extra, total)),
