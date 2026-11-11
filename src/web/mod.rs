@@ -48,6 +48,7 @@ use crate::config::Config;
 use crate::cost::TariffSchedule;
 use crate::ev_cost::PetrolHistory;
 use crate::ev_cost::{CostSetup, EvPrices};
+use crate::hub::{self, SpokeInfo};
 use crate::modbus::{Latest, LatestSettings};
 use crate::teslamate::Car;
 pub(crate) use api::ApiError;
@@ -99,6 +100,8 @@ pub struct AppState {
     backup_dir: Option<PathBuf>,
     /// How the last offsite upload went, for the admin page.
     offsite: crate::offsite::Status,
+    /// Every spoke and whether it is on, for `/api/spokes`.
+    spokes: Arc<[SpokeInfo]>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -134,7 +137,14 @@ impl AppState {
             globird_configured: false,
             backup_dir: None,
             offsite: crate::offsite::Status::default(),
+            spokes: hub::spoke_infos(&[]).into(),
         })
+    }
+
+    /// Records which spokes (by id) are running, for `/api/spokes`.
+    pub fn with_enabled_spokes(mut self, enabled: &[&str]) -> Self {
+        self.spokes = hub::spoke_infos(enabled).into();
+        self
     }
 
     /// Sets the folder the admin page downloads the latest backup from.
@@ -327,6 +337,7 @@ pub fn router(state: AppState) -> Router {
         .route("/next", get(next_redirect))
         .route("/static/{*path}", get(static_file))
         .route("/api/latest", get(api::latest))
+        .route("/api/spokes", get(api::spokes))
         .route("/api/live", get(api::live))
         .route("/api/live/series", get(api::live_series))
         .route("/api/inverter", get(api::inverter))
@@ -1011,6 +1022,32 @@ mod tests {
                 .unwrap();
             assert_eq!(send(&app, request).await.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[tokio::test]
+    async fn spokes_api_lists_every_spoke_and_needs_a_login() {
+        let (_dir, app) = test_app().await;
+        let response = send(&app, get_request("/api/spokes", None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = log_in(&app).await;
+        let response = send(&app, get_request("/api/spokes", Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let spokes = json["spokes"].as_array().unwrap();
+        assert_eq!(spokes.len(), 7);
+        let modbus = &spokes[0];
+        assert_eq!(modbus["id"], "sungrow-modbus");
+        assert_eq!(modbus["kind"], "source");
+        assert_eq!(
+            modbus["capabilities"],
+            serde_json::json!(["live", "meter", "settings"])
+        );
+        // A state that was never told what is running reports all spokes off.
+        assert_eq!(modbus["enabled"], false);
+        let backups = spokes.iter().find(|s| s["id"] == "backups").unwrap();
+        assert_eq!(backups["kind"], "sink");
+        assert_eq!(backups["capabilities"], serde_json::json!(["backup"]));
     }
 
     #[tokio::test]

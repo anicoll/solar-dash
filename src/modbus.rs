@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Modbus;
 use crate::db;
+use crate::hub::{Hub, HubEvent};
 
 /// How long one request (or the connection attempt) may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -782,6 +783,7 @@ pub async fn run_poll(
     pool: &SqlitePool,
     latest: Latest,
     latest_settings: LatestSettings,
+    hub: &Hub,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(config.interval_secs));
@@ -827,6 +829,7 @@ pub async fn run_poll(
                     info!(failed_reads = count, "Modbus back");
                 }
                 latest.set(sample);
+                hub.publish(HubEvent::SampleArrived(sample));
                 if let Err(err) = db::insert_live_sample(pool, &sample).await {
                     warn!("could not save Modbus sample: {err:#}");
                 }
