@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use super::backfill::Backfill;
 use super::client::{Client, NotFound};
+use super::models::IntervalKind;
 use super::probe::{SiteChoice, choose_site};
 use super::store;
 use crate::config::Amber;
@@ -43,8 +44,10 @@ const STARTUP_PREVIOUS: u32 = 288;
 /// Later fetches only need the last hour, to pick up final prices that
 /// replaced the current one.
 const REFRESH_PREVIOUS: u32 = 12;
-/// 96 x 5 minutes = 8 hours of forecast.
-const NEXT: u32 = 96;
+/// 12 x 5 minutes = the next hour of 5-minute forecast rows.
+const NEXT_FIVE: u32 = 12;
+/// 48 x 30 minutes = 24 hours of 30-minute forecast rows.
+const NEXT_THIRTY: u32 = 48;
 /// First wait after a failed fetch.
 const BACKOFF_START: Duration = Duration::from_secs(30);
 /// The wait after failures never grows beyond this.
@@ -119,6 +122,13 @@ async fn resolve_site(client: &Client, config: &Amber) -> Result<String> {
 
 /// One fetch: asks Amber for prices and saves them, then prunes old
 /// forecasts. Returns how many intervals were saved.
+///
+/// Two calls, because Amber answers in one interval length at a time:
+/// 30-minute rows for the 24 h forecast, then 5-minute rows for the past, the
+/// current interval and the next hour. The 5-minute call goes second on
+/// purpose: a row is keyed by its start, so where both lengths start at the
+/// same time the 5-minute row (the more precise one) is the one that stays.
+/// If either call fails, the whole fetch fails and is retried with backoff.
 async fn fetch_and_store(
     client: &Client,
     pool: &SqlitePool,
@@ -126,10 +136,21 @@ async fn fetch_and_store(
     previous: u32,
     hub: &Hub,
 ) -> Result<usize> {
-    let reply = client.current_prices(site_id, previous, NEXT).await?;
+    let long = client.current_prices(site_id, 0, NEXT_THIRTY, 30).await?;
+    let short = client
+        .current_prices(site_id, previous, NEXT_FIVE, 5)
+        .await?;
     let now = Utc::now().timestamp();
     let source = store::source_name(site_id);
-    let saved = store::save_prices(pool, &source, &reply.items, now).await?;
+    // From the 30-minute call only the forecast is wanted: its "current" row
+    // is the whole half hour under way, which the 5-minute rows describe better.
+    let forecasts: Vec<_> = long
+        .items
+        .into_iter()
+        .filter(|item| item.kind == IntervalKind::ForecastInterval)
+        .collect();
+    let mut saved = store::save_prices(pool, &source, &forecasts, now).await?;
+    saved += store::save_prices(pool, &source, &short.items, now).await?;
     hub.publish(HubEvent::PricesStored { source });
     let pruned = store::prune_forecasts(pool, now).await?;
     debug!(saved, pruned, "Amber prices stored");
@@ -319,7 +340,8 @@ mod tests {
         let saved = fetch_and_store(&client, &pool, "s1", 12, &Hub::default())
             .await
             .unwrap();
-        assert_eq!(saved, 3);
+        // One forecast from the 30-minute call plus the three 5-minute rows.
+        assert_eq!(saved, 4);
         let stored = store::prices_between(&pool, Some("amber:s1"), 0, i64::MAX)
             .await
             .unwrap();

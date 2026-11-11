@@ -877,8 +877,10 @@ fn known_source(text: &str) -> Option<&'static str> {
 /// zero-import credit of an inverter day is decided from the meter counter
 /// (see [`meter_window_import_kwh`]). Version 6: a big step of a cloud counter
 /// is spread over the last reading gap, not smeared back up to 30 minutes (see
-/// `spread_steps`). Old rows are replaced by date as days are recomputed.
-const COST_CACHE_VERSION: u32 = 6;
+/// `spread_steps`). Version 7: price rows are stored with their start on the
+/// minute (Amber sends it one second late), so dynamic days are costed again.
+/// Old rows are replaced by date as days are recomputed.
+const COST_CACHE_VERSION: u32 = 7;
 
 /// What stored costs are tagged with. The time zone is in it too, because
 /// moving it moves where every local day starts.

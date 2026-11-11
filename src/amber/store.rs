@@ -16,6 +16,15 @@ use crate::cost::{DayPrices, PriceSpan};
 /// actual price replaces them; this clears the ones that never were.
 pub const FORECAST_KEEP_SECS: i64 = 2 * 24 * 3600;
 
+/// Amber gives each interval a `startTime` one second after the boundary
+/// (`12:00:01`) but an `endTime` on it (`12:05:00`, or `12:30:00` for a
+/// 30-minute row). Every reader wants the start on the boundary, so
+/// [`save_prices`] floors it to the whole minute. Real interval starts are
+/// always on a minute, so this only removes the extra second.
+pub fn normalise_start(start_ts: i64) -> i64 {
+    start_ts - start_ts.rem_euclid(60)
+}
+
 /// The source name for an Amber site.
 pub fn source_name(site_id: &str) -> String {
     format!("amber:{site_id}")
@@ -50,6 +59,10 @@ fn kind_name(kind: IntervalKind) -> Option<&'static str> {
 /// forecast overwrite each other, and an actual replaces either. The
 /// `WHERE` on the `DO UPDATE` is what enforces that: when it is false the
 /// existing row is left as it is.
+///
+/// Start times are stored on the minute (see [`normalise_start`]), so the
+/// primary key, the actual-wins rule and the overlap delete below all see the
+/// same boundary whichever way Amber rounds it.
 pub async fn save_prices(
     pool: &SqlitePool,
     source: &str,
@@ -65,6 +78,7 @@ pub async fn save_prices(
         ) else {
             continue;
         };
+        let start_ts = normalise_start(interval.start_time.timestamp());
         sqlx::query(
             "INSERT INTO price_interval
                (source, channel, start_ts, end_ts, cents, spot_cents, kind, fetched_at,
@@ -79,7 +93,7 @@ pub async fn save_prices(
         )
         .bind(source)
         .bind(channel)
-        .bind(interval.start_time.timestamp())
+        .bind(start_ts)
         .bind(interval.end_time.timestamp())
         .bind(interval.per_kwh)
         .bind(interval.spot_per_kwh)
@@ -102,7 +116,7 @@ pub async fn save_prices(
             )
             .bind(source)
             .bind(channel)
-            .bind(interval.start_time.timestamp())
+            .bind(start_ts)
             .bind(interval.end_time.timestamp())
             .execute(&mut *tx)
             .await
@@ -149,6 +163,9 @@ pub struct StoredPrice {
     pub cents: f64,
     pub spot_cents: Option<f64>,
     pub kind: String,
+    /// Unix seconds when we stored this row. For a `current` row this is when
+    /// its price was last refreshed (the Today header shows it as "settled").
+    pub fetched_at: i64,
     /// Amber's label: extremelyLow, veryLow, low, neutral, high or spike.
     pub descriptor: Option<String>,
     /// Percent of the grid that is renewable, when known.
@@ -165,7 +182,7 @@ pub async fn prices_between(
 ) -> Result<Vec<StoredPrice>> {
     sqlx::query_as(
         "SELECT channel, start_ts AS start, end_ts AS end, cents, spot_cents, kind,
-                descriptor, renewables
+                fetched_at, descriptor, renewables
          FROM price_interval
          WHERE start_ts >= ? AND start_ts < ? AND (? IS NULL OR source = ?)
          ORDER BY channel, start_ts",
@@ -187,7 +204,7 @@ pub async fn prices_at(
 ) -> Result<Vec<StoredPrice>> {
     sqlx::query_as(
         "SELECT channel, start_ts AS start, end_ts AS end, cents, spot_cents, kind,
-                descriptor, renewables
+                fetched_at, descriptor, renewables
          FROM price_interval
          WHERE start_ts <= ? AND end_ts > ? AND (? IS NULL OR source = ?)
          ORDER BY channel, start_ts DESC",
@@ -363,7 +380,7 @@ mod tests {
         let save = |kind, cents| {
             let pool = pool.clone();
             async move {
-                save_prices(&pool, "amber:s", &[interval(kind, General, 1000, cents)], 5)
+                save_prices(&pool, "amber:s", &[interval(kind, General, 1020, cents)], 5)
                     .await
                     .unwrap()
             }
@@ -371,20 +388,20 @@ mod tests {
 
         // Forecast, then current, overwrite each other.
         save(ForecastInterval, 10.0).await;
-        assert_eq!(kind_and_cents(&pool, 1000).await, ("forecast".into(), 10.0));
+        assert_eq!(kind_and_cents(&pool, 1020).await, ("forecast".into(), 10.0));
         save(CurrentInterval, 11.0).await;
-        assert_eq!(kind_and_cents(&pool, 1000).await, ("current".into(), 11.0));
+        assert_eq!(kind_and_cents(&pool, 1020).await, ("current".into(), 11.0));
         save(ForecastInterval, 12.0).await;
-        assert_eq!(kind_and_cents(&pool, 1000).await, ("forecast".into(), 12.0));
+        assert_eq!(kind_and_cents(&pool, 1020).await, ("forecast".into(), 12.0));
 
         // An actual replaces them, and then nothing but an actual does.
         save(ActualInterval, 13.0).await;
-        assert_eq!(kind_and_cents(&pool, 1000).await, ("actual".into(), 13.0));
+        assert_eq!(kind_and_cents(&pool, 1020).await, ("actual".into(), 13.0));
         save(CurrentInterval, 14.0).await;
         save(ForecastInterval, 15.0).await;
-        assert_eq!(kind_and_cents(&pool, 1000).await, ("actual".into(), 13.0));
+        assert_eq!(kind_and_cents(&pool, 1020).await, ("actual".into(), 13.0));
         save(ActualInterval, 16.0).await;
-        assert_eq!(kind_and_cents(&pool, 1000).await, ("actual".into(), 16.0));
+        assert_eq!(kind_and_cents(&pool, 1020).await, ("actual".into(), 16.0));
     }
 
     #[tokio::test]
@@ -591,5 +608,141 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(fp().await.unwrap(), two);
+    }
+
+    /// An Amber-style interval: the start one second after the boundary, the
+    /// end on it, `minutes` long.
+    fn amber_style(kind: IntervalKind, boundary: i64, minutes: i64, cents: f64) -> PriceInterval {
+        let at = |ts| -> DateTime<Utc> { DateTime::from_timestamp(ts, 0).unwrap() };
+        let mut row = interval(kind, ChannelType::General, boundary + 1, cents);
+        row.duration = minutes as u32;
+        row.end_time = at(boundary + minutes * 60);
+        row
+    }
+
+    // 2026-11-11 02:00:00 UTC, a multiple of 1800.
+    const T0: i64 = 1_794_362_400;
+
+    #[tokio::test]
+    async fn starts_are_stored_on_the_boundary() {
+        use IntervalKind::*;
+        let (_dir, pool) = pool().await;
+        let rows = [
+            amber_style(ActualInterval, T0, 5, 10.0),
+            amber_style(CurrentInterval, T0 + 300, 5, 11.0),
+            amber_style(ForecastInterval, T0 + 1800, 30, 12.0),
+        ];
+        save_prices(&pool, "amber:s", &rows, 5).await.unwrap();
+        let stored = prices_between(&pool, None, T0, T0 + 7200).await.unwrap();
+        let spans: Vec<_> = stored.iter().map(|p| (p.start, p.end)).collect();
+        assert_eq!(
+            spans,
+            [(T0, T0 + 300), (T0 + 300, T0 + 600), (T0 + 1800, T0 + 3600)]
+        );
+        assert_eq!(normalise_start(-59), -60);
+    }
+
+    #[tokio::test]
+    async fn a_shifted_start_still_obeys_the_actual_and_overlap_rules() {
+        use IntervalKind::*;
+        let (_dir, pool) = pool().await;
+        // Actual at :00:01 is not overwritten by a later forecast at :00:01.
+        save_prices(
+            &pool,
+            "amber:s",
+            &[amber_style(ActualInterval, T0, 5, 13.0)],
+            1,
+        )
+        .await
+        .unwrap();
+        save_prices(
+            &pool,
+            "amber:s",
+            &[amber_style(ForecastInterval, T0, 5, 99.0)],
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kind_and_cents(&pool, T0).await, ("actual".into(), 13.0));
+        // A 30-minute forecast drops the 5-minute forecasts inside it.
+        let short: Vec<_> = (1..6)
+            .map(|i| amber_style(ForecastInterval, T0 + i * 300, 5, 1.0))
+            .collect();
+        save_prices(&pool, "amber:s", &short, 3).await.unwrap();
+        save_prices(
+            &pool,
+            "amber:s",
+            &[amber_style(ForecastInterval, T0, 30, 7.0)],
+            4,
+        )
+        .await
+        .unwrap();
+        let rows = prices_between(&pool, None, T0, T0 + 1800).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].kind.as_str(), rows[0].cents), ("actual", 13.0));
+    }
+
+    #[tokio::test]
+    async fn a_current_row_with_a_one_second_start_wins_prices_at() {
+        use IntervalKind::*;
+        let (_dir, pool) = pool().await;
+        let rows = [
+            amber_style(ForecastInterval, T0, 30, 50.0),
+            amber_style(CurrentInterval, T0 + 600, 5, 32.0),
+        ];
+        save_prices(&pool, "amber:s", &rows, 9).await.unwrap();
+        // Exactly on the boundary, which the +1 s start would have missed.
+        let now = prices_at(&pool, None, T0 + 600).await.unwrap();
+        assert_eq!(now.len(), 2);
+        assert_eq!((now[0].start, now[0].cents), (T0 + 600, 32.0));
+        assert_eq!(now[0].fetched_at, 9);
+    }
+
+    #[tokio::test]
+    async fn the_migration_moves_old_rows_to_the_boundary() {
+        let (_dir, pool) = pool().await;
+        let insert = |start: i64, kind: &'static str, cents: f64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO price_interval
+                       (source, channel, start_ts, end_ts, cents, kind, fetched_at)
+                     VALUES ('amber:s', 'general', ?, ?, ?, ?, 1)",
+                )
+                .bind(start)
+                .bind(start + 300)
+                .bind(cents)
+                .bind(kind)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        insert(T0 + 1, "actual", 1.0).await; // just moves
+        insert(T0 + 301, "forecast", 2.0).await; // shifted, collides with...
+        insert(T0 + 300, "actual", 3.0).await; // ...an actual: the actual stays
+        insert(T0 + 601, "actual", 4.0).await; // shifted actual, collides with...
+        insert(T0 + 600, "forecast", 5.0).await; // ...a forecast: the actual wins
+        insert(T0 + 900, "current", 6.0).await; // already on the boundary
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0022_price_start_on_boundary.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows: Vec<(i64, String, f64)> =
+            sqlx::query_as("SELECT start_ts, kind, cents FROM price_interval ORDER BY start_ts")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (T0, "actual".to_string(), 1.0),
+                (T0 + 300, "actual".to_string(), 3.0),
+                (T0 + 600, "actual".to_string(), 4.0),
+                (T0 + 900, "current".to_string(), 6.0),
+            ]
+        );
     }
 }

@@ -733,12 +733,19 @@
 
   const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 
+  /** Amber sends interval starts one second after the boundary (12:00:01); work on the whole minute. */
+  const floorMinute = (ts) => ts - (((ts % 60) + 60) % 60);
+  /** Rows of about 30 minutes (25 to 35, so a 1799 s row counts) are "blocks"; 15 minutes or less are 5-minute rows. */
+  const isBlockRow = (r) => r.end - r.start >= 25 * 60 && r.end - r.start <= 35 * 60;
+  const isFiveRow = (r) => r.end - r.start <= 15 * 60;
+
   /**
    * The timeline's 30-minute blocks, from the start of today (local time) as far as the forecasts go.
    *
-   * - A past block is the simple mean (not weighted) of its 5-minute actual rows.
+   * - A past block is the simple mean (not weighted) of its 5-minute actual rows, or Amber's 30-minute actual row when there are none.
    * - The block we are in shows the current 5-minute price, and is marked "now".
-   * - A future block uses Amber's 30-minute forecast row.
+   * - A future block uses Amber's 30-minute forecast row, or the mean of 5-minute forecast rows when it has none.
+   * Rows are binned by the floored minute of their start, never by exact time, so Amber's +1 s starts match.
    * Each block keeps its six 5-minute slots for the detail panel. A block with no buy price is left out.
    */
   function priceBlocks(prices, buy, nowTs) {
@@ -746,26 +753,28 @@
     const dayStart = nowTs - local.minute * 60 - local.sec;
     const curIdx = Math.floor((nowTs - dayStart) / BLOCK_S);
     const ch = (prices && prices.channels) || {};
-    const idxOf = (ts) => Math.floor((ts - dayStart) / BLOCK_S);
+    const blockOf = (r) => Math.floor((floorMinute(r.start) - dayStart) / BLOCK_S);
+    const slotOf = (r) => Math.floor((floorMinute(r.start) - dayStart) / 300);
 
-    // Settled 5-minute rows (and the current one) by start time, per channel.
-    const fivesOf = (rows) => {
-      const m = new Map();
+    // One channel's rows, sorted into the groups the blocks are made from.
+    const indexOf = (rows, current) => {
+      const ix = { fives: new Map(), actual30: new Map(), forecast30: new Map(), forecastFives: new Map() };
       for (const r of rows || []) {
-        if ((r.kind === 'actual' || r.kind === 'current') && r.end - r.start <= BLOCK_S / 2) m.set(r.start, r);
+        const known = r.kind === 'actual' || r.kind === 'current';
+        if (known && isFiveRow(r)) ix.fives.set(slotOf(r), r);
+        else if (known && isBlockRow(r)) ix.actual30.set(blockOf(r), r);
+        else if (r.kind === 'forecast' && isBlockRow(r)) ix.forecast30.set(blockOf(r), r);
+        else if (r.kind === 'forecast' && isFiveRow(r)) {
+          const list = ix.forecastFives.get(blockOf(r)) || [];
+          list.push(r);
+          ix.forecastFives.set(blockOf(r), list);
+        }
       }
-      return m;
+      if (current && !ix.fives.has(slotOf(current))) ix.fives.set(slotOf(current), current);
+      return ix;
     };
-    const buyFives = fivesOf(ch.general);
-    const sellFives = fivesOf(ch.feed_in);
-    if (buy && !buyFives.has(buy.start)) buyFives.set(buy.start, buy);
-    const forecastOf = (rows) => {
-      const m = new Map();
-      for (const r of rows || []) if (r.kind === 'forecast' && r.end - r.start === BLOCK_S) m.set(idxOf(r.start), r);
-      return m;
-    };
-    const buyForecast = forecastOf(ch.general);
-    const sellForecast = forecastOf(ch.feed_in);
+    const buyIx = indexOf(ch.general, buy);
+    const sellIx = indexOf(ch.feed_in, null);
 
     // The row best standing for a set of rows: Amber's label from the one nearest the mean.
     const summarise = (rows) => {
@@ -775,34 +784,39 @@
       const ren = rows.filter((r) => r.renewables != null).map((r) => r.renewables);
       return { cents, descriptor: nearest.descriptor, renewables: ren.length ? mean(ren) : null };
     };
+    const plain = (r) => (r ? { cents: r.cents, descriptor: r.descriptor, renewables: r.renewables } : null);
 
-    const last = Math.max(curIdx, ...buyForecast.keys());
+    const last = Math.max(curIdx, ...buyIx.forecast30.keys(), ...buyIx.forecastFives.keys());
     const blocks = [];
     for (let i = 0; i <= last; i++) {
       const start = dayStart + i * BLOCK_S;
       const slots = [];
       for (let k = 0; k < 6; k++) {
         const t = start + k * 300;
-        slots.push({ start: t, buy: buyFives.get(t) || null, sell: sellFives.get(t) || null });
+        const n = i * 6 + k;
+        slots.push({ start: t, buy: buyIx.fives.get(n) || null, sell: sellIx.fives.get(n) || null });
       }
+      const buys = slots.map((x) => x.buy).filter(Boolean);
+      const sells = slots.map((x) => x.sell).filter(Boolean);
+      const meanSell = (list) => (list.length ? mean(list.map((r) => r.cents)) : null);
       let kind = 'actual';
       let b;
       let s;
       if (i === curIdx) {
         kind = 'now';
-        b = buy ? { cents: buy.cents, descriptor: buy.descriptor, renewables: buy.renewables } : summarise(slots.map((x) => x.buy).filter(Boolean));
-        const sRow = slots.find((x) => x.sell && x.start <= nowTs && nowTs < x.sell.end);
-        s = sRow ? sRow.sell.cents : null;
+        b = buy ? plain(buy) : summarise(buys) || plain(buyIx.actual30.get(i));
+        const sRow = slots.find((x) => x.sell && x.start <= nowTs && nowTs < x.start + 300);
+        s = sRow ? sRow.sell.cents : meanSell(sells);
+        if (s == null && sellIx.actual30.has(i)) s = sellIx.actual30.get(i).cents;
       } else if (i < curIdx) {
-        b = summarise(slots.map((x) => x.buy).filter(Boolean));
-        const sells = slots.map((x) => x.sell).filter(Boolean);
-        s = sells.length ? mean(sells.map((r) => r.cents)) : null;
+        b = summarise(buys) || plain(buyIx.actual30.get(i));
+        s = meanSell(sells);
+        if (s == null && sellIx.actual30.has(i)) s = sellIx.actual30.get(i).cents;
       } else {
         kind = 'forecast';
-        const f = buyForecast.get(i);
-        b = f ? { cents: f.cents, descriptor: f.descriptor, renewables: f.renewables } : null;
-        const sf = sellForecast.get(i);
-        s = sf ? sf.cents : null;
+        b = plain(buyIx.forecast30.get(i)) || summarise(buyIx.forecastFives.get(i) || []);
+        const sf = sellIx.forecast30.get(i);
+        s = sf ? sf.cents : meanSell(sellIx.forecastFives.get(i) || []);
       }
       if (!b) continue;
       blocks.push({ idx: i, start, end: start + BLOCK_S, kind, buy: b, sell: s, slots });
