@@ -1427,8 +1427,11 @@ pub struct TmChargeTotals {
     pub cost_cents: f64,
 }
 
-/// All cars' charging sessions that started in `[start, end)` (unix seconds),
-/// added up. `None` when there are none.
+/// All cars' charging sessions at home (geofence "Home", the same rule as
+/// [`tm_charges_at_home`]) that started in `[start, end)` (unix seconds),
+/// added up. Energy is the wall energy, or the energy added to the battery
+/// when that is missing; sessions with no energy are not counted. `None` when
+/// there are none.
 pub async fn tm_charge_totals(
     pool: &SqlitePool,
     start: i64,
@@ -1436,11 +1439,14 @@ pub async fn tm_charge_totals(
 ) -> Result<Option<TmChargeTotals>> {
     let totals: TmChargeTotals = sqlx::query_as(
         "SELECT COUNT(*) AS sessions,
-                CAST(COALESCE(SUM(energy_used_kwh), 0.0) AS REAL) AS energy_used_kwh,
+                CAST(COALESCE(SUM(COALESCE(energy_used_kwh, energy_added_kwh)), 0.0) AS REAL)
+                    AS energy_used_kwh,
                 CAST(COALESCE(SUM(grid_kwh), 0.0) AS REAL) AS grid_kwh,
                 CAST(COALESCE(SUM(self_kwh), 0.0) AS REAL) AS self_kwh,
                 CAST(COALESCE(SUM(cost_cents), 0.0) AS REAL) AS cost_cents
-         FROM tm_charge WHERE started_at >= ? AND started_at < ?",
+         FROM tm_charge
+         WHERE geofence = 'Home' AND started_at >= ? AND started_at < ?
+           AND COALESCE(energy_used_kwh, energy_added_kwh) > 0",
     )
     .bind(start)
     .bind(end)
@@ -2426,12 +2432,28 @@ mod tests {
         let (_dir, pool) = test_db().await;
         assert_eq!(tm_charge_totals(&pool, 0, 10_000).await.unwrap(), None);
         // started_at is 2000 + id: sessions 1 and 2 (car 1), 3 (car 2), 9 (out of range).
+        // Session 4 has no energy used, so its energy added (10) counts.
+        let mut no_used = tm_charge(4, 2, Some(100));
+        no_used.energy_used_kwh = None;
+        // Away from home, and with no geofence at all: neither counts.
+        let mut away = tm_charge(5, 1, Some(100));
+        away.geofence = Some("Nile Street".to_string());
+        let mut unknown = tm_charge(6, 1, Some(100));
+        unknown.geofence = None;
+        // Home, but no energy at all: not a session worth counting.
+        let mut empty = tm_charge(7, 1, Some(100));
+        empty.energy_used_kwh = None;
+        empty.energy_added_kwh = None;
         save_tm_charges(
             &pool,
             &[
                 tm_charge(1, 1, Some(100)),
                 tm_charge(2, 1, Some(100)),
                 tm_charge(3, 2, None),
+                no_used,
+                away,
+                unknown,
+                empty,
                 tm_charge(9, 1, Some(100)),
             ],
         )
@@ -2453,8 +2475,8 @@ mod tests {
         assert_eq!(
             got,
             TmChargeTotals {
-                sessions: 3,
-                energy_used_kwh: 33.0,
+                sessions: 4,
+                energy_used_kwh: 43.0,
                 grid_kwh: 12.0,
                 self_kwh: 10.0,
                 cost_cents: 200.0,

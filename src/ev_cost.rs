@@ -28,13 +28,19 @@ const MAX_GAP_SECS: i64 = 120;
 /// W·s in one kWh.
 const WS_PER_KWH: f64 = 3.6e6;
 
-/// The energy of one session by source, and its price. Only the time the live
-/// samples cover is counted (see `coverage`); the rest is not guessed.
+/// The energy of one session by source, and its price. In the time the live
+/// samples cover, the car gets the house's mix. Car energy in time they do
+/// not cover is counted as grid at the import price (see `uncovered_kwh`),
+/// like [`historic_session_cost`] does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionCost {
     pub solar_kwh: f64,
     pub battery_kwh: f64,
+    /// The part bought from the grid, including `uncovered_kwh`.
     pub grid_kwh: f64,
+    /// The part in time no live sample covers. It is counted as grid, so this
+    /// tells how much of the cost is an estimate.
+    pub uncovered_kwh: f64,
     /// What the grid part cost at the import price, in cents.
     pub cost_cents: f64,
     /// What the solar part would have earned if it had been exported
@@ -81,7 +87,9 @@ pub fn is_home(session: &ChargeSession) -> bool {
 ///
 /// The grid part is priced at the import price of the sample's local time,
 /// on the plan in effect that day. A sample with no load reading, and a gap
-/// longer than [`MAX_GAP_SECS`], are skipped.
+/// longer than [`MAX_GAP_SECS`], do not cover the session. The car's average
+/// power over that uncovered time counts as grid, priced at the import price
+/// of the middle of each uncovered stretch.
 ///
 /// Returns `None` if the session has no energy or no length to work from.
 pub fn session_cost(
@@ -103,11 +111,14 @@ pub fn session_cost(
         solar_kwh: 0.0,
         battery_kwh: 0.0,
         grid_kwh: 0.0,
+        uncovered_kwh: 0.0,
         cost_cents: 0.0,
         solar_value_cents: 0.0,
         coverage: 0.0,
     };
     let mut covered_secs = 0;
+    // The covered stretches, oldest first, to find what is left over.
+    let mut covered: Vec<(i64, i64)> = Vec::new();
     for pair in samples.windows(2) {
         // Only the part of the interval inside the session counts.
         let (from, to) = (pair[0].ts.max(start), pair[1].ts.min(end));
@@ -122,6 +133,7 @@ pub fn session_cost(
             continue;
         };
         covered_secs += to - from;
+        covered.push((from, to));
 
         let pv_w = pair[0].pv_w.unwrap_or(0.0).max(0.0);
         let battery_now_w = pair[0].battery_w.unwrap_or(0.0);
@@ -147,6 +159,21 @@ pub fn session_cost(
         cost.solar_value_cents += to_kwh(solar_w) * tariff.export_cents_at(minute);
     }
     cost.coverage = covered_secs as f64 / (end - start) as f64;
+
+    // Time the samples do not cover: the car still drew its average power,
+    // and we cannot say where it came from, so it counts as grid.
+    let mut gap_from = start;
+    for (from, to) in covered.into_iter().chain([(end, end)]) {
+        if from > gap_from
+            && let Some((date, minute)) = local_time(tz, gap_from + (from - gap_from) / 2)
+        {
+            let kwh = car_avg_w * (from - gap_from) as f64 / WS_PER_KWH;
+            cost.uncovered_kwh += kwh;
+            cost.grid_kwh += kwh;
+            cost.cost_cents += kwh * schedule.for_date(date).import_cents_at(minute);
+        }
+        gap_from = gap_from.max(to);
+    }
     Some(cost)
 }
 
@@ -1278,8 +1305,40 @@ mod tests {
         )
         .unwrap();
         close(got.coverage, 3000.0 / 3600.0);
-        // Only the 3000 s with samples is counted, not guessed.
-        close(got.grid_kwh, 7.4 * 3000.0 / 3600.0);
+        // The 600 s with no samples is grid at the 60 c import price.
+        let gap_kwh = 7.4 * 600.0 / 3600.0;
+        close(got.uncovered_kwh, gap_kwh);
+        close(got.grid_kwh, 7.4 * 3000.0 / 3600.0 + gap_kwh);
+        close(got.cost_cents, 7.4 * 60.0);
+    }
+
+    #[test]
+    fn a_half_covered_session_costs_the_mix_plus_grid_for_the_rest() {
+        let start = at(18, 0);
+        // Samples for the first half hour only, all solar; the rest is a gap.
+        let samples = steady(start, start + 1800, sample(0, 9000.0, 8000.0, -1000.0, 0.0));
+        let got = session_cost(
+            &session(start, 1),
+            &samples,
+            &schedule(),
+            ADELAIDE,
+            start + 3600,
+        )
+        .unwrap();
+        close(got.coverage, 0.5);
+        close(got.solar_kwh, 3.7);
+        close(got.uncovered_kwh, 3.7);
+        close(got.grid_kwh, 3.7);
+        close(got.cost_cents, 3.7 * 60.0);
+    }
+
+    #[test]
+    fn a_fully_covered_session_has_nothing_uncovered() {
+        let (from, to) = (at(18, 0), at(19, 0));
+        let samples = steady(from, to, sample(0, 0.0, 8000.0, 8000.0, 0.0));
+        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        close(got.uncovered_kwh, 0.0);
+        close(got.grid_kwh, 7.4);
     }
 
     #[test]
@@ -1287,7 +1346,11 @@ mod tests {
         let start = at(18, 0);
         let none = session_cost(&session(start, 1), &[], &schedule(), ADELAIDE, start).unwrap();
         close(none.coverage, 0.0);
-        close(none.grid_kwh, 0.0);
+        // No samples at all: the whole session is grid at the import price.
+        close(none.grid_kwh, 7.4);
+        close(none.uncovered_kwh, 7.4);
+        close(none.solar_kwh, 0.0);
+        close(none.cost_cents, 7.4 * 60.0);
 
         let mut empty = session(start, 1);
         empty.energy_used_kwh = None;
