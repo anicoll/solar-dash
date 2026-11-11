@@ -48,16 +48,17 @@
    It sets <html data-theme>, re-checks every minute, and fires `document` event 'sd:theme' with
    detail {theme} on a change (redraw anything that paints its own colours).
 
-   SD.page(name, {mount(el, hashRest), unmount(), update?(hashRest)})
+   SD.page(name, {mount(el, hashRest, query), unmount(), update?(hashRest)})
                                            Register a page. name is one of today bill history cars payback admin.
                                            mount runs when its hash is opened; el is the empty <section id="page-NAME">.
                                            The router hides the section and clears it after unmount(). hashRest is the
                                            part of the hash after the page name: '#history/day/2026-10-27' gives
-                                           'day/2026-10-27' ('' when there is none). If only hashRest changes while
-                                           the page is open, update(hashRest) is called when the page has one,
+                                           'day/2026-10-27' ('' when there is none). query is the part after a '?'
+                                           ('#bill?date=2026-10-01' gives 'date=2026-10-01'). If only hashRest or query
+                                           changes while the page is open, update(hashRest) is called when the page has one,
                                            otherwise unmount() then mount() run again.
    SD.go(hash)                             navigate: SD.go('history/day/2026-10-27')
-   SD.route()                              -> {name, rest} for the current hash
+   SD.route()                              -> {name, rest, query} for the current hash
 
    SD.live.subscribe(fn)                   -> unsubscribe function. fn(data, err): data is the /api/live JSON,
                                               {sample:{ts,pv_w,load_w,grid_w,battery_w,soc_pct}|null, car:{...}|null},
@@ -606,9 +607,13 @@
 
   SD.route = function () {
     const raw = decodeURIComponent(location.hash.replace(/^#/, ''));
-    const slash = raw.indexOf('/');
-    const name = slash < 0 ? raw : raw.slice(0, slash);
-    return { name: NAMES.includes(name) ? name : 'today', rest: slash < 0 ? '' : raw.slice(slash + 1) };
+    // A page may carry a query after its name or path: '#bill?date=2026-10-01'.
+    const mark = raw.indexOf('?');
+    const query = mark < 0 ? '' : raw.slice(mark + 1);
+    const path = mark < 0 ? raw : raw.slice(0, mark);
+    const slash = path.indexOf('/');
+    const name = slash < 0 ? path : path.slice(0, slash);
+    return { name: NAMES.includes(name) ? name : 'today', rest: slash < 0 ? '' : path.slice(slash + 1), query };
   };
 
   SD.go = function (hash) {
@@ -627,7 +632,7 @@
   function render() {
     const next = SD.route();
     if (current && current.name === next.name) {
-      if (current.rest === next.rest) return;
+      if (current.rest === next.rest && current.query === next.query) return;
       const page = pages[next.name];
       current = next;
       if (page && page.update && !gated(next.name)) { page.update(next.rest); return; }
@@ -667,7 +672,7 @@
         SD.emptyState(g.title, g.text, { href: '#admin', text: 'Open Admin' }));
       return;
     }
-    try { page.mount(el, route.rest); } catch (e) {
+    try { page.mount(el, route.rest, route.query); } catch (e) {
       console.error(e);
       el.replaceChildren(SD.h('div', { class: 'card', role: 'alert' }, SD.h('p', { text: 'This page failed to load. ' + e.message })));
     }
