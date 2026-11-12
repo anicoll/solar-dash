@@ -602,8 +602,14 @@ pub(super) async fn grid_splits(
         }
         keys.push((date, key));
     }
-    let mut found: HashMap<NaiveDate, GridSplit> =
-        day_cache::load(&state.pool, GRID_SPLIT_KIND, &keys).await?;
+    let mut found: HashMap<NaiveDate, GridSplit> = day_cache::load_with_data(
+        &state.pool,
+        state.plant_id,
+        state.tz,
+        GRID_SPLIT_KIND,
+        &keys,
+    )
+    .await?;
 
     let live_range = db::live_ts_range(&state.pool).await?;
     let now = db::now();
@@ -617,15 +623,22 @@ pub(super) async fn grid_splits(
         if let Some((split, cacheable)) =
             day_grid_split_checked(state, schedule, *date, &live, now).await?
         {
-            if cacheable {
-                to_store.push((*date, key.clone(), split));
+            // A day with gaps is stored too, keyed on its readings.
+            if *date < today {
+                to_store.push((*date, key.clone(), cacheable, split));
             }
             found.insert(*date, split);
         }
     }
-    let rows: Vec<(NaiveDate, String, &GridSplit)> = to_store
+    let store_as: Vec<(NaiveDate, String, bool)> = to_store
         .iter()
-        .map(|(date, key, split)| (*date, key.clone(), split))
+        .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
+        .collect();
+    let store_as = day_cache::store_keys(&state.pool, state.plant_id, state.tz, &store_as).await?;
+    let rows: Vec<(NaiveDate, String, &GridSplit)> = store_as
+        .into_iter()
+        .zip(&to_store)
+        .map(|((date, key), (_, _, _, split))| (date, key, split))
         .collect();
     day_cache::save(&state.pool, GRID_SPLIT_KIND, &rows).await?;
     Ok(found)
@@ -1220,32 +1233,56 @@ async fn costed_days_on(
     // A static plan has one key for every day. A dynamic plan's key also
     // carries each day's price fingerprint, so it is worked out per day.
     let mut day_keys: HashMap<String, String> = HashMap::new();
-    let mut stored = Vec::new();
+    let mut stored: Vec<(db::CachedDayCost, String)> = Vec::new();
     if let Some(source) = tariff.dynamic_source() {
         for &date in dates {
             let day_key = dynamic_day_key(state, tariff, source, date, today).await?;
             let text = date.to_string();
-            stored.extend(db::daily_costs_in_range(&state.pool, &text, &text, &day_key).await?);
+            stored
+                .extend(db::daily_costs_in_range_keyed(&state.pool, &text, &text, &day_key).await?);
             day_keys.insert(text, day_key);
         }
     } else {
-        stored = db::daily_costs_in_range(&state.pool, &first.to_string(), &last.to_string(), &key)
-            .await?;
+        stored = db::daily_costs_in_range_keyed(
+            &state.pool,
+            &first.to_string(),
+            &last.to_string(),
+            &key,
+        )
+        .await?;
     }
+    let base_key_of = |date: &str| day_keys.get(date).unwrap_or(&key).clone();
+    // A day stored with gaps in its data is only good while its readings are
+    // as they were: check the fingerprint of those days' readings.
+    let incomplete: Vec<NaiveDate> = stored
+        .iter()
+        .filter(|(row, row_key)| day_cache::is_data_key_of(row_key, &base_key_of(&row.date)))
+        .filter_map(|(row, _)| NaiveDate::from_str(&row.date).ok())
+        .collect();
+    let prints =
+        day_cache::fingerprints(&state.pool, state.plant_id, state.tz, &incomplete).await?;
     let mut by_date: HashMap<String, CostedDay> = HashMap::new();
-    for row in stored {
+    for (row, row_key) in stored {
         let parsed = (NaiveDate::from_str(&row.date), known_source(&row.source));
-        if let (Ok(date), Some(source)) = parsed {
-            by_date.insert(
-                row.date,
-                CostedDay {
-                    date,
-                    source,
-                    cost: row.cost,
-                    complete: true,
-                },
-            );
-        }
+        let (Ok(date), Some(source)) = parsed else {
+            continue;
+        };
+        let base = base_key_of(&row.date);
+        let complete = match prints.get(&date) {
+            Some(print) if row_key == day_cache::data_key(&base, print) => false,
+            Some(_) => continue,
+            None if row_key == base => true,
+            None => continue,
+        };
+        by_date.insert(
+            row.date,
+            CostedDay {
+                date,
+                source,
+                cost: row.cost,
+                complete,
+            },
+        );
     }
 
     let missing: Vec<NaiveDate> = dates
@@ -1253,26 +1290,47 @@ async fn costed_days_on(
         .copied()
         .filter(|date| !by_date.contains_key(&date.to_string()))
         .collect();
-    let mut to_store = Vec::new();
+    // Each finished day to store, with whether its data is complete.
+    let mut to_store: Vec<(db::CachedDayCost, bool)> = Vec::new();
     for run in consecutive_runs(&missing) {
         for (day, cacheable) in compute_days(state, tariff, run, today).await? {
-            if cacheable {
-                to_store.push(db::CachedDayCost {
-                    date: day.date.to_string(),
-                    source: day.source.to_string(),
-                    cost: day.cost.clone(),
-                });
+            if day.date < today {
+                to_store.push((
+                    db::CachedDayCost {
+                        date: day.date.to_string(),
+                        source: day.source.to_string(),
+                        cost: day.cost.clone(),
+                    },
+                    cacheable,
+                ));
             }
             by_date.insert(day.date.to_string(), day);
         }
     }
+    let store_as: Vec<(NaiveDate, String, bool)> = to_store
+        .iter()
+        .filter_map(|(day, complete)| {
+            let date = NaiveDate::from_str(&day.date).ok()?;
+            Some((date, base_key_of(&day.date), *complete))
+        })
+        .collect();
+    let store_as = day_cache::store_keys(&state.pool, state.plant_id, state.tz, &store_as).await?;
     if tariff.dynamic_source().is_some() {
-        for day in &to_store {
-            let day_key = day_keys.get(&day.date).unwrap_or(&key);
+        for ((day, _), (_, day_key)) in to_store.iter().zip(&store_as) {
             db::save_daily_costs(&state.pool, std::slice::from_ref(day), day_key).await?;
         }
     } else {
-        db::save_daily_costs(&state.pool, &to_store, &key).await?;
+        // Complete days share the plan's key; each incomplete day has its own.
+        let (plain, keyed): (Vec<_>, Vec<_>) = to_store
+            .iter()
+            .zip(&store_as)
+            .partition(|((_, _), (_, k))| *k == key);
+        let plain: Vec<db::CachedDayCost> =
+            plain.into_iter().map(|((d, _), _)| d.clone()).collect();
+        db::save_daily_costs(&state.pool, &plain, &key).await?;
+        for ((day, _), (_, day_key)) in keyed {
+            db::save_daily_costs(&state.pool, std::slice::from_ref(day), day_key).await?;
+        }
     }
 
     // Back in date order, which `HashMap` does not keep.

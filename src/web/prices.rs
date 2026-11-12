@@ -307,14 +307,14 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
         ));
     }
     let mut stored: HashMap<NaiveDate, Option<StoredDay>> =
-        day_cache::load(&state.pool, STATS_KIND, &keys).await?;
+        day_cache::load_with_data(&state.pool, state.plant_id, tz, STATS_KIND, &keys).await?;
     let missing: Vec<NaiveDate> = dates
         .iter()
         .copied()
         .filter(|d| !stored.contains_key(d))
         .collect();
 
-    let mut to_store: Vec<(NaiveDate, String, Option<StoredDay>)> = Vec::new();
+    let mut to_store: Vec<(NaiveDate, String, bool, Option<StoredDay>)> = Vec::new();
     let key_of: HashMap<NaiveDate, &String> = keys.iter().map(|(d, k)| (*d, k)).collect();
     let (today_start, _) = day_bounds_or_error(today_date, tz)?;
     // Each run of consecutive missing days is loaded on its own, so a stored
@@ -359,18 +359,26 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
                     stats,
                     import_kwh: import_total(&usage, start, end),
                 });
-            // A day without prices stays without them; a priced day is only
-            // final once its usage is (a later backfill could add to it).
+            // A day without prices stays without them. A priced day whose
+            // usage is not final (the inverter or the sync missed part of it)
+            // is stored too, but keyed on its readings, so a later backfill
+            // makes it be worked out again.
             let final_usage = day.is_none() || cacheable_usage.get(&date).copied().unwrap_or(false);
-            if let (Some(key), true) = (key_of.get(&date), final_usage) {
-                to_store.push((date, (*key).clone(), day.clone()));
+            if let Some(key) = key_of.get(&date) {
+                to_store.push((date, (*key).clone(), final_usage, day.clone()));
             }
             stored.insert(date, day);
         }
     }
-    let rows: Vec<(NaiveDate, String, &Option<StoredDay>)> = to_store
+    let store_as: Vec<(NaiveDate, String, bool)> = to_store
         .iter()
-        .map(|(date, key, day)| (*date, key.clone(), day))
+        .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
+        .collect();
+    let store_as = day_cache::store_keys(&state.pool, state.plant_id, tz, &store_as).await?;
+    let rows: Vec<(NaiveDate, String, &Option<StoredDay>)> = store_as
+        .into_iter()
+        .zip(&to_store)
+        .map(|((date, key), (_, _, _, day))| (date, key, day))
         .collect();
     day_cache::save(&state.pool, STATS_KIND, &rows).await?;
 
