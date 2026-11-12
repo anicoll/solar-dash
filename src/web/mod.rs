@@ -3601,14 +3601,19 @@ mod tests {
     async fn an_incomplete_day_is_not_cached_until_it_is_complete() {
         let (_dir, app, pool) = costs_app().await;
         let range = "from=2026-09-15&to=2026-09-15";
-        // Readings stop at 01:05: the day shows up but is not stored.
+        // Readings stop at 01:05: the day shows up and is stored, but under a
+        // key made from its readings (it has gaps).
         seed_counters(&pool, SEP_15_START, &[3600, 3900], 1000.0).await;
         let partial = costs_json(&app, range).await;
         assert_eq!(partial["days"][0]["import_kwh"], 1.0);
-        assert_eq!(stored_days(&pool).await, 0);
+        assert_eq!(stored_days(&pool).await, 1);
+        assert_eq!(
+            costs_json(&app, range).await.to_string(),
+            partial.to_string()
+        );
 
-        // A backfill adds the rest of the day, so the next request sees it
-        // and stores it.
+        // A backfill adds the rest of the day: its readings changed, so the
+        // stored copy is not used and the next request sees the new figures.
         seed_counters(&pool, SEP_15_START, &[LAST_READING], 3000.0).await;
         let complete = costs_json(&app, range).await;
         assert_eq!(complete["days"][0]["import_kwh"], 3.0);

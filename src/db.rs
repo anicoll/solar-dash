@@ -615,6 +615,84 @@ pub async fn live_samples_raw(pool: &SqlitePool, from: i64, to: i64) -> Result<V
     .context("could not read live samples")
 }
 
+/// The width of the time buckets [`data_fingerprints`] groups readings into.
+/// Every local day starts on a multiple of this (zone offsets are whole
+/// quarter hours), so a bucket never straddles two days.
+const FINGERPRINT_BUCKET_SECS: i64 = 900;
+
+/// A cheap fingerprint of the stored readings of each day in `bounds` (each
+/// `[start, end)` in unix seconds, sorted and not overlapping): how many
+/// readings the day has and the newest one's time, for the cloud's load
+/// counter (every cloud counter is written by the same poll, so it stands for
+/// them all), the inverter's grid totals and the live samples. A day that has
+/// been backfilled, or had a reading removed, gets another fingerprint, which
+/// is what a stored day with gaps in its data is keyed on.
+///
+/// One grouped query per table over the whole span, answered from the
+/// (source, metric, ts) or ts key without touching the table rows; the
+/// buckets are folded into days here, so a 23 or 25 hour day is exact.
+pub async fn data_fingerprints(
+    pool: &SqlitePool,
+    plant_id: i64,
+    bounds: &[(i64, i64)],
+) -> Result<Vec<String>> {
+    let (Some(&(from, _)), Some(&(_, to))) = (bounds.first(), bounds.last()) else {
+        return Ok(Vec::new());
+    };
+    let source = points::source(plant_id);
+    let load = Metric::LoadDayWh.name();
+    let tables = [
+        (
+            "SELECT ts / ?1, COUNT(*), MAX(ts) FROM metric_reading
+             WHERE source = ?2 AND metric = ?3 AND ts >= ?4 AND ts < ?5 GROUP BY 1",
+            true,
+        ),
+        (
+            "SELECT ts / ?1, COUNT(*), MAX(ts) FROM grid_meter
+             WHERE ts >= ?4 AND ts < ?5 GROUP BY 1",
+            false,
+        ),
+        (
+            "SELECT ts / ?1, COUNT(*), MAX(ts) FROM live_sample
+             WHERE ts >= ?4 AND ts < ?5 GROUP BY 1",
+            false,
+        ),
+    ];
+    let mut totals = vec![String::new(); bounds.len()];
+    for (sql, by_metric) in tables {
+        let mut query = sqlx::query_as::<_, (i64, i64, i64)>(sql).bind(FINGERPRINT_BUCKET_SECS);
+        // SQLite wants every numbered parameter bound; the tables without a
+        // source or metric still get the two values so the numbers line up.
+        query = if by_metric {
+            query.bind(&source).bind(load)
+        } else {
+            query.bind("").bind("")
+        };
+        let rows = query
+            .bind(from)
+            .bind(to)
+            .fetch_all(pool)
+            .await
+            .context("could not fingerprint the readings")?;
+        let mut sums = vec![(0i64, 0i64); bounds.len()];
+        for (bucket, count, newest) in rows {
+            let at = bucket * FINGERPRINT_BUCKET_SECS;
+            let day = bounds.partition_point(|b| b.1 <= at);
+            if bounds.get(day).is_some_and(|b| b.0 <= at) {
+                sums[day].0 += count;
+                sums[day].1 = sums[day].1.max(newest);
+            }
+        }
+        for (total, (count, newest)) in totals.iter_mut().zip(sums) {
+            if !total.is_empty() {
+                total.push('-');
+            }
+            total.push_str(&format!("{count}-{newest}"));
+        }
+    }
+    Ok(totals)
+}
+
 /// A finished local day's cost as stored in `daily_cost`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedDayCost {
@@ -666,6 +744,7 @@ impl From<DailyCostRow> for CachedDayCost {
 /// Stored day costs with `from <= date <= to` (`YYYY-MM-DD` text sorts like
 /// dates) that were worked out with `tariff_key`. Rows made with other rates
 /// are skipped, so they count as missing and get replaced.
+#[cfg(test)]
 pub async fn daily_costs_in_range(
     pool: &SqlitePool,
     from: &str,
@@ -684,6 +763,46 @@ pub async fn daily_costs_in_range(
     .await
     .context("could not read stored day costs")?;
     Ok(rows.into_iter().map(CachedDayCost::from).collect())
+}
+
+/// [`daily_costs_in_range`], and also the rows stored with a data fingerprint
+/// on `tariff_key` (a key of the form `{tariff_key}|data:...`, for a day that
+/// had gaps). Each row comes with the key it was stored under, so the caller
+/// can check the fingerprint.
+pub async fn daily_costs_in_range_keyed(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+    tariff_key: &str,
+) -> Result<Vec<(CachedDayCost, String)>> {
+    #[derive(sqlx::FromRow)]
+    struct Keyed {
+        #[sqlx(flatten)]
+        row: DailyCostRow,
+        tariff_key: String,
+    }
+    // `;` is the character after `:`, so the range is exactly the keys that
+    // start with `{tariff_key}|data:` (no `LIKE`, whose wildcards could
+    // appear in a key).
+    let rows: Vec<Keyed> = sqlx::query_as(
+        "SELECT date, source, import_cents, export_cents, supply_cents, credit_cents,
+                actual_cents, baseline_cents, savings_cents, import_kwh, export_kwh, load_kwh,
+                tariff_key
+         FROM daily_cost WHERE date >= ?1 AND date <= ?2
+           AND (tariff_key = ?3 OR (tariff_key >= ?4 AND tariff_key < ?5)) ORDER BY date",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(tariff_key)
+    .bind(format!("{tariff_key}|data:"))
+    .bind(format!("{tariff_key}|data;"))
+    .fetch_all(pool)
+    .await
+    .context("could not read stored day costs")?;
+    Ok(rows
+        .into_iter()
+        .map(|k| (CachedDayCost::from(k.row), k.tariff_key))
+        .collect())
 }
 
 /// The average daily load (kWh) per calendar month (1 to 12, any year) over

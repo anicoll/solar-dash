@@ -1126,7 +1126,7 @@ pub async fn day(State(state): State<AppState>, Query(params): Query<DayParams>)
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct DailyParams {
     from: Option<String>,
     to: Option<String>,
@@ -1269,7 +1269,8 @@ pub(super) async fn battery_discharge_by_date(
         ));
     }
     let mut stored: HashMap<NaiveDate, Option<f64>> =
-        day_cache::load(&state.pool, DISCHARGE_KIND, &keys).await?;
+        day_cache::load_with_data(&state.pool, state.plant_id, state.tz, DISCHARGE_KIND, &keys)
+            .await?;
 
     let mut to_store = Vec::new();
     for &date in dates {
@@ -1284,14 +1285,21 @@ pub(super) async fn battery_discharge_by_date(
         }
         let (totals, _, final_day) = day_totals_flagged(state, date, live_range, now).await?;
         let discharge = totals.battery_discharge_kwh;
-        if let (true, Some((_, key))) = (final_day, keys.iter().find(|(d, _)| *d == date)) {
-            to_store.push((date, key.clone(), discharge));
+        // A finished day with gaps is stored too, keyed on its readings.
+        if let Some((_, key)) = keys.iter().find(|(d, _)| *d == date) {
+            to_store.push((date, key.clone(), final_day, discharge));
         }
         stored.insert(date, discharge);
     }
-    let rows: Vec<(NaiveDate, String, &Option<f64>)> = to_store
+    let store_as: Vec<(NaiveDate, String, bool)> = to_store
         .iter()
-        .map(|(date, key, discharge)| (*date, key.clone(), discharge))
+        .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
+        .collect();
+    let store_as = day_cache::store_keys(&state.pool, state.plant_id, state.tz, &store_as).await?;
+    let rows: Vec<(NaiveDate, String, &Option<f64>)> = store_as
+        .into_iter()
+        .zip(&to_store)
+        .map(|((date, key), (_, _, _, discharge))| (date, key, discharge))
         .collect();
     day_cache::save(&state.pool, DISCHARGE_KIND, &rows).await?;
 
@@ -1677,7 +1685,7 @@ async fn daily_days(
         keys.push((date, key));
     }
     let mut stored: HashMap<NaiveDate, DayTotals> =
-        day_cache::load(&state.pool, DAILY_KIND, &keys).await?;
+        day_cache::load_with_data(&state.pool, state.plant_id, state.tz, DAILY_KIND, &keys).await?;
 
     let mut out = Vec::with_capacity(dates.len());
     let mut to_store = Vec::new();
@@ -1696,14 +1704,21 @@ async fn daily_days(
             final_day &= cacheable;
         }
         totals.home = day_home_mix(state, &data, date, &totals, &live).await?;
-        if final_day && let Some((_, key)) = keys.iter().find(|(d, _)| *d == date) {
-            to_store.push((date, key.clone(), out.len()));
+        // A finished day with gaps is stored too, keyed on its readings.
+        if let Some((_, key)) = keys.iter().find(|(d, _)| *d == date) {
+            to_store.push((date, key.clone(), final_day, out.len()));
         }
         out.push((date, totals));
     }
-    let rows: Vec<(NaiveDate, String, &DayTotals)> = to_store
+    let store_as: Vec<(NaiveDate, String, bool)> = to_store
         .iter()
-        .map(|(date, key, i)| (*date, key.clone(), &out[*i].1))
+        .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
+        .collect();
+    let store_as = day_cache::store_keys(&state.pool, state.plant_id, state.tz, &store_as).await?;
+    let rows: Vec<(NaiveDate, String, &DayTotals)> = store_as
+        .into_iter()
+        .zip(&to_store)
+        .map(|((date, key), (_, _, _, i))| (date, key, &out[*i].1))
         .collect();
     day_cache::save(&state.pool, DAILY_KIND, &rows).await?;
     Ok(out)
@@ -2623,12 +2638,15 @@ mod tests {
             let Json(worked_out) = daily(State(state.clone()), Query(ask(group)))
                 .await
                 .unwrap();
-            // Only the finished day with data is stored.
-            assert_eq!(stored().await, 1);
+            // The finished days are stored (a day before any reading, or one
+            // a grouped request skips, may not be), and a second request
+            // stores no more.
+            let after_first = stored().await;
+            assert!(after_first >= 2);
             let Json(from_store) = daily(State(state.clone()), Query(ask(group)))
                 .await
                 .unwrap();
-            assert_eq!(stored().await, 1);
+            assert_eq!(stored().await, after_first);
             assert_eq!(worked_out.to_string(), from_store.to_string());
         }
 
@@ -2638,6 +2656,62 @@ mod tests {
         let Json(no_plan) = daily(State(plain), Query(ask(None))).await.unwrap();
         assert!(no_plan["days"][1]["import_free_kwh"].is_null());
         assert_eq!(no_plan["days"][1]["import_kwh"], 1.5);
+    }
+
+    #[tokio::test]
+    async fn a_finished_day_with_gaps_is_stored_keyed_on_its_readings() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let start = day_bounds(date("2026-10-20"), ADELAIDE).unwrap().0;
+        let today_date = today(ADELAIDE);
+        let today_start = day_bounds(today_date, ADELAIDE).unwrap().0;
+        // The cloud stopped at noon: no reading in the day's last 10 minutes,
+        // so the day is not complete.
+        let rows = [
+            (Metric::PvDayWh, start + 12 * 3600, 5000.0),
+            (Metric::LoadDayWh, start + 12 * 3600, 3000.0),
+            // Today has readings too, and must never be stored.
+            (Metric::LoadDayWh, today_start + 3600, 1000.0),
+        ];
+        db::seed_metrics(&pool, 7, &rows).await;
+        let hash = super::super::hash_password("x").unwrap();
+        let state = AppState::new(pool.clone(), 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let params = DailyParams {
+            from: Some("2026-10-19".to_string()),
+            to: Some(today_date.to_string()),
+            group: None,
+        };
+        let stored = || async {
+            db::daily_cache_in_range(&pool, DAILY_KIND, "2026-10-01", "2099-01-01")
+                .await
+                .unwrap()
+        };
+
+        let Json(worked_out) = daily(State(state.clone()), Query(params.clone()))
+            .await
+            .unwrap();
+        let rows = stored().await;
+        // The incomplete day is stored under its data key; today is not.
+        assert!(rows.iter().all(|r| r.date != today_date.to_string()));
+        let row = rows.iter().find(|r| r.date == "2026-10-20").unwrap();
+        assert!(row.cache_key.contains("|data:"));
+        let key_before = row.cache_key.clone();
+        let Json(from_store) = daily(State(state.clone()), Query(params.clone()))
+            .await
+            .unwrap();
+        assert_eq!(worked_out.to_string(), from_store.to_string());
+        assert_eq!(stored().await, rows);
+
+        // A backfilled reading changes the key, and the day is worked out again.
+        db::seed_metrics(&pool, 7, &[(Metric::LoadDayWh, start + 13 * 3600, 4000.0)]).await;
+        let Json(after) = daily(State(state), Query(params)).await.unwrap();
+        let now_rows = stored().await;
+        let row = now_rows.iter().find(|r| r.date == "2026-10-20").unwrap();
+        assert_ne!(row.cache_key, key_before);
+        assert_ne!(after.to_string(), from_store.to_string());
     }
 
     #[tokio::test]
