@@ -950,7 +950,7 @@
     let list = (periods || []).filter((p) => usableWhatif(p.res));
     if (!list.length) return null;
     const ORDER = ['bill', 'd30', 'd90'];
-    const state = { period: list[0].key, on: { car: true, grid_charge: true, spikes: true }, all: false, how: false };
+    const state = { period: list[0].key, on: { car: true, grid_charge: true, spikes: true }, all: false, how: false, days: false };
     const node = h('div', { class: 'bill-wi' });
     const money = (v) => (v < 0 ? MINUS : '') + SD.fmt.dollars(Math.abs(v));
 
@@ -1040,9 +1040,15 @@
         return { d, amber, paid: amber < 0 };
       });
       const shown = state.all ? rows : rows.slice(0, 14);
-      children.push(h('section', { class: 'card bill-wi-days' },
-        h('div', { class: 'bill-wi-days-h' }, h('h2', { class: 'bill-wi-h', text: 'Day by day' }),
-          h('span', { class: 'bill-wi-sub', text: 'Amber with your switches' })),
+      // The day list is the longest part of the page, so it sits behind a disclosure, closed
+      // by default. The summary line carries the verdict, so most visits never need to open it.
+      const cheaper = rows.filter((r) => r.amber < r.d.globird_dollars).length;
+      const days = h('details', { class: 'card bill-wi-days', open: state.days ? true : null },
+        h('summary', { class: 'bill-wi-days-h' },
+          h('span', { class: 'bill-wi-days-t' },
+            h('h2', { class: 'bill-wi-h', text: 'Day by day' }),
+            h('span', { class: 'bill-wi-sub', text: `Amber cheaper on ${cheaper} of ${plural(rows.length, 'day', 'days')}, with your switches` })),
+          h('span', { class: 'bill-chev', 'aria-hidden': 'true', text: '›' })),
         h('div', { class: 'bill-wi-row is-head', 'aria-hidden': 'true' },
           h('span', { text: 'Day' }), h('span', { text: 'GloBird' }), h('span', { text: 'Amber' })),
         ...shown.map(({ d, amber, paid }) => h('div', { class: `bill-wi-row${paid ? ' is-paid' : ''}` },
@@ -1054,7 +1060,10 @@
           type: 'button', class: 'bill-wi-more', text: state.all ? 'Show fewer days' : `Show all ${rows.length} days`,
           onclick: () => { state.all = !state.all; render(); },
         }) : null,
-        h('p', { class: 'bill-wi-sub', text: 'Highlighted days are ones where Amber would have paid you overall.' })));
+        h('p', { class: 'bill-wi-sub', text: 'Highlighted days are ones where Amber would have paid you overall.' }));
+      // Rebuilding the page on every switch must not shut the list again.
+      days.addEventListener('toggle', () => { state.days = days.open; });
+      children.push(days);
 
       const notes = Array.isArray(res.assumptions) ? res.assumptions : [];
       if (notes.length) {

@@ -1417,7 +1417,30 @@
 #page-bill .bill-wi-days-h {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  list-style: none;
+  cursor: pointer;
+}
+
+#page-bill .bill-wi-days-h::-webkit-details-marker {
+  display: none;
+}
+
+#page-bill .bill-wi-days-t {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+#page-bill .bill-wi-days[open] .bill-chev {
+  transform: rotate(90deg);
+}
+
+/* Closed, the card is just its summary line; the flex gap only applies once it opens. */
+#page-bill .bill-wi-days:not([open]) {
+  gap: 0;
 }
 
 #page-bill .bill-wi-row {
