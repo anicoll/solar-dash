@@ -359,21 +359,48 @@
     return out;
   }
 
+  /** Unix seconds of local midnight (Adelaide) at the start of a 'YYYY-MM-DD'. */
+  function localMidnight(dateStr) {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const target = Date.UTC(y, m - 1, d) / 1000;
+    let ts = target - 9.5 * 3600; // close; the loop corrects for the exact offset
+    for (let i = 0; i < 3; i++) {
+      const l = SD.local(ts);
+      const [ly, lm, ld] = l.date.split('-').map(Number);
+      ts -= (Date.UTC(ly, lm - 1, ld) / 1000 - target) + l.minute * 60 + l.sec;
+    }
+    return ts;
+  }
+
+  /** The local day's [start, end) in unix seconds: the next midnight, not +24 h, so a 23 or 25 hour day is right. */
+  function dayBounds(date) {
+    const [y, m, d] = date.split('-').map(Number);
+    const next = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+    return { start: localMidnight(date), end: localMidnight(next) };
+  }
+
   async function loadDay(date) {
     const today = SD.local().date;
-    const [dayData, tariffRaw, daily, costs] = await Promise.all([
+    // Everything starts at once: the series and prices only need the day's bounds, which the
+    // browser knows. If the server ever disagrees, they are fetched again with its bounds.
+    const guess = dayBounds(date);
+    const fetchLive = (b) => quiet(SD.fetchJSON(`/api/live/series?from=${b.start}&to=${b.end - 1}`));
+    const [dayData, tariffRaw, daily, costs, liveGuess, pricesGuess] = await Promise.all([
       SD.fetchJSON(`/api/day?date=${date}`),
       quiet(SD.tariff.get(date)),
       quiet(SD.fetchJSON(`/api/daily?from=${date}&to=${date}`)),
       quiet(SD.fetchJSON(`/api/costs?from=${date}&to=${date}`)),
+      fetchLive(guess),
+      SD.caps.prices ? loadDayPrices(guess) : Promise.resolve([]),
     ]);
-    const live = await quiet(SD.fetchJSON(`/api/live/series?from=${dayData.start}&to=${dayData.end - 1}`));
+    const same = dayData.start === guess.start && dayData.end === guess.end;
+    const live = same ? liveGuess : await fetchLive(dayData);
     const tariff = tariffRaw && tariffRaw.configured ? tariffRaw : null;
     const d = (daily && daily.days && daily.days[0]) || {};
     const c = (costs && costs.days && costs.days[0]) || null;
     const curves = dayCurves(dayData, (live && live.data) || []);
     const grid = gridFromRows(curves.rows, tariff);
-    const prices = SD.caps.prices ? await loadDayPrices(dayData) : [];
+    const prices = !SD.caps.prices ? [] : same ? pricesGuess : await loadDayPrices(dayData);
     const hasCurve = curves.pv.length > 0 || curves.load.length > 0;
     const hasEnergy = num(d.pv_kwh) || num(d.load_kwh) || num(d.import_kwh);
 

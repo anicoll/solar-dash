@@ -50,7 +50,7 @@ pub fn build(
         spokes.push(Box::new(isolarcloud::IsolarCloudSpoke::new(client, cloud)));
     }
     if let Some(globird) = config.globird.clone() {
-        spokes.push(Box::new(globird_portal::GlobirdPortal::new(globird)));
+        spokes.push(Box::new(globird_portal::GlobirdPortal::new(globird, state)));
     }
     if let Some(teslamate) = config.teslamate.clone() {
         spokes.push(Box::new(teslamate_mqtt::TeslamateMqtt::new(
