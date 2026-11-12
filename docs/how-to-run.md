@@ -635,6 +635,7 @@ also never published back to it by the MQTT sink.
    [home_assistant.source]
    url = "http://homeassistant.local:8123"   # https:// for TLS
    token = "eyJhbGciOi..."
+   # backfill_days = 365    # history to copy in on first sight; 0 = off
 
    [[home_assistant.source.entity]]
    entity_id = "sensor.solar_power"
@@ -685,6 +686,29 @@ only). Home Assistant is not an accepted id there yet: putting `home-assistant`
 in `daily_energy` is an error that says so. The mapped readings are stored
 under the `home-assistant` source name, ready for the pages to prefer them per
 metric in a later change; until then they are visible through the API below.
+
+**History backfill.** The first time an entity is seen, solar-dash copies its
+past from Home Assistant's long-term statistics (`recorder/statistics_during_period`),
+walking back from where the live readings begin to `backfill_days` ago (default
+365; `0` turns it off; set in `[home_assistant.source]`). The last 10 days use
+the 5-minute statistics, older days the hourly ones (Home Assistant keeps
+5-minute statistics for about 10 days), requested in chunks of 5 or 30 days
+with a pause between. Only entities with a `state_class` have statistics;
+others are skipped with one log line. Each row is stored at the start of its
+period in `ha_reading` (and `metric_reading` for mapped entities):
+
+- sensors with a mean (`state_class: measurement`, e.g. power): the **mean**;
+- meters (`total`, `total_increasing`, e.g. energy): the meter's **state** at the
+  end of the period, the same value the live source stores, in the entity's own
+  unit (the cumulative `sum` is used only when the state is missing).
+
+Progress is kept in `sync_state` (job `ha-backfill:<entity_id>`, the oldest
+time copied so far), so a restart resumes and a finished entity is never asked
+again. Raising `backfill_days` later fetches only the extra older part. A
+new entity added to the config is backfilled on the next start. Gaps while
+solar-dash was not running are not filled. A failed request is retried with a
+growing pause; the live readings are not held up. Only the read commands
+`recorder/get_statistics_metadata` and `recorder/statistics_during_period` are used.
 
 **API** (same login as the other `/api` routes):
 
