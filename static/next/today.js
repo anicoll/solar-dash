@@ -342,7 +342,7 @@
     const m = SD.local().minute;
     if (nxt && !nxt.off) {
       const mins = nxt.at - m;
-      const inText = mins >= 60 ? `${Math.floor(mins / 60)} h ${mins % 60} min` : `${mins} min`;
+      const inText = mins >= 60 ? `${Math.floor(mins / 60)} h${mins % 60 ? ` ${mins % 60} min` : ''}` : `${mins} min`;
       return `${nxt.free ? 'Free' : 'Credit'} window opens at ${SD.fmt.minute(nxt.at % 1440)}, in ${inText}.`;
     }
     if (win.cw.start <= m) {
