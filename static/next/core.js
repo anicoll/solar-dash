@@ -560,6 +560,333 @@
   })();
   SD.live = live;
 
+  /* ---------------------------------------------------------------- prices: bands, blocks, timeline */
+
+  /* The shared price helpers. Today ("Price now") and History (the day's "Prices" card and the
+     week / month / year heat strip) read prices the same way, so the maths and the colours live here.
+
+     SD.price.band(cents, spike)             -> 'free' | 'shoulder' | 'peak'   (0 or less, up to the spike level, above it)
+     SD.price.look(row, spike)               -> {name, tone}: the source's own label for a price row when it has one,
+                                                else our band. tone is one of free cheap neutral high spike.
+     SD.price.cellLook(cents, spike)         -> {name, tone} from the cents alone (the heat strip has no labels):
+                                                free <= 0c, spike >= spike level, else cheap / neutral / high by LOW_CENTS and HIGH_CENTS.
+     SD.price.sellText(cents)                -> what a feed-in price earns ('-4c' when you would pay to export)
+     SD.price.blocks(prices, {buy, nowTs, dayStart, dayEnd?})
+                                             -> the day's 30-minute blocks (see priceBlocks below)
+     SD.priceTimeline(opts)                  -> {el, update(prices, o), settle()}: the scrollable row of 30-minute blocks
+                                                with its Buying / Selling switch, the 5-minute detail panel and the colour key.
+                                                update() redraws; settle() re-tries the first scroll once el is on the page. */
+
+  const h = SD.h;
+  const PRICE_BLOCK_S = 1800;
+  const PRICE_BAND_NAME = { free: 'Free', shoulder: 'Shoulder', peak: 'Peak' };
+  /** The source's own labels, and the colour tone each one uses. */
+  const PRICE_DESCRIPTORS = {
+    extremelyLow: { name: 'Extremely low', tone: 'cheap' },
+    veryLow: { name: 'Very low', tone: 'cheap' },
+    low: { name: 'Low', tone: 'cheap' },
+    neutral: { name: 'Neutral', tone: 'neutral' },
+    high: { name: 'High', tone: 'high' },
+    spike: { name: 'Spike', tone: 'spike' },
+  };
+  const BAND_TONE = { free: 'free', shoulder: 'neutral', peak: 'high' };
+  /** Without a label to go on, the heat strip calls a price low under this many cents and high over the second one. */
+  const LOW_CENTS = 15;
+  const HIGH_CENTS = 40;
+
+  /** The same three bands as the engine: 0 or less is Free, above the spike level is Peak, the rest Shoulder. */
+  function priceBand(cents, spike) {
+    if (cents <= 0) return 'free';
+    return cents > spike ? 'peak' : 'shoulder';
+  }
+
+  /** How a row is named and coloured: the source's descriptor when it has one, else our band. */
+  function priceLook(row, spike) {
+    // 0c or less always reads as free (sun), whatever the descriptor says, so
+    // the colour matches the Free band used everywhere else.
+    if (row.cents <= 0) return { name: PRICE_BAND_NAME.free, tone: 'free' };
+    const d = row.descriptor && PRICE_DESCRIPTORS[row.descriptor];
+    if (d) return d;
+    const band = priceBand(row.cents, spike);
+    return { name: PRICE_BAND_NAME[band], tone: BAND_TONE[band] };
+  }
+
+  /** A look from the cents alone, for the heat strip's averaged cells. */
+  function priceCellLook(cents, spike) {
+    if (cents <= 0) return { name: PRICE_BAND_NAME.free, tone: 'free' };
+    if (spike > 0 && cents >= spike) return PRICE_DESCRIPTORS.spike;
+    if (cents < LOW_CENTS) return PRICE_DESCRIPTORS.low;
+    return cents > HIGH_CENTS ? PRICE_DESCRIPTORS.high : PRICE_DESCRIPTORS.neutral;
+  }
+
+  /** Fallback when the API sent no `now`: the newest-starting stored interval that covers `ts`. */
+  function priceAt(rows, ts) {
+    let best = null;
+    for (const r of rows || []) if (r.start <= ts && ts < r.end && (!best || r.start > best.start)) best = r;
+    return best;
+  }
+
+  /** What the customer gets for exporting: feed-in is negative when paid, so flip it. */
+  function sellText(cents) {
+    const earned = -cents;
+    if (Math.abs(earned) < 0.05) return '0c';
+    return earned > 0 ? SD.fmt.cents(earned) : `-${SD.fmt.cents(-earned)}`;
+  }
+
+  const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  /** The source sends interval starts one second after the boundary (12:00:01); work on the whole minute. */
+  const floorMinute = (ts) => ts - (((ts % 60) + 60) % 60);
+  /** Rows of about 30 minutes (25 to 35, so a 1799 s row counts) are "blocks"; 15 minutes or less are 5-minute rows. */
+  const isBlockRow = (r) => r.end - r.start >= 25 * 60 && r.end - r.start <= 35 * 60;
+  const isFiveRow = (r) => r.end - r.start <= 15 * 60;
+
+  /**
+   * A day's 30-minute blocks, from `dayStart` (local midnight, unix seconds).
+   *
+   * - A past block is the simple mean (not weighted) of its 5-minute actual rows, or the 30-minute actual row when there are none.
+   * - The block we are in (`nowTs` inside the day) shows the current 5-minute price, and is marked "now".
+   * - A future block uses the 30-minute forecast row, or the mean of 5-minute forecast rows when it has none.
+   * Rows are binned by the floored minute of their start, never by exact time, so +1 s starts match.
+   * Each block keeps its six 5-minute slots for the detail panel. A block with no buy price is left out.
+   * With `dayEnd` the blocks stop there (a whole day: 48 of them, 46 or 50 when the clocks change);
+   * without it they run as far as the forecasts go (Today).
+   */
+  function priceBlocks(prices, o) {
+    const { buy, nowTs, dayStart, dayEnd } = o;
+    const ch = (prices && prices.channels) || {};
+    const blockOf = (r) => Math.floor((floorMinute(r.start) - dayStart) / PRICE_BLOCK_S);
+    const slotOf = (r) => Math.floor((floorMinute(r.start) - dayStart) / 300);
+    // The block we are in: none when the day is wholly past (every block is settled) or wholly ahead.
+    const curIdx = nowTs < dayStart ? -1 : dayEnd != null && nowTs >= dayEnd ? Infinity : Math.floor((nowTs - dayStart) / PRICE_BLOCK_S);
+
+    // One channel's rows, sorted into the groups the blocks are made from.
+    const indexOf = (rows, current) => {
+      const ix = { fives: new Map(), actual30: new Map(), forecast30: new Map(), forecastFives: new Map() };
+      for (const r of rows || []) {
+        const known = r.kind === 'actual' || r.kind === 'current';
+        if (known && isFiveRow(r)) ix.fives.set(slotOf(r), r);
+        else if (known && isBlockRow(r)) ix.actual30.set(blockOf(r), r);
+        else if (r.kind === 'forecast' && isBlockRow(r)) ix.forecast30.set(blockOf(r), r);
+        else if (r.kind === 'forecast' && isFiveRow(r)) {
+          const list = ix.forecastFives.get(blockOf(r)) || [];
+          list.push(r);
+          ix.forecastFives.set(blockOf(r), list);
+        }
+      }
+      if (current && !ix.fives.has(slotOf(current))) ix.fives.set(slotOf(current), current);
+      return ix;
+    };
+    const buyIx = indexOf(ch.general, buy);
+    const sellIx = indexOf(ch.feed_in, null);
+
+    // The row best standing for a set of rows: the label from the one nearest the mean.
+    const summarise = (rows) => {
+      if (!rows.length) return null;
+      const cents = mean(rows.map((r) => r.cents));
+      const nearest = rows.reduce((a, b) => (Math.abs(b.cents - cents) < Math.abs(a.cents - cents) ? b : a));
+      const ren = rows.filter((r) => r.renewables != null).map((r) => r.renewables);
+      return { cents, descriptor: nearest.descriptor, renewables: ren.length ? mean(ren) : null };
+    };
+    const plain = (r) => (r ? { cents: r.cents, descriptor: r.descriptor, renewables: r.renewables } : null);
+
+    const count = dayEnd != null ? Math.ceil((dayEnd - dayStart) / PRICE_BLOCK_S) : null;
+    const last = count != null ? count - 1 : Math.max(curIdx, ...buyIx.forecast30.keys(), ...buyIx.forecastFives.keys());
+    const blocks = [];
+    for (let i = 0; i <= last; i++) {
+      const start = dayStart + i * PRICE_BLOCK_S;
+      const slots = [];
+      for (let k = 0; k < 6; k++) {
+        const t = start + k * 300;
+        const n = i * 6 + k;
+        slots.push({ start: t, buy: buyIx.fives.get(n) || null, sell: sellIx.fives.get(n) || null });
+      }
+      const buys = slots.map((x) => x.buy).filter(Boolean);
+      const sells = slots.map((x) => x.sell).filter(Boolean);
+      const meanSell = (list) => (list.length ? mean(list.map((r) => r.cents)) : null);
+      let kind = 'actual';
+      let b;
+      let s;
+      if (i === curIdx) {
+        kind = 'now';
+        b = buy ? plain(buy) : summarise(buys) || plain(buyIx.actual30.get(i));
+        const sRow = slots.find((x) => x.sell && x.start <= nowTs && nowTs < x.start + 300);
+        s = sRow ? sRow.sell.cents : meanSell(sells);
+        if (s == null && sellIx.actual30.has(i)) s = sellIx.actual30.get(i).cents;
+      } else if (i < curIdx) {
+        b = summarise(buys) || plain(buyIx.actual30.get(i));
+        s = meanSell(sells);
+        if (s == null && sellIx.actual30.has(i)) s = sellIx.actual30.get(i).cents;
+      } else {
+        kind = 'forecast';
+        b = plain(buyIx.forecast30.get(i)) || summarise(buyIx.forecastFives.get(i) || []);
+        const sf = sellIx.forecast30.get(i);
+        s = sf ? sf.cents : meanSell(sellIx.forecastFives.get(i) || []);
+      }
+      if (!b) continue;
+      blocks.push({ idx: i, start, end: start + PRICE_BLOCK_S, kind, buy: b, sell: s, slots });
+    }
+    return blocks;
+  }
+
+  SD.price = {
+    band: priceBand, look: priceLook, cellLook: priceCellLook, at: priceAt, sellText, blocks: priceBlocks,
+    LOW_CENTS, HIGH_CENTS,
+  };
+
+  /**
+   * The timeline: a row of 30-minute blocks that scrolls sideways, a Buying / Selling switch, the
+   * five-minute prices of the open block, and the colour key. The caller owns everything around it.
+   *
+   *   opts.title   the line left of the switch (default 'Today and the next 24 hours · 30-minute blocks')
+   *   opts.source  the price source's name for the notes (default SD.caps.price_source or 'Amber')
+   *
+   *   update(prices, o)  prices = the /api/prices JSON. o = {nowTs, dayStart, dayEnd?, buy?, spike, scrollTo?}.
+   *     nowTs is unix seconds (the clock, so a past day passes the real now and has no "now" block);
+   *     dayStart/dayEnd the day's bounds; buy the current 5-minute row when the caller has it;
+   *     scrollTo 'cheapest' sends the first draw to the cheapest buy block when no block is "now".
+   *     Returns the number of blocks (0 draws nothing).
+   *   The person's choices (buying or selling, the open block, the scroll) survive every update.
+   */
+  SD.priceTimeline = function (opts) {
+    opts = opts || {};
+    const root = h('div', { class: 'ptl-root' });
+    const ui = { channel: 'buy', selected: null, scrolled: false, args: null };
+    let scroller = null;
+    let want = null; // the element the first draw should bring into view
+
+    /** Scrolls `target` to the middle of the scroller. Measured against the scroller itself, so it
+        holds whatever the page positions (offsetLeft is relative to the nearest positioned ancestor). */
+    function centre(target) {
+      const s = scroller.getBoundingClientRect();
+      const t = target.getBoundingClientRect();
+      scroller.scrollLeft = Math.max(0, scroller.scrollLeft + (t.left - s.left) - (s.width - t.width) / 2);
+    }
+
+    /** First draw only: bring the wanted block into view (a redraw must not undo the person's scrolling).
+        Waits (returns without marking it done) while the row is not laid out yet, e.g. its card is hidden. */
+    function firstScroll() {
+      if (ui.scrolled || !want || !scroller || !want.isConnected || scroller.clientWidth === 0) return;
+      centre(want);
+      ui.scrolled = true;
+    }
+
+    function draw() {
+      const { prices, o } = ui.args;
+      const source = opts.source || SD.caps.price_source || 'Amber';
+      const spike = o.spike > 0 ? o.spike : 100;
+      const sellMode = ui.channel === 'sell';
+      const fmtVal = (cents) => (sellMode ? sellText(cents) : SD.fmt.cents(cents, { round: true }));
+      const blocks = priceBlocks(prices, o);
+      if (!blocks.length) { root.replaceChildren(); return 0; }
+      const cur = blocks.find((b) => b.kind === 'now') || null;
+      // The block to open and scroll to: the current one, else (a past day) the cheapest.
+      const cheapest = o.scrollTo === 'cheapest' ? blocks.reduce((a, b) => (b.buy.cents < a.buy.cents ? b : a)) : null;
+      const picked = blocks.find((b) => b.start === ui.selected) || cur || cheapest || blocks[0];
+
+      // Keep keyboard focus on the same block through the redraw.
+      const focused = document.activeElement && root.contains(document.activeElement) ? document.activeElement.dataset.start : null;
+      const prevScroll = scroller ? scroller.scrollLeft : 0;
+
+      const list = h('div', { class: 'ptl' });
+      const words = [];
+      for (const b of blocks) {
+        const l = priceLook(b.buy, spike);
+        const value = sellMode ? (b.sell == null ? null : sellText(b.sell)) : SD.fmt.cents(b.buy.cents, { round: true });
+        const kindText = b.kind === 'now' ? 'now' : b.kind;
+        const time = SD.fmt.time(b.start);
+        words.push(`${time}, ${value == null ? 'no price' : value}, ${kindText}`);
+        list.append(h('button', {
+          type: 'button',
+          class: `ptl-block is-${b.kind}${b === picked ? ' is-picked' : ''}`,
+          dataset: { start: String(b.start) },
+          'aria-pressed': b === picked ? 'true' : 'false',
+          'aria-label': `${time} to ${SD.fmt.time(b.end)}, ${value == null ? 'no price' : value}, ${l.name}, ${kindText}`,
+          onclick: () => { ui.selected = b.start; draw(); },
+        },
+        h('span', { class: 'ptl-time', text: time }),
+        h('b', { class: `ptl-dot tone-${l.tone}${l.tone === 'spike' ? ' is-spike' : ''}`, 'aria-hidden': 'true' }),
+        h('span', { class: 'ptl-cents', text: value == null ? '–' : value }),
+        h('span', { class: 'ptl-ren', text: b.buy.renewables != null ? `${Math.round(b.buy.renewables)}%` : ' ' }),
+        h('span', { class: 'ptl-kind', text: kindText })));
+      }
+      if (!scroller) scroller = h('div', { class: 'ptl-wrap' });
+      scroller.replaceChildren(list);
+
+      const toggle = (key, text) => h('button', {
+        type: 'button', class: 'ptl-toggle-btn', 'aria-pressed': ui.channel === key ? 'true' : 'false',
+        onclick: () => { ui.channel = key; draw(); },
+      }, text);
+
+      root.replaceChildren(
+        h('div', { class: 'ptl-head' },
+          h('span', { class: 'ptl-title', text: opts.title || 'Today and the next 24 hours · 30-minute blocks' }),
+          h('div', { class: 'ptl-toggle', role: 'group', 'aria-label': 'Price shown' }, toggle('buy', 'Buying'), toggle('sell', 'Selling'))),
+        h('p', { class: 'sr-only', text: `Price timeline. ${words.slice(0, 16).join('. ')}.` }),
+        scroller,
+        priceDetail(picked, o.nowTs, spike, fmtVal, sellMode, source),
+        priceLegend());
+
+      if (focused) {
+        const again = list.querySelector(`[data-start="${focused}"]`);
+        if (again) again.focus({ preventScroll: true });
+      }
+      want = list.querySelector('.is-now') || (cheapest && list.querySelector(`[data-start="${cheapest.start}"]`)) || null;
+      scroller.scrollLeft = prevScroll;
+      firstScroll();
+      return blocks.length;
+    }
+
+    return {
+      el: root,
+      update(prices, o) {
+        ui.args = { prices, o };
+        return draw();
+      },
+      settle: firstScroll,
+    };
+  };
+
+  /** The panel under the timeline for the open block. */
+  function priceDetail(b, nowTs, spike, fmtVal, sellMode, source) {
+    const l = priceLook(b.buy, spike);
+    const forecast = b.kind === 'forecast';
+    const value = sellMode ? (b.sell == null ? null : sellText(b.sell)) : SD.fmt.cents(b.buy.cents, { round: false });
+    const parts = [h('div', { class: 'ptl-detail-head' },
+      h('span', { class: 'ptl-detail-title', text: `${SD.fmt.time(b.start)} block · ${l.name}` }),
+      h('span', { class: 'label', text: { actual: 'Settled', now: 'In progress', forecast: 'Forecast' }[b.kind] }))];
+    if (forecast) {
+      // We do not store the forecast range, so only the forecast itself is shown.
+      parts.push(h('p', { class: 'ptl-detail-line' }, 'Forecast ', h('b', { text: value == null ? 'not available' : value }), '.'),
+        h('p', { class: 'ptl-detail-note', text: `${source} only forecasts in 30-minute blocks. The six 5-minute prices fill in as each one settles, about 15 seconds after it starts.` }));
+    } else {
+      const grid = h('ol', { class: 'ptl-fives' });
+      for (const s of b.slots) {
+        const row = sellMode ? s.sell : s.buy;
+        const settled = !!row;
+        const fl = s.buy ? priceLook(s.buy, spike) : null;
+        const label = settled ? fmtVal(row.cents) : (s.start >= nowTs ? '…' : '–');
+        grid.append(h('li', { class: `ptl-five${s.start <= nowTs && nowTs < s.start + 300 ? ' is-now' : ''}${settled ? '' : ' is-pending'}` },
+          h('span', { class: 'ptl-five-time', text: SD.fmt.time(s.start).replace(/ (am|pm)$/, '') }),
+          fl ? h('b', { class: `ptl-dot ptl-dot-sm tone-${fl.tone}${fl.tone === 'spike' ? ' is-spike' : ''}`, 'aria-hidden': 'true' }) : h('b', { class: 'ptl-dot ptl-dot-sm ptl-dot-empty', 'aria-hidden': 'true' }),
+          h('span', { class: 'ptl-five-cents', text: label })));
+      }
+      parts.push(grid);
+      parts.push(h('p', { class: 'ptl-detail-note', text: b.kind === 'actual'
+        ? `Block average ${value == null ? 'not available' : value}: the simple mean of its 5-minute prices.`
+        : 'The block in progress. Each 5-minute price settles about 15 seconds after it starts.' }));
+    }
+    if (sellMode) parts.push(h('p', { class: 'ptl-detail-note', text: 'Selling shows what you earn per kWh exported. A minus means you pay to export.' }));
+    return h('div', { class: 'ptl-detail', role: 'region', 'aria-label': 'Selected price block' }, parts);
+  }
+
+  /** The colour key: the dot colour always follows the buying price. */
+  function priceLegend() {
+    const item = (tone, text) => h('span', { class: 'ptl-key' }, h('b', { class: `ptl-dot ptl-dot-sm tone-${tone}${tone === 'spike' ? ' is-spike' : ''}`, 'aria-hidden': 'true' }), text);
+    return h('div', { class: 'ptl-legend' },
+      item('free', 'Free (0c or less)'), item('cheap', 'Low'), item('neutral', 'Neutral'), item('high', 'High'), item('spike', 'Spike'),
+      h('span', { class: 'ptl-key', text: 'Colours follow the buying price' }));
+  }
+
   /* The header: "Live · N s" counts the age of the newest reading, once a second. */
   function startHeaderLive() {
     const box = document.getElementById('sd-live');

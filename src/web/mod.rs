@@ -14,6 +14,7 @@ mod globird;
 mod home_mix;
 mod payback;
 mod petrol;
+mod price_grid;
 mod prices;
 mod warm;
 mod whatif;
@@ -443,6 +444,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/series", get(api::series))
         .route("/api/prices", get(prices::prices))
         .route("/api/prices/daily", get(prices::daily))
+        .route("/api/prices/grid", get(price_grid::grid))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
         .route("/api/battery", get(battery::battery))
@@ -853,6 +855,7 @@ mod tests {
         "/api/series?metrics=battery_soc_pct&from=1767225600&to=1767312000&step=300",
         "/api/prices?from=1767225600&to=1767312000",
         "/api/prices/daily?from=2026-01-01&to=2026-01-07",
+        "/api/prices/grid?from=2026-01-01&to=2026-01-07",
         "/api/day?date=2026-01-01",
         "/api/day",
         "/api/daily",
