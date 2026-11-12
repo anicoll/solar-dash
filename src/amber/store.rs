@@ -196,6 +196,12 @@ pub async fn prices_between(
     .context("could not read prices")
 }
 
+/// How far back from `now` [`prices_at`] looks for a row that started before
+/// it. Rows are 5 or 30 minutes long; a day is far more than any stored
+/// interval, and it lets SQLite use the `start_ts` index as a short range
+/// instead of walking it from the oldest row.
+const CURRENT_LOOKBACK_SECS: i64 = 24 * 3600;
+
 /// The interval each channel is in at `now` (`start <= now < end`).
 pub async fn prices_at(
     pool: &SqlitePool,
@@ -206,10 +212,11 @@ pub async fn prices_at(
         "SELECT channel, start_ts AS start, end_ts AS end, cents, spot_cents, kind,
                 fetched_at, descriptor, renewables
          FROM price_interval
-         WHERE start_ts <= ? AND end_ts > ? AND (? IS NULL OR source = ?)
+         WHERE start_ts <= ? AND start_ts > ? AND end_ts > ? AND (? IS NULL OR source = ?)
          ORDER BY channel, start_ts DESC",
     )
     .bind(now)
+    .bind(now - CURRENT_LOOKBACK_SECS)
     .bind(now)
     .bind(source)
     .bind(source)
@@ -746,5 +753,29 @@ mod tests {
                 (T0 + 900, "current".to_string(), 6.0),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn now_ignores_rows_older_than_the_lookback() {
+        use ChannelType::General;
+        use IntervalKind::*;
+        let (_dir, pool) = pool().await;
+        let now = 10 * CURRENT_LOOKBACK_SECS;
+        // A (bogus) row that started two days ago and is still open is out of
+        // reach; one that started a minute ago is found.
+        let mut stale = interval(
+            ActualInterval,
+            General,
+            now - 2 * CURRENT_LOOKBACK_SECS,
+            1.0,
+        );
+        stale.end_time = DateTime::from_timestamp(now + 300, 0).unwrap();
+        let fresh = interval(CurrentInterval, General, now - 60, 2.0);
+        save_prices(&pool, "amber:s", &[stale, fresh], 0)
+            .await
+            .unwrap();
+        let rows = prices_at(&pool, None, now).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cents, 2.0);
     }
 }
