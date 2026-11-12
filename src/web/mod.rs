@@ -15,6 +15,7 @@ mod home_mix;
 mod payback;
 mod petrol;
 mod prices;
+mod warm;
 mod whatif;
 
 pub(crate) use costs::house_intervals;
@@ -112,6 +113,8 @@ pub struct AppState {
     spokes: Arc<[SpokeInfo]>,
     /// Which source wins for a day's energy (`[sources]`).
     rules: Arc<SourceRules>,
+    /// Pinged when a GloBird sync finishes, so the cache warm-up runs again.
+    warm: Arc<tokio::sync::Notify>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -151,6 +154,7 @@ impl AppState {
             offsite: crate::offsite::Status::default(),
             spokes: hub::spoke_infos(&[]).into(),
             rules: Arc::new(SourceRules::default()),
+            warm: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -161,6 +165,16 @@ impl AppState {
     }
 
     /// Records which spokes (by id) are running, for `/api/spokes`.
+    /// The signal the nightly GloBird sync gives when it brings in new data.
+    pub fn warm_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.warm.clone()
+    }
+
+    /// Starts the background task that warms the caches (see `warm`).
+    pub fn spawn_warmup(&self) {
+        tokio::spawn(warm::run(self.clone()));
+    }
+
     pub fn with_enabled_spokes(mut self, enabled: &[&str]) -> Self {
         self.spokes = hub::spoke_infos(enabled).into();
         self
