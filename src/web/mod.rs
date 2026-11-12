@@ -17,6 +17,7 @@ mod payback;
 mod petrol;
 mod price_grid;
 mod prices;
+mod samples;
 mod warm;
 mod whatif;
 
@@ -173,6 +174,12 @@ impl AppState {
     pub fn with_source_rules(mut self, rules: SourceRules) -> Self {
         self.rules = Arc::new(rules);
         self
+    }
+
+    /// The `metric_reading` source the day counters are read from (see
+    /// [`samples::counter_source_name`]).
+    pub(super) fn counter_source(&self) -> String {
+        samples::counter_source_name(&self.rules, self.plant_id)
     }
 
     /// Gives the web API the Home Assistant source's view of its entities.
@@ -862,6 +869,7 @@ mod tests {
                 metric: Some(crate::metric::Metric::PvW),
                 name: Some("Solar".into()),
                 unit: None,
+                invert: false,
             };
             state = state.with_ha_view(Some(crate::ha_source::HaView::new(&[entity])));
         }
@@ -5471,4 +5479,6 @@ mod tests {
         put(r#"{"petrol_grade":null,"price_rise_percent":5.5}"#).await;
         assert_eq!(count(&pool, "admin_change").await, changes);
     }
+
+    mod ha_pages;
 }

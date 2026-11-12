@@ -167,6 +167,7 @@ path = "data/solar.db"
 # metric = "pv_w"
 # name = "Solar"
 # unit = "W"   # only if Home Assistant reports no unit
+# invert = true  # flip the sign: grid + = import, battery + = charging
 
 # Optional: your GloBird Energy customer portal login, used by `globird-probe`
 # and by `serve`, which keeps GloBird's daily cost and usage in the database
@@ -224,10 +225,16 @@ path = "data/solar.db"
 # has always behaved. Today the only such question is a day's energy totals:
 # the inverter's live Modbus samples or iSolarCloud's daily counters.
 # [sources]
-# # Source ids, best first. Valid ids: "sungrow-modbus", "isolarcloud". Leave one
-# # out to never use it. Putting "isolarcloud" first makes the cloud counters
-# # win whenever they have data; live samples then only fill days it lacks.
+# # Source ids, best first. Valid ids: "sungrow-modbus", "home-assistant",
+# # "isolarcloud". Leave one out to never use it. Putting "isolarcloud" first
+# # makes the cloud counters win whenever they have data; live samples then
+# # only fill days it lacks. "home-assistant" needs [home_assistant.source]
+# # with entities mapped to load_w or grid_w (power) or to *_day_wh counters;
+# # see docs/how-to-run.md ("Using Home Assistant as a data source").
 # daily_energy = ["sungrow-modbus", "isolarcloud"]
+# # Source ids for the live view (Today's live numbers, the History power
+# # chart), best first: "sungrow-modbus" and/or "home-assistant".
+# live = ["sungrow-modbus"]
 # # A finished day needs this share of its time covered by live samples to
 # # win over the cloud counters (0 to 1).
 # finished_day_coverage = 0.98

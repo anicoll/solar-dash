@@ -279,13 +279,23 @@ pub async fn readings_in_range(
     from: i64,
     to: i64,
 ) -> Result<Vec<(i64, f64)>> {
-    let source = points::source(plant_id);
+    readings_in_range_from(pool, &points::source(plant_id), metric, from, to).await
+}
+
+/// Like [`readings_in_range`], for the readings of any source name (the cloud's or `home-assistant`).
+pub async fn readings_in_range_from(
+    pool: &SqlitePool,
+    source: &str,
+    metric: Metric,
+    from: i64,
+    to: i64,
+) -> Result<Vec<(i64, f64)>> {
     sqlx::query_as(
         "SELECT ts, value FROM metric_reading
          WHERE source = ? AND metric = ? AND ts >= ? AND ts < ? AND value IS NOT NULL
          ORDER BY ts",
     )
-    .bind(&source)
+    .bind(source)
     .bind(metric.name())
     .bind(from)
     .bind(to)
@@ -297,18 +307,19 @@ pub async fn readings_in_range(
 /// The `(metric, ts, value)` rows of several metrics with `from <= ts < to`,
 /// ordered by metric name and then time. One query for all of them, so a long
 /// range does not cost a query per day. Rows without a value are left out.
-pub async fn readings_for_metrics(
+/// `source` is the readings' source name (the cloud plant's, see
+/// `isolar::points::source`, or `home-assistant`).
+pub async fn readings_for_metrics_from(
     pool: &SqlitePool,
-    plant_id: i64,
+    source: &str,
     metrics: &[Metric],
     from: i64,
     to: i64,
 ) -> Result<Vec<(Metric, i64, f64)>> {
-    let source = points::source(plant_id);
     // `QueryBuilder` adds the `?` for each metric, so no value is pasted into the SQL.
     let mut query =
         sqlx::QueryBuilder::new("SELECT metric, ts, value FROM metric_reading WHERE source = ");
-    query.push_bind(&source).push(" AND metric IN (");
+    query.push_bind(source).push(" AND metric IN (");
     let mut names = query.separated(", ");
     for metric in metrics {
         names.push_bind(metric.name());
@@ -331,19 +342,20 @@ pub async fn readings_for_metrics(
 }
 
 /// The largest value of one metric with `from <= ts < to`, or `None` if there is none.
-pub async fn max_value_in_range(
+/// `source` is the readings' source name (the cloud plant's, see
+/// `isolar::points::source`, or `home-assistant`).
+pub async fn max_value_in_range_from(
     pool: &SqlitePool,
-    plant_id: i64,
+    source: &str,
     metric: Metric,
     from: i64,
     to: i64,
 ) -> Result<Option<f64>> {
-    let source = points::source(plant_id);
     let max = sqlx::query_scalar(
         "SELECT MAX(value) FROM metric_reading
          WHERE source = ? AND metric = ? AND ts >= ? AND ts < ?",
     )
-    .bind(&source)
+    .bind(source)
     .bind(metric.name())
     .bind(from)
     .bind(to)
@@ -354,19 +366,20 @@ pub async fn max_value_in_range(
 }
 
 /// The time of the newest reading of `metric` in `[from, to)`, or `None`.
-pub async fn newest_reading_ts_in_range(
+/// `source` is the readings' source name (the cloud plant's, see
+/// `isolar::points::source`, or `home-assistant`).
+pub async fn newest_reading_ts_in_range_from(
     pool: &SqlitePool,
-    plant_id: i64,
+    source: &str,
     metric: Metric,
     from: i64,
     to: i64,
 ) -> Result<Option<i64>> {
-    let source = points::source(plant_id);
     sqlx::query_scalar(
         "SELECT MAX(ts) FROM metric_reading
          WHERE source = ? AND metric = ? AND ts >= ? AND ts < ?",
     )
-    .bind(&source)
+    .bind(source)
     .bind(metric.name())
     .bind(from)
     .bind(to)
@@ -577,19 +590,20 @@ pub async fn live_ts_range(pool: &SqlitePool) -> Result<Option<(i64, i64)>> {
 }
 
 /// The oldest reading of any of `metrics`, or `None` if there is none.
-pub async fn first_reading_ts(
+/// `source` is the readings' source name (the cloud plant's, see
+/// `isolar::points::source`, or `home-assistant`).
+pub async fn first_reading_ts_from(
     pool: &SqlitePool,
-    plant_id: i64,
+    source: &str,
     metrics: &[Metric],
 ) -> Result<Option<i64>> {
-    let source = points::source(plant_id);
     let mut first: Option<i64> = None;
     // One lookup per metric, each answered from the (source, metric, ts) key.
     for &metric in metrics {
         let ts: Option<i64> = sqlx::query_scalar(
             "SELECT MIN(ts) FROM metric_reading WHERE source = ? AND metric = ?",
         )
-        .bind(&source)
+        .bind(source)
         .bind(metric.name())
         .fetch_one(pool)
         .await
@@ -635,40 +649,49 @@ pub async fn data_fingerprints(
     pool: &SqlitePool,
     plant_id: i64,
     bounds: &[(i64, i64)],
+    with_home_assistant: bool,
 ) -> Result<Vec<String>> {
     let (Some(&(from, _)), Some(&(_, to))) = (bounds.first(), bounds.last()) else {
         return Ok(Vec::new());
     };
     let source = points::source(plant_id);
     let load = Metric::LoadDayWh.name();
-    let tables = [
+    // Each table with the source and metric it is filtered by (`""` when the
+    // query ignores them).
+    let mut tables = vec![
         (
             "SELECT ts / ?1, COUNT(*), MAX(ts) FROM metric_reading
              WHERE source = ?2 AND metric = ?3 AND ts >= ?4 AND ts < ?5 GROUP BY 1",
-            true,
+            (source.as_str(), load),
         ),
         (
             "SELECT ts / ?1, COUNT(*), MAX(ts) FROM grid_meter
              WHERE ts >= ?4 AND ts < ?5 GROUP BY 1",
-            false,
+            ("", ""),
         ),
         (
             "SELECT ts / ?1, COUNT(*), MAX(ts) FROM live_sample
              WHERE ts >= ?4 AND ts < ?5 GROUP BY 1",
-            false,
+            ("", ""),
         ),
     ];
+    // Home Assistant's readings (all its mapped metrics) only when the rules
+    // use them, so an install without them keeps the fingerprints it had.
+    if with_home_assistant {
+        tables.push((
+            "SELECT ts / ?1, COUNT(*), MAX(ts) FROM metric_reading
+             WHERE source = ?2 AND ts >= ?4 AND ts < ?5 GROUP BY 1",
+            (crate::ha_source::SOURCE_NAME, ""),
+        ));
+    }
     let mut totals = vec![String::new(); bounds.len()];
-    for (sql, by_metric) in tables {
-        let mut query = sqlx::query_as::<_, (i64, i64, i64)>(sql).bind(FINGERPRINT_BUCKET_SECS);
+    for (sql, (table_source, table_metric)) in tables {
         // SQLite wants every numbered parameter bound; the tables without a
         // source or metric still get the two values so the numbers line up.
-        query = if by_metric {
-            query.bind(&source).bind(load)
-        } else {
-            query.bind("").bind("")
-        };
-        let rows = query
+        let rows = sqlx::query_as::<_, (i64, i64, i64)>(sql)
+            .bind(FINGERPRINT_BUCKET_SECS)
+            .bind(table_source)
+            .bind(table_metric)
             .bind(from)
             .bind(to)
             .fetch_all(pool)
@@ -2182,17 +2205,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, vec![(100, 1.0), (200, 5.0)]);
-        let max = |from, to| max_value_in_range(&pool, 7, Metric::PvW, from, to);
+        let cloud = points::source(7);
+        let max = |from, to| max_value_in_range_from(&pool, &cloud, Metric::PvW, from, to);
         assert_eq!(max(0, 1000).await.unwrap(), Some(5.0));
         assert_eq!(max(0, 100).await.unwrap(), None);
         assert_eq!(
-            first_reading_ts(&pool, 7, &[Metric::LoadW, Metric::PvW])
+            first_reading_ts_from(&pool, &points::source(7), &[Metric::LoadW, Metric::PvW])
                 .await
                 .unwrap(),
             Some(100)
         );
         assert_eq!(
-            first_reading_ts(&pool, 7, &[Metric::LoadW]).await.unwrap(),
+            first_reading_ts_from(&pool, &points::source(7), &[Metric::LoadW])
+                .await
+                .unwrap(),
             None
         );
     }
@@ -2215,9 +2241,15 @@ mod tests {
         upsert_metric_readings(&pool, &points::source(7), &rows)
             .await
             .unwrap();
-        let got = readings_for_metrics(&pool, 7, &[Metric::PvW, Metric::SocPct], 0, 300)
-            .await
-            .unwrap();
+        let got = readings_for_metrics_from(
+            &pool,
+            &points::source(7),
+            &[Metric::PvW, Metric::SocPct],
+            0,
+            300,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             got,
             vec![(Metric::PvW, 100, 1.0), (Metric::SocPct, 100, 67.4)]
@@ -2266,6 +2298,30 @@ mod tests {
         );
         // Only exporting since then: no peak.
         assert_eq!(peak_grid_import(&pool, 240).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn fingerprints_include_home_assistant_readings_only_when_asked() {
+        let (_dir, pool) = test_db().await;
+        let bounds = [(0, 86_400)];
+        let plain = data_fingerprints(&pool, 7, &bounds, false).await.unwrap();
+        // Without the flag the fingerprint is the three it always had.
+        assert_eq!(plain, ["0-0-0-0-0-0"]);
+        sqlx::query(
+            "INSERT INTO metric_reading (source, metric, ts, value)
+             VALUES ('home-assistant', 'grid_w', 500, 1.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            data_fingerprints(&pool, 7, &bounds, false).await.unwrap(),
+            plain
+        );
+        assert_eq!(
+            data_fingerprints(&pool, 7, &bounds, true).await.unwrap(),
+            ["0-0-0-0-0-0-1-500"]
+        );
     }
 
     #[tokio::test]

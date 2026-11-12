@@ -306,8 +306,15 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
             ),
         ));
     }
-    let mut stored: HashMap<NaiveDate, Option<StoredDay>> =
-        day_cache::load_with_data(&state.pool, state.plant_id, tz, STATS_KIND, &keys).await?;
+    let mut stored: HashMap<NaiveDate, Option<StoredDay>> = day_cache::load_with_data(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        tz,
+        STATS_KIND,
+        &keys,
+    )
+    .await?;
     let missing: Vec<NaiveDate> = dates
         .iter()
         .copied()
@@ -374,7 +381,14 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
         .iter()
         .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
         .collect();
-    let store_as = day_cache::store_keys(&state.pool, state.plant_id, tz, &store_as).await?;
+    let store_as = day_cache::store_keys(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        tz,
+        &store_as,
+    )
+    .await?;
     let rows: Vec<(NaiveDate, String, &Option<StoredDay>)> = store_as
         .into_iter()
         .zip(&to_store)

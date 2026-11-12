@@ -642,6 +642,7 @@ also never published back to it by the MQTT sink.
    metric = "pv_w"          # optional: one of the dashboard's metric names
    name = "Solar"           # optional: a friendlier name
    # unit = "W"             # optional: when Home Assistant reports no unit
+   # invert = true          # optional: flip the sign (power metrics only)
 
    [[home_assistant.source.entity]]
    entity_id = "sensor.outdoor_temperature"
@@ -679,13 +680,10 @@ as `home-assistant` in `/api/spokes` and in the `sources` of `/api/capabilities`
 - `metric_reading` with source `home-assistant`, for entities that have a
   `metric`, converted to the metric's unit.
 
-**Which source the app uses.** Today the dashboard's pages read the
-iSolarCloud copy of a metric, the live Modbus samples and, for a day's energy,
-the `[sources] daily_energy` rule (ids `sungrow-modbus` and `isolarcloud`
-only). Home Assistant is not an accepted id there yet: putting `home-assistant`
-in `daily_energy` is an error that says so. The mapped readings are stored
-under the `home-assistant` source name, ready for the pages to prefer them per
-metric in a later change; until then they are visible through the API below.
+**Which source the app uses.** Nothing changes until you say so: by default the
+pages read Modbus and iSolarCloud exactly as before, and the mapped readings
+are only stored. To make the pages use them, list `home-assistant` in the
+`[sources]` rules (see "Using Home Assistant as a data source" below).
 
 **History backfill.** The first time an entity is seen, solar-dash copies its
 past from Home Assistant's long-term statistics (`recorder/statistics_during_period`),
@@ -719,6 +717,136 @@ growing pause; the live readings are not held up. Only the read commands
   `{"entity_id", "unit", "step", "points": [{"ts", "value"}]}`, at most 31 days.
   Ranges over about 12 hours are averaged into buckets (at most about 3000
   points); `step=<seconds>` chooses the bucket length.
+
+### Using Home Assistant as a data source
+
+To make the pages show Home Assistant's numbers (for a home without a Sungrow
+inverter, or to fill gaps in one), map the entities to metrics (above) and list
+`home-assistant` in `[sources]`:
+
+- `live = [...]` is the source of the **live view**: the Today page's live
+  numbers (`GET /api/live`) and the History power chart
+  (`GET /api/live/series`). Default `["sungrow-modbus"]`.
+- `daily_energy = [...]` is the source of a **day's energy**: Today, History,
+  the daily totals, the costs, the battery page and the bill all read the same
+  days. Default `["sungrow-modbus", "isolarcloud"]`.
+
+Both are ordered lists, best first. A config that lists `home-assistant` without
+a `[home_assistant.source]` table, or without the entities it needs, stops
+`serve` at startup with a message that says what is missing.
+
+**What a day is made of.** Home Assistant counts as one of two kinds of source,
+decided by what you mapped:
+
+- **Power** (`pv_w`, `load_w`, `grid_w`, `battery_w`): the day's energy is
+  worked out by adding up the power over time, the same way the Modbus samples
+  are. You need `load_w` or `grid_w` (the other is worked out as
+  `load = solar + grid - battery`); an unmapped `pv_w` or `battery_w` means
+  the home has none and counts as 0. Each reading is held until the next one,
+  for at most an hour (a sensor that does not change sends nothing, so a
+  battery idling at 0 W is fine), and an hour or more with no reading is a gap.
+  A day is **covered** by the share of its time that has readings, and the
+  usual coverage rules apply (`finished_day_coverage`, `partial_day_coverage`).
+- **Day counters** (`load_day_wh`, `grid_import_day_wh`, `grid_export_day_wh`,
+  `pv_day_wh`, ...): the day's energy is the largest value of the day, like
+  iSolarCloud's counters. They are exact, so if any is mapped they are used
+  instead of adding up power. They stand in for the cloud's counters, so list
+  either `home-assistant` or `isolarcloud` in `daily_energy`, not both.
+
+When several sources are listed, the first is preferred when it covers the day
+well, and the next ones are the fallback (the same rule as Modbus and the
+cloud). With two sources of power (Modbus and Home Assistant) the later one
+fills the **gaps** of the first: Home Assistant's readings are used only where
+the dongle sent nothing for a couple of minutes. The costs, tariff split and
+bill are worked out from the very same day intervals, so an HA-only home gets
+a bill.
+
+**Signs.** The pages read grid power as **positive when importing** (negative
+when exporting) and battery power as **positive when charging** (negative when
+discharging). Map entities that follow this, or add `invert = true` to the
+entity whose sign is the other way round (common for a grid meter that reports
+exports as positive, or a battery that reports discharge as positive). The
+flip happens when the pages read the data, so the stored readings stay as
+Home Assistant reported them, and fixing `invert` fixes past days too.
+`invert` is only for the power metrics. Units are converted from W/kW/MW.
+
+**The live view.** `live` picks the first source that has a fresh sample. For
+Home Assistant that is the newest reading of each mapped power metric, used
+only when the newest of them is under 5 minutes old (otherwise the live view
+is empty, like a stopped dongle); a single metric that has not changed for an
+hour is left blank. A missing `load_w` is worked out from solar, grid and
+battery; a missing `pv_w` or `battery_w` is left blank, not shown as 0.
+`/api/capabilities` reports `live` and `history` as on when Home Assistant
+supplies them, and lists `home-assistant` in `sources`.
+
+Anything that came from Home Assistant is still never published back to it by
+the MQTT sink.
+
+**Example: a home with only Home Assistant** (no Modbus, no iSolarCloud):
+
+```toml
+[sources]
+live = ["home-assistant"]
+daily_energy = ["home-assistant"]
+
+[home_assistant.source]
+url = "http://homeassistant.local:8123"
+token = "eyJhbGciOi..."
+
+[[home_assistant.source.entity]]
+entity_id = "sensor.solar_power"
+metric = "pv_w"
+
+[[home_assistant.source.entity]]
+entity_id = "sensor.house_consumption"
+metric = "load_w"
+
+[[home_assistant.source.entity]]
+entity_id = "sensor.grid_power"
+metric = "grid_w"
+invert = true            # this meter reports exports as positive
+
+[[home_assistant.source.entity]]
+entity_id = "sensor.battery_power"
+metric = "battery_w"
+
+[[home_assistant.source.entity]]
+entity_id = "sensor.battery_level"
+metric = "soc_pct"
+```
+
+If you also have daily energy sensors (daily `utility_meter`s that reset at
+midnight), map them as `load_day_wh`, `grid_import_day_wh`, `grid_export_day_wh`
+and `pv_day_wh` and the days use those instead of adding up power.
+
+**Example: Modbus first, Home Assistant as the backup** (it fills the gaps when
+the dongle drops out, and the cloud is the last resort for days neither
+covers):
+
+```toml
+[sources]
+live = ["sungrow-modbus", "home-assistant"]
+daily_energy = ["sungrow-modbus", "home-assistant", "isolarcloud"]
+```
+
+with the same `[home_assistant.source]` entities as above (here at least
+`load_w` or `grid_w`, and power metrics rather than day counters, so Home
+Assistant is added to the Modbus samples; with day counters mapped you would
+list `home-assistant` or `isolarcloud` after Modbus, not both).
+
+**Changing the rules.** The rules (including which metrics are mapped and
+`invert`) are part of the key of every stored day, so after changing them the
+days are worked out again from the readings on the next request. Existing
+installs that do not list `home-assistant` keep their stored days and answer
+byte for byte as before.
+
+**Limits.** The `source` label of a day stays `inverter` for days added up
+from power (Modbus or Home Assistant) and `cloud` for days read from counters
+(iSolarCloud or Home Assistant): it names the kind of data. A day read from
+Home Assistant's counters is stored for good only when a counter changed in
+the last ten minutes of the day, so for a sensor that is flat late in the
+evening it is simply worked out again each time. `/api/day` and `/api/series`
+(the metric charts) still read the iSolarCloud copy of each metric.
 
 ### Publishing to Home Assistant over MQTT (the sink)
 
@@ -1120,11 +1248,12 @@ When two sources can answer the same question, the optional `[sources]` section 
 ```toml
 [sources]
 daily_energy = ["sungrow-modbus", "isolarcloud"]
+live = ["sungrow-modbus"]
 finished_day_coverage = 0.98
 partial_day_coverage = 0.9
 ```
 
-These values are the defaults, so leaving the section out changes nothing. A day's energy comes from the live Modbus samples when they cover at least `finished_day_coverage` of a finished day (or `partial_day_coverage` of today); a day covered by at least `partial_day_coverage` but less than `finished_day_coverage` uses them only if iSolarCloud has nothing for it. Listing `"isolarcloud"` first makes the cloud counters win whenever they have data, and listing only one id means the other is never used. A source that is not configured simply never has data (startup logs a warning if `daily_energy` names one). An unknown id is an error at startup that names the valid ids. The same rule decides the intervals the costs, battery and bill pages use.
+These values are the defaults, so leaving the section out changes nothing. A day's energy comes from the live Modbus samples when they cover at least `finished_day_coverage` of a finished day (or `partial_day_coverage` of today); a day covered by at least `partial_day_coverage` but less than `finished_day_coverage` uses them only if iSolarCloud has nothing for it. Listing `"isolarcloud"` first makes the cloud counters win whenever they have data, and listing only one id means the other is never used. A source that is not configured simply never has data (startup logs a warning if `daily_energy` names one). An unknown id is an error at startup that names the valid ids (`sungrow-modbus`, `home-assistant`, `isolarcloud` for `daily_energy`; `sungrow-modbus` and `home-assistant` for `live`). The same rule decides the intervals the costs, battery and bill pages use. `home-assistant` is explained under "Using Home Assistant as a data source".
 
 ## Where the settings live
 

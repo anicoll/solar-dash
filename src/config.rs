@@ -69,6 +69,9 @@ pub struct Site {
 pub struct Sources {
     /// Source ids for a day's energy, best first.
     pub daily_energy: Option<Vec<String>>,
+    /// Source ids for the live view (the Today page's live numbers and the
+    /// History power chart), best first. Default: `["sungrow-modbus"]`.
+    pub live: Option<Vec<String>>,
     pub finished_day_coverage: Option<f64>,
     pub partial_day_coverage: Option<f64>,
 }
@@ -680,6 +683,14 @@ pub struct HaEntity {
     /// Overrides the unit Home Assistant reports (`unit_of_measurement`),
     /// for sensors that report none.
     pub unit: Option<String>,
+    /// Flip the sign of the value when the pages read it. Use it when this
+    /// sensor's sign is the opposite of the dashboard's: grid power positive
+    /// when importing, battery power positive when charging (see "Signs" in
+    /// docs/how-to-run.md). Only for the power metrics. It is applied on
+    /// read, so the stored readings stay as Home Assistant reported them and
+    /// changing it fixes the past too.
+    #[serde(default)]
+    pub invert: bool,
 }
 
 impl HaSource {
@@ -756,6 +767,15 @@ impl HaSource {
                     "metric {:?} is given to more than one entity in [home_assistant.source]; \
                      a metric can only come from one entity",
                     metric.name()
+                );
+            }
+            if entity.invert {
+                anyhow::ensure!(
+                    entity
+                        .metric
+                        .is_some_and(|m| m.kind() == crate::metric::MetricKind::Power),
+                    "invert on {id:?} in [home_assistant.source] only applies to an entity \
+                     with a power metric (pv_w, pv_dc_w, load_w, grid_w, battery_w)"
                 );
             }
             for (field, value) in [("name", &entity.name), ("unit", &entity.unit)] {
@@ -1281,7 +1301,12 @@ impl Config {
 
     /// The rules from `[sources]`, with the defaults filled in.
     pub fn source_rules(&self) -> Result<crate::hub::SourceRules> {
-        crate::hub::SourceRules::from_config(&self.sources)
+        crate::hub::SourceRules::from_config(
+            &self.sources,
+            self.home_assistant
+                .as_ref()
+                .and_then(|ha| ha.source.as_ref()),
+        )
     }
 
     /// Read and parse the config file at `path`.
@@ -1375,11 +1400,54 @@ mod tests {
         let text = format!("{MINIMAL}\n[sources]\ndaily_energy = [\"solarweb\"]\n");
         let cfg: Config = toml::from_str(&text).unwrap();
         let err = format!("{:#}", cfg.source_rules().unwrap_err());
-        assert!(err.contains("sungrow-modbus, isolarcloud"), "{err}");
+        assert!(
+            err.contains("sungrow-modbus, home-assistant, isolarcloud"),
+            "{err}"
+        );
 
         // A misspelt key is an error, not silently ignored.
         let text = format!("{MINIMAL}\n[sources]\ndaily_energies = []\n");
         assert!(toml::from_str::<Config>(&text).is_err());
+    }
+
+    #[test]
+    fn home_assistant_in_sources_needs_the_source_table_and_mappings() {
+        // The `[sources]` rules are checked together with the Home Assistant
+        // table, so a missing or too-thin mapping stops `serve` at startup.
+        let sources =
+            "[sources]\ndaily_energy = [\"home-assistant\"]\nlive = [\"home-assistant\"]\n";
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{sources}")).unwrap();
+        let err = format!("{:#}", cfg.source_rules().unwrap_err());
+        assert!(err.contains("no [home_assistant.source] table"), "{err}");
+
+        let power = "[home_assistant.source]\nurl = \"http://ha:8123\"\ntoken = \"t\"\n\
+            [[home_assistant.source.entity]]\nentity_id = \"sensor.grid\"\nmetric = \"grid_w\"\n\
+            invert = true\n";
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n{sources}{power}")).unwrap();
+        let rules = cfg.source_rules().unwrap();
+        assert!(
+            rules
+                .ha()
+                .unwrap()
+                .is_inverted(crate::metric::Metric::GridW)
+        );
+        assert!(rules.ha_live() && rules.ha_daily());
+    }
+
+    #[test]
+    fn invert_only_applies_to_power_metrics() {
+        let with = |metric: &str| {
+            let text = format!(
+                "[home_assistant.source]\nurl = \"http://ha:8123\"\ntoken = \"t\"\n\
+                 [[home_assistant.source.entity]]\nentity_id = \"sensor.x\"\n{metric}invert = true\n"
+            );
+            parse_source(&text).check().map_err(|e| e.to_string())
+        };
+        assert!(with("metric = \"battery_w\"\n").is_ok());
+        for bad in ["", "metric = \"soc_pct\"\n", "metric = \"load_day_wh\"\n"] {
+            let err = with(bad).unwrap_err();
+            assert!(err.contains("invert on"), "{bad}: {err}");
+        }
     }
 
     #[test]
