@@ -1,12 +1,15 @@
 /* Today page: what is today costing, and is tonight's $1 safe?
 
-   One function per section, top to bottom on a phone (head, credit window, grid pull,
-   right now, your day so far, coming up, evening credit, totals). Each builds a
-   section element once and returns {el, update}; update() redraws it from `data`.
+   One function per section, top to bottom on a phone (head, live, price now, your day so
+   far, evening credit). Each builds a section element once and returns {el, update};
+   update() redraws it from `data`. The Live card holds what used to be three cards: the
+   flows (solar, home, battery, grid), the grid pull against its limit, and one status
+   line for the free and credit windows. Your day holds the ribbon, bought, sold and cost,
+   and one sentence on what comes next.
 
-   Live parts (head, credit window, grid pull, right now, coming up) redraw on every
-   SD.live tick. Slower data (today's cost and totals, the minute series for the day
-   chart, the credit history) is fetched again every 5 minutes.
+   Live parts (head, live, price now, the next line) redraw on every SD.live tick. Slower
+   data (today's cost and totals, the minute series for the day chart, the credit history)
+   is fetched again every 5 minutes.
 
    Everything shown comes from the API; when a field is missing the element hides. */
 (function () {
@@ -15,7 +18,6 @@
   const SLOW_MS = 5 * 60 * 1000;
   const FLOW_MIN_W = 20; // below this a flow counts as idle (as on the old home page)
   const NUDGE_MIN_W = 500; // selling less than this is not worth a nudge
-  const METER_MIN_W = 5000; // above this the grid pull meter shows even without a car
   const PULL_VOLTS = 240; // /api/live volts is null for now, so amps are worked out at this
   const PULL_SERIES_MS = 30 * 1000; // how often the last-30-minutes line is fetched
   const NIGHTS = 14; // nights in the evening credit strip
@@ -227,70 +229,12 @@
     };
   }
 
-  /* ---------------------------------------------------------------- 2. credit window card */
-
-  function windowSection() {
-    const el = h('section', { class: 'card card-accent today-window', 'aria-labelledby': 'today-window-h' });
-    return {
-      el,
-      update() {
-        const win = windowNow();
-        el.hidden = !(win && win.inside);
-        if (el.hidden) return;
-        const { sample } = liveParts();
-        const { cw } = win;
-        const imp = windowImport(win);
-        const soc = sample && sample.soc_pct != null ? sample.soc_pct : null;
-        const typ = batteryTypical();
-        const pct = Math.min(100, (win.elapsed / win.length) * 100);
-        const mins = Math.max(0, Math.round(win.left));
-        const togo = mins >= 60 ? `${Math.floor(mins / 60)} h ${mins % 60} m to go` : `${mins} m to go`;
-        const figs = [];
-        if (imp) figs.push(fig('Bought', SD.fmt.kwh(imp.kwh, 2)));
-        if (soc != null) figs.push(fig('Battery', `${Math.round(soc)}%`, 'is-battery'));
-        if (soc != null && typ) {
-          const spare = Math.max(0, soc - typ.used * (win.left / win.length));
-          figs.push(fig(`Spare at ${SD.fmt.minute(cw.end)}`, `~${Math.round(spare)}%`));
-        }
-        fill(el,
-          h('div', { class: 'card-head' },
-            h('h2', { class: 'section-title', id: 'today-window-h', text: `Credit window, ${windowText(cw)}` }),
-            h('span', { class: 'label', text: togo })),
-          h('div', { class: 'today-progress', role: 'img', 'aria-label': `${Math.round(pct)}% of the credit window has passed, ${togo}` },
-            h('div', { class: 'today-progress-fill', style: `width: ${pct}%` }),
-            h('div', { class: 'today-progress-now', style: `left: ${pct}%` })),
-          h('div', { class: 'today-axis', 'aria-hidden': 'true' },
-            h('span', { text: SD.fmt.minute(cw.start) }),
-            h('span', { text: SD.fmt.minute((cw.start + Math.round(win.length / 2)) % 1440) }),
-            h('span', { text: SD.fmt.minute(cw.end) })),
-          figs.length ? h('div', { class: 'today-figs' }, figs) : null);
-      },
-    };
-  }
-
   /** Replaces an element's children, skipping the null ones (replaceChildren would print "null"). */
   function fill(el, ...kids) {
     el.replaceChildren(...kids.filter(Boolean));
   }
 
-  /** A label above a figure. */
-  function fig(label, value, cls) {
-    return h('div', { class: 'today-fig' },
-      h('div', { class: 'label', text: label }),
-      h('div', { class: `fig fig-md ${cls || ''}`, text: value }));
-  }
-
-  /* ---------------------------------------------------------------- 3. grid pull */
-
-  /** Which of the three note-n11 states applies: 'none', 'quiet', 'meter' or 'big'. */
-  function pullState() {
-    const { pull, car } = liveParts();
-    if (!pull) return 'none';
-    const now = pull.now_w;
-    if (now != null && pull.warn_w != null && now >= pull.warn_w) return 'big';
-    if (now != null && (isCharging(car) || now > METER_MIN_W)) return 'meter';
-    return pull.peak_today_w != null || now != null ? 'quiet' : 'none';
-  }
+  /* ---------------------------------------------------------------- 2. grid pull helpers (used by the Live card) */
 
   /** The bar: a fill for the pull, a hatched warning zone and a line at the limit. */
   function pullMeter(pull, compact) {
@@ -343,79 +287,11 @@
     SD.fetchJSON(`/api/live/series?from=${to - 1800}&to=${to}`).then((r) => {
       if (!view) return;
       data.pull30 = (r.data || []).filter((row) => row[3] != null).map((row) => [row[0], pos(row[3])]);
-      view.sections.pull.update();
+      view.sections.live.update();
     }).catch(() => { data.pullAt = 0; });
   }
 
-  function pullSection() {
-    const el = h('section', { class: 'card today-pull', 'aria-labelledby': 'today-pull-h' });
-    return {
-      el,
-      update() {
-        const st = pullState();
-        el.hidden = st !== 'big';
-        if (el.hidden) return;
-        const { pull } = liveParts();
-        refreshPullSeries();
-        const rows = (data.pull30 || []).slice();
-        rows.push([Math.floor(Date.now() / 1000), pull.now_w]); // the reading on screen is the last point
-        const peak = peakText(pull);
-        fill(el,
-          h('div', { class: 'card-head' },
-            h('h2', { class: 'section-title', id: 'today-pull-h', text: 'Grid pull' }),
-            h('span', { class: 'label', text: `Your limit ${SD.fmt.kw(pull.limit_w / 1000, 0)}` })),
-          h('div', { class: 'today-pull-now' },
-            h('span', { class: 'fig today-pull-kw', text: kwOf(pull.now_w) }),
-            h('span', { class: 'today-pull-amps', text: `about ${Math.round(pull.now_w / (pull.volts || PULL_VOLTS))} A` })),
-          pullMeter(pull, false),
-          rows.length > 1 ? h('div', { class: 'today-pull-recent' },
-            h('div', { class: 'label', text: 'Last 30 minutes' }),
-            pullSpark(pull, rows),
-            h('div', { class: 'today-axis', 'aria-hidden': 'true' },
-              h('span', { text: SD.fmt.time(Math.floor(Date.now() / 1000) - 1800) }),
-              h('span', { text: 'Now' }))) : null,
-          peak ? h('p', { class: 'today-pull-peak', text: peak }) : null);
-      },
-    };
-  }
-
-  /* ---------------------------------------------------------------- 4. right now */
-
-  /** Where power comes from and where it goes, in watts, with the car split out of the home load. */
-  function flows(s, car) {
-    const load = pos(s.load_w);
-    const carW = isCharging(car) && car.charger_power_kw != null ? Math.min(car.charger_power_kw * 1000, load) : 0;
-    const from = [
-      { kind: 'solar', label: 'Solar', w: pos(s.pv_w) },
-      { kind: 'battery', label: 'Battery', w: pos(-s.battery_w) },
-      { kind: 'grid-in', label: 'Grid', w: pos(s.grid_w) },
-    ];
-    const to = [
-      { kind: 'home', label: 'Home', w: load - carW },
-      { kind: 'car', label: car && car.display_name ? car.display_name : 'Car', w: carW },
-      { kind: 'battery', label: 'Battery', w: pos(s.battery_w) },
-      { kind: 'grid-out', label: 'Grid', w: pos(-s.grid_w) },
-    ];
-    return { from: from.filter((x) => x.w >= FLOW_MIN_W), to: to.filter((x) => x.w >= FLOW_MIN_W) };
-  }
-
-  /** One balance bar. Segments too narrow for words are listed under it instead. */
-  function balanceBar(title, list) {
-    const total = list.reduce((a, x) => a + x.w, 0);
-    const small = [];
-    const segs = list.map((x) => {
-      const share = total ? x.w / total : 0;
-      const text = share >= 0.3 ? `${x.label} ${kwOf(x.w)}` : share >= 0.16 ? x.label : null;
-      if (!text) small.push(`${x.label} ${kwOf(x.w)}`);
-      return h('div', { class: `today-seg is-${x.kind}`, style: `flex: ${x.w} 1 0`, text });
-    });
-    const spoken = list.map((x) => `${x.label} ${kwOf(x.w)}`).join(', ');
-    return h('div', { class: 'today-balance' },
-      h('span', { class: 'label', text: title }),
-      total ? h('div', { class: 'today-bar', role: 'img', 'aria-label': `${title}: ${spoken}` }, segs)
-        : h('div', { class: 'today-bar is-empty', role: 'img', 'aria-label': `${title}: nothing` }, h('span', { text: 'Nothing right now' })),
-      small.length ? h('span', { class: 'label', text: small.join(' · ') }) : null);
-  }
+  /* ---------------------------------------------------------------- 3. live */
 
   /** The 0c export nudge text, or null when it does not apply. */
   function nudgeText(s) {
@@ -438,71 +314,112 @@
     return h('p', { class: 'today-car' }, h('b', { text: carName(car) }), ` ${state}${pct}`);
   }
 
-  function nowSection() {
-    const el = h('section', { class: 'card today-now', 'aria-labelledby': 'today-now-h' });
+  /** A figure with a small line under it (battery power, buying or selling). */
+  function liveFig(label, value, sub, cls) {
+    return h('div', { class: 'today-fig' },
+      h('div', { class: 'label', text: label }),
+      h('div', { class: `fig fig-md ${cls || ''}`, text: value }),
+      h('div', { class: `today-fig-sub ${cls || ''}`, text: sub || null }));
+  }
+
+  /** The next free window or credit window start still to come, as {at, free, off}, or null. */
+  function nextWindow() {
+    const e = upcoming().find((x) => x.kind === 'credit' || (x.kind === 'band' && x.seg.band === 'free'));
+    return e ? { at: e.at, free: e.kind === 'band', off: e.day } : null;
+  }
+
+  /** The one status line for the free and credit windows: "Free window opens at 11 am, in 55 min",
+      "Credit window open until 9 pm, 0.4 kWh bought so far", "Credit window closed, 0.1 kWh bought". */
+  function windowStatus() {
+    const win = windowNow();
+    if (!win) return null;
+    const imp = windowImport(win);
+    const bought = imp ? `${SD.fmt.kwh(imp.kwh, 2)} bought` : null;
+    if (win.inside) {
+      return `Credit window open until ${SD.fmt.minute(win.cw.end)}${bought ? `, ${bought} so far` : ''}.`;
+    }
+    const nxt = nextWindow();
+    const m = SD.local().minute;
+    if (nxt && !nxt.off) {
+      const mins = nxt.at - m;
+      const inText = mins >= 60 ? `${Math.floor(mins / 60)} h ${mins % 60} min` : `${mins} min`;
+      return `${nxt.free ? 'Free' : 'Credit'} window opens at ${SD.fmt.minute(nxt.at % 1440)}, in ${inText}.`;
+    }
+    if (win.cw.start <= m) {
+      return `Credit window closed${bought ? `, ${bought}` : ''}.`;
+    }
+    return nxt ? `${nxt.free ? 'Free' : 'Credit'} window opens tomorrow at ${SD.fmt.minute(nxt.at % 1440)}.` : null;
+  }
+
+  /** Grid pull against the limit: one meter, the figure beside it, the highest reading and the warning mark. */
+  function pullBlock(pull, sample) {
+    if (!pull || pull.now_w == null || pull.limit_w == null) return null;
+    const big = pull.warn_w != null && pull.now_w >= pull.warn_w;
+    const selling = sample && sample.grid_w != null && sample.grid_w < -FLOW_MIN_W;
+    const bits = [];
+    const peak = peakText(pull);
+    if (peak) bits.push(peak);
+    if (pull.warn_w != null) bits.push(`Warning from ${SD.fmt.kw(pull.warn_w / 1000, 0)} (red zone)`);
+    let spark = null;
+    if (big) {
+      refreshPullSeries();
+      const rows = (data.pull30 || []).slice();
+      rows.push([Math.floor(Date.now() / 1000), pull.now_w]); // the reading on screen is the last point
+      if (rows.length > 1) {
+        spark = h('div', { class: 'today-pull-recent' },
+          h('div', { class: 'label', text: 'Last 30 minutes' }),
+          pullSpark(pull, rows),
+          h('div', { class: 'today-axis', 'aria-hidden': 'true' },
+            h('span', { text: SD.fmt.time(Math.floor(Date.now() / 1000) - 1800) }),
+            h('span', { text: 'Now' })));
+      }
+    }
+    return h('div', { class: `today-pull-inline${big ? ' is-big' : ''}` },
+      h('div', { class: 'card-head' },
+        h('span', { class: 'today-sub-title', text: 'Grid pull' }),
+        h('span', { class: 'label', text: `${SD.fmt.kw(pull.now_w / 1000)}${selling ? ' (selling)' : ''} of ${SD.fmt.kw(pull.limit_w / 1000, 0)}` })),
+      pull.warn_w != null ? pullMeter(pull, true) : null,
+      spark,
+      bits.length ? h('p', { class: 'today-pull-line', text: `${bits.join('. ')}.` }) : null);
+  }
+
+  /** One card for everything happening now: the four flows, the grid pull and the window status. */
+  function liveSection() {
+    const el = h('section', { class: 'card card-accent today-live', 'aria-labelledby': 'today-live-h' });
     return {
       el,
       update() {
         const { sample, car, pull } = liveParts();
         const head = h('div', { class: 'card-head' },
-          h('h2', { class: 'section-title', id: 'today-now-h', text: 'Right now' }),
+          h('h2', { class: 'section-title', id: 'today-live-h', text: 'Live' }),
           h('span', { class: 'card-sub', text: data.tariff ? bandLabel(SD.local().minute) : null }));
-        // No live source at all (not just a quiet moment): say so, and let the day cards below carry the page.
+        const status = windowStatus();
+        const statusLine = status ? h('p', { class: 'today-window-line', text: status }) : null;
+        // No live source at all (not just a quiet moment): say so, and let the day card below carry the page.
         if (!SD.caps.live) {
-          el.replaceChildren(head, h('p', { class: 'muted today-gap', text: 'No live source configured. The figures below come from the latest day data.' }));
+          fill(el, head, h('p', { class: 'muted today-gap', text: 'No live source configured. The figures below come from the latest day data.' }), statusLine);
           return;
         }
         if (!sample) {
-          el.replaceChildren(head, h('p', { class: 'muted today-gap', text: 'No live reading from the inverter right now.' }));
+          fill(el, head, h('p', { class: 'muted today-gap', text: 'No live reading from the inverter right now.' }), statusLine);
           return;
         }
-        const f = flows(sample, car);
         const idle = (w) => w == null || Math.abs(w) < FLOW_MIN_W;
         const bat = sample.battery_w;
         const grid = sample.grid_w;
-        const st = pullState();
-        let pullBlock = null;
-        if (st === 'meter') {
-          pullBlock = h('div', { class: 'today-pull-inline' },
-            h('div', { class: 'card-head' },
-              h('span', { class: 'today-sub-title', text: 'Grid pull' }),
-              h('span', { class: 'label', text: `Your limit ${SD.fmt.kw(pull.limit_w / 1000, 0)}` })),
-            h('p', { class: 'today-pull-line' }, h('b', { text: `${kwOf(pull.now_w)} now` }), peakText(pull) ? `. ${peakText(pull)}.` : '.'),
-            pullMeter(pull, true));
-        } else if (st === 'quiet') {
-          const bits = [];
-          if (pull.now_w != null) bits.push(h('b', { text: `${SD.fmt.kw(pull.now_w / 1000, pull.now_w < 100 ? 0 : 1)} now` }), grid != null && grid < -FLOW_MIN_W ? ", you're selling" : '');
-          const peak = peakText(pull);
-          if (peak) {
-            let tail = '';
-            if (pull.limit_w != null && pull.peak_today_w != null) {
-              const gap = pull.limit_w - pull.peak_today_w;
-              tail = gap >= 0 ? `, ${kwOf(gap)} under your limit` : `, ${kwOf(-gap)} over your limit`;
-            }
-            bits.push(`${bits.length ? '. ' : ''}${peak}${tail}.`);
-          }
-          pullBlock = h('div', { class: 'today-pull-inline' },
-            h('div', { class: 'card-head' },
-              h('span', { class: 'today-sub-title', text: 'Grid pull' }),
-              pull.limit_w != null ? h('span', { class: 'label', text: `Your limit ${SD.fmt.kw(pull.limit_w / 1000, 0)}` }) : null),
-            h('p', { class: 'today-pull-line' }, bits));
-        }
         const nudge = nudgeText(sample);
         fill(el,
           head,
-          h('div', { class: 'today-balances' },
-            balanceBar('Coming from', f.from),
-            balanceBar('Going to', f.to)),
-          h('div', { class: 'today-figs' },
-            fig('Home', kwOf(pos(sample.load_w))),
-            fig(sample.soc_pct == null ? 'Battery' : `Battery ${Math.round(sample.soc_pct)}%`,
-              idle(bat) ? 'Idle' : `${bat > 0 ? '+' : '-'}${kwOf(Math.abs(bat))}`, 'is-battery'),
-            fig(idle(grid) ? 'Grid' : grid < 0 ? 'Grid, selling' : 'Grid, buying', idle(grid) ? 'Idle' : kwOf(Math.abs(grid)))),
+          h('div', { class: 'today-figs is-four' },
+            liveFig('Solar', kwOf(pos(sample.pv_w))),
+            liveFig('Home', kwOf(pos(sample.load_w))),
+            liveFig('Battery', sample.soc_pct == null ? kwOf(Math.abs(bat || 0)) : `${Math.round(sample.soc_pct)}%`,
+              idle(bat) ? 'idle' : `${bat > 0 ? '+' : '-'}${kwOf(Math.abs(bat))}`, 'is-battery'),
+            liveFig('Grid', idle(grid) ? '0 kW' : kwOf(Math.abs(grid)), idle(grid) ? 'idle' : grid < 0 ? 'selling' : 'buying')),
           carLine(car),
-          pullBlock,
-          nudge ? h('div', { class: 'today-nudge' },
-            nudgeIcon(),
-            h('span', { text: nudge })) : null);
+          pullBlock(pull, sample),
+          statusLine,
+          nudge ? h('div', { class: 'today-nudge' }, nudgeIcon(), h('span', { text: nudge })) : null);
       },
     };
   }
@@ -587,13 +504,14 @@
     const tip = h('div', { class: 'today-chart-tip', hidden: true });
     const ribbonBox = h('div', { class: 'today-ribbon' });
     const summary = h('div', { class: 'today-day-sum' });
+    const next = h('p', { class: 'today-next' });
     const today = SD.local().date;
     const el = h('section', { class: 'card today-day', 'aria-labelledby': 'today-day-h' },
       h('div', { class: 'card-head' },
         h('h2', { class: 'section-title', id: 'today-day-h', text: 'Your day so far' }),
         h('a', { class: 'card-link today-link-phone', href: `#history/day/${today}`, text: 'Open day' }),
         h('a', { class: 'card-link today-link-wide', href: '#history', text: 'Open history' })),
-      h('div', { class: 'today-chart-wrap' }, chartBox, tip), ribbonBox, summary);
+      h('div', { class: 'today-chart-wrap' }, chartBox, tip), ribbonBox, summary, next);
     let ribbon = null;
     let hrs = null;
     let hoverHour = null;
@@ -656,26 +574,36 @@
         }
         if (data.tariff) drawRibbon(minute);
         summary.replaceChildren(...daySummary());
+        const nl = nextLine();
+        next.hidden = !nl;
+        next.replaceChildren(...(nl ? ['Next: ', h('b', { text: nl[0] }), nl[1]] : []));
       },
     };
   }
 
-  /** "Bought 11.6 kWh, 10.4 of it free · Sold 8.5 kWh" as two small figures. */
+  /** "Bought 11.6 kWh, 10.4 of it free · Sold 8.5 kWh · Cost 18c" as three small figures in one row. */
   function daySummary() {
     const d = data.daily || {};
     const hrs = data.samples ? hourly() : null;
     const sum = (a) => a.reduce((x, y) => x + y, 0);
     const bought = d.import_kwh != null ? d.import_kwh : hrs ? sum(hrs.bought) : null;
     const sold = d.export_kwh != null ? d.export_kwh : hrs ? sum(hrs.sold) : null;
+    const cost = powerCost();
     const out = [];
     if (bought != null) {
       out.push(h('div', {}, h('div', { class: 'label', text: 'Bought' }),
         h('div', { class: 'fig today-sum-fig', text: SD.fmt.kwh(bought) }),
-        d.import_free_kwh != null ? h('div', { class: 'today-sum-note', text: `${SD.fmt.kwh(d.import_free_kwh)} of it free` }) : null));
+        d.import_free_kwh != null && d.import_free_kwh > 0 ? h('div', { class: 'today-sum-note', text: `${SD.fmt.kwh(d.import_free_kwh)} free` }) : null));
     }
     if (sold != null) {
       out.push(h('div', {}, h('div', { class: 'label', text: 'Sold' }),
         h('div', { class: 'fig today-sum-fig', text: SD.fmt.kwh(sold) })));
+    }
+    if (cost != null) {
+      // Under a dollar is easier to read in cents; a credit (selling more than buying) shows as a negative.
+      const text = Math.abs(cost) < 1 ? SD.fmt.cents(cost * 100) : SD.fmt.dollars(cost);
+      out.push(h('div', {}, h('div', { class: 'label', text: 'Cost' }),
+        h('div', { class: 'fig today-sum-fig', text })));
     }
     return out;
   }
@@ -983,7 +911,7 @@
       h('span', { class: 'ptl-key', text: 'Colours follow the buying price' }));
   }
 
-  /* ---------------------------------------------------------------- 6. coming up */
+  /* ---------------------------------------------------------------- 6. what comes next */
 
   /** The next three price changes and credit window events, today and tomorrow. */
   function upcoming() {
@@ -1012,43 +940,28 @@
     return events.filter((e) => e.at > now.minute).sort((a, b) => a.at - b.at).slice(0, 3);
   }
 
-  function upcomingRow(e) {
-    const t = data.tariff;
-    const weekday = e.day ? ` ${SD.fmt.date(SD.local(Date.now() / 1000 + 86400).date, 'medium').split(' ')[0]}` : '';
-    const when = (m) => `${SD.fmt.minute(m % 1440)}${weekday}`;
-    if (e.kind === 'band') {
+  /** The upcoming events as one sentence: "free from 11 am for 3 h, then shoulder at 2 pm and peak at 4 pm".
+      Returns [lead, rest] so the lead can be bold, or null when nothing is coming. */
+  function nextLine() {
+    const evs = upcoming();
+    if (!evs.length) return null;
+    const dayName = (e) => (e.day ? ' tomorrow' : '');
+    const text = (e, first) => {
+      const when = `${SD.fmt.minute(e.at % 1440)}${dayName(e)}`;
+      if (e.kind === 'credit') return `the credit window at ${when}`;
+      if (e.kind === 'credit-end') return `the credit window closes at ${when}`;
       const { seg } = e;
-      const swatch = h('b', { class: `swatch band-${seg.band}` });
-      let text;
       if (seg.band === 'free') {
         const hrs = (seg.end - seg.start) / 60;
-        text = `Free power for ${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)} ${hrs === 1 ? 'hour' : 'hours'}`;
-      } else {
-        text = `${seg.band === 'peak' ? 'Peak' : 'Shoulder'} starts, ${SD.fmt.cents(seg.cents)} a kWh`;
+        const len = `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)} h`;
+        return first ? `free from ${when} for ${len}` : `free power at ${when} for ${len}`;
       }
-      return { when: when(e.at), body: [swatch, text] };
-    }
-    const credit = creditText(e.cw);
-    if (e.kind === 'credit-end') return { when: when(e.at), body: `Credit window closes. The result shows here a little later.` };
-    const { sample } = liveParts();
-    const typ = batteryTypical();
-    let extra = '';
-    if (!e.day && sample && sample.soc_pct != null && typ) extra = ` Battery ${Math.round(sample.soc_pct)}%, tonight usually needs about ${Math.round(typ.used)}%.`;
-    return { when: e.day ? when(e.at) : windowText(e.cw), body: `Zero grid import earns ${credit}.${extra}` };
-  }
-
-  function upSection() {
-    const list = h('ul', { class: 'today-up' });
-    const el = h('section', { class: 'card', 'aria-labelledby': 'today-up-h' },
-      h('h2', { class: 'section-title', id: 'today-up-h', text: 'Coming up' }), list);
-    return {
-      el,
-      update() {
-        const rows = upcoming().map(upcomingRow);
-        el.hidden = !rows.length;
-        list.replaceChildren(...rows.map((r) => h('li', {}, h('span', { class: 'today-up-when', text: r.when }), h('span', { class: 'today-up-what' }, r.body))));
-      },
+      return `${seg.band} at ${when}`;
     };
+    const parts = evs.map((e, i) => text(e, i === 0));
+    const rest = parts.slice(1);
+    const tail = rest.length > 1 ? `${rest.slice(0, -1).join(', ')} and ${rest[rest.length - 1]}` : rest[0];
+    return [parts[0], tail ? `, then ${tail}.` : '.'];
   }
 
   /* ---------------------------------------------------------------- 7. evening credit */
@@ -1127,32 +1040,6 @@
             h('li', {}, h('span', { class: 'today-night is-missed' }), 'Missed'),
             tonight ? h('li', {}, h('span', { class: 'today-night is-tonight' }), 'Tonight') : null),
           h('p', { class: 'today-miss', text: recent ? `${missText(recent)}${tonight ? ' Tonight is still to come.' : ''}` : (tonight ? 'No missed nights lately. Tonight is still to come.' : 'No missed nights lately.') }));
-      },
-    };
-  }
-
-  /* ---------------------------------------------------------------- 8. totals */
-
-  function totalsSection() {
-    const el = h('section', { class: 'today-totals', 'aria-label': "Today's totals" });
-    return {
-      el,
-      update() {
-        const d = data.daily || {};
-        const mix = SD.homeMix(d);
-        const own = mix ? mix.own : null;
-        const freeNote = mix && mix.free > 0 ? `plus ${mix.free}% free grid power` : null;
-        const saved = data.costDay && data.costDay.savings != null ? data.costDay.savings : null;
-        const tiles = [
-          d.pv_kwh != null ? ['Solar made', SD.fmt.kwh(d.pv_kwh)] : null,
-          d.load_kwh != null ? ['Home used', SD.fmt.kwh(d.load_kwh)] : null,
-          own != null ? ['Ran on own power', `${own}%`, freeNote] : null,
-          saved != null ? ['Saved vs no system', SD.fmt.dollars(saved)] : null,
-        ].filter(Boolean);
-        el.hidden = !tiles.length;
-        el.replaceChildren(...tiles.map(([label, value, note]) => h('div', { class: 'today-tile' },
-          h('div', { class: 'label', text: label }), h('div', { class: 'fig fig-lg', text: value }),
-          note ? h('div', { class: 'today-sum-note', text: note }) : null)));
       },
     };
   }
@@ -1244,11 +1131,11 @@
     const wide = window.matchMedia('(min-width: 760px)').matches;
     if (wide) {
       view.el.replaceChildren(h('div', { class: 'cols cols-2-1' },
-        h('div', { class: 'stack' }, s.head.el, s.window.el, s.pull.el, s.day.el, s.up.el),
-        h('div', { class: 'stack' }, s.now.el, s.price.el, s.credit.el, s.totals.el)));
+        h('div', { class: 'stack' }, s.head.el, s.day.el),
+        h('div', { class: 'stack' }, s.live.el, s.price.el, s.credit.el)));
     } else {
       view.el.replaceChildren(h('div', { class: 'stack' },
-        s.head.el, s.window.el, s.pull.el, s.now.el, s.price.el, s.day.el, s.up.el, s.credit.el, s.totals.el));
+        s.head.el, s.live.el, s.price.el, s.day.el, s.credit.el));
     }
     s.day.relayout();
   }
@@ -1259,8 +1146,8 @@
         el,
         timers: [],
         sections: {
-          head: headSection(), window: windowSection(), pull: pullSection(), now: nowSection(), price: priceSection(),
-          day: daySection(), up: upSection(), credit: creditSection(), totals: totalsSection(),
+          head: headSection(), live: liveSection(), price: priceSection(),
+          day: daySection(), credit: creditSection(),
         },
       };
       for (const k of Object.keys(data)) delete data[k];

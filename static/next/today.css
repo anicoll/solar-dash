@@ -37,34 +37,41 @@ html[data-theme="night"] #page-today {
   margin-top: 14px;
 }
 
-#page-today .fig.is-battery {
+/* The Live card: solar, home, battery and grid in one compact row. */
+#page-today .today-figs.is-four {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  text-align: center;
+}
+
+#page-today .today-figs.is-four .fig {
+  font-size: 20px;
+}
+
+#page-today .today-fig-sub {
+  min-height: 15px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+#page-today .today-fig-sub.is-battery {
   color: var(--battery);
 }
 
-/* ---------- credit window ---------- */
-
-#page-today .today-progress {
-  position: relative;
-  height: 40px;
+/* The one status line for the free and credit windows. */
+#page-today .today-window-line {
   margin-top: 14px;
-  border-radius: 10px;
-  background: var(--credit-fill);
-  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ink);
 }
 
-#page-today .today-progress-fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  background: var(--credit);
+#page-today .today-pull-inline + .today-window-line {
+  margin-top: 10px;
 }
 
-#page-today .today-progress-now {
-  position: absolute;
-  top: -4px;
-  bottom: -4px;
-  width: 3px;
-  margin-left: -1.5px;
-  background: var(--ink);
+#page-today .fig.is-battery {
+  color: var(--battery);
 }
 
 #page-today .today-axis {
@@ -76,30 +83,6 @@ html[data-theme="night"] #page-today {
 }
 
 /* ---------- grid pull ---------- */
-
-#page-today .today-pull {
-  border: 2px solid var(--ink);
-}
-
-#page-today .today-pull-now {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  margin-top: 8px;
-}
-
-#page-today .today-pull-kw {
-  font-size: 48px;
-  line-height: 1;
-  font-weight: 800;
-}
-
-#page-today .today-pull-amps {
-  font-size: 18px;
-  font-weight: 700;
-  color: var(--ink-2);
-}
 
 #page-today .today-meter {
   position: relative;
@@ -222,81 +205,6 @@ html[data-theme="night"] #page-today {
 
 #page-today .today-pull-line b {
   color: var(--ink);
-}
-
-/* ---------- right now ---------- */
-
-#page-today .today-balances {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-top: 12px;
-}
-
-#page-today .today-balance {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-#page-today .today-bar {
-  display: flex;
-  gap: 2px;
-  height: 32px;
-  border-radius: 8px;
-  overflow: hidden;
-  font-size: 13px;
-  font-weight: 700;
-}
-
-#page-today .today-bar.is-empty {
-  align-items: center;
-  padding: 0 10px;
-  background: var(--today-track);
-  color: var(--ink-2);
-  font-weight: 500;
-}
-
-#page-today .today-seg {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  padding: 0 8px;
-  overflow: hidden;
-  white-space: nowrap;
-}
-
-#page-today .today-seg.is-solar {
-  background: var(--sun);
-  color: var(--on-sun);
-}
-
-#page-today .today-seg.is-battery {
-  background: var(--battery);
-  color: var(--today-on-battery);
-}
-
-#page-today .today-seg.is-home {
-  background: var(--ink);
-  color: var(--paper);
-}
-
-#page-today .today-seg.is-car {
-  background: var(--card);
-  color: var(--ink);
-  box-shadow: inset 0 0 0 1.5px var(--ink);
-}
-
-/* Grid is hatched, as on the day ribbon: buying in sun stripes, selling in neutral ones. */
-#page-today .today-seg.is-grid-in {
-  background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--sun) 55%, var(--card)) 0 6px, var(--sun) 6px 12px);
-  color: var(--on-sun);
-}
-
-#page-today .today-seg.is-grid-out {
-  background: repeating-linear-gradient(135deg, var(--today-track) 0 6px, var(--card) 6px 12px);
-  color: var(--ink);
-  box-shadow: inset 0 0 0 1.5px var(--ink);
 }
 
 #page-today .today-car {
@@ -456,7 +364,7 @@ html[data-theme="night"] #page-today {
 
 #page-today .today-day-sum {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   margin-top: 16px;
   padding-top: 14px;
@@ -469,6 +377,19 @@ html[data-theme="night"] #page-today {
 
 #page-today .today-sum-fig {
   font-size: 18px;
+}
+
+#page-today .today-next {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ink-2);
+}
+
+#page-today .today-next b {
+  color: var(--ink);
 }
 
 #page-today .today-sum-note {
@@ -664,33 +585,6 @@ html[data-theme="night"] #page-today {
   gap: 4px;
 }
 
-/* ---------- coming up ---------- */
-
-#page-today .today-up {
-  list-style: none;
-  margin: 6px 0 0;
-  padding: 0;
-}
-
-#page-today .today-up li {
-  display: grid;
-  grid-template-columns: 88px minmax(0, 1fr);
-  gap: 10px;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--line);
-  font-size: 14px;
-  line-height: 1.4;
-}
-
-#page-today .today-up li:last-child {
-  border-bottom: 0;
-  padding-bottom: 0;
-}
-
-#page-today .today-up-when {
-  font-weight: 700;
-}
-
 /* ---------- evening credit ---------- */
 
 #page-today .today-streak {
@@ -761,25 +655,6 @@ html[data-theme="night"] #page-today {
   color: var(--ink-2);
 }
 
-/* ---------- totals ---------- */
-
-#page-today .today-totals {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-#page-today .today-totals[hidden] {
-  display: none;
-}
-
-#page-today .today-tile {
-  background: var(--card);
-  border-radius: 16px;
-  padding: 12px 14px;
-  box-shadow: var(--shadow);
-}
-
 @media (min-width: 760px) {
   #page-today .today-link-phone {
     display: none;
@@ -791,10 +666,6 @@ html[data-theme="night"] #page-today {
 
   #page-today .today-lede {
     font-size: 18px;
-  }
-
-  #page-today .today-up li {
-    grid-template-columns: 110px minmax(0, 1fr);
   }
 
   #page-today .today-night {
