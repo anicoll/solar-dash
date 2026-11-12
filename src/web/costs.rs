@@ -23,6 +23,7 @@ use super::api::{
 };
 use super::battery::local_time;
 use super::day_cache;
+use super::samples::{self, Role};
 use crate::amber::store as amber_store;
 use crate::bills::{self, Metered, PastBill};
 use crate::cost::{self, DayCost, DayPrices, GridSplit, Interval, Tariff, TariffSchedule};
@@ -81,12 +82,23 @@ const CLOUD_LAG_SECS: i64 = 300;
 /// A day's counter readings moved back to the time they were really taken.
 /// A reading that lands on or before midnight is dropped: it belongs to the
 /// day before, and `with_midnight_zero` starts the day at 0 anyway.
-pub(super) fn undo_cloud_lag(day_start: i64, counter: &[(i64, f64)]) -> Vec<(i64, f64)> {
+/// `lag_secs` is [`counter_lag_secs`] of the rules.
+pub(super) fn undo_counter_lag(
+    day_start: i64,
+    counter: &[(i64, f64)],
+    lag_secs: i64,
+) -> Vec<(i64, f64)> {
     counter
         .iter()
-        .map(|&(ts, wh)| (ts - CLOUD_LAG_SECS, wh))
+        .map(|&(ts, wh)| (ts - lag_secs, wh))
         .filter(|&(ts, _)| ts > day_start)
         .collect()
+}
+
+/// How late the day counters of the rules' counter source are stamped:
+/// [`CLOUD_LAG_SECS`] for the cloud, 0 for Home Assistant.
+pub(super) fn counter_lag_secs(rules: &SourceRules) -> i64 {
+    rules.counter_lag_secs(CLOUD_LAG_SECS)
 }
 
 /// How far either side of a day the grid totals are loaded, so the step
@@ -282,7 +294,7 @@ pub(super) fn day_intervals(
     now: i64,
 ) -> Option<(&'static str, Vec<Interval>, bool)> {
     let cloud_has_data =
-        day.rules.cloud_enabled() && cloud_day_has_data(day.import, day.export, day.load);
+        day.rules.counters_enabled() && cloud_day_has_data(day.import, day.export, day.load);
     if let Some(live) = live_totals(day.live, day.start, day.end, now, day.rules)
         && live.usable(day.rules, cloud_has_data)
     {
@@ -293,8 +305,8 @@ pub(super) fn day_intervals(
     if !cloud_has_data {
         return None;
     }
-    let [import, export, load] =
-        [day.import, day.export, day.load].map(|c| undo_cloud_lag(day.start, c));
+    let [import, export, load] = [day.import, day.export, day.load]
+        .map(|c| undo_counter_lag(day.start, c, counter_lag_secs(day.rules)));
     let intervals = cloud_intervals(day.start, &import, &export, &load);
     Some(("cloud", intervals, true))
 }
@@ -354,10 +366,10 @@ struct Counters {
 }
 
 /// Reads the import, export and load counters in `[start, end)` with one query.
-async fn counters_in(pool: &SqlitePool, plant_id: i64, start: i64, end: i64) -> Result<Counters> {
-    let rows = db::readings_for_metrics(
+async fn counters_in(pool: &SqlitePool, source: &str, start: i64, end: i64) -> Result<Counters> {
+    let rows = db::readings_for_metrics_from(
         pool,
-        plant_id,
+        source,
         &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER],
         start,
         end,
@@ -400,13 +412,21 @@ pub(super) fn meter_for_day(meter: &[(i64, f64, f64)], start: i64, end: i64) -> 
 /// (`live_range`, from [`db::live_ts_range`]) is loaded.
 pub(super) async fn live_in(
     pool: &SqlitePool,
+    rules: &SourceRules,
     live_range: Option<(i64, i64)>,
     start: i64,
     end: i64,
 ) -> Result<Vec<Sample>> {
     match live_range {
         Some((first, last)) if first < end && last >= start => {
-            db::live_samples_raw(pool, start.max(first), end.min(last + 1)).await
+            samples::raw(
+                pool,
+                rules,
+                Role::Daily,
+                start.max(first),
+                end.min(last + 1),
+            )
+            .await
         }
         _ => Ok(Vec::new()),
     }
@@ -477,9 +497,15 @@ pub(super) async fn house_intervals_by_day(
     }
     let range_start = bounds[0].0;
     let range_end = bounds[bounds.len() - 1].1;
-    let counters = counters_in(pool, plant_id, range_start, range_end).await?;
-    let live_range = db::live_ts_range(pool).await?;
-    let live = live_in(pool, live_range, range_start, range_end).await?;
+    let counters = counters_in(
+        pool,
+        &samples::counter_source_name(rules, plant_id),
+        range_start,
+        range_end,
+    )
+    .await?;
+    let live_range = samples::ts_range(pool, rules, Role::Daily).await?;
+    let live = live_in(pool, rules, live_range, range_start, range_end).await?;
     let meter = meter_in(pool, range_start, range_end).await?;
 
     let mut days = Vec::new();
@@ -531,12 +557,13 @@ pub(super) async fn day_grid_split_checked(
 ) -> Result<Option<(GridSplit, bool)>, ApiError> {
     let (start, end) = day_bounds_or_error(date, state.tz)?;
     let rules = &state.rules;
-    let skip_cloud = !rules.cloud_enabled()
-        || live_totals(live, start, end, now, rules).is_some_and(|l| !rules.cloud_needed(l.solid));
+    let skip_cloud = !rules.counters_enabled()
+        || live_totals(live, start, end, now, rules)
+            .is_some_and(|l| !rules.counters_needed(l.solid));
     let counters = if skip_cloud {
         Counters::default()
     } else {
-        counters_in(&state.pool, state.plant_id, start, end).await?
+        counters_in(&state.pool, &state.counter_source(), start, end).await?
     };
     let meter = meter_in(&state.pool, start, end).await?;
     let day = DayData {
@@ -605,13 +632,14 @@ pub(super) async fn grid_splits(
     let mut found: HashMap<NaiveDate, GridSplit> = day_cache::load_with_data(
         &state.pool,
         state.plant_id,
+        state.rules.uses_ha(),
         state.tz,
         GRID_SPLIT_KIND,
         &keys,
     )
     .await?;
 
-    let live_range = db::live_ts_range(&state.pool).await?;
+    let live_range = samples::ts_range(&state.pool, &state.rules, Role::Daily).await?;
     let now = db::now();
     let mut to_store = Vec::new();
     for (date, key) in &keys {
@@ -619,7 +647,7 @@ pub(super) async fn grid_splits(
             continue;
         }
         let (start, end) = day_bounds_or_error(*date, state.tz)?;
-        let live = live_in(&state.pool, live_range, start, end).await?;
+        let live = live_in(&state.pool, &state.rules, live_range, start, end).await?;
         if let Some((split, cacheable)) =
             day_grid_split_checked(state, schedule, *date, &live, now).await?
         {
@@ -634,7 +662,14 @@ pub(super) async fn grid_splits(
         .iter()
         .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
         .collect();
-    let store_as = day_cache::store_keys(&state.pool, state.plant_id, state.tz, &store_as).await?;
+    let store_as = day_cache::store_keys(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        state.tz,
+        &store_as,
+    )
+    .await?;
     let rows: Vec<(NaiveDate, String, &GridSplit)> = store_as
         .into_iter()
         .zip(&to_store)
@@ -1017,6 +1052,19 @@ pub(super) fn cache_key(tz: Tz, tariff: &Tariff) -> String {
     format!("{COST_CACHE_VERSION}|{tz}|{}", tariff.key())
 }
 
+/// The part of a stored day's key that says which sources the rules chose.
+/// Empty for the default rules, so installs that never change them keep the
+/// days they have stored; any other rules (another source order, Home
+/// Assistant, its mapping or `invert`) give a different key, so switching
+/// the preference works the days out again.
+pub(super) fn rules_key(rules: &SourceRules) -> String {
+    if *rules == SourceRules::default() {
+        String::new()
+    } else {
+        format!("|rules:{rules:?}")
+    }
+}
+
 /// The stored prices to cost one day with, or `None` for a plan that is not
 /// dynamic (which does no query at all). `include_current` is true for today
 /// and later, where the interval under way counts as known; for a finished
@@ -1049,8 +1097,9 @@ async fn dynamic_day_key(
     let fingerprint =
         amber_store::day_prices_fingerprint(&state.pool, source, start, end, date >= today).await?;
     Ok(format!(
-        "{}|prices:{fingerprint}",
-        cache_key(state.tz, tariff)
+        "{}{}|prices:{fingerprint}",
+        cache_key(state.tz, tariff),
+        rules_key(&state.rules)
     ))
 }
 
@@ -1129,9 +1178,10 @@ async fn compute_days_with(
     let range_end = bounds[bounds.len() - 1].1;
 
     // One query for all three counters over the whole range, then split.
-    let counters = counters_in(&state.pool, state.plant_id, range_start, range_end).await?;
+    let counters =
+        counters_in(&state.pool, &state.counter_source(), range_start, range_end).await?;
 
-    let live_range = db::live_ts_range(&state.pool).await?;
+    let live_range = samples::ts_range(&state.pool, &state.rules, Role::Daily).await?;
     let now = db::now();
     let mut days = Vec::new();
 
@@ -1142,7 +1192,14 @@ async fn compute_days_with(
         // Only the part of the chunk the live samples cover is loaded.
         let chunk_start = chunk_bounds[0].0;
         let chunk_end = chunk_bounds[chunk_bounds.len() - 1].1;
-        let live = live_in(&state.pool, live_range, chunk_start, chunk_end).await?;
+        let live = live_in(
+            &state.pool,
+            &state.rules,
+            live_range,
+            chunk_start,
+            chunk_end,
+        )
+        .await?;
         let meter = meter_in(&state.pool, chunk_start, chunk_end).await?;
 
         for (&date, &(start, end)) in chunk_dates.iter().zip(chunk_bounds) {
@@ -1228,7 +1285,7 @@ async fn costed_days_on(
     let (Some(first), Some(last)) = (dates.first(), dates.last()) else {
         return Ok(Vec::new());
     };
-    let key = cache_key(state.tz, tariff);
+    let key = format!("{}{}", cache_key(state.tz, tariff), rules_key(&state.rules));
     let today = today(state.tz);
     // A static plan has one key for every day. A dynamic plan's key also
     // carries each day's price fingerprint, so it is worked out per day.
@@ -1259,8 +1316,14 @@ async fn costed_days_on(
         .filter(|(row, row_key)| day_cache::is_data_key_of(row_key, &base_key_of(&row.date)))
         .filter_map(|(row, _)| NaiveDate::from_str(&row.date).ok())
         .collect();
-    let prints =
-        day_cache::fingerprints(&state.pool, state.plant_id, state.tz, &incomplete).await?;
+    let prints = day_cache::fingerprints(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        state.tz,
+        &incomplete,
+    )
+    .await?;
     let mut by_date: HashMap<String, CostedDay> = HashMap::new();
     for (row, row_key) in stored {
         let parsed = (NaiveDate::from_str(&row.date), known_source(&row.source));
@@ -1314,7 +1377,14 @@ async fn costed_days_on(
             Some((date, base_key_of(&day.date), *complete))
         })
         .collect();
-    let store_as = day_cache::store_keys(&state.pool, state.plant_id, state.tz, &store_as).await?;
+    let store_as = day_cache::store_keys(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        state.tz,
+        &store_as,
+    )
+    .await?;
     if tariff.dynamic_source().is_some() {
         for ((day, _), (_, day_key)) in to_store.iter().zip(&store_as) {
             db::save_daily_costs(&state.pool, std::slice::from_ref(day), day_key).await?;
@@ -1811,6 +1881,21 @@ mod tests {
     }
 
     #[test]
+    fn stored_day_keys_only_carry_non_default_rules() {
+        // The default rules add nothing, so existing stored days stay valid.
+        assert_eq!(rules_key(&SourceRules::default()), "");
+        let cloud_only = SourceRules::from_config(
+            &crate::config::Sources {
+                daily_energy: Some(vec!["isolarcloud".into()]),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_ne!(rules_key(&cloud_only), "");
+    }
+
+    #[test]
     fn live_samples_become_held_intervals() {
         let samples = [
             sample(0, Some(500.0), Some(1000.0)),  // import 1 kW, held 60 s
@@ -1947,10 +2032,10 @@ mod tests {
             (start + 900, 700.0),
         ];
         assert_eq!(
-            undo_cloud_lag(start, &counter),
+            undo_counter_lag(start, &counter, CLOUD_LAG_SECS),
             vec![(start + 300, 100.0), (start + 600, 700.0)]
         );
-        assert!(undo_cloud_lag(start, &[]).is_empty());
+        assert!(undo_counter_lag(start, &[], CLOUD_LAG_SECS).is_empty());
     }
 
     #[test]

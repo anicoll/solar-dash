@@ -77,6 +77,7 @@ pub(super) fn is_data_key_of(row_key: &str, key: &str) -> bool {
 pub(super) async fn fingerprints(
     pool: &SqlitePool,
     plant_id: i64,
+    with_ha: bool,
     tz: Tz,
     dates: &[NaiveDate],
 ) -> Result<HashMap<NaiveDate, String>, ApiError> {
@@ -87,7 +88,7 @@ pub(super) async fn fingerprints(
         .iter()
         .map(|d| day_bounds_or_error(*d, tz))
         .collect::<Result<Vec<_>, _>>()?;
-    let prints = db::data_fingerprints(pool, plant_id, &bounds).await?;
+    let prints = db::data_fingerprints(pool, plant_id, &bounds, with_ha).await?;
     Ok(sorted.into_iter().zip(prints).collect())
 }
 
@@ -96,6 +97,7 @@ pub(super) async fn fingerprints(
 pub(super) async fn load_with_data<T: DeserializeOwned>(
     pool: &SqlitePool,
     plant_id: i64,
+    with_ha: bool,
     tz: Tz,
     kind: &str,
     keys: &[(NaiveDate, String)],
@@ -116,7 +118,7 @@ pub(super) async fn load_with_data<T: DeserializeOwned>(
         .filter(|(date, row)| is_data_key_of(&row.cache_key, wanted[date]))
         .map(|(date, _)| *date)
         .collect();
-    let prints = fingerprints(pool, plant_id, tz, &incomplete).await?;
+    let prints = fingerprints(pool, plant_id, with_ha, tz, &incomplete).await?;
     let mut found = HashMap::new();
     for (date, row) in rows {
         let key = wanted[&date];
@@ -141,6 +143,7 @@ pub(super) async fn load_with_data<T: DeserializeOwned>(
 pub(super) async fn store_keys(
     pool: &SqlitePool,
     plant_id: i64,
+    with_ha: bool,
     tz: Tz,
     days: &[(NaiveDate, String, bool)],
 ) -> Result<Vec<(NaiveDate, String)>, ApiError> {
@@ -149,7 +152,7 @@ pub(super) async fn store_keys(
         .filter(|(_, _, complete)| !complete)
         .map(|(date, _, _)| *date)
         .collect();
-    let prints = fingerprints(pool, plant_id, tz, &incomplete).await?;
+    let prints = fingerprints(pool, plant_id, with_ha, tz, &incomplete).await?;
     Ok(days
         .iter()
         .map(|(date, key, _)| match prints.get(date) {

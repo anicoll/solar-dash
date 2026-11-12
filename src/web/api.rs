@@ -15,16 +15,18 @@ use tracing::error;
 
 use super::AppState;
 use super::costs::{
-    Group, MAX_GROUPED_COSTS_DAYS, cache_key, day_grid_split_checked, is_cacheable, round2,
-    undo_cloud_lag,
+    Group, MAX_GROUPED_COSTS_DAYS, cache_key, counter_lag_secs, day_grid_split_checked,
+    is_cacheable, round2, undo_counter_lag,
 };
 use super::day_cache;
 use super::home_mix::{self, HomeMix};
+use super::samples::{self, Role};
 use crate::amber::store as amber_store;
 use crate::cost::{GridSplit, TariffSchedule};
 use crate::db;
 use crate::ev_cost;
-use crate::hub::SourceRules;
+use crate::ha_source::samples as ha_samples;
+use crate::hub::{SampleSource, SourceRules};
 use crate::isolar::points;
 use crate::metric::Metric;
 use crate::modbus::{self, Sample};
@@ -202,8 +204,12 @@ pub async fn spokes(State(state): State<AppState>) -> Json<Value> {
 /// page.
 pub async fn capabilities(State(state): State<AppState>) -> ApiResult {
     let enabled = |id: &str| state.spokes.iter().any(|s| s.id == id && s.enabled);
-    let live = enabled("sungrow-modbus");
-    let history = enabled("isolarcloud");
+    // Home Assistant supplies the live view or history only when the rules
+    // say so (and its source is running); see `[sources]`.
+    let ha_on = enabled("home-assistant");
+    let modbus_live = state.rules.live_order().contains(&SampleSource::Modbus);
+    let live = (enabled("sungrow-modbus") && modbus_live) || (ha_on && state.rules.ha_live());
+    let history = enabled("isolarcloud") || (ha_on && state.rules.ha_daily());
     let meter = state.globird_configured || enabled("globird-portal");
     let prices = state.amber_configured || enabled("amber");
     let admin = state.admin.get();
@@ -271,13 +277,40 @@ pub async fn latest(State(state): State<AppState>) -> ApiResult {
 /// `grid_pull` is how hard the house is drawing from the grid, for watching
 /// the main breaker (see [`grid_pull_json`]).
 pub async fn live(State(state): State<AppState>) -> ApiResult {
-    let sample = match state.latest.get() {
-        Some(sample) => Some(sample),
-        None => db::latest_live_sample(&state.pool).await?,
-    };
-    let fresh = sample.filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
+    // The sources of `[sources] live`, best first: the first with a fresh
+    // sample wins. By default that is Modbus alone.
+    let mut fresh = None;
+    let mut from_ha = false;
+    for source in state.rules.live_order() {
+        match source {
+            SampleSource::Modbus => {
+                let sample = match state.latest.get() {
+                    Some(sample) => Some(sample),
+                    None => db::latest_live_sample(&state.pool).await?,
+                };
+                fresh = sample.filter(|s| s.ts >= db::now() - LIVE_MAX_AGE_SECS);
+            }
+            SampleSource::HomeAssistant => {
+                if let Some(ha) = state.rules.ha() {
+                    fresh = ha_samples::latest(&state.pool, ha, db::now()).await?;
+                    from_ha = fresh.is_some();
+                }
+            }
+        }
+        if fresh.is_some() {
+            break;
+        }
+    }
     let since = local_midnight(today(state.tz), state.tz).unwrap_or(0);
-    let peak = db::peak_grid_import(&state.pool, since).await?;
+    // The peak comes from the source of the sample (or, with no sample, from
+    // the preferred source).
+    let peak_from_ha = from_ha
+        || (fresh.is_none()
+            && state.rules.live_order().first() == Some(&SampleSource::HomeAssistant));
+    let peak = match state.rules.ha() {
+        Some(ha) if peak_from_ha => ha_samples::peak_import(&state.pool, ha, since).await?,
+        _ => db::peak_grid_import(&state.pool, since).await?,
+    };
     let data = state.admin.get();
     let grid_pull = grid_pull_json(
         fresh.as_ref(),
@@ -408,7 +441,7 @@ pub async fn live_series(
     }
 
     // `to` is inclusive here; the query's end is exclusive.
-    let samples = db::live_samples_in_range(&state.pool, from, to + 1).await?;
+    let samples = samples::per_minute(&state.pool, &state.rules, Role::Live, from, to + 1).await?;
     let data: Vec<Value> = samples
         .iter()
         .map(|s| json!([s.ts, s.pv_w, s.load_w, s.grid_w, s.battery_w, s.soc_pct]))
@@ -446,7 +479,14 @@ async fn home_session_cost(
     };
     // `to` is exclusive in the query, so add a second to include the end.
     let end = session.ended_at.unwrap_or(now);
-    let samples = db::live_samples_raw(&state.pool, session.started_at, end + 1).await?;
+    let samples = samples::raw(
+        &state.pool,
+        &state.rules,
+        Role::Daily,
+        session.started_at,
+        end + 1,
+    )
+    .await?;
     Ok(ev_cost::session_cost(
         session, &samples, schedule, state.tz, now,
     ))
@@ -1213,7 +1253,8 @@ async fn day_max_kwh(
     start: i64,
     end: i64,
 ) -> Result<Option<f64>, ApiError> {
-    let max = db::max_value_in_range(&state.pool, state.plant_id, metric, start, end).await?;
+    let max = db::max_value_in_range_from(&state.pool, &state.counter_source(), metric, start, end)
+        .await?;
     Ok(max.map(|wh| wh / 1000.0))
 }
 
@@ -1238,10 +1279,11 @@ const CLOUD_DAY_METRICS: [Metric; 7] = [
 /// or a cloud counter), or `None` before any. A local day that ends at or
 /// before it has no energy data, so its figures need no queries.
 pub(super) async fn first_data_ts(state: &AppState) -> Result<Option<i64>, ApiError> {
-    let first_live = db::live_ts_range(&state.pool)
+    let first_live = samples::ts_range(&state.pool, &state.rules, Role::Daily)
         .await?
         .map(|(first, _)| first);
-    let first_cloud = db::first_reading_ts(&state.pool, state.plant_id, &CLOUD_DAY_METRICS).await?;
+    let first_cloud =
+        db::first_reading_ts_from(&state.pool, &state.counter_source(), &CLOUD_DAY_METRICS).await?;
     Ok([first_live, first_cloud].into_iter().flatten().min())
 }
 
@@ -1256,7 +1298,7 @@ pub(super) async fn battery_discharge_by_date(
     state: &AppState,
     dates: &[NaiveDate],
 ) -> Result<std::collections::BTreeMap<NaiveDate, f64>, ApiError> {
-    let live_range = db::live_ts_range(&state.pool).await?;
+    let live_range = samples::ts_range(&state.pool, &state.rules, Role::Daily).await?;
     let now = db::now();
     let today = today(state.tz);
     let first_data = first_data_ts(state).await?;
@@ -1268,9 +1310,15 @@ pub(super) async fn battery_discharge_by_date(
             format!("{DISCHARGE_VERSION}|{}|{:?}", state.tz, state.rules),
         ));
     }
-    let mut stored: HashMap<NaiveDate, Option<f64>> =
-        day_cache::load_with_data(&state.pool, state.plant_id, state.tz, DISCHARGE_KIND, &keys)
-            .await?;
+    let mut stored: HashMap<NaiveDate, Option<f64>> = day_cache::load_with_data(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        state.tz,
+        DISCHARGE_KIND,
+        &keys,
+    )
+    .await?;
 
     let mut to_store = Vec::new();
     for &date in dates {
@@ -1295,7 +1343,14 @@ pub(super) async fn battery_discharge_by_date(
         .iter()
         .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
         .collect();
-    let store_as = day_cache::store_keys(&state.pool, state.plant_id, state.tz, &store_as).await?;
+    let store_as = day_cache::store_keys(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        state.tz,
+        &store_as,
+    )
+    .await?;
     let rows: Vec<(NaiveDate, String, &Option<f64>)> = store_as
         .into_iter()
         .zip(&to_store)
@@ -1337,7 +1392,7 @@ async fn day_totals_flagged(
     let (start, end) = day_bounds_or_error(date, state.tz)?;
     let samples = match live_range {
         Some((first, last)) if first < end && last >= start => {
-            db::live_samples_raw(&state.pool, start, end).await?
+            samples::raw(&state.pool, &state.rules, Role::Daily, start, end).await?
         }
         _ => Vec::new(),
     };
@@ -1348,12 +1403,12 @@ async fn day_totals_flagged(
     // cloud, or there is no cloud source at all); skip its queries.
     if let Some(live) = live
         .as_ref()
-        .filter(|live| !state.rules.cloud_needed(live.solid))
+        .filter(|live| !state.rules.counters_needed(live.solid))
     {
         let final_day = is_cacheable(date, today, "inverter", solid, None, end);
         return Ok((live_day(date, live), samples, final_day));
     }
-    let cloud = if state.rules.cloud_enabled() {
+    let cloud = if state.rules.counters_enabled() {
         cloud_day(state, date, start, end).await?
     } else {
         DayTotals::no_data(date, "cloud")
@@ -1364,9 +1419,9 @@ async fn day_totals_flagged(
             Ok((live_day(date, &live), samples, final_day))
         }
         _ => {
-            let newest = db::newest_reading_ts_in_range(
+            let newest = db::newest_reading_ts_in_range_from(
                 &state.pool,
-                state.plant_id,
+                &state.counter_source(),
                 Metric::LoadDayWh,
                 start,
                 end,
@@ -1579,9 +1634,19 @@ async fn day_home_mix(
     } else if totals.load_kwh.is_some() {
         let (start, end) = day_bounds_or_error(date, state.tz)?;
         let read = async |metric| -> Result<Vec<(i64, f64)>, ApiError> {
-            let rows =
-                db::readings_in_range(&state.pool, state.plant_id, metric, start, end).await?;
-            Ok(undo_cloud_lag(start, &rows))
+            let rows = db::readings_in_range_from(
+                &state.pool,
+                &state.counter_source(),
+                metric,
+                start,
+                end,
+            )
+            .await?;
+            Ok(undo_counter_lag(
+                start,
+                &rows,
+                counter_lag_secs(&state.rules),
+            ))
         };
         home_mix::cloud_steps(
             &read(Metric::PvDayWh).await?,
@@ -1621,7 +1686,7 @@ pub struct DayEnergy {
 /// `daily_days` is the one function behind both, so the two can never
 /// disagree (and a finished day comes from the same per-day cache).
 pub async fn day_energy(state: &AppState, date: NaiveDate) -> anyhow::Result<DayEnergy> {
-    let live_range = db::live_ts_range(&state.pool).await?;
+    let live_range = samples::ts_range(&state.pool, &state.rules, Role::Daily).await?;
     let days = daily_days(state, &[date], live_range, db::now())
         .await
         .map_err(|err| anyhow::anyhow!("could not work out the day's totals: {}", err.message()))?;
@@ -1684,8 +1749,15 @@ async fn daily_days(
         }
         keys.push((date, key));
     }
-    let mut stored: HashMap<NaiveDate, DayTotals> =
-        day_cache::load_with_data(&state.pool, state.plant_id, state.tz, DAILY_KIND, &keys).await?;
+    let mut stored: HashMap<NaiveDate, DayTotals> = day_cache::load_with_data(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        state.tz,
+        DAILY_KIND,
+        &keys,
+    )
+    .await?;
 
     let mut out = Vec::with_capacity(dates.len());
     let mut to_store = Vec::new();
@@ -1714,7 +1786,14 @@ async fn daily_days(
         .iter()
         .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
         .collect();
-    let store_as = day_cache::store_keys(&state.pool, state.plant_id, state.tz, &store_as).await?;
+    let store_as = day_cache::store_keys(
+        &state.pool,
+        state.plant_id,
+        state.rules.uses_ha(),
+        state.tz,
+        &store_as,
+    )
+    .await?;
     let rows: Vec<(NaiveDate, String, &DayTotals)> = store_as
         .into_iter()
         .zip(&to_store)
@@ -1740,11 +1819,12 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
         DEFAULT_DAILY_DAYS,
     )?;
 
-    let live_range = db::live_ts_range(&state.pool).await?;
+    let live_range = samples::ts_range(&state.pool, &state.rules, Role::Daily).await?;
     let now = db::now();
     if group != Group::Day {
         // Days before the first reading have nothing in them; do not read them.
-        let cloud_first = db::first_reading_ts(&state.pool, state.plant_id, &DAILY_METRICS).await?;
+        let cloud_first =
+            db::first_reading_ts_from(&state.pool, &state.counter_source(), &DAILY_METRICS).await?;
         let first = [cloud_first, live_range.map(|(first, _)| first)]
             .into_iter()
             .flatten()
@@ -2353,11 +2433,15 @@ mod tests {
     #[tokio::test]
     async fn source_rules_change_which_source_wins() {
         let rules = |ids: &[&str], finished, partial| {
-            SourceRules::from_config(&crate::config::Sources {
-                daily_energy: Some(ids.iter().map(|id| id.to_string()).collect()),
-                finished_day_coverage: finished,
-                partial_day_coverage: partial,
-            })
+            SourceRules::from_config(
+                &crate::config::Sources {
+                    daily_energy: Some(ids.iter().map(|id| id.to_string()).collect()),
+                    finished_day_coverage: finished,
+                    partial_day_coverage: partial,
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap()
         };
         let live_first = ["sungrow-modbus", "isolarcloud"];

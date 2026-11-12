@@ -22,12 +22,15 @@ use super::AppState;
 use super::api::{ApiError, ApiResult, day_bounds_or_error, today};
 use super::costs::{
     DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, cache_key, credit_override_kwh,
-    day_intervals, is_cacheable, live_in, meter_for_day, meter_in, round2, slice_between,
+    day_intervals, is_cacheable, live_in, meter_for_day, meter_in, round2, rules_key,
+    slice_between,
 };
+use super::samples::{self, Role};
 use crate::cost::{self, Interval, Tariff, TariffSchedule, local_minute_of_day};
 use crate::db::{self, ChargeSession, GlobirdCostRow};
 use crate::ev_cost;
 use crate::globird::data::{Bucket, bucket_of, is_supply};
+use crate::hub::SourceRules;
 use crate::metric::Metric;
 
 const DEFAULT_DAYS: u64 = 30;
@@ -583,8 +586,12 @@ const BATTERY_CACHE_VERSION: u32 = 3;
 
 /// What stored [`DayFacts`] are tagged with: they only count while the time
 /// zone and the plan for that day are unchanged.
-fn battery_cache_key(tz: Tz, tariff: &Tariff) -> String {
-    format!("{BATTERY_CACHE_VERSION}|{}", cache_key(tz, tariff))
+fn battery_cache_key(tz: Tz, tariff: &Tariff, rules: &SourceRules) -> String {
+    format!(
+        "{BATTERY_CACHE_VERSION}|{}{}",
+        cache_key(tz, tariff),
+        rules_key(rules)
+    )
 }
 
 /// Works out the [`DayFacts`] of consecutive local `dates` from the stored
@@ -601,9 +608,9 @@ async fn compute_facts(
     let tz = state.tz;
     let range_start = day_bounds_or_error(dates[0], tz)?.0;
     let range_end = day_bounds_or_error(dates[dates.len() - 1], tz)?.1;
-    let rows = db::readings_for_metrics(
+    let rows = db::readings_for_metrics_from(
         &state.pool,
-        state.plant_id,
+        &state.counter_source(),
         &[IMPORT_COUNTER, EXPORT_COUNTER, LOAD_COUNTER, Metric::SocPct],
         range_start,
         range_end,
@@ -613,14 +620,14 @@ async fn compute_facts(
     let export = metric_series(&rows, EXPORT_COUNTER);
     let load = metric_series(&rows, LOAD_COUNTER);
     let cloud_soc = metric_series(&rows, Metric::SocPct);
-    let live_range = db::live_ts_range(&state.pool).await?;
+    let live_range = samples::ts_range(&state.pool, &state.rules, Role::Daily).await?;
     let meter = meter_in(&state.pool, range_start, range_end).await?;
 
     let mut out = Vec::with_capacity(dates.len());
     for &date in dates {
         let (start, end) = day_bounds_or_error(date, tz)?;
         // One day of live samples at a time, to keep memory small.
-        let live = live_in(&state.pool, live_range, start, end).await?;
+        let live = live_in(&state.pool, &state.rules, live_range, start, end).await?;
         let day = DayData {
             start,
             end,
@@ -681,7 +688,7 @@ async fn facts_for(
         let Ok(date) = NaiveDate::from_str(&row.date) else {
             continue;
         };
-        if row.tariff_key != battery_cache_key(tz, schedule.for_date(date)) {
+        if row.tariff_key != battery_cache_key(tz, schedule.for_date(date), &state.rules) {
             continue;
         }
         // A row that no longer parses is worked out again and replaced.
@@ -702,7 +709,7 @@ async fn facts_for(
             if cacheable {
                 to_store.push(db::DailyBattery {
                     date: date.to_string(),
-                    tariff_key: battery_cache_key(tz, schedule.for_date(date)),
+                    tariff_key: battery_cache_key(tz, schedule.for_date(date), &state.rules),
                     facts: serde_json::to_string(&facts).map_err(anyhow::Error::from)?,
                 });
             }

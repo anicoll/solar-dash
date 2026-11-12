@@ -616,6 +616,7 @@ mod tests {
             metric: Some(Metric::PvW),
             name: None,
             unit: None,
+            invert: false,
         }
     }
 

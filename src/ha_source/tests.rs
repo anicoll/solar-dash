@@ -7,6 +7,7 @@ fn entity(id: &str, metric: Option<Metric>, unit: Option<&str>) -> HaEntity {
         metric,
         name: None,
         unit: unit.map(str::to_string),
+        invert: false,
     }
 }
 

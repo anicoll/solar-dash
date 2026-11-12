@@ -17,6 +17,7 @@ use super::bill::{MIN_PRICE_COVERAGE, hypothetical_tariff};
 use super::costs::{HypotheticalDay, cache_key, compare_days, consecutive_runs};
 use super::day_cache;
 use super::payback::Purchase;
+use super::samples::{self, Role};
 use crate::amber::store as amber_store;
 use crate::config::AmberCompare;
 use crate::cost::{Tariff, TariffSchedule};
@@ -88,7 +89,7 @@ async fn battery_readings(
     start: i64,
     end: i64,
 ) -> Result<Vec<BatteryReading>, ApiError> {
-    let live = db::live_samples_in_range(&state.pool, start, end).await?;
+    let live = samples::per_minute(&state.pool, &state.rules, Role::Daily, start, end).await?;
     if !live.is_empty() {
         return Ok(live
             .into_iter()

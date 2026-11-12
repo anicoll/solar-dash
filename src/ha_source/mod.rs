@@ -28,6 +28,7 @@
 
 pub mod backfill;
 pub mod protocol;
+pub mod samples;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};

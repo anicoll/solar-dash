@@ -34,7 +34,7 @@ use tokio::sync::watch;
 use tracing::{debug, error};
 
 pub use bus::{Hub, HubEvent};
-pub use rules::SourceRules;
+pub use rules::{CounterSource, HaMapping, SampleSource, SourceRules};
 
 /// What a spoke can give the dashboard. A spoke may offer several.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
