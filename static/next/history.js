@@ -13,7 +13,9 @@
      /api/daily                   energy per day (or per month or year with group=)
      /api/costs                   dollars: import, feed-in, credit, supply, total
      /api/tariff                  price bands (through SD.tariff)
-   /api/prices/daily            Amber buy price per day, for the price panel (week, month, year) */
+   /api/prices                  the day's prices, for the Prices card (day)
+   /api/prices/grid             half-hour average buy prices, for the heat strip (week, month, year)
+   /api/prices/daily            price stats per day, for the tiles under the strip */
 (function () {
   'use strict';
 
@@ -236,32 +238,27 @@
 
   /* ---------------------------------------------------------------- the day view */
 
-  /* ---------------------------------------------------------------- Amber price on the day */
+  /* ---------------------------------------------------------------- the day's Prices card */
 
-  // The "Amber price" switch, remembered in this browser (on unless turned off).
-  const PRICE_KEY = 'sd-history-amber-price';
-  function priceOn() {
-    try { return localStorage.getItem(PRICE_KEY) !== 'off'; } catch { return true; }
-  }
-  function setPriceOn(on) {
-    try { localStorage.setItem(PRICE_KEY, on ? 'on' : 'off'); } catch { /* not saved; fine */ }
-  }
-
-  /** The settled 5-minute buy (general) prices of a day, oldest first. Empty when there are none. */
+  /**
+   * The day's prices from /api/prices: `raw` is the whole answer (both channels, forecasts, `now`),
+   * which the shared timeline reads; `rows` the settled 5-minute buy (general) prices, oldest first,
+   * which the tiles are worked out from. `rows` is empty when the day has none.
+   */
   async function loadDayPrices(day) {
-    const p = await quiet(SD.fetchJSON(`/api/prices?from=${day.start}&to=${day.end}`));
-    const rows = (p && p.channels && p.channels.general) || [];
+    const raw = await quiet(SD.fetchJSON(`/api/prices?from=${day.start}&to=${day.end}`));
+    const found = (raw && raw.channels && raw.channels.general) || [];
     // 5-minute rows, or 30-minute ones (any length up to 35 minutes, so Amber's 1799 s rows count) when
     // that is all a day has. A row that starts inside the previous one is dropped, so lengths never double count.
-    const sorted = rows
+    const sorted = found
       .filter((r) => (r.kind === 'actual' || r.kind === 'current') && r.end - r.start <= 35 * 60 && num(r.cents))
       .sort((a, b) => a.start - b.start);
-    const out = [];
+    const rows = [];
     for (const r of sorted) {
-      if (out.length && r.start < out[out.length - 1].end - 60) continue;
-      out.push(r);
+      if (rows.length && r.start < rows[rows.length - 1].end - 60) continue;
+      rows.push(r);
     }
-    return out;
+    return { raw, rows };
   }
 
   /** "9 h 10 min", "45 min". */
@@ -272,32 +269,47 @@
   }
 
   /**
-   * One line about the day's prices, from the stored rows only: lowest and highest 5-minute
-   * price and when, time at or below 0c, and the kWh bought from the grid in those minutes
-   * (needs the inverter's minute readings; left out when there are none).
+   * The four tiles of the Prices card, from the stored rows only. The inverter's minute readings
+   * (`minuteRows`: [ts, pv, load, grid_w, ...], grid watts positive when buying) say how much was
+   * bought and sold in each price interval; without enough of them the usage parts are left out.
+   *
+   * - paid: the average price weighted by the kWh bought in each interval, else the time-weighted average.
+   * - free: how long the price was 0c or less, and the kWh bought then.
+   * - lo / hi: the cheapest and dearest interval, with its start; hi also has the kWh sold in it.
    */
-  function priceSummary(prices, minuteRows) {
-    const lo = prices.reduce((a, b) => (b.cents < a.cents ? b : a));
-    const hi = prices.reduce((a, b) => (b.cents > a.cents ? b : a));
-    const free = prices.filter((r) => r.cents <= 0);
-    const parts = [`Lowest ${SD.fmt.cents(lo.cents)} at ${SD.fmt.time(lo.start)}, highest ${SD.fmt.cents(hi.cents)} at ${SD.fmt.time(hi.start)}.`];
-    if (!free.length) {
-      parts.push('Never at or below 0c.');
-    } else {
-      const mins = Math.round(sum(free.map((r) => r.end - r.start)) / 60);
-      let text = `At or below 0c for ${durationText(mins)}`;
-      if (minuteRows.length >= LIVE_MIN_MINUTES) {
-        let kwh = 0;
-        for (const r of minuteRows) {
-          if (r[3] == null || r[3] <= 0) continue; // only grid import counts as bought
-          const row = free.find((f) => f.start <= r[0] && r[0] < f.end);
-          if (row) kwh += r[3] * 60 / 3.6e6; // a row is one minute of watts
-        }
-        text += `; bought ${SD.fmt.kwh(kwh)} then`;
+  function priceStats(prices, minuteRows) {
+    const hasUsage = minuteRows.length >= LIVE_MIN_MINUTES;
+    // kWh bought and sold in each price interval, by the minute's start.
+    const bought = prices.map(() => 0);
+    const sold = prices.map(() => 0);
+    if (hasUsage) {
+      let i = 0;
+      for (const r of minuteRows) {
+        if (r[3] == null) continue;
+        while (i < prices.length - 1 && prices[i].end <= r[0]) i++;
+        const row = prices[i];
+        if (!(row.start <= r[0] && r[0] < row.end)) continue;
+        const kwh = Math.abs(r[3]) * 60 / 3.6e6; // a row is one minute of watts
+        if (r[3] > 0) bought[i] += kwh; else sold[i] += kwh;
       }
-      parts.push(`${text}.`);
     }
-    return parts.join(' ');
+    const secs = (r) => r.end - r.start;
+    const kwhBought = sum(bought);
+    const weighted = kwhBought > 1e-6;
+    const paid = weighted
+      ? sum(prices.map((r, i) => r.cents * bought[i])) / kwhBought
+      : sum(prices.map((r) => r.cents * secs(r))) / sum(prices.map(secs));
+    const freeIdx = prices.map((r, i) => (r.cents <= 0 ? i : -1)).filter((i) => i >= 0);
+    const at = (better) => prices.reduce((best, r, i) => (better(r, prices[best]) ? i : best), 0);
+    const lo = at((a, b) => a.cents < b.cents);
+    const hi = at((a, b) => a.cents > b.cents);
+    return {
+      paid, weighted, kwhBought,
+      freeMins: Math.round(sum(freeIdx.map((i) => secs(prices[i]))) / 60),
+      freeKwh: hasUsage ? sum(freeIdx.map((i) => bought[i])) : null,
+      lo: prices[lo],
+      hi: prices[hi], hiSold: hasUsage ? sold[hi] : null,
+    };
   }
 
   /** Power curves: the cloud's, with the inverter's own minute readings over them when it has enough. */
@@ -400,7 +412,7 @@
     const c = (costs && costs.days && costs.days[0]) || null;
     const curves = dayCurves(dayData, (live && live.data) || []);
     const grid = gridFromRows(curves.rows, tariff);
-    const prices = !SD.caps.prices ? [] : same ? pricesGuess : await loadDayPrices(dayData);
+    const dayPrices = SD.caps.prices ? await loadDayPrices(dayData) : { raw: null, rows: [] };
     const hasCurve = curves.pv.length > 0 || curves.load.length > 0;
     const hasEnergy = num(d.pv_kwh) || num(d.load_kwh) || num(d.import_kwh);
 
@@ -457,24 +469,6 @@
         SD.h('span', {}, SD.h('i', { class: 'history-key history-key-solar', 'aria-hidden': 'true' }), 'Solar'),
         SD.h('span', {}, SD.h('i', { class: 'history-key history-key-home', 'aria-hidden': 'true' }), 'Home'),
         curves.soc.length ? SD.h('span', {}, SD.h('i', { class: 'history-key history-key-battery', 'aria-hidden': 'true' }), 'Battery %') : null);
-      // Amber's 5-minute buy price as a line with its own cents axis; only on days that have prices.
-      const priceKey = prices.length ? SD.h('span', {}, SD.h('i', { class: 'history-key history-key-price', 'aria-hidden': 'true' }), 'Amber price (right axis)') : null;
-      if (priceKey) legend.append(priceKey);
-      const summaryText = prices.length ? priceSummary(prices, curves.rows) : null;
-      const summary = summaryText ? SD.h('p', { class: 'history-price-summary', text: summaryText }) : null;
-      const priceSwitch = prices.length ? SD.h('button', {
-        type: 'button', class: 'history-switch', role: 'switch', 'aria-checked': String(priceOn()), text: 'Amber price',
-        onclick: () => {
-          setPriceOn(!priceOn());
-          priceSwitch.setAttribute('aria-checked', String(priceOn()));
-          showPrice();
-          redraw();
-        },
-      }) : null;
-      const showPrice = () => {
-        if (priceKey) priceKey.hidden = !priceOn();
-        if (summary) summary.hidden = !priceOn();
-      };
       const smoothSeg = SD.h('div', { class: 'seg history-smooth', role: 'group', 'aria-label': 'Line style' });
       for (const [on, text] of [[true, 'Smooth'], [false, 'Raw']]) {
         smoothSeg.append(SD.h('button', {
@@ -489,16 +483,24 @@
       nodes.push(SD.h('section', { class: 'card history-card', 'aria-labelledby': 'history-power-h' },
         SD.h('div', { class: 'card-head' },
           SD.h('h2', { class: 'section-title', id: 'history-power-h', text: 'Power through the day' }),
-          SD.h('div', { class: 'history-controls' }, priceSwitch, smoothSeg)),
-        chartBox, ribbonBox, legend, summary));
-      showPrice();
+          SD.h('div', { class: 'history-controls' }, smoothSeg)),
+        chartBox, ribbonBox, legend));
       let ribbon = null;
       redraw = () => {
-        drawPower(chartBox, dayData, smoothOn() ? smoothCurves(curves) : curves, tariff, d, priceOn() ? prices : []);
+        drawPower(chartBox, dayData, smoothOn() ? smoothCurves(curves) : curves, tariff, d);
         if (!ribbon || ribbon.long !== wide()) {
           ribbon = { long: wide(), r: SD.ribbon(ribbonBox, tariffRaw, { showCredit: true, labels: wide() ? 'long' : 'short' }) };
         }
       };
+    }
+
+    // The day's prices, right under the chart: only where there is a price source and the day has prices.
+    if (dayPrices.rows.length) {
+      const card = pricesCard(dayData, dayPrices, curves.rows, date === today);
+      nodes.push(card.el);
+      const chartRedraw = redraw;
+      // The card is on the page when the page redraws, so the timeline can scroll to its first block then.
+      redraw = () => { if (chartRedraw) chartRedraw(); card.settle(); };
     }
 
     // Where the solar went.
@@ -511,12 +513,53 @@
     return { nodes: [wrapDay(nodes)], redraw };
   }
 
+  /**
+   * "Prices": the day's 30-minute blocks (the shared timeline: buying or selling, tap a block for its
+   * 5-minute prices) and four tiles. Returns {el, settle}: call settle() once `el` is on the page so
+   * the first scroll (to the cheapest buy block, or the current one today) can be measured.
+   */
+  function pricesCard(day, priceData, minuteRows, isToday) {
+    const { raw, rows } = priceData;
+    const source = SD.caps.price_source || 'Amber';
+    const timeline = SD.priceTimeline({ title: 'The whole day · 30-minute blocks', source });
+    const nowTs = Math.floor(Date.now() / 1000);
+    const live = isToday && raw.now ? raw.now.general : null;
+    timeline.update(raw, {
+      nowTs, dayStart: day.start, dayEnd: day.end, buy: live && live.end > nowTs ? live : null,
+      spike: raw.spike_cents, scrollTo: 'cheapest',
+    });
+
+    const st = priceStats(rows, minuteRows);
+    const lowTime = SD.fmt.time(st.lo.start);
+    const soldText = st.hiSold > 0.005 ? `, you sold ${SD.fmt.kwh(st.hiSold)}` : '';
+    const ptile = (name, big, sub) => SD.h('div', { class: 'history-ptile' },
+      SD.h('div', { class: 'label', text: name }),
+      SD.h('div', { class: 'fig fig-md', text: big }),
+      sub ? SD.h('div', { class: 'history-tile-sub', text: sub }) : null);
+    const tilesBox = SD.h('div', { class: 'history-ptiles' },
+      ptile('What you paid on average', SD.fmt.cents(st.paid, { round: false }),
+        st.weighted ? `weighted by your ${SD.fmt.kwh(st.kwhBought)}` : 'simple average (no usage data)'),
+      ptile('At 0c or less', st.freeMins ? durationText(st.freeMins) : 'Never',
+        st.freeMins && st.freeKwh != null ? `you bought ${SD.fmt.kwh(st.freeKwh)} then` : st.freeMins ? '' : 'no price at or below 0c'),
+      ptile('Lowest', SD.fmt.cents(st.lo.cents, { round: false }), lowTime),
+      ptile('Highest', SD.fmt.cents(st.hi.cents, { round: false }), `${SD.fmt.time(st.hi.start)}${soldText}`));
+
+    const el = SD.h('section', { class: 'card history-card history-prices-day', 'aria-labelledby': 'history-prices-h' },
+      SD.h('div', { class: 'card-head' },
+        SD.h('h2', { class: 'section-title', id: 'history-prices-h', text: 'Prices' }),
+        SD.h('span', { class: 'label', text: `${source} · settled 5-minute prices` })),
+      timeline.el, tilesBox);
+    return { el, settle: timeline.settle };
+  }
+
   /** On a wide screen the cards after the chart sit side by side. */
   function wrapDay(nodes) {
     const [head, ...cards] = nodes;
-    const chart = cards.find((n) => n.getAttribute('aria-labelledby') === 'history-power-h');
-    const rest = cards.filter((n) => n !== chart);
-    return SD.h('div', { class: 'history-day' }, head, chart,
+    const wanted = (id) => cards.find((n) => n.getAttribute('aria-labelledby') === id);
+    const chart = wanted('history-power-h');
+    const prices = wanted('history-prices-h'); // as wide as the chart: the timeline needs the room
+    const rest = cards.filter((n) => n !== chart && n !== prices);
+    return SD.h('div', { class: 'history-day' }, head, chart, prices,
       rest.length ? SD.h('div', { class: 'history-pair' }, rest) : null);
   }
 
@@ -703,7 +746,7 @@
     return best && Math.abs(best[0] - ts) <= 600 ? best[1] : null;
   }
 
-  function drawPower(box, day, curves, tariff, totals, prices) {
+  function drawPower(box, day, curves, tariff, totals) {
     const width = Math.max(box.clientWidth || box.parentElement.clientWidth || 300, 200);
     const height = width >= 560 ? 230 : 170;
     const top = 16;
@@ -728,10 +771,7 @@
     for (const frac of [0.5, 1]) {
       const yy = bottom - frac * (bottom - top);
       svg.append(S('line', { x1: 0, x2: width, y1: yy, y2: yy, class: 'history-grid' }));
-      // With a price line the right-hand side belongs to the cents axis, so the kW labels move left.
-      svg.append(S('text', prices.length
-        ? { x: 2, y: yy - 3, 'text-anchor': 'start', class: 'history-axis-label' }
-        : { x: width - 2, y: yy - 3, 'text-anchor': 'end', class: 'history-axis-label' }, `${+(maxKw * frac).toFixed(1)} kW`));
+      svg.append(S('text', { x: width - 2, y: yy - 3, 'text-anchor': 'end', class: 'history-axis-label' }, `${+(maxKw * frac).toFixed(1)} kW`));
     }
     svg.append(S('line', { x1: 0, x2: width, y1: bottom, y2: bottom, class: 'history-base' }));
 
@@ -755,28 +795,6 @@
     for (const run of runs(curves.load)) if (run.length > 1) svg.append(S('path', { d: line(run, yKw), class: 'history-home-line' }));
     for (const run of runs(curves.soc)) if (run.length > 1) svg.append(S('path', { d: line(run, ySoc), class: 'history-battery-line' }));
 
-    // Amber's price as a step line (each 5-minute price holds until the next), on its own cents axis.
-    let yPrice = null;
-    if (prices.length) {
-      const cents = prices.map((r) => r.cents);
-      const pHi = Math.max(10, ...cents);
-      const pLo = Math.min(0, ...cents);
-      yPrice = (c) => bottom - ((c - pLo) / (pHi - pLo)) * (bottom - top);
-      if (pLo < 0) svg.append(S('line', { x1: 0, x2: width, y1: yPrice(0), y2: yPrice(0), class: 'history-price-zero' }));
-      let d = '';
-      let prevEnd = null;
-      for (const r of prices) {
-        const move = prevEnd == null || r.start - prevEnd > 60; // a missing price is a gap in the line
-        d += `${move ? 'M' : 'L'}${x(r.start).toFixed(1)} ${yPrice(r.cents).toFixed(1)}L${x(r.end).toFixed(1)} ${yPrice(r.cents).toFixed(1)}`;
-        prevEnd = r.end;
-      }
-      svg.append(S('path', { d, class: 'history-price-line' }));
-      const label = (c, yy, base) => svg.append(S('text', { x: width - 2, y: yy, 'text-anchor': 'end', 'dominant-baseline': base, class: 'history-axis-label history-price-label' }, SD.fmt.cents(c, { round: true })));
-      label(pHi, top + 1, 'hanging');
-      if (pLo < 0) label(0, yPrice(0) - 2, 'auto'); else label(pLo, bottom - 2, 'auto');
-      if (pLo < 0) label(pLo, bottom - 2, 'auto');
-    }
-
     box.replaceChildren(svg);
     // Hover: the readings at that time, and what was bought and sold in that hour.
     const hourly = curves.source === 'inverter' ? hourlyGrid(curves.rows) : null;
@@ -795,8 +813,6 @@
       if (load != null) now.push(`home ${SD.fmt.kw(load / 1000)}`);
       if (soc != null) now.push(`battery ${Math.round(soc)}%`);
       if (now.length) nodes.push(tipLine(now.join(', ')));
-      const pr = prices.find((r) => r.start <= ts && ts < r.end);
-      if (pr) nodes.push(tipLine(`Amber ${SD.fmt.cents(pr.cents)}`));
       if (hourly) {
         const from = SD.fmt.minute(hr * 60);
         const to = SD.fmt.minute(((hr + 1) % 24) * 60);
@@ -838,14 +854,15 @@
     const grouped = r.view === 'year' ? 'month' : r.view === 'all' ? 'year' : null;
     const g = grouped ? `&group=${grouped}` : '';
     const prev = r.view === 'all' ? null : rangeOf(shift(r, -1));
-    // The Amber price panel: only where there is a price source and the range is days.
+    // The price heat strip and tiles: only where there is a price source and the range is days.
     const wantPrices = SD.caps.prices && (r.view === 'week' || r.view === 'month' || r.view === 'year');
-    const [energy, costs, prevEnergy, tariff, priceDays] = await Promise.all([
+    const [energy, costs, prevEnergy, tariff, priceDays, priceGrid] = await Promise.all([
       SD.fetchJSON(`/api/daily?from=${from}&to=${to}${g}`),
       quiet(SD.fetchJSON(`/api/costs?from=${from}&to=${to}${g}`)),
       prev ? quiet(SD.fetchJSON(`/api/daily?from=${prev.from}&to=${prev.fullTo < SD.local().date ? prev.fullTo : prev.to}&group=month`)) : Promise.resolve(null),
       quiet(SD.tariff.get(r.view === 'week' || r.view === 'month' ? to : undefined)),
       wantPrices ? quiet(SD.fetchJSON(`/api/prices/daily?from=${from}&to=${to}`)) : Promise.resolve(null),
+      wantPrices ? quiet(SD.fetchJSON(`/api/prices/grid?from=${from}&to=${to}`)) : Promise.resolve(null),
     ]);
 
     // One bar slot per day (or month, or year), in order, including days still to come.
@@ -890,11 +907,10 @@
     const nodes = [summaryCard(r, totals, costs && costs.totals, tariff, slots), tiles(r, totals, costs && costs.totals, prevEnergy && prevEnergy.totals, rows)];
     const box = nodes[0].querySelector('.history-chart');
     const draws = [() => drawBars(box, r, slots)];
-    if (priceDays && priceDays.days && priceDays.days.length) {
-      const panel = pricePanel(r, priceDays);
-      nodes.push(panel.card, panel.tiles);
-      draws.push(() => drawPriceRange(panel.box, panel.days, panel.spike));
-    }
+    // The heat strip needs the half-hour grid; its tiles need the day stats. Either may be missing.
+    const gridRows = (priceGrid && priceGrid.days || []).filter((d) => d.cells.some((c) => c != null));
+    if (gridRows.length) nodes.push(heatCard(r, priceGrid, gridRows));
+    if (priceDays && priceDays.days && priceDays.days.length && priceDays.summary) nodes.push(priceTiles(priceDays));
     return { nodes, redraw: () => draws.forEach((d) => d()) };
   }
 
@@ -1056,29 +1072,93 @@
     }, { touch: false });
   }
 
-  /* ---------------------------------------------------------------- Amber price per day */
+  /* ---------------------------------------------------------------- price heat strip */
 
-  /** The price card and its tiles for a week, month or year, from /api/prices/daily. */
-  function pricePanel(r, data) {
+  /** "2:00-2:30 pm" for the half-hour cell `i` (0 = 12:00 am), "11:30 pm-12:00 am" across a change of am and pm. */
+  function halfHour(i) {
+    const part = (m) => {
+      const hr = Math.floor(m / 60) % 24;
+      return { clock: `${hr % 12 || 12}:${pad(m % 60)}`, ap: hr < 12 ? 'am' : 'pm' };
+    };
+    const a = part(i * 30);
+    const b = part(i * 30 + 30);
+    return a.ap === b.ap ? `${a.clock}-${b.clock} ${b.ap}` : `${a.clock} ${a.ap}-${b.clock} ${b.ap}`;
+  }
+
+  /**
+   * One row per day (Week, Month) or per week (Year), from /api/prices/grid. A week row averages each
+   * half hour over the week's days that have a price there (a plain mean of the days' averages).
+   * Returns [{key, href, name, long, cells}] where `key` is the day, or the week's Monday.
+   */
+  function heatRows(r, gridDays) {
+    if (r.view !== 'year') {
+      return gridDays.map((d) => ({
+        key: d.date, href: `history/day/${d.date}`, name: SD.fmt.date(d.date, 'medium').split(' ').slice(0, 2).join(' '),
+        long: SD.fmt.date(d.date, 'medium'), cells: d.cells,
+      }));
+    }
+    const weeks = new Map();
+    for (const d of gridDays) {
+      const monday = mondayOf(d.date);
+      if (!weeks.has(monday)) weeks.set(monday, []);
+      weeks.get(monday).push(d.cells);
+    }
+    return [...weeks].map(([monday, list]) => ({
+      key: monday, href: `history/week/${monday}`, name: SD.fmt.date(monday, 'short'),
+      long: `Week of ${SD.fmt.date(monday, 'medium')}, average`,
+      cells: Array.from({ length: 48 }, (_, i) => {
+        const have = list.map((c) => c[i]).filter((v) => v != null);
+        return have.length ? sum(have) / have.length : null;
+      }),
+    }));
+  }
+
+  /**
+   * The heat strip: a row per day (or week), 48 squares per row, one for each half hour of the clock, coloured
+   * by the average buy price in it with the same tones as Today's timeline. Each row opens that day (or week).
+   */
+  function heatCard(r, grid, gridDays) {
+    const spike = grid.spike_cents;
+    const rows = heatRows(r, gridDays);
+    const axis = SD.h('div', { class: 'heat-axis', 'aria-hidden': 'true' },
+      ...['12a', '6a', '12p', '6p', '12a'].map((t) => SD.h('span', { text: t })));
+    const box = SD.h('div', { class: `heat heat-${r.view}` }, SD.h('span'), axis);
+    for (const row of rows) {
+      const cells = SD.h('span', { class: 'heat-cells', 'aria-hidden': 'true' });
+      row.cells.forEach((c, i) => {
+        const look = c == null ? null : SD.price.cellLook(c, spike);
+        cells.append(SD.h('i', {
+          class: `heat-cell${look ? ` tone-${look.tone}` : ' is-none'}`,
+          title: `${row.long}, ${halfHour(i)}: ${c == null ? 'no price' : SD.fmt.cents(c, { round: false })}`,
+        }));
+      });
+      const priced = row.cells.filter((c) => c != null);
+      box.append(SD.h('a', {
+        class: 'heat-row', href: `#${row.href}`,
+        'aria-label': `${row.long}: ${priced.length ? `lowest ${SD.fmt.cents(Math.min(...priced), { round: false })}, highest ${SD.fmt.cents(Math.max(...priced), { round: false })}` : 'no prices'}. Open`,
+      }, SD.h('span', { class: 'heat-name', text: row.name }), cells));
+    }
+    const key = (tone, text) => SD.h('span', {}, SD.h('b', { class: `swatch tone-${tone}`, 'aria-hidden': 'true' }), text);
+    const legend = SD.h('p', { class: 'history-legend' },
+      key('free', `${SD.fmt.cents(0)} or less`), key('cheap', `Low, under ${SD.fmt.cents(SD.price.LOW_CENTS)}`),
+      key('neutral', 'Neutral'), key('high', `High, over ${SD.fmt.cents(SD.price.HIGH_CENTS)}`),
+      key('spike', `Spike, ${SD.fmt.cents(spike)} or more`),
+      SD.h('span', {}, SD.h('b', { class: 'swatch heat-none', 'aria-hidden': 'true' }), 'No price'));
+    const intro = r.view === 'year'
+      ? 'Each row is a week and each square a half hour of the day, averaged over the days of that week. Tap a row to open that week.'
+      : 'Each row is a day and each square a half hour. Tap a row to open that day.';
+    return SD.h('section', { class: 'card history-card history-prices', 'aria-labelledby': 'history-price-h' },
+      SD.h('h2', { class: 'section-title', id: 'history-price-h', text: `Prices, ${label(r)}` }),
+      SD.h('p', { class: 'history-sentence', text: intro }),
+      box, legend);
+  }
+
+  /** The four tiles under the heat strip, from /api/prices/daily. */
+  function priceTiles(data) {
     const days = data.days;
     const spike = data.spike_cents;
     const total = data.summary;
-    const box = SD.h('div', { class: 'history-chart' });
     const free = days.filter((d) => d.free_minutes > 0).length;
-    const hasWeighted = days.some((d) => num(d.weighted_cents));
-    const legend = SD.h('p', { class: 'history-legend' },
-      SD.h('span', {}, SD.h('span', { class: 'history-key history-key-range', 'aria-hidden': 'true' }), 'Lowest to highest price'),
-      SD.h('span', {}, SD.h('span', { class: 'history-key history-key-free', 'aria-hidden': 'true' }), `Went to ${SD.fmt.cents(0)} or below`),
-      SD.h('span', {}, SD.h('span', { class: 'history-key history-key-dot', 'aria-hidden': 'true' }), 'Your average'),
-      days.some((d) => !num(d.weighted_cents))
-        ? SD.h('span', {}, SD.h('span', { class: 'history-key history-key-mean', 'aria-hidden': 'true' }), hasWeighted ? 'Simple average (no usage data)' : 'Simple average')
-        : null);
-    const sentence = `Each bar is a day: it spans the lowest to the highest 5-minute buy price. The dot is your average, weighted by what you bought${hasWeighted ? '' : ' (no usage data for these days, so it is the simple average)'}. Yellow days dipped to ${SD.fmt.cents(0)} or below.`;
-    const card = SD.h('section', { class: 'card history-card history-prices', 'aria-labelledby': 'history-price-h' },
-      SD.h('h2', { class: 'section-title', id: 'history-price-h', text: 'Amber buy price' }),
-      SD.h('p', { class: 'history-sentence', text: sentence }),
-      box, legend);
-
     const tiles = SD.h('div', { class: 'history-tiles' });
     const usage = num(total.weighted_cents);
     tiles.append(tile('Average buy price', SD.fmt.cents(usage ? total.weighted_cents : total.mean_cents, { round: false }),
@@ -1090,74 +1170,7 @@
       `${SD.fmt.date(total.max_start, 'medium')}, ${SD.fmt.time(total.max_start)}`));
     tiles.append(tile(`Spikes over ${SD.fmt.cents(spike)}`, String(total.spike_intervals),
       total.spike_intervals ? '5-minute prices above it' : 'None in this period'));
-    return { card, tiles, box, days, spike };
-  }
-
-  /** One bar per day from its lowest to its highest buy price, and a dot for the average. */
-  function drawPriceRange(box, days, spike) {
-    const width = Math.max(box.clientWidth || 300, 200);
-    const height = width >= 560 ? 230 : 170;
-    const top = 16;
-    const axisH = 20;
-    const base = height - axisH;
-    const from = days[0].date;
-    const slots = [];
-    const byDate = new Map(days.map((d) => [d.date, d]));
-    for (let day = from; day <= days[days.length - 1].date; day = addDays(day, 1)) slots.push({ date: day, row: byDate.get(day) });
-    const n = slots.length;
-    const slotW = width / n;
-    const barW = Math.max(1.5, Math.min(slotW * 0.5, 22));
-
-    // One huge spike would flatten every other day, so the scale stops at a little over the spike level.
-    const rawMax = Math.max(...days.map((d) => d.max_cents));
-    const capMax = Math.max(100, num(spike) ? spike * 1.25 : 0);
-    const hi = Math.max(10, Math.min(rawMax, capMax));
-    const lo = Math.min(0, ...days.map((d) => d.min_cents));
-    const y = (c) => base - ((Math.max(lo, Math.min(hi, c)) - lo) / (hi - lo)) * (base - top);
-
-    const svg = S('svg', {
-      width, height, viewBox: `0 0 ${width} ${height}`, role: 'img',
-      'aria-label': `Amber buy price, one bar per day from lowest to highest, ${days.length} days with prices. Highest ${SD.fmt.cents(rawMax)}.`,
-    });
-    for (const c of [hi, 0].filter((v, i, a) => a.indexOf(v) === i)) {
-      svg.append(S('line', { x1: 0, x2: width, y1: y(c), y2: y(c), class: c === 0 ? 'history-base' : 'history-grid' }));
-      svg.append(S('text', { x: 2, y: y(c) - 3, class: 'history-axis-label' }, `${SD.fmt.cents(c)}${c === hi && rawMax > hi ? '+' : ''}`));
-    }
-    // Which x labels fit: every day of a week, then every few.
-    const every = n <= 8 ? 1 : n <= 31 ? 5 : 0;
-    slots.forEach((s, i) => {
-      const cx = slotW * i + slotW / 2;
-      const first = s.date.slice(8) === '01';
-      const text = n > 31 ? (first ? SD.fmt.date(s.date, 'short').split(' ')[1] : null)
-        : n <= 8 ? SD.fmt.date(s.date, 'medium').split(' ')[0] : (i % every === 0 ? String(+s.date.slice(8)) : null);
-      if (text) svg.append(S('text', { x: cx, y: height - 5, 'text-anchor': 'middle', class: 'history-axis-label' }, text));
-      const d = s.row;
-      if (!d) return;
-      const dipped = d.free_minutes > 0;
-      const top0 = y(d.max_cents);
-      const said = `${SD.fmt.date(s.date, 'medium')}: ${SD.fmt.cents(d.min_cents, { round: false })} to ${SD.fmt.cents(d.max_cents, { round: false })}`;
-      const parts = [
-        S('rect', { x: cx - barW / 2, y: top0, width: barW, height: Math.max(2, y(d.min_cents) - top0), rx: Math.min(3, barW / 2), class: `history-price-range${dipped ? ' is-free' : ''}` }),
-      ];
-      const avg = num(d.weighted_cents) ? d.weighted_cents : d.mean_cents;
-      const dotR = Math.max(1.2, Math.min(4.5, slotW * 0.3));
-      parts.push(S('circle', { cx, cy: y(avg), r: dotR, class: `history-price-dot${num(d.weighted_cents) ? '' : ' is-mean'}` }));
-      svg.append(S('a', { href: `#history/day/${s.date}`, 'aria-label': said, class: 'history-bar-link' },
-        S('title', {}, said), S('rect', { x: slotW * i, y: 0, width: slotW, height: height - axisH, class: 'history-hit' }), parts));
-    });
-    box.replaceChildren(svg);
-    chartTip(box, svg, base, (frac) => {
-      const i = Math.min(n - 1, Math.floor(frac * n));
-      const d = slots[i] && slots[i].row;
-      if (!d) return null;
-      const nodes = [SD.h('b', { text: SD.fmt.date(slots[i].date, 'medium') }),
-        tipLine(`Low ${SD.fmt.cents(d.min_cents, { round: false })} at ${SD.fmt.time(d.min_start)}`),
-        tipLine(`High ${SD.fmt.cents(d.max_cents, { round: false })} at ${SD.fmt.time(d.max_start)}`),
-        tipLine(num(d.weighted_cents) ? `Your average ${SD.fmt.cents(d.weighted_cents, { round: false })}` : `Simple average ${SD.fmt.cents(d.mean_cents, { round: false })}`)];
-      if (d.free_minutes > 0) nodes.push(tipLine(`${SD.fmt.cents(0)} or below for ${Math.round(d.free_minutes)} min`));
-      if (d.coverage < 0.95) nodes.push(tipLine(`Prices cover ${Math.round(d.coverage * 100)}% of the day`));
-      return { at: (i + 0.5) / n, nodes };
-    }, { touch: false });
+    return tiles;
   }
 
   SD.page('history', { mount, update, unmount });

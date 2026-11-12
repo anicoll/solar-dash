@@ -254,60 +254,11 @@ html[data-theme="night"] #page-history {
   border-top: 2px solid var(--ink);
 }
 
-#page-history .history-key-price {
-  width: 16px;
-  border-top: 3px solid var(--credit);
-}
-
-#page-history .history-price-line {
-  fill: none;
-  stroke: var(--credit);
-  stroke-width: 2;
-  stroke-linejoin: round;
-}
-
-#page-history .history-price-zero {
-  stroke: var(--credit);
-  stroke-width: 1;
-  stroke-dasharray: 2 3;
-  opacity: 0.7;
-}
-
-#page-history .history-price-label {
-  fill: var(--credit);
-}
-
-#page-history .history-price-summary {
-  margin: 10px 0 0;
-  font-size: 13px;
-  line-height: 1.4;
-  color: var(--ink-2);
-}
-
 #page-history .history-controls {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-}
-
-#page-history .history-switch {
-  min-height: 44px;
-  padding: 4px 14px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--ink-2);
-  font: inherit;
-  font-size: 14px;
-  cursor: pointer;
-}
-
-#page-history .history-switch[aria-checked='true'] {
-  background: var(--ink);
-  border-color: var(--ink);
-  color: var(--card);
-  font-weight: 700;
 }
 
 #page-history .history-key-battery {
@@ -445,59 +396,84 @@ html[data-theme="night"] #page-history {
   margin-top: 8px;
 }
 
-/* ---------- Amber price per day ---------- */
+/* ---------- price heat strip (week, month, year) ---------- */
 
-#page-history .history-price-range {
-  fill: var(--bar);
-  fill-opacity: 0.55;
+/* A label column, then 48 squares a row. The rows are links, so a tap opens the day (or week). */
+#page-history .heat {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  column-gap: 8px;
+  row-gap: 2px;
+  margin-top: 12px;
+  align-items: center;
 }
 
-#page-history .history-price-range.is-free {
-  fill: var(--sun);
-  fill-opacity: 1;
-  stroke: var(--sun-line);
-  stroke-width: 1;
+#page-history .heat-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--ink-2);
 }
 
-#page-history .history-price-dot {
-  fill: var(--ink);
-  stroke: var(--card);
-  stroke-width: 1.5;
+#page-history .heat-row {
+  display: contents;
+  color: inherit;
+  text-decoration: none;
 }
 
-/* No usage that day, so this is the simple average: a ring, not a dot. */
-#page-history .history-price-dot.is-mean {
-  fill: var(--card);
-  stroke: var(--ink);
+#page-history .heat-name {
+  font-size: 12px;
+  color: var(--ink-2);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
-#page-history .history-key-range {
-  width: 8px;
-  height: 14px;
-  border-radius: 3px;
-  background: var(--bar);
+#page-history .heat-cells {
+  display: flex;
+  gap: 1px;
+}
+
+#page-history .heat-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 20px;
+  border-radius: 2px;
+}
+
+#page-history .heat-month .heat-cell { height: 13px; }
+#page-history .heat-year .heat-cell { height: 9px; }
+#page-history .heat-month .heat-name { font-size: 11px; line-height: 13px; }
+#page-history .heat-year .heat-name { font-size: 11px; line-height: 9px; }
+
+#page-history .heat-cell.is-none,
+#page-history .heat-none {
+  background: var(--line);
   opacity: 0.55;
 }
 
-#page-history .history-key-free {
-  width: 8px;
-  height: 14px;
-  border-radius: 3px;
-  background: var(--sun);
-  box-shadow: inset 0 0 0 1px var(--sun-line);
+#page-history .heat-row:hover .heat-name { color: var(--ink); text-decoration: underline; }
+#page-history .heat-row:hover .heat-cell { outline: 1px solid color-mix(in srgb, var(--ink) 30%, transparent); }
+#page-history .heat-row:focus-visible .heat-cells { outline: 3px solid var(--focus); outline-offset: 1px; }
+
+/* ---------- the day's Prices card ---------- */
+
+#page-history .history-prices-day .ptl-wrap { margin-top: 4px; }
+
+#page-history .history-ptiles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
 }
 
-#page-history .history-key-dot,
-#page-history .history-key-mean {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--ink);
+#page-history .history-ptile {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
 }
 
-#page-history .history-key-mean {
-  background: transparent;
-  box-shadow: inset 0 0 0 2px var(--ink);
+#page-history .history-ptile .fig-md {
+  overflow-wrap: anywhere;
 }
 
 /* ---------- tiles ---------- */
@@ -569,6 +545,11 @@ html[data-theme="night"] #page-history {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 16px;
     align-items: start;
+  }
+
+  #page-history .history-ptiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
   }
 
   #page-history .history-tiles {
