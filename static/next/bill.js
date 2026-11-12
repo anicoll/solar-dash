@@ -812,7 +812,11 @@
 
   /* ---------------------------------------------------------------- 6. against last bill */
 
-  function comparePanel(bill) {
+  /**
+   * This bill against the last one, per day: the table, its notes and the headline change.
+   * Null when there is no last bill or nothing to divide by. It is the open view of "Your bills".
+   */
+  function compareParts(bill) {
     const prev = bill.previous;
     const s = bill.so_far;
     if (!prev || !(prev.days > 0) || !num(prev.total_dollars)) return null;
@@ -849,12 +853,9 @@
       notes.push(`It earned the credit on ${prev.credit_nights} of ${prev.days} evenings.`);
     }
     return {
-      title: isPast(bill) ? 'Against the bill before' : 'Against last bill',
+      diff,
       summary: `${amt(nowTotal)} a day, was ${amt(lastTotal)}`,
-      fig: [`${diff > 0.0049 ? '+' : ''}${amt(diff)}`, h('span', { class: 'bill-ph-u', text: '/day' })],
-      figClass: diff < -0.0049 ? 'is-good' : diff > 0.0049 ? 'is-bad' : '',
-      collapse: true,
-      body: h('div', {}, table, h('p', { class: 'bill-note', text: notes.join(' ') })),
+      body: h('div', { class: 'bill-more' }, table, h('p', { class: 'bill-note', text: notes.join(' ') })),
     };
   }
 
@@ -1080,7 +1081,31 @@
 
   /* ---------------------------------------------------------------- 7. past bills */
 
+  /**
+   * "Your bills": the per-day change against the last bill as the headline, the per-day table
+   * as the open view, then the past-bill bars (each opens that bill). Either half may be missing:
+   * without a last bill there is no table, without past bills there are no bars.
+   */
   function historyPanel(bill) {
+    const cmp = safe(() => compareParts(bill));
+    const bars = safe(() => historyBars(bill));
+    if (!cmp && !bars) return null;
+    const title = SD.caps.meter_name ? `Your ${SD.caps.meter_name} bills` : 'Your bills';
+    if (!cmp) return { title, summary: bars.summary, fig: bars.fig, fixed: true, body: bars.body };
+    const d = cmp.diff;
+    return {
+      title,
+      summary: cmp.summary,
+      fig: [`${d > 0.0049 ? '+' : ''}${amt(d)}`, h('span', { class: 'bill-ph-u', text: ' a day' })],
+      figClass: d < -0.0049 ? 'is-good' : d > 0.0049 ? 'is-bad' : '',
+      // The bars stay in view on a phone; only the table waits for a tap.
+      collapse: !bars,
+      body: h('div', {}, cmp.body, bars ? bars.body : null),
+    };
+  }
+
+  /** The past-bill bars, as { summary, fig, body }; null when there are no past bills. */
+  function historyBars(bill) {
     const past = (Array.isArray(bill.history) ? bill.history : []).filter((b) => b && num(b.total_dollars) && b.to).slice(-5);
     if (!past.length) return null;
     const range = projectionRange(bill);
@@ -1106,10 +1131,8 @@
         ? ` Without the system each would have been about ${whole(Math.min(...bars.filter((b) => b.without != null).map((b) => b.without)))} to ${whole(Math.max(...bars.filter((b) => b.without != null).map((b) => b.without)))}.` : '');
 
     return {
-      title: SD.caps.meter_name ? `Your ${SD.caps.meter_name} bills` : 'Your bills',
       summary: `${plural(past.length, 'bill', 'bills')}${withSum != null ? `, ~${whole(withSum)} without the system` : ''}`,
       fig: whole(sumPast),
-      collapse: true,
       body: h('div', {},
         h('div', Object.assign({ class: 'bill-hist', role: 'group', 'aria-label': label }, cols),
           bars.map((b) => {
@@ -1265,7 +1288,6 @@
       const breakdown = panel('break', 'a-break', () => breakdownPanel(bill, tariff));
       if (breakdown) left.append(breakdown);
       right.append(...[
-        panel('cmp', 'a-compare', () => comparePanel(bill)),
         panel('hist', 'a-history', () => historyPanel(bill)),
         side.children.length ? side : null,
       ].filter(Boolean));
