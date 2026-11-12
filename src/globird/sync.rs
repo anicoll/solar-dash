@@ -18,12 +18,14 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Days, LocalResult, Months, NaiveDate, NaiveTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 use sqlx::SqlitePool;
+use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use super::client::{CaptchaRequired, Client};
@@ -421,6 +423,7 @@ pub async fn run(
     config: Globird,
     pool: SqlitePool,
     tz: Tz,
+    synced: Option<Arc<Notify>>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let sync_time = config.sync_time_of_day()?;
@@ -439,6 +442,10 @@ pub async fn run(
             outcome = run_once(&config, &pool, tz) => outcome,
         };
 
+        // New meter data is in: let the page-cache warm-up run again.
+        if let (Outcome::Done { .. }, Some(synced)) = (&outcome, &synced) {
+            synced.notify_one();
+        }
         let now = Utc::now().with_timezone(&tz);
         let next = match outcome {
             Outcome::Done { yesterday_complete } => next_run(now, sync_time, yesterday_complete),
@@ -662,7 +669,7 @@ mod tests {
         let shutdown = tokio::time::sleep(Duration::from_millis(200));
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run(config, pool, Adelaide, shutdown),
+            run(config, pool, Adelaide, None, shutdown),
         )
         .await;
         assert!(result.expect("did not stop on shutdown").is_ok());
@@ -679,7 +686,7 @@ mod tests {
             password: "pw".into(),
             sync_time: "9am".into(),
         };
-        let result = run(config, pool, Adelaide, std::future::pending()).await;
+        let result = run(config, pool, Adelaide, None, std::future::pending()).await;
         assert!(result.is_err());
     }
 }
