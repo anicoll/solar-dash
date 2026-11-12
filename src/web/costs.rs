@@ -511,32 +511,18 @@ pub(super) async fn house_intervals_by_day(
     Ok(days)
 }
 
-/// One day's grid energy split by tariff band, priced on the plan in effect
-/// that day, or `None` when the day has no interval data (or no tariff).
+/// The day's grid energy split by tariff band, or `None` when the day has no
+/// interval data (or no tariff), and whether the split may be stored for good
+/// (the same test as the stored day costs, see [`is_cacheable`]).
 ///
 /// This uses [`day_intervals`], the same intervals `/api/costs` prices, so the
 /// parts add up to its `import_kwh` and `export_kwh`. `live` is the day's live
 /// samples as `/api/daily` already loaded them; the cloud counters are read
-/// here, and only when the live samples do not cover the day well (a solid
-/// live day never looks at them). The split can differ slightly from
-/// `/api/daily`'s own `import_kwh`: that reads the cloud's daily counter total
-/// (or the live integral), while the split sums the intervals built from the
-/// 5-minute counter steps, which can lose the first reading or cap long gaps.
-pub(super) async fn day_grid_split(
-    state: &AppState,
-    schedule: &TariffSchedule,
-    date: NaiveDate,
-    live: &[Sample],
-    now: i64,
-) -> Result<Option<GridSplit>, ApiError> {
-    Ok(day_grid_split_checked(state, schedule, date, live, now)
-        .await?
-        .map(|(split, _)| split))
-}
-
-/// [`day_grid_split`], and whether the split may be stored for good (the same
-/// test as the stored day costs, see [`is_cacheable`]).
-async fn day_grid_split_checked(
+/// here, and only when the live samples do not cover the day well. The split
+/// can differ slightly from `/api/daily`'s own `import_kwh`: that reads the
+/// cloud's daily counter total (or the live integral), while the split sums
+/// the intervals built from the 5-minute counter steps.
+pub(super) async fn day_grid_split_checked(
     state: &AppState,
     schedule: &TariffSchedule,
     date: NaiveDate,
@@ -584,7 +570,7 @@ async fn day_grid_split_checked(
 /// The `daily_cache` kind for [`grid_splits`].
 const GRID_SPLIT_KIND: &str = "grid_split";
 
-/// Bump when [`day_grid_split`]'s result would change for the same inputs.
+/// Bump when [`day_grid_split_checked`]'s result would change for the same inputs.
 const GRID_SPLIT_VERSION: u32 = 1;
 
 /// The tariff split of each of `dates` that has interval data, for the bill's
@@ -1648,6 +1634,33 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
         "totals": totals,
         "days": days,
     })))
+}
+
+/// What one day cost so far, in dollars, for the Home Assistant feed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DayMoney {
+    /// Bought less sold: the "Today's power has cost ..." figure of the Today
+    /// page. Negative when selling earned more than buying cost.
+    pub power: f64,
+    /// Everything: supply charge and bought, less sold and the zero-import
+    /// credit (`actual` in `/api/costs`).
+    pub net: f64,
+}
+
+/// What `date` cost, from the same cost engine as `/api/costs` (which the
+/// Today page reads). `None` without a `[tariff]` or without data that day.
+pub async fn day_money(state: &AppState, date: NaiveDate) -> Result<Option<DayMoney>> {
+    let data = state.admin.get();
+    let Some(tariff) = &data.tariff else {
+        return Ok(None);
+    };
+    let days = billed_days(state, tariff, &[date])
+        .await
+        .map_err(|err| anyhow::anyhow!("could not cost the day: {}", err.message()))?;
+    Ok(days.iter().find(|d| d.date == date).map(|d| DayMoney {
+        power: dollars(d.cost.import_cents - d.cost.export_cents),
+        net: dollars(d.cost.actual_cents),
+    }))
 }
 
 #[derive(Deserialize)]

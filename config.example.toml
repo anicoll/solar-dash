@@ -129,6 +129,25 @@ path = "data/solar.db"
 # password, so keep this file private; it is never logged.
 # database_url = "postgres://solar_dash:change-me@192.168.1.70:5432/teslamate"
 
+# Optional: publish live readings, today's energy and cost (and, with [amber],
+# the current prices) to Home Assistant over MQTT discovery
+# (publish only: solar-dash never listens for commands). The broker can be
+# the same one as [teslamate]'s. Without this section nothing is published.
+# See "Home Assistant" in docs/how-to-run.md.
+# [home_assistant]
+# mqtt_host = "192.168.1.70"
+# mqtt_port = 1883
+# Only if the broker needs a login. Give both or neither.
+# mqtt_username = "mqtt-user"
+# mqtt_password = "mqtt-password"
+# Home Assistant's MQTT discovery prefix, solar-dash's own topic prefix, and
+# the name of the device the sensors are grouped under.
+# discovery_prefix = "homeassistant"
+# base_topic = "solar-dash"
+# device_name = "solar-dash"
+# At most one state message per this many seconds.
+# min_interval_secs = 15
+
 # Optional: your GloBird Energy customer portal login, used by `globird-probe`
 # and by `serve`, which keeps GloBird's daily cost and usage in the database
 # (read-only access to your account at myaccount.globirdenergy.com.au). The
