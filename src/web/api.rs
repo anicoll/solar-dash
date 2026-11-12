@@ -15,10 +15,12 @@ use tracing::error;
 
 use super::AppState;
 use super::costs::{
-    Group, MAX_GROUPED_COSTS_DAYS, day_grid_split, is_cacheable, round2, undo_cloud_lag,
+    Group, MAX_GROUPED_COSTS_DAYS, cache_key, day_grid_split_checked, is_cacheable, round2,
+    undo_cloud_lag,
 };
 use super::day_cache;
 use super::home_mix::{self, HomeMix};
+use crate::amber::store as amber_store;
 use crate::cost::{GridSplit, TariffSchedule};
 use crate::db;
 use crate::ev_cost;
@@ -1129,11 +1131,11 @@ pub struct DailyParams {
 }
 
 /// Energy totals of one local day, in kWh. `None` means no data that day.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct DayTotals {
     date: String,
     /// Where the numbers come from: "inverter" (live samples) or "cloud".
-    source: &'static str,
+    source: std::borrow::Cow<'static, str>,
     pv_kwh: Option<f64>,
     load_kwh: Option<f64>,
     import_kwh: Option<f64>,
@@ -1151,7 +1153,7 @@ struct DayTotals {
 
 /// Grid energy by tariff band in kWh (see `cost::grid_split`), summed over
 /// any number of days. A figure is `None` when no day had interval data.
-#[derive(Debug, Default, Serialize, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 struct SplitSums {
     import_free_kwh: Option<f64>,
     import_shoulder_kwh: Option<f64>,
@@ -1307,22 +1309,11 @@ async fn day_totals(
     live_range: Option<(i64, i64)>,
     now: i64,
 ) -> Result<DayTotals, ApiError> {
-    Ok(day_totals_with_live(state, date, live_range, now).await?.0)
+    Ok(day_totals_flagged(state, date, live_range, now).await?.0)
 }
 
-/// [`day_totals`], plus the live samples it loaded (empty when none), so the
-/// tariff split can reuse them instead of querying again.
-async fn day_totals_with_live(
-    state: &AppState,
-    date: NaiveDate,
-    live_range: Option<(i64, i64)>,
-    now: i64,
-) -> Result<(DayTotals, Vec<Sample>), ApiError> {
-    let (totals, samples, _) = day_totals_flagged(state, date, live_range, now).await?;
-    Ok((totals, samples))
-}
-
-/// [`day_totals_with_live`], and whether the day is final: finished, with all
+/// A day's totals and the live samples it loaded (empty when none, so the
+/// tariff split can reuse them), and whether the day is final: finished, with all
 /// its data (the test of [`is_cacheable`]), so a stored copy stays right.
 async fn day_totals_flagged(
     state: &AppState,
@@ -1379,7 +1370,7 @@ async fn day_totals_flagged(
 fn live_day(date: NaiveDate, live: &LiveTotals) -> DayTotals {
     DayTotals {
         date: date.to_string(),
-        source: "inverter",
+        source: "inverter".into(),
         pv_kwh: Some(live.pv_kwh),
         load_kwh: Some(live.load_kwh),
         import_kwh: Some(live.import_kwh),
@@ -1415,7 +1406,7 @@ async fn cloud_day(
     }
     Ok(DayTotals {
         date: date.to_string(),
-        source: "cloud",
+        source: "cloud".into(),
         pv_kwh,
         load_kwh,
         import_kwh,
@@ -1434,7 +1425,7 @@ impl DayTotals {
     fn no_data(date: NaiveDate, source: &'static str) -> Self {
         DayTotals {
             date: date.to_string(),
-            source,
+            source: source.into(),
             pv_kwh: None,
             load_kwh: None,
             import_kwh: None,
@@ -1602,6 +1593,85 @@ const DAILY_METRICS: [Metric; 7] = [
     Metric::SelfConsumedDayWh,
 ];
 
+/// The `daily_cache` kind for [`daily_days`].
+const DAILY_KIND: &str = "daily";
+
+/// Bump when a day's figures in `/api/daily` would change for the same inputs
+/// (the totals, the tariff split or the home mix).
+const DAILY_VERSION: u32 = 1;
+
+/// The full `/api/daily` figures of each of `dates` (oldest first). A finished
+/// day with all its data (see [`is_cacheable`]) comes from the `daily_cache`
+/// table when it was stored under the key it would get now (the version, the
+/// time zone, the source rules, the plan for that date and the prices its
+/// grid split used); the others read their samples, and the finished ones
+/// are stored. Today and later are never stored.
+async fn daily_days(
+    state: &AppState,
+    dates: &[NaiveDate],
+    live_range: Option<(i64, i64)>,
+    now: i64,
+) -> Result<Vec<(NaiveDate, DayTotals)>, ApiError> {
+    let data = state.admin.get();
+    let today = today(state.tz);
+    let spike_cents = data.price_spike_cents;
+    let mut keys = Vec::new();
+    for &date in dates.iter().filter(|d| **d < today) {
+        let tariff = data.tariff.as_ref().map(|s| s.for_date(date));
+        let mut key = format!(
+            "{DAILY_VERSION}|{}|{:?}|spike={}",
+            state.tz,
+            state.rules,
+            spike_cents.to_bits()
+        );
+        match tariff {
+            Some(tariff) => {
+                key.push_str(&format!("|{}", cache_key(state.tz, tariff)));
+                if let Some(source) = tariff.dynamic_source() {
+                    let (start, end) = day_bounds_or_error(date, state.tz)?;
+                    let fingerprint =
+                        amber_store::day_prices_fingerprint(&state.pool, source, start, end, false)
+                            .await?;
+                    key.push_str(&format!("|prices:{fingerprint}"));
+                }
+            }
+            None => key.push_str("|no-plan"),
+        }
+        keys.push((date, key));
+    }
+    let mut stored: HashMap<NaiveDate, DayTotals> =
+        day_cache::load(&state.pool, DAILY_KIND, &keys).await?;
+
+    let mut out = Vec::with_capacity(dates.len());
+    let mut to_store = Vec::new();
+    for &date in dates {
+        if let Some(day) = stored.remove(&date) {
+            out.push((date, day));
+            continue;
+        }
+        let (mut totals, live, mut final_day) =
+            day_totals_flagged(state, date, live_range, now).await?;
+        if let Some(schedule) = &data.tariff
+            && let Some((split, cacheable)) =
+                day_grid_split_checked(state, schedule, date, &live, now).await?
+        {
+            totals.split.add(&split);
+            final_day &= cacheable;
+        }
+        totals.home = day_home_mix(state, &data, date, &totals, &live).await?;
+        if final_day && let Some((_, key)) = keys.iter().find(|(d, _)| *d == date) {
+            to_store.push((date, key.clone(), out.len()));
+        }
+        out.push((date, totals));
+    }
+    let rows: Vec<(NaiveDate, String, &DayTotals)> = to_store
+        .iter()
+        .map(|(date, key, i)| (*date, key.clone(), &out[*i].1))
+        .collect();
+    day_cache::save(&state.pool, DAILY_KIND, &rows).await?;
+    Ok(out)
+}
+
 pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyParams>) -> ApiResult {
     let group = Group::parse(params.group.as_deref())?;
     // Grouped rows can cover the whole history. The days are still read one by one,
@@ -1645,18 +1715,8 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
             _ => {}
         }
     }
-    let data = state.admin.get();
-    let mut days = Vec::new();
-    for date in from.iter_days().take(count as usize) {
-        let (mut totals, live) = day_totals_with_live(&state, date, live_range, now).await?;
-        if let Some(schedule) = &data.tariff
-            && let Some(split) = day_grid_split(&state, schedule, date, &live, now).await?
-        {
-            totals.split.add(&split);
-        }
-        totals.home = day_home_mix(&state, &data, date, &totals, &live).await?;
-        days.push((date, totals));
-    }
+    let dates: Vec<NaiveDate> = from.iter_days().take(count as usize).collect();
+    let days = daily_days(&state, &dates, live_range, now).await?;
     if group == Group::Day {
         let days: Vec<_> = days.into_iter().map(|(_, d)| d).collect();
         return Ok(Json(json!({ "days": days })));
@@ -2205,7 +2265,7 @@ mod tests {
 
     /// A finished day with cloud data and live samples covering `covered_pct`
     /// percent of it. Returns the day's source under the given rules.
-    async fn source_with_rules(covered_pct: i64, rules: SourceRules) -> &'static str {
+    async fn source_with_rules(covered_pct: i64, rules: SourceRules) -> String {
         let dir = tempfile::tempdir().unwrap();
         let pool = db::open(dir.path().join("t.db").to_str().unwrap())
             .await
@@ -2235,6 +2295,7 @@ mod tests {
             .await
             .unwrap()
             .source
+            .into_owned()
     }
 
     #[tokio::test]
@@ -2289,7 +2350,7 @@ mod tests {
         let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
         let day = DayTotals {
             date: date.to_string(),
-            source: "cloud",
+            source: "cloud".into(),
             pv_kwh: pv,
             load_kwh: None,
             import_kwh: import,
@@ -2462,6 +2523,84 @@ mod tests {
         let Json(json) = daily(State(state), Query(ask(None))).await.unwrap();
         assert!(json["days"][0]["import_free_kwh"].is_null());
         assert_eq!(json["days"][0]["import_kwh"], 1.5);
+    }
+
+    #[tokio::test]
+    async fn daily_stored_days_answer_the_same_as_worked_out_ones() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            tariff: crate::config::Tariff,
+        }
+        let plan: Wrapper = toml::from_str(
+            r#"
+            [tariff]
+            supply_cents_per_day = 150.0
+            default_import_cents = 40.0
+            import = [{ from = "11:00", to = "14:00", cents = 0.0 }]
+            default_export_cents = 5.0
+            "#,
+        )
+        .unwrap();
+        let schedule = crate::cost::TariffSchedule::from_config(&plan.tariff, &[]).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let start = day_bounds(date("2026-10-20"), ADELAIDE).unwrap().0;
+        let at = |hour: i64, minute: i64| start + hour * 3600 + minute * 60;
+        let rows = [
+            (Metric::PvDayWh, at(12, 0), 5000.0),
+            (Metric::GridImportDayWh, at(12, 0), 0.0),
+            (Metric::GridImportDayWh, at(12, 5), 1000.0),
+            (Metric::GridImportDayWh, at(17, 0), 1000.0),
+            (Metric::GridImportDayWh, at(17, 5), 1500.0),
+            // The last reading of the day is what makes a cloud day final.
+            (Metric::LoadDayWh, at(23, 55), 9000.0),
+        ];
+        db::seed_metrics(&pool, 7, &rows).await;
+        let hash = super::super::hash_password("x").unwrap();
+        let plain = AppState::new(pool.clone(), 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let state = plain.clone().with_tariff(Some(schedule));
+        let ask = |group: Option<&str>| DailyParams {
+            from: Some("2026-10-19".to_string()),
+            to: Some("2026-10-21".to_string()),
+            group: group.map(str::to_string),
+        };
+        let stored = || async {
+            db::daily_cache_in_range(&pool, DAILY_KIND, "2026-10-01", "2026-10-31")
+                .await
+                .unwrap()
+                .len()
+        };
+        let clear = || async {
+            sqlx::query("DELETE FROM daily_cache")
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+
+        for group in [None, Some("month")] {
+            clear().await;
+            let Json(worked_out) = daily(State(state.clone()), Query(ask(group)))
+                .await
+                .unwrap();
+            // Only the finished day with data is stored.
+            assert_eq!(stored().await, 1);
+            let Json(from_store) = daily(State(state.clone()), Query(ask(group)))
+                .await
+                .unwrap();
+            assert_eq!(stored().await, 1);
+            assert_eq!(worked_out.to_string(), from_store.to_string());
+        }
+
+        // A stored day is not used for another plan: without one the split is null.
+        let Json(with_plan) = daily(State(state.clone()), Query(ask(None))).await.unwrap();
+        assert_eq!(with_plan["days"][1]["import_free_kwh"], 1.0);
+        let Json(no_plan) = daily(State(plain), Query(ask(None))).await.unwrap();
+        assert!(no_plan["days"][1]["import_free_kwh"].is_null());
+        assert_eq!(no_plan["days"][1]["import_kwh"], 1.5);
     }
 
     #[tokio::test]
