@@ -1818,12 +1818,12 @@ mod tests {
              ('point', 'reading', 'sync_state', 'api_call', 'daily_cost', 'ev_charge_session',
               'ev_odometer_daily', 'globird_cost', 'globird_usage', 'globird_interval',
               'tm_car', 'tm_drive_daily', 'tm_charge', 'manual_car', 'fuel_fill',
-              'tm_car_owned', 'daily_battery', 'metric_reading', 'daily_cache')",
+              'tm_car_owned', 'daily_battery', 'metric_reading', 'daily_cache', 'ha_reading')",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(tables.len(), 19);
+        assert_eq!(tables.len(), 20);
     }
 
     /// Migration 0019 copies `reading` into `metric_reading` in SQL. It has its

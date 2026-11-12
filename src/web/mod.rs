@@ -11,6 +11,7 @@ mod costs;
 mod day_cache;
 mod fuel;
 mod globird;
+mod ha;
 mod home_mix;
 mod payback;
 mod petrol;
@@ -119,6 +120,9 @@ pub struct AppState {
     spokes: Arc<[SpokeInfo]>,
     /// Which source wins for a day's energy (`[sources]`).
     rules: Arc<SourceRules>,
+    /// What the Home Assistant source has read; `None` without
+    /// `[home_assistant.source]`.
+    ha: Option<crate::ha_source::HaView>,
     /// Pinged when a GloBird sync finishes, so the cache warm-up runs again.
     warm: Arc<tokio::sync::Notify>,
 }
@@ -160,6 +164,7 @@ impl AppState {
             offsite: crate::offsite::Status::default(),
             spokes: hub::spoke_infos(&[]).into(),
             rules: Arc::new(SourceRules::default()),
+            ha: None,
             warm: Arc::new(tokio::sync::Notify::new()),
         })
     }
@@ -168,6 +173,17 @@ impl AppState {
     pub fn with_source_rules(mut self, rules: SourceRules) -> Self {
         self.rules = Arc::new(rules);
         self
+    }
+
+    /// Gives the web API the Home Assistant source's view of its entities.
+    pub fn with_ha_view(mut self, view: Option<crate::ha_source::HaView>) -> Self {
+        self.ha = view;
+        self
+    }
+
+    /// The Home Assistant source's view, if it is configured.
+    pub fn ha_view(&self) -> Option<crate::ha_source::HaView> {
+        self.ha.clone()
     }
 
     /// Whether a tariff is set up (on the Admin page or imported from the
@@ -369,7 +385,14 @@ impl AppState {
             .with_globird_configured(config.globird.is_some())
             .with_source_rules(config.source_rules()?)
             .with_amber_configured(config.amber.is_some())
-            .with_amber_compare(config.amber.as_ref().map(|a| a.compare.clone())))
+            .with_amber_compare(config.amber.as_ref().map(|a| a.compare.clone()))
+            .with_ha_view(
+                config
+                    .home_assistant
+                    .as_ref()
+                    .and_then(|ha| ha.source.as_ref())
+                    .map(|source| crate::ha_source::HaView::new(&source.entity)),
+            ))
     }
 }
 
@@ -442,6 +465,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/backup", get(admin::backup_info))
         .route("/api/admin/backup/download", get(admin::backup_download))
         .route("/api/series", get(api::series))
+        .route("/api/ha/entities", get(ha::entities))
+        .route("/api/ha/history", get(ha::history))
         .route("/api/prices", get(prices::prices))
         .route("/api/prices/daily", get(prices::daily))
         .route("/api/prices/grid", get(price_grid::grid))
@@ -831,6 +856,15 @@ mod tests {
         if enabled.contains(&"amber") {
             state = state.with_amber_configured(true);
         }
+        if enabled.contains(&"home-assistant") {
+            let entity = crate::config::HaEntity {
+                entity_id: "sensor.solar_power".into(),
+                metric: Some(crate::metric::Metric::PvW),
+                name: Some("Solar".into()),
+                unit: None,
+            };
+            state = state.with_ha_view(Some(crate::ha_source::HaView::new(&[entity])));
+        }
         (dir, router(state))
     }
 
@@ -853,6 +887,9 @@ mod tests {
         "/api/admin/backup",
         "/api/series?metrics=pv_w,load_w,grid_w&from=1767225600&to=1767312000",
         "/api/series?metrics=battery_soc_pct&from=1767225600&to=1767312000&step=300",
+        "/api/ha/entities",
+        "/api/ha/history?entity_id=sensor.solar_power&from=1767225600&to=1767312000",
+        "/api/ha/history?entity_id=sensor.solar_power&from=1767225600&to=1769904000&step=300",
         "/api/prices?from=1767225600&to=1767312000",
         "/api/prices/daily?from=2026-01-01&to=2026-01-07",
         "/api/prices/grid?from=2026-01-01&to=2026-01-07",
@@ -1235,6 +1272,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ha_entities_without_the_source_is_an_empty_list() {
+        let (_dir, app) = bare_app(&[]).await;
+        assert_eq!(
+            send(&app, get_request("/api/ha/entities", None))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let cookie = log_in(&app).await;
+        let json =
+            body_json(send(&app, get_request("/api/ha/entities", Some(&cookie))).await).await;
+        assert_eq!(
+            json,
+            serde_json::json!({"configured": false, "connected": false, "entities": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn ha_source_shows_up_in_spokes_capabilities_and_entities() {
+        let (_dir, app) = bare_app(&["home-assistant"]).await;
+        let cookie = log_in(&app).await;
+        let json = body_json(send(&app, get_request("/api/spokes", Some(&cookie))).await).await;
+        let ha = json["spokes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == "home-assistant")
+            .unwrap();
+        assert_eq!(ha["kind"], "source");
+        assert_eq!(ha["enabled"], true);
+        let json =
+            body_json(send(&app, get_request("/api/capabilities", Some(&cookie))).await).await;
+        assert_eq!(json["sources"], serde_json::json!(["home-assistant"]));
+
+        let json =
+            body_json(send(&app, get_request("/api/ha/entities", Some(&cookie))).await).await;
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["entities"][0]["entity_id"], "sensor.solar_power");
+        assert_eq!(json["entities"][0]["name"], "Solar");
+        assert_eq!(json["entities"][0]["metric"], "pv_w");
+        assert_eq!(json["entities"][0]["value"], Value::Null);
+        // The sweep also covers the routes with the source configured.
+        assert_no_server_errors(&app, &cookie, "home assistant").await;
+    }
+
+    #[tokio::test]
+    async fn ha_history_validates_and_returns_stored_readings() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(dir.path().join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = hash_password(PASSWORD).unwrap();
+        let state = AppState::new(pool.clone(), 0, chrono_tz::UTC, &hash, Key::generate()).unwrap();
+        let app = router(state);
+        let cookie = log_in(&app).await;
+        for (ts, value) in [(1000, 1.0), (1015, 2.0), (5000, 9.0)] {
+            sqlx::query("INSERT INTO ha_reading (entity_id, ts, value, unit) VALUES ('sensor.solar_power', ?, ?, 'kW')")
+                .bind(ts)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let get = |uri: &str| get_request(uri, Some(&cookie));
+        let json = body_json(
+            send(
+                &app,
+                get("/api/ha/history?entity_id=sensor.solar_power&from=0&to=5000"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(json["unit"], "kW");
+        assert_eq!(json["step"], Value::Null);
+        assert_eq!(
+            json["points"],
+            serde_json::json!([{"ts": 1000, "value": 1.0}, {"ts": 1015, "value": 2.0}])
+        );
+        // Averaged into buckets.
+        let json = body_json(
+            send(
+                &app,
+                get("/api/ha/history?entity_id=sensor.solar_power&from=0&to=6000&step=60"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            json["points"][0],
+            serde_json::json!({"ts": 960, "value": 1.5})
+        );
+        // Unknown entity: an empty answer, not an error.
+        let json = body_json(
+            send(
+                &app,
+                get("/api/ha/history?entity_id=sensor.nope&from=0&to=10"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(json["points"], serde_json::json!([]));
+        for uri in [
+            "/api/ha/history",
+            "/api/ha/history?from=0&to=10",
+            "/api/ha/history?entity_id=sensor.a",
+            "/api/ha/history?entity_id=sensor.a&from=2&to=1",
+            "/api/ha/history?entity_id=sensor.a&from=0&to=2678401",
+            "/api/ha/history?entity_id=sensor.a&from=a&to=1",
+            "/api/ha/history?entity_id=sensor.a&from=0&to=10&step=0",
+            "/api/ha/history?entity_id=sensor.a&from=0&to=10&step=x",
+        ] {
+            assert_eq!(
+                send(&app, get(uri)).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn spokes_api_lists_every_spoke_and_needs_a_login() {
         let (_dir, app) = test_app().await;
         let response = send(&app, get_request("/api/spokes", None)).await;
@@ -1245,7 +1402,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let spokes = json["spokes"].as_array().unwrap();
-        assert_eq!(spokes.len(), 8);
+        assert_eq!(spokes.len(), 9);
         let modbus = &spokes[0];
         assert_eq!(modbus["id"], "sungrow-modbus");
         assert_eq!(modbus["kind"], "source");

@@ -512,14 +512,22 @@ impl fmt::Debug for Globird {
     }
 }
 
-/// The `[home_assistant]` section: where to publish, and what to call things.
-/// solar-dash only publishes here; it never listens for commands.
+/// The `[home_assistant]` section. It has two independent halves:
+///
+/// - the MQTT **sink** (`mqtt_*`, `discovery_prefix`, ...): solar-dash
+///   publishes its readings to Home Assistant. On when `mqtt_host` is set.
+/// - the **source** (`[home_assistant.source]`): solar-dash reads entity
+///   states from Home Assistant. On when that sub-table exists.
+///
+/// Either half, or both, may be used. solar-dash never controls anything in
+/// Home Assistant: the sink only publishes and the source only reads.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HomeAssistant {
     /// IP address or host name of the MQTT broker Home Assistant uses. This
-    /// may be the same broker as `[teslamate]`'s. No default.
-    pub mqtt_host: String,
+    /// may be the same broker as `[teslamate]`'s. No default. Without it the
+    /// MQTT sink is off (a source-only setup).
+    pub mqtt_host: Option<String>,
     #[serde(default = "default_mqtt_port")]
     pub mqtt_port: u16,
     /// Broker login. Give both or neither.
@@ -539,14 +547,46 @@ pub struct HomeAssistant {
     /// every 15 s, so the default publishes every reading.
     #[serde(default = "default_ha_min_interval")]
     pub min_interval_secs: u64,
+    /// Reads entity states from Home Assistant. `None` means it is off.
+    pub source: Option<HaSource>,
 }
 
 impl HomeAssistant {
+    /// Whether the MQTT sink is on.
+    pub fn mqtt_enabled(&self) -> bool {
+        self.mqtt_host.is_some()
+    }
+
     fn check(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.mqtt_host.trim().is_empty(),
-            "mqtt_host in [home_assistant] must not be empty"
-        );
+        match &self.mqtt_host {
+            Some(host) => anyhow::ensure!(
+                !host.trim().is_empty(),
+                "mqtt_host in [home_assistant] must not be empty"
+            ),
+            None => {
+                anyhow::ensure!(
+                    self.source.is_some(),
+                    "[home_assistant] needs mqtt_host (to publish to Home Assistant) \
+                     or a [home_assistant.source] table (to read from it), or both"
+                );
+                // A source-only setup: any MQTT setting would be silently
+                // ignored, so say so instead.
+                anyhow::ensure!(
+                    self.mqtt_username.is_none()
+                        && self.mqtt_password.is_none()
+                        && self.mqtt_port == default_mqtt_port()
+                        && self.discovery_prefix == default_ha_discovery_prefix()
+                        && self.base_topic == default_ha_base_topic()
+                        && self.device_name == default_ha_device_name()
+                        && self.min_interval_secs == default_ha_min_interval(),
+                    "[home_assistant] has MQTT settings but no mqtt_host; \
+                     add mqtt_host or remove them"
+                );
+            }
+        }
+        if let Some(source) = &self.source {
+            source.check()?;
+        }
         anyhow::ensure!(
             self.mqtt_port != 0,
             "mqtt_port in [home_assistant] must not be 0"
@@ -598,6 +638,136 @@ impl fmt::Debug for HomeAssistant {
             .field("base_topic", &self.base_topic)
             .field("device_name", &self.device_name)
             .field("min_interval_secs", &self.min_interval_secs)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// The `[home_assistant.source]` table: how to reach Home Assistant's
+/// WebSocket API and which entities to read. Read-only: solar-dash never
+/// calls a service or writes a state.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaSource {
+    /// Where Home Assistant is, like `http://homeassistant.local:8123`
+    /// (`https://` for TLS). The WebSocket address is worked out from it.
+    pub url: String,
+    /// A long-lived access token (Profile page in Home Assistant). A secret:
+    /// hidden in debug output and never logged.
+    pub token: String,
+    /// The entities to read, as repeated `[[home_assistant.source.entity]]`.
+    #[serde(default)]
+    pub entity: Vec<HaEntity>,
+}
+
+/// One `[[home_assistant.source.entity]]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaEntity {
+    /// Home Assistant's id, like `sensor.solar_power`.
+    pub entity_id: String,
+    /// Optional: one of the dashboard's own metric names (such as `pv_w`),
+    /// so this entity stands in for a source the home does not have. The
+    /// value is also stored as that metric under the source name
+    /// `home-assistant`.
+    pub metric: Option<crate::metric::Metric>,
+    /// A friendlier name for lists. Default: the entity id.
+    pub name: Option<String>,
+    /// Overrides the unit Home Assistant reports (`unit_of_measurement`),
+    /// for sensors that report none.
+    pub unit: Option<String>,
+}
+
+impl HaSource {
+    /// The WebSocket address (`ws://host:8123/api/websocket`) for `url`.
+    pub fn websocket_url(&self) -> Result<String> {
+        let url = reqwest::Url::parse(self.url.trim()).with_context(|| {
+            format!(
+                "url in [home_assistant.source] is not a URL: {:?}",
+                self.url
+            )
+        })?;
+        let scheme = match url.scheme() {
+            "http" | "ws" => "ws",
+            "https" | "wss" => "wss",
+            other => anyhow::bail!(
+                "url in [home_assistant.source] must start with http:// or https://, not {other}://"
+            ),
+        };
+        let host = url
+            .host_str()
+            .context("url in [home_assistant.source] has no host")?;
+        // IPv6 hosts come back from `host_str` already in brackets.
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let path = url.path().trim_end_matches('/');
+        Ok(format!("{scheme}://{host}{port}{path}/api/websocket"))
+    }
+
+    fn check(&self) -> Result<()> {
+        self.websocket_url()?;
+        let url = reqwest::Url::parse(self.url.trim())?;
+        anyhow::ensure!(
+            url.query().is_none() && url.fragment().is_none(),
+            "url in [home_assistant.source] must not have a query or fragment"
+        );
+        anyhow::ensure!(
+            !self.token.trim().is_empty(),
+            "token in [home_assistant.source] must not be empty \
+             (make a long-lived access token on your Home Assistant profile page)"
+        );
+        anyhow::ensure!(
+            !self.entity.is_empty(),
+            "[home_assistant.source] needs at least one [[home_assistant.source.entity]]"
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut metrics = std::collections::HashSet::new();
+        for entity in &self.entity {
+            let id = &entity.entity_id;
+            // Home Assistant ids are `<domain>.<object_id>`, lower case.
+            let valid = id.split_once('.').is_some_and(|(domain, object)| {
+                let ok = |part: &str| {
+                    !part.is_empty()
+                        && part
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                };
+                ok(domain) && ok(object)
+            });
+            anyhow::ensure!(
+                valid,
+                "entity_id {id:?} in [home_assistant.source] must look like \
+                 \"sensor.solar_power\" (lower case, one dot)"
+            );
+            anyhow::ensure!(
+                seen.insert(id.as_str()),
+                "entity_id {id:?} is listed twice in [home_assistant.source]"
+            );
+            if let Some(metric) = entity.metric {
+                anyhow::ensure!(
+                    metrics.insert(metric),
+                    "metric {:?} is given to more than one entity in [home_assistant.source]; \
+                     a metric can only come from one entity",
+                    metric.name()
+                );
+            }
+            for (field, value) in [("name", &entity.name), ("unit", &entity.unit)] {
+                anyhow::ensure!(
+                    value.as_deref().is_none_or(|v| !v.trim().is_empty()),
+                    "{field} of {id:?} in [home_assistant.source] must not be empty"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Hides the access token, like the other secrets in this file.
+impl fmt::Debug for HaSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HaSource")
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .field("entity", &self.entity)
             .finish()
     }
 }
@@ -1472,7 +1642,7 @@ mod tests {
     #[test]
     fn home_assistant_defaults_apply() {
         let ha = parse_ha("");
-        assert_eq!(ha.mqtt_host, "broker");
+        assert_eq!(ha.mqtt_host.as_deref(), Some("broker"));
         assert_eq!(ha.mqtt_port, 1883);
         assert_eq!(ha.mqtt_username, None);
         assert_eq!(ha.discovery_prefix, "homeassistant");
@@ -1483,9 +1653,128 @@ mod tests {
     }
 
     #[test]
-    fn home_assistant_section_needs_a_host() {
+    fn home_assistant_section_needs_a_host_or_a_source() {
         let text = format!("{MINIMAL}\n[home_assistant]\nmqtt_port = 1883\n");
-        assert!(toml::from_str::<Config>(&text).is_err());
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let err = cfg.home_assistant.unwrap().check().unwrap_err().to_string();
+        assert!(err.contains("mqtt_host") && err.contains("source"), "{err}");
+    }
+
+    const SOURCE_ONLY: &str = "[home_assistant.source]\n\
+        url = \"http://homeassistant.local:8123\"\ntoken = \"secret-token\"\n\
+        [[home_assistant.source.entity]]\nentity_id = \"sensor.solar_power\"\n\
+        metric = \"pv_w\"\nname = \"Solar\"\nunit = \"W\"\n\
+        [[home_assistant.source.entity]]\nentity_id = \"sensor.outdoor_temp\"\n";
+
+    fn parse_source(text: &str) -> HomeAssistant {
+        toml::from_str::<Config>(&format!("{MINIMAL}\n{text}"))
+            .unwrap()
+            .home_assistant
+            .unwrap()
+    }
+
+    #[test]
+    fn home_assistant_source_only_is_valid_and_has_no_mqtt() {
+        let ha = parse_source(SOURCE_ONLY);
+        assert!(ha.check().is_ok());
+        assert!(!ha.mqtt_enabled());
+        let source = ha.source.as_ref().unwrap();
+        assert_eq!(source.entity.len(), 2);
+        assert_eq!(source.entity[0].metric, Some(crate::metric::Metric::PvW));
+        assert_eq!(source.entity[1].metric, None);
+        assert_eq!(
+            source.websocket_url().unwrap(),
+            "ws://homeassistant.local:8123/api/websocket"
+        );
+    }
+
+    #[test]
+    fn home_assistant_mqtt_and_source_can_be_combined() {
+        let ha = parse_source(&format!(
+            "[home_assistant]\nmqtt_host = \"b\"\n{SOURCE_ONLY}"
+        ));
+        assert!(ha.check().is_ok());
+        assert!(ha.mqtt_enabled() && ha.source.is_some());
+    }
+
+    #[test]
+    fn home_assistant_mqtt_settings_need_a_host() {
+        let ha = parse_source(&format!(
+            "[home_assistant]\nmqtt_username = \"u\"\nmqtt_password = \"p\"\n{SOURCE_ONLY}"
+        ));
+        assert!(ha.check().unwrap_err().to_string().contains("mqtt_host"));
+    }
+
+    #[test]
+    fn websocket_url_follows_the_scheme() {
+        let url = |u: &str| {
+            HaSource {
+                url: u.into(),
+                token: "t".into(),
+                entity: vec![],
+            }
+            .websocket_url()
+        };
+        assert_eq!(
+            url("https://ha.example.com").unwrap(),
+            "wss://ha.example.com/api/websocket"
+        );
+        assert_eq!(
+            url("http://10.0.0.5:8123/").unwrap(),
+            "ws://10.0.0.5:8123/api/websocket"
+        );
+        assert_eq!(
+            url("https://example.com/ha/").unwrap(),
+            "wss://example.com/ha/api/websocket"
+        );
+        assert!(url("ftp://x").unwrap_err().to_string().contains("http://"));
+        assert!(url("homeassistant.local:8123").is_err());
+        assert!(url("not a url").is_err());
+    }
+
+    #[test]
+    fn home_assistant_source_is_validated() {
+        let bad = |edit: &dyn Fn(&str) -> String| -> String {
+            parse_source(&edit(SOURCE_ONLY))
+                .check()
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(bad(&|s| s.replace("token = \"secret-token\"", "token = \" \"")).contains("token"));
+        assert!(bad(&|s| s.replace("http://homeassistant.local:8123", "ftp://h")).contains("http"));
+        assert!(
+            bad(&|s| s.replace("http://homeassistant.local:8123", "http://h/?a=1"))
+                .contains("query")
+        );
+        assert!(bad(&|s| s.replace("sensor.outdoor_temp", "Sensor Outdoor")).contains("entity_id"));
+        assert!(bad(&|s| s.replace("sensor.outdoor_temp", "sensor.solar_power")).contains("twice"));
+        assert!(bad(&|s| s.replace("name = \"Solar\"", "name = \" \"")).contains("name"));
+        let twice = format!(
+            "{SOURCE_ONLY}[[home_assistant.source.entity]]\nentity_id = \"sensor.other\"\nmetric = \"pv_w\"\n"
+        );
+        let err = parse_source(&twice).check().unwrap_err().to_string();
+        assert!(err.contains("more than one entity"), "{err}");
+        let none = parse_source("[home_assistant.source]\nurl = \"http://h\"\ntoken = \"t\"\n");
+        assert!(
+            none.check()
+                .unwrap_err()
+                .to_string()
+                .contains("at least one")
+        );
+    }
+
+    #[test]
+    fn unknown_metric_name_is_a_parse_error() {
+        let text = SOURCE_ONLY.replace("pv_w", "solar_watts");
+        assert!(toml::from_str::<Config>(&format!("{MINIMAL}\n{text}")).is_err());
+    }
+
+    #[test]
+    fn home_assistant_token_is_not_in_debug_output() {
+        let ha = parse_source(SOURCE_ONLY);
+        let text = format!("{ha:?}");
+        assert!(!text.contains("secret-token"));
+        assert!(text.contains("<redacted>") && text.contains("sensor.solar_power"));
     }
 
     #[test]
