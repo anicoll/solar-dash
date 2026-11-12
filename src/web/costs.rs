@@ -1636,6 +1636,33 @@ pub async fn costs(State(state): State<AppState>, Query(params): Query<CostsPara
     })))
 }
 
+/// What one day cost so far, in dollars, for the Home Assistant feed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DayMoney {
+    /// Bought less sold: the "Today's power has cost ..." figure of the Today
+    /// page. Negative when selling earned more than buying cost.
+    pub power: f64,
+    /// Everything: supply charge and bought, less sold and the zero-import
+    /// credit (`actual` in `/api/costs`).
+    pub net: f64,
+}
+
+/// What `date` cost, from the same cost engine as `/api/costs` (which the
+/// Today page reads). `None` without a `[tariff]` or without data that day.
+pub async fn day_money(state: &AppState, date: NaiveDate) -> Result<Option<DayMoney>> {
+    let data = state.admin.get();
+    let Some(tariff) = &data.tariff else {
+        return Ok(None);
+    };
+    let days = billed_days(state, tariff, &[date])
+        .await
+        .map_err(|err| anyhow::anyhow!("could not cost the day: {}", err.message()))?;
+    Ok(days.iter().find(|d| d.date == date).map(|d| DayMoney {
+        power: dollars(d.cost.import_cents - d.cost.export_cents),
+        net: dollars(d.cost.actual_cents),
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct TariffParams {
     date: Option<String>,

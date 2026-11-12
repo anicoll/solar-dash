@@ -631,7 +631,7 @@ a `[home_assistant]` section nothing is published and no task runs.
    ```
 
 3. In Home Assistant a **solar-dash** device appears (Settings, Devices) with
-   these sensors. All come from one JSON message per inverter sample on
+   these live sensors. All come from one JSON message per inverter sample on
    `<base_topic>/live` (not retained), so by default they update every 15 s:
 
    | Sensor | Unit | Meaning |
@@ -647,6 +647,41 @@ a `[home_assistant]` section nothing is published and no task runs.
    These are solar-dash's own sign conventions (the same as `/api/live`), not
    the inverter's register signs. A value the inverter did not report shows
    as unknown in Home Assistant.
+
+### Daily energy, cost and prices
+
+A second message, `<base_topic>/today` (retained), is sent about once a minute,
+when a day closes, when new prices arrive, and on every (re)connect. Its
+figures are the Today page's own: the energy is the day total of `/api/daily`
+and the cost is the day cost of `/api/costs`, both for the **local** day in
+the site time zone. Each message carries the `date` it is for.
+
+| Sensor | Unit | Meaning |
+|---|---|---|
+| Grid import today | kWh | Bought from the grid since local midnight |
+| Grid export today | kWh | Sold to the grid |
+| Solar today | kWh | Solar generation |
+| Battery charge today | kWh | Into the battery |
+| Battery discharge today | kWh | Out of the battery |
+| Home use today | kWh | House consumption |
+| Power cost today | AUD | Bought less sold (the Today page's "has cost so far"); negative when selling earned more. Supply charge and credit are not in it |
+| Net cost today | AUD | The whole day: supply and bought, less sold and the zero-import credit |
+| Amber general price | c/kWh | What buying costs now (only with `[amber]`) |
+| Amber feed-in price | c/kWh | What selling **earns** now: Amber's stored price is negative when you are paid, so it is flipped (positive = paid, negative = you pay to export) (only with `[amber]`) |
+| Amber price level | text | Amber's label: extremelyLow, veryLow, low, neutral, high or spike (only with `[amber]`) |
+
+The six energy sensors use `device_class: energy` and
+`state_class: total_increasing`, so they can be added to Home Assistant's
+Energy dashboard. They fall back to near 0 at local midnight, which Home
+Assistant reads as a new day. A day with no data yet is `unknown`, not 0. The
+two cost sensors appear only when a tariff is set up when solar-dash starts
+(restart after adding a plan), and the Amber ones only with an `[amber]`
+section. Both cost sensors are `monetary` with no state class, because the
+figure can fall as well as rise.
+
+Not published: a "ZeroHero credit still possible tonight" sensor. The Today
+page works that out in the browser from the samples; the server has no such
+figure, and this feed does not make a second calculation.
 
 Topics: configs are retained at
 `<discovery_prefix>/sensor/<node_id>/<object_id>/config` (`node_id` is the
