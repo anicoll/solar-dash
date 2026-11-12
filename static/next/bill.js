@@ -1,21 +1,23 @@
-/* Bill page: what this bill is so far, where it is heading, whether the
-   numbers can be trusted, how each line is made up, and what is left to cut.
+/* Bill page: what this bill is so far, where it is heading, whether the numbers can be
+   trusted, how the bill breaks down line by line, and how it compares with past bills.
+   The Amber what-if has its own sub-page, #bill/amber (the Bill page keeps a summary card).
 
    Data (fetched together, none of them blocks the others):
      /api/bill/current     the period, the so-far lines, the projection range, the daily
-                           series, the previous bill, past bills and cars (required)
+                           series, the previous bill and past bills (required)
      /api/globird/compare  our estimate against GloBird's meter, day by day
      /api/tariff           band times, through SD.tariff
      /api/bill/amber-whatif  "Would Amber have been cheaper?" for three periods, with the
                            per-switch savings (only with prices and a covered day); without
-                           it the panel falls back to:
+                           it the Amber page falls back to:
      /api/bill/compare-dynamic  "What would Amber cost?" (only with [amber] and a covered day)
    Every newer field of /api/bill/current may be missing (an older server): the part
    that needs it is left out and nothing else changes.
 
-   Layout: on a phone (under 760 px) the panels start closed, a tap on a panel's header
-   opens or closes it, and several may be open. The open set is remembered in
-   localStorage. From 760 px every panel is open and the headers are plain headings. */
+   Layout: on a phone (under 760 px) the collapsible panels start closed, a tap on a panel's
+   header opens or closes it, and several may be open. The open set is remembered in
+   localStorage. From 760 px every panel is open and the headers are plain headings. Two
+   independent columns hold the panels (see .bill-column in bill.css). */
 (function () {
   'use strict';
 
@@ -424,8 +426,8 @@
       stats.push(stat('Per day', amt(s.total_dollars / days), prev ? `was ${amt(prev.total_dollars / prev.days)}` : null));
     }
     if (num(s.without_system_dollars)) {
-      stats.push(stat('No system', SD.fmt.dollars(s.without_system_dollars),
-        !past && num(bill.projected_without_system_dollars) ? `~${whole(bill.projected_without_system_dollars)} bill` : null));
+      stats.push(stat('Without the system', SD.fmt.dollars(s.without_system_dollars),
+        !past && num(bill.projected_without_system_dollars) ? `so far, ~${whole(bill.projected_without_system_dollars)} bill` : (past ? 'for the bill' : 'so far')));
     }
     if (num(s.credit_nights) && (s.credit_nights > 0 || s.credit_possible_nights > 0)) {
       const possible = num(s.credit_possible_nights) ? s.credit_possible_nights : null;
@@ -800,7 +802,7 @@
         sum('Best day', amt(Number(best.total_dollars)), SD.fmt.date(best.date, 'medium')),
         sum('Dearest', amt(Number(dear.total_dollars)), SD.fmt.date(dear.date, 'medium')),
         anyCredit ? sum('Streak', String(streak), streak === 1 ? 'night in a row' : 'nights in a row') : null,
-        perDay != null ? sum('Without system', SD.fmt.dollars(perDay), 'a day', 'bill-hide-phone') : null));
+        perDay != null ? sum('Without the system', SD.fmt.dollars(perDay), 'a day', 'bill-hide-phone') : null));
 
     return {
       title: 'Each day',
@@ -1231,15 +1233,19 @@
 
   /* ---------------------------------------------------------------- 10. how this is worked out */
 
+  /** One closed disclosure holding the explainers, so the foot of the page is a single line until asked. */
   function renderHow(bill) {
     const source = SD.caps.meter && bill.uses_globird_figures
       ? `Days ${SD.retailer()} has posted use its own billed amounts. Newer days use our meter readings and your plan's prices until ${SD.retailer()} catches up.`
       : 'The figures are our estimate from the meter, using your plan\'s prices.';
-    const d = (title, text) => h('details', {}, h('summary', { text }), h('p', { text: title }));
-    return h('div', { class: 'bill-how a-how' },
-      d('It adds up every complete day in this bill: supply, power bought, feed-in and the evening credit. Today joins once it is over and the figures are in, usually the next morning.', isPast(bill) ? 'How the total is worked out' : 'How "so far" is worked out'),
-      isPast(bill) ? null : d('The low end and the high end are two ways of finishing the bill: carry this bill\'s average day to the end of the period, or assume the days left are like last bill\'s average day. The real bill usually lands between the two.', 'How the projection range is worked out'),
-      d(`${source} "Without system" is the same house load bought from the grid with no solar or battery.`, 'Where the numbers come from'));
+    const d = (heading, text) => h('div', { class: 'bill-how-item' }, h('h3', { text: heading }), h('p', { text }));
+    return h('details', { class: 'card bill-how a-how' },
+      h('summary', { text: 'How the numbers are worked out' }),
+      d(isPast(bill) ? 'How the total is worked out' : 'How "so far" is worked out',
+        'It adds up every complete day in this bill: supply, power bought, feed-in and the evening credit. Today joins once it is over and the figures are in, usually the next morning.'),
+      isPast(bill) ? null : d('How the projection range is worked out',
+        'The low end and the high end are two ways of finishing the bill: carry this bill\'s average day to the end of the period, or assume the days left are like last bill\'s average day. The real bill usually lands between the two.'),
+      d('Where the numbers come from', `${source} "Without the system" is the same house load bought from the grid with no solar or battery.`));
   }
 
   /* ---------------------------------------------------------------- page */
@@ -1343,15 +1349,16 @@
       side = h('div', { class: `bill-tiles a-side${free && slot ? '' : ' is-one'}` }, free, slot);
       const breakdown = panel('break', 'a-break', () => breakdownPanel(bill, tariff));
       if (breakdown) left.append(breakdown);
+      // Left: hero and Breakdown, then the tiles; right: the two tall panels. The columns end
+      // near the same height. (On a phone the order comes from the a-* classes instead.)
       right.append(...[
+        panel('days', 'a-days', () => daysPanel(bill, today)),
         panel('hist', 'a-history', () => historyPanel(bill)),
-        side.children.length ? side : null,
       ].filter(Boolean));
-      const days = panel('days', 'a-days', () => daysPanel(bill, today));
-      if (days) grid.append(days);
+      if (side.children.length) left.append(side);
     }
     const how = safe(() => renderHow(bill));
-    if (how) grid.append(how);
+    if (how) left.append(how);
     el.append(grid);
 
     ctx.apply();

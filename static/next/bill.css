@@ -78,21 +78,19 @@
 #page-bill .bill-column { display: contents; }
 #page-bill .a-hero { order: 1; }
 #page-bill .a-break { order: 2; }
-#page-bill .a-days { order: 4; }
-#page-bill .a-history { order: 6; }
-#page-bill .a-side { order: 7; }
-#page-bill .a-how { order: 8; }
+#page-bill .a-days { order: 3; }
+#page-bill .a-history { order: 4; }
+#page-bill .a-side { order: 5; }
+#page-bill .a-how { order: 6; }
 
 #page-bill .bill-grid > .card,
 #page-bill .bill-column > .card,
 #page-bill .bill-heroset > .card,
-#page-bill .bill-side > .card,
 #page-bill .bill-tiles > .card {
   margin-top: 0;
 }
 
-#page-bill .bill-heroset,
-#page-bill .bill-side {
+#page-bill .bill-heroset {
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -1146,26 +1144,29 @@
 
 /* ---------- how ---------- */
 
+/* One closed disclosure; its three sections show when it opens. */
 #page-bill .bill-how {
-  border-top: 1px solid var(--line);
-}
-
-#page-bill .bill-how details {
-  border-bottom: 1px solid var(--line);
+  padding: 4px 18px;
 }
 
 #page-bill .bill-how summary {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   min-height: 48px;
-  padding: 8px 0;
   font-weight: 600;
   cursor: pointer;
 }
 
+#page-bill .bill-how-item h3 {
+  margin: 8px 0 2px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
 #page-bill .bill-how p {
   max-width: 70ch;
-  padding-bottom: 14px;
+  margin: 0 0 12px;
   font-size: 14px;
   line-height: 1.5;
   color: var(--ink-2);
@@ -1178,14 +1179,12 @@
     font-size: 40px;
   }
 
-  /* Two columns that stack independently, then the full-width day chart and notes. */
+  /* Two columns that stack independently, so a tall panel on one side never pushes the other
+     down: the hero and Breakdown on the left, the smaller panels on the right. */
   #page-bill .bill-grid {
     display: grid;
     grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
-    grid-template-areas:
-      "left right"
-      "days days"
-      "how how";
+    grid-template-areas: "left right";
     gap: 20px;
     align-items: start;
   }
@@ -1199,8 +1198,6 @@
 
   #page-bill .bill-column-l { grid-area: left; }
   #page-bill .bill-column-r { grid-area: right; }
-  #page-bill .a-days { grid-area: days; }
-  #page-bill .a-how { grid-area: how; }
 
   #page-bill .bill-hero {
     padding: 28px;
@@ -1236,36 +1233,13 @@
     grid-template-columns: 44px minmax(0, 1fr);
   }
 
-  #page-bill .bill-cols {
-    gap: 6px;
-  }
-
-  #page-bill .bill-dot i {
-    width: 12px;
-    height: 12px;
-  }
-
-  #page-bill .bill-dn {
-    font-size: 12px;
-  }
-
-  #page-bill .bill-dn.is-minor {
-    visibility: visible;
-  }
-
+  /* The day chart now sits in the narrower right column, so it keeps its phone density. */
   #page-bill .bill-sums {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   #page-bill .bill-hide-phone {
     display: block;
-  }
-
-  #page-bill .bill-how {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 0 28px;
-    border-top: 0;
   }
 }
 
