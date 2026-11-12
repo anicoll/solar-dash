@@ -1013,6 +1013,41 @@
     mount(route);
   }
 
+  /* ---------------------------------------------------------------- tab bar */
+
+  /**
+   * Keeps the phone tab bar on the bottom of the screen. iOS Safari can leave the layout viewport
+   * (which `position: fixed` uses) shorter than the screen, most often after the keyboard closes,
+   * so a bar fixed to `bottom: 0` floats mid-page with the page showing below it. The visual
+   * viewport still knows where the screen ends: move the bar down by the gap. Elsewhere the gap
+   * is 0 and nothing moves.
+   */
+  function pinTabbar() {
+    const bar = document.querySelector('.tabbar');
+    const vv = window.visualViewport;
+    if (!bar || !vv) return;
+    let queued = false;
+    const place = () => {
+      queued = false;
+      // Pinch zoom also opens a gap; leave the bar alone then, as every browser does.
+      const gap = vv.scale > 1.01 ? 0 : Math.round(vv.offsetTop + vv.height - document.documentElement.clientHeight);
+      bar.style.transform = gap > 0 ? 'translateY(' + gap + 'px)' : '';
+    };
+    const queue = () => {
+      if (!queued) { queued = true; requestAnimationFrame(place); }
+    };
+    vv.addEventListener('resize', queue);
+    vv.addEventListener('scroll', queue);
+    window.addEventListener('resize', queue);
+    window.addEventListener('pageshow', queue);
+    window.addEventListener('orientationchange', queue);
+    // A closing keyboard: nudge iOS into re-measuring, then measure.
+    document.addEventListener('focusout', () => {
+      setTimeout(() => { window.scrollTo(window.scrollX, window.scrollY); queue(); }, 300);
+    });
+    queue();
+  }
+
   /* ---------------------------------------------------------------- start */
 
   document.addEventListener('DOMContentLoaded', () => {
@@ -1024,6 +1059,7 @@
       });
     }
     applyTheme();
+    pinTabbar();
     window.addEventListener('hashchange', render);
     // Wait for the capabilities (cached, never rejects, 4 s at most) so the first paint is the right one.
     SD.capabilities().then(() => {
