@@ -441,7 +441,8 @@
 
   /**
    * One collapsible card. `o` = {key, area, title, summary: string | (open, desktop) => string,
-   * fig: children | null, body: node, collapse: true when the whole body hides while closed}.
+   * fig: children | null, body: node, collapse: true when the whole body hides while closed,
+   * fixed: true for a panel that is always open and whose header is a plain heading}.
    * Parts of a body that only show when open carry class bill-more.
    */
   function makePanel(ctx, o) {
@@ -454,9 +455,9 @@
     const el = h('section', { class: `card bill-panel ${o.area || ''}`, 'data-key': o.key, 'aria-labelledby': `${id}-t` },
       h('h2', { class: 'bill-ph-h' }, btn),
       h('div', { class: `bill-body${o.collapse ? ' bill-more' : ''}`, id: `${id}-body` }, o.body));
-    const panel = { key: o.key, el, btn, sum, summary: o.summary };
+    const panel = { key: o.key, el, btn, sum, summary: o.summary, fixed: !!o.fixed };
     btn.addEventListener('click', () => {
-      if (ctx.desktop()) return;
+      if (ctx.desktop() || o.fixed) return;
       if (ctx.open.has(o.key)) ctx.open.delete(o.key); else ctx.open.add(o.key);
       writeOpen(ctx.open);
       ctx.apply();
@@ -468,72 +469,17 @@
   function applyPanels(ctx) {
     const desk = ctx.desktop();
     for (const p of ctx.panels) {
-      const open = desk || ctx.open.has(p.key);
+      const open = desk || p.fixed || ctx.open.has(p.key);
       p.el.classList.toggle('is-open', open);
-      if (desk) p.btn.removeAttribute('aria-expanded');
+      p.el.classList.toggle('is-fixed', p.fixed);
+      if (desk || p.fixed) p.btn.removeAttribute('aria-expanded');
       else p.btn.setAttribute('aria-expanded', String(open));
-      p.btn.disabled = desk;
+      p.btn.disabled = desk || p.fixed;
       p.sum.textContent = typeof p.summary === 'function' ? p.summary(open, desk) : p.summary;
     }
   }
 
-  /* ---------------------------------------------------------------- 3. where it comes from */
-
-  function waterfall(bill) {
-    const s = bill.so_far;
-    if (![s.total_dollars, s.supply_dollars, s.feed_in_dollars].every(num)) return null;
-    const total = Number(s.total_dollars);
-    const feed = Number(s.feed_in_dollars);
-    const credit = num(s.credit_dollars) ? Number(s.credit_dollars) : 0;
-    const supply = Number(s.supply_dollars);
-    // Worked back from the total so the rows always add up to it.
-    const charged = total + feed + credit;
-    const bought = charged - supply;
-    const bands = Object.fromEntries((s.bands || []).map((b) => [b.band, b]));
-    const shoulder = bands.shoulder ? Number(bands.shoulder.dollars) : 0;
-    const peak = bands.peak ? Number(bands.peak.dollars) : 0;
-    const boughtKwh = (bands.shoulder ? Number(bands.shoulder.kwh) : 0) + (bands.peak ? Number(bands.peak.kwh) : 0);
-    const scale = Math.max(charged, 0.01);
-    const p = (v) => clamp((v / scale) * 100, 0, 100);
-    const place = (from, to) => `left: ${p(from)}%; width: ${Math.max(0, p(to) - p(from))}%`;
-    const hasCredit = credit > 0 || s.credit_nights > 0;
-    const supplySub = num(s.supply_days) && num(s.supply_cents_per_day)
-      ? `${plural(s.supply_days, 'day', 'days')} × ${SD.fmt.cents(s.supply_cents_per_day)}` : null;
-
-    const row = (name, sub, bar, value, cls) => h('div', { class: `bill-wf-row${cls ? ` ${cls}` : ''}` },
-      h('span', { class: 'bill-wf-nm' }, name, sub ? h('small', { text: sub }) : null),
-      h('span', { class: 'bill-wf-bar' }, bar),
-      h('span', { class: `bill-wf-v fig${cls === 'is-cr' ? ' is-credit' : ''}`, text: value }));
-    const bar = (cls, from, to) => h('span', { class: cls, style: place(from, to) });
-    const guide = (at) => h('span', { class: 'bill-wf-guide', style: `left: ${p(at)}%` });
-
-    const split = shoulder + peak > 0 ? shoulder / (shoulder + peak) : 1;
-    const midway = supply + Math.max(0, bought) * split;
-    const rows = [
-      row('Supply', supplySub, bar('bill-f-supply', 0, supply), SD.fmt.dollars(supply)),
-      row('Bought', boughtKwh > 0 ? SD.fmt.kwh(boughtKwh, 1) : null,
-        [bar('bill-f-shoulder', supply, midway), bar('bill-f-peak', midway, charged)], `+${SD.fmt.dollars(Math.max(0, bought))}`),
-      row('Feed-in', num(s.feed_in_kwh) ? SD.fmt.kwh(s.feed_in_kwh, 0) : null,
-        [guide(charged), bar('bill-f-feed', charged - feed, charged)], `${MINUS}${SD.fmt.dollars(feed)}`, 'is-cr'),
-    ];
-    if (hasCredit) {
-      rows.push(row('Credits', s.credit_nights > 0 ? plural(s.credit_nights, 'evening', 'evenings') : null,
-        [guide(charged - feed), bar('bill-f-credit', charged - feed - credit, charged - feed)], `${MINUS}${SD.fmt.dollars(credit)}`, 'is-cr'));
-    }
-    rows.push(row(total < 0 ? 'You are owed' : 'You owe', null, bar('bill-f-total', 0, Math.max(0, total)), SD.fmt.dollars(total), 'is-tot'));
-
-    const said1 = `Supply ${SD.fmt.dollars(supply)} plus power bought ${SD.fmt.dollars(Math.max(0, bought))} makes ${SD.fmt.dollars(charged)} charged. `
-      + `Feed-in takes off ${SD.fmt.dollars(feed)}${hasCredit ? ` and evening credits ${SD.fmt.dollars(credit)}` : ''}, leaving ${SD.fmt.dollars(total)}.`;
-    return {
-      title: 'Where it comes from',
-      summary: `${SD.fmt.dollars(charged)} charged, ${SD.fmt.dollars(feed + credit)} came back`,
-      fig: SD.fmt.dollars(total),
-      collapse: true,
-      body: h('div', { class: 'bill-wf', role: 'img', 'aria-label': said1 }, rows),
-    };
-  }
-
-  /* ---------------------------------------------------------------- 4. line by line */
+  /* ---------------------------------------------------------------- 3. breakdown */
 
   function bandLabel(band, tariff) {
     const name = { free: 'Free', shoulder: 'Shoulder', peak: 'Peak' }[band] || band;
@@ -556,13 +502,13 @@
     return runs.map((r) => `${SD.fmt.minute(r.start)} to ${SD.fmt.minute(r.end % 1440)}`).join(' and ');
   }
 
-  /** One bill line: label, amount, then (when the panel is open) "kWh x rate" and a plain reason. */
+  /** One bill line: label, amount, then "kWh x rate" and a plain reason. It sits inside a Breakdown row's detail. */
   function item(o) {
-    return h('div', { class: `bill-ln${o.zero ? ' is-zero' : ''}${o.total ? ' is-total' : ''}` },
+    return h('div', { class: `bill-ln${o.zero ? ' is-zero' : ''}` },
       h('dt', {}, o.sw ? h('span', { class: `bill-sw ${o.sw}`, 'aria-hidden': 'true' }) : null, o.label),
       h('dd', { class: `bill-ln-v fig${o.credit ? ' is-credit' : ''}`, text: o.amount }),
-      o.calc ? h('dd', { class: 'bill-calc bill-more', text: o.calc }) : null,
-      o.why ? h('dd', { class: 'bill-why bill-more' }, o.why) : null);
+      o.calc ? h('dd', { class: 'bill-calc', text: o.calc }) : null,
+      o.why ? h('dd', { class: 'bill-why' }, o.why) : null);
   }
 
   const WINDOW_NAME = { super: 'Super export', peak: 'Evening export', other: 'Other exports', tier: 'Tiered export' };
@@ -573,12 +519,16 @@
     tier: 'Paid in tiers, by how much is exported.',
   };
 
-  function linesPanel(bill, tariff) {
+  /**
+   * The line-by-line detail of the bill, grouped by the Breakdown row it opens from:
+   * { supply, bought, feed, credit }, each a list of item() nodes (possibly empty).
+   */
+  function lineItems(bill, tariff) {
     const s = bill.so_far;
-    const rows = [];
+    const out = { supply: [], bought: [], feed: [], credit: [] };
     const supplyCalc = num(s.supply_days) && num(s.supply_cents_per_day)
       ? `${plural(s.supply_days, 'day', 'days')} × ${SD.fmt.cents(s.supply_cents_per_day)}` : null;
-    rows.push(item({
+    out.supply.push(item({
       sw: 'is-supply', label: 'Supply', amount: SD.fmt.dollars(s.supply_dollars), calc: supplyCalc,
       why: 'Fixed daily fee for being connected, even when you buy nothing.',
     }));
@@ -599,7 +549,7 @@
       } else if (b.band === 'peak') {
         why = 'The dearest power, so each kWh bought here counts for most.';
       }
-      rows.push(item({
+      out.bought.push(item({
         sw: `is-${b.band}`, label: bandLabel(b.band, tariff), amount: SD.fmt.dollars(b.dollars),
         zero: Number(b.dollars) === 0, calc: `${SD.fmt.kwh(b.kwh, 1)}${rate}`, why,
       }));
@@ -611,7 +561,7 @@
         const from = hhmm(w.from);
         const to = hhmm(w.to);
         const when = from != null && to != null ? ` ${SD.fmt.minute(from)} to ${SD.fmt.minute(to % 1440)}` : '';
-        rows.push(item({
+        out.feed.push(item({
           sw: 'is-feed', credit: true, label: `${WINDOW_NAME[w.window] || 'Feed-in'}${when}`,
           amount: off(w.dollars), zero: Number(w.dollars) === 0,
           calc: `${SD.fmt.kwh(w.kwh, 1)}${num(w.cents_per_kwh) ? ` × ${SD.fmt.cents(w.cents_per_kwh)}` : ''}`,
@@ -619,7 +569,7 @@
         }));
       }
     } else if (num(s.feed_in_dollars)) {
-      rows.push(item({
+      out.feed.push(item({
         sw: 'is-feed', credit: true, label: 'Feed-in', amount: off(s.feed_in_dollars),
         calc: num(s.feed_in_kwh) ? SD.fmt.kwh(s.feed_in_kwh, 1) : null, why: 'Paid for power sent to the grid.',
       }));
@@ -633,7 +583,7 @@
       const calc = possible != null
         ? `${nights} of ${plural(possible, 'evening', 'evenings')}${per != null ? ` × ${tidy(per)}` : ''}`
         : plural(nights, 'evening', 'evenings');
-      rows.push(item({
+      out.credit.push(item({
         sw: 'is-credit', credit: true, label: 'ZeroHero credit', amount: off(s.credit_dollars),
         calc,
         why: win
@@ -641,13 +591,124 @@
           : 'Each evening with almost no power bought in the credit window.',
       }));
     }
-    rows.push(item({ total: true, label: isPast(bill) ? 'Total' : 'So far', amount: SD.fmt.dollars(s.total_dollars) }));
+    return out;
+  }
 
+  /**
+   * "Left to cut": a short plain sentence on what is still worth cutting. Only for a bill that is
+   * still running (a finished bill has nothing left to cut); null when the bands are unknown.
+   */
+  function cutNote(bill, tariff) {
+    const s = bill.so_far;
+    if (isPast(bill) || !num(s.supply_dollars) || !Array.isArray(s.bands)) return null;
+    const byBand = Object.fromEntries(s.bands.map((b) => [b.band, b]));
+    const shoulder = byBand.shoulder ? Number(byBand.shoulder.dollars) : 0;
+    const peak = byBand.peak ? Number(byBand.peak.dollars) : 0;
+    const supply = Number(s.supply_dollars);
+    const power = shoulder + peak;
+    const lead = peak > shoulder ? 'peak' : 'shoulder';
+    const leadDollars = lead === 'peak' ? peak : shoulder;
+    const missed = Array.isArray(bill.daily) ? bill.daily.filter((d) => d && d.credit === 'missed').length : 0;
+    const nights = num(s.supply_days) && s.supply_days > 0 ? s.supply_days : bill.days_elapsed;
+
+    const parts = [];
+    if (power < 0.005) {
+      parts.push(`No power has been bought at shoulder or peak prices so far. What is left is the ${SD.fmt.dollars(supply)} supply charge.`);
+    } else {
+      parts.push(supply > power
+        ? `The supply charge (${SD.fmt.dollars(supply)}) is bigger than all the power you bought (${SD.fmt.dollars(power)}).`
+        : `You have spent ${SD.fmt.dollars(power)} on power so far, on top of ${SD.fmt.dollars(supply)} supply.`);
+      const piece = (band, dollars) => h('span', {}, h('b', { class: band === lead ? 'bill-hl' : null, text: SD.fmt.dollars(dollars) }), ` was ${band}`);
+      const bits = [];
+      if (shoulder > 0) bits.push(piece('shoulder', shoulder));
+      if (peak > 0) bits.push(piece('peak', peak));
+      const second = h('span', {}, 'Of that, ');
+      bits.forEach((b, i) => { if (i) second.append(' and '); second.append(b); });
+      second.append('.');
+      if (missed > 0 && peak > 0) second.append(` ${plural(missed, 'evening', 'evenings')} missed the credit.`);
+      parts.push(second);
+      if (nights > 0 && leadDollars > 0) {
+        const when = bandTimes(tariff, lead);
+        parts.push(`About ${amt(leadDollars / nights)} a night of ${lead}${when ? `, bought between ${when}` : ''}.`);
+      }
+    }
+    return h('p', { class: 'bill-cut-text' }, h('b', { text: 'Left to cut. ' }), parts.flatMap((p, i) => (i ? [' ', p] : [p])));
+  }
+
+  /**
+   * One "Breakdown" panel: the waterfall of where the bill comes from (supply, power bought,
+   * feed-in, credits, the total), each row opening to its rates and kWh, and the left-to-cut
+   * sentence at the foot. The panel is always open: the rows are the thing that expands.
+   */
+  function breakdownPanel(bill, tariff) {
+    const s = bill.so_far;
+    if (![s.total_dollars, s.supply_dollars, s.feed_in_dollars].every(num)) return null;
+    const total = Number(s.total_dollars);
+    const feed = Number(s.feed_in_dollars);
+    const credit = num(s.credit_dollars) ? Number(s.credit_dollars) : 0;
+    const supply = Number(s.supply_dollars);
+    // Worked back from the total so the rows always add up to it.
+    const charged = total + feed + credit;
+    const bought = charged - supply;
+    const bands = Object.fromEntries((s.bands || []).map((b) => [b.band, b]));
+    const shoulder = bands.shoulder ? Number(bands.shoulder.dollars) : 0;
+    const peak = bands.peak ? Number(bands.peak.dollars) : 0;
+    const boughtKwh = (bands.shoulder ? Number(bands.shoulder.kwh) : 0) + (bands.peak ? Number(bands.peak.kwh) : 0);
+    const scale = Math.max(charged, 0.01);
+    const p = (v) => clamp((v / scale) * 100, 0, 100);
+    const place = (from, to) => `left: ${p(from)}%; width: ${Math.max(0, p(to) - p(from))}%`;
+    const hasCredit = credit > 0 || s.credit_nights > 0;
+    const supplySub = num(s.supply_days) && num(s.supply_cents_per_day)
+      ? `${plural(s.supply_days, 'day', 'days')} × ${SD.fmt.cents(s.supply_cents_per_day)}` : null;
+    const lines = lineItems(bill, tariff);
+
+    /** A row of the waterfall; a row with line detail is a button that shows or hides it. */
+    const row = (key, name, sub, bar, value, cls) => {
+      const parts = [
+        h('span', { class: 'bill-wf-nm' }, name, sub ? h('small', { text: sub }) : null),
+        h('span', { class: 'bill-wf-bar', 'aria-hidden': 'true' }, bar),
+        h('span', { class: `bill-wf-v fig${cls === 'is-cr' ? ' is-credit' : ''}`, text: value })];
+      const detail = lines[key] || [];
+      if (!detail.length) return h('div', { class: `bill-bk${cls ? ` ${cls}` : ''}` }, h('div', { class: 'bill-wf-row' }, parts, h('span', { class: 'bill-bk-chev' })));
+      const id = `bill-bk-${key}`;
+      const box = h('dl', { class: 'bill-dl bill-bk-d', id, hidden: true }, detail);
+      const btn = h('button', {
+        type: 'button', class: 'bill-wf-row is-btn', 'aria-expanded': 'false', 'aria-controls': id,
+        onclick: () => {
+          const open = box.hidden;
+          box.hidden = !open;
+          btn.setAttribute('aria-expanded', String(open));
+          wrap.classList.toggle('is-open', open);
+        },
+      }, parts, h('span', { class: 'bill-bk-chev', 'aria-hidden': 'true', text: '›' }));
+      const wrap = h('div', { class: `bill-bk${cls ? ` ${cls}` : ''}` }, btn, box);
+      return wrap;
+    };
+    const bar = (cls, from, to) => h('span', { class: cls, style: place(from, to) });
+    const guide = (at) => h('span', { class: 'bill-wf-guide', style: `left: ${p(at)}%` });
+
+    const split = shoulder + peak > 0 ? shoulder / (shoulder + peak) : 1;
+    const midway = supply + Math.max(0, bought) * split;
+    const rows = [
+      row('supply', 'Supply', supplySub, bar('bill-f-supply', 0, supply), SD.fmt.dollars(supply)),
+      row('bought', 'Bought', boughtKwh > 0 ? SD.fmt.kwh(boughtKwh, 1) : null,
+        [bar('bill-f-shoulder', supply, midway), bar('bill-f-peak', midway, charged)], `+${SD.fmt.dollars(Math.max(0, bought))}`),
+      row('feed', 'Feed-in', num(s.feed_in_kwh) ? SD.fmt.kwh(s.feed_in_kwh, 0) : null,
+        [guide(charged), bar('bill-f-feed', charged - feed, charged)], `${MINUS}${SD.fmt.dollars(feed)}`, 'is-cr'),
+    ];
+    if (hasCredit) {
+      rows.push(row('credit', 'Credits', s.credit_nights > 0 ? plural(s.credit_nights, 'evening', 'evenings') : null,
+        [guide(charged - feed), bar('bill-f-credit', charged - feed - credit, charged - feed)], `${MINUS}${SD.fmt.dollars(credit)}`, 'is-cr'));
+    }
+    rows.push(row('total', total < 0 ? 'You are owed' : 'You owe', null, bar('bill-f-total', 0, Math.max(0, total)), SD.fmt.dollars(total), 'is-tot'));
+
+    const cut = safe(() => cutNote(bill, tariff));
     return {
-      title: 'Line by line',
-      summary: (open, desk) => (desk ? 'Rates and what each line means' : open ? 'Tap to hide the workings' : 'Tap for rates and what each line means'),
-      fig: null,
-      body: h('dl', { class: 'bill-dl' }, rows),
+      title: 'Breakdown',
+      summary: `${SD.fmt.dollars(charged)} charged, ${SD.fmt.dollars(feed + credit)} came back. Tap a line for its rates.`,
+      fig: SD.fmt.dollars(total),
+      fixed: true,
+      body: h('div', {}, h('div', { class: 'bill-wf' }, rows), cut),
     };
   }
 
@@ -1092,60 +1153,6 @@
     return out.length ? h('div', { class: `bill-tiles${out.length === 1 ? ' is-one' : ''}` }, out) : null;
   }
 
-  /* ---------------------------------------------------------------- 9. what's left to cut */
-
-  function cutPanel(bill, tariff) {
-    const s = bill.so_far;
-    if (!num(s.supply_dollars) || !Array.isArray(s.bands)) return null;
-    const byBand = Object.fromEntries(s.bands.map((b) => [b.band, b]));
-    const shoulder = byBand.shoulder ? Number(byBand.shoulder.dollars) : 0;
-    const peak = byBand.peak ? Number(byBand.peak.dollars) : 0;
-    const supply = Number(s.supply_dollars);
-    const power = shoulder + peak;
-    const lead = peak > shoulder ? 'peak' : 'shoulder';
-    const leadDollars = lead === 'peak' ? peak : shoulder;
-    const missed = Array.isArray(bill.daily) ? bill.daily.filter((d) => d && d.credit === 'missed').length : 0;
-    const nights = num(s.supply_days) && s.supply_days > 0 ? s.supply_days : bill.days_elapsed;
-
-    const parts = [];
-    if (power < 0.005) {
-      parts.push(`No power has been bought at shoulder or peak prices so far. What is left is the ${SD.fmt.dollars(supply)} supply charge.`);
-    } else {
-      parts.push(supply > power
-        ? `The supply charge (${SD.fmt.dollars(supply)}) is bigger than all the power you bought (${SD.fmt.dollars(power)}).`
-        : `You have spent ${SD.fmt.dollars(power)} on power so far, on top of ${SD.fmt.dollars(supply)} supply.`);
-      const piece = (band, dollars) => h('span', {}, h('b', { class: band === lead ? 'bill-hl' : null, text: SD.fmt.dollars(dollars) }), ` was ${band}`);
-      const bits = [];
-      if (shoulder > 0) bits.push(piece('shoulder', shoulder));
-      if (peak > 0) bits.push(piece('peak', peak));
-      const second = h('span', {}, 'Of that, ');
-      bits.forEach((b, i) => { if (i) second.append(' and '); second.append(b); });
-      second.append('.');
-      if (missed > 0 && peak > 0) second.append(` ${plural(missed, 'evening', 'evenings')} missed the credit.`);
-      parts.push(second);
-      if (nights > 0 && leadDollars > 0) {
-        const when = bandTimes(tariff, lead);
-        parts.push(`About ${amt(leadDollars / nights)} a night of ${lead}${when ? `, bought between ${when}` : ''}.`);
-      }
-    }
-
-    const charged = supply + power;
-    const w = (v) => `${((v / Math.max(charged, 0.01)) * 100).toFixed(1)}%`;
-    return {
-      title: 'Left to cut',
-      summary: power < 0.005 ? 'Supply is fixed. Nothing else was bought.' : `Supply is fixed. ${lead === 'peak' ? 'Peak' : 'Shoulder'} is what's biggest.`,
-      fig: SD.fmt.dollars(leadDollars, 2),
-      collapse: true,
-      body: h('div', {},
-        h('div', { class: 'bill-pbar', role: 'img', 'aria-label': `Of ${SD.fmt.dollars(charged)} charged: supply ${SD.fmt.dollars(supply)}, shoulder ${SD.fmt.dollars(shoulder)}, peak ${SD.fmt.dollars(peak)}.` },
-          h('span', { style: `width: ${w(supply)}; background: var(--bar)` }),
-          h('span', { style: `width: ${w(shoulder)}; background: var(--shoulder)` }),
-          h('span', { style: `width: ${w(peak)}; background: var(--peak)` })),
-        h('p', { class: 'label', text: `Supply ${SD.fmt.dollars(supply)} · shoulder ${SD.fmt.dollars(shoulder)} · peak ${SD.fmt.dollars(peak)}` }),
-        h('p', { class: 'bill-cut-text' }, parts.flatMap((p, i) => (i ? [' ', p] : [p])))),
-    };
-  }
-
   /* ---------------------------------------------------------------- 10. how this is worked out */
 
   function renderHow(bill) {
@@ -1254,11 +1261,10 @@
       side = h('div', { class: 'bill-side a-side' },
         safe(() => tiles(bill)),
         slot,
-        isPast(bill) ? null : panel('cut', '', () => cutPanel(bill, tariff)));
-      const lines = panel('lines', 'a-lines', () => linesPanel(bill, tariff));
-      if (lines) left.append(lines);
+        null);
+      const breakdown = panel('break', 'a-break', () => breakdownPanel(bill, tariff));
+      if (breakdown) left.append(breakdown);
       right.append(...[
-        panel('flow', 'a-flow', () => waterfall(bill)),
         panel('cmp', 'a-compare', () => comparePanel(bill)),
         panel('hist', 'a-history', () => historyPanel(bill)),
         side.children.length ? side : null,

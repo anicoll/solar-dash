@@ -77,8 +77,7 @@
 /* On a phone the two desktop columns disappear and the panels keep this order. */
 #page-bill .bill-column { display: contents; }
 #page-bill .a-hero { order: 1; }
-#page-bill .a-flow { order: 2; }
-#page-bill .a-lines { order: 3; }
+#page-bill .a-break { order: 2; }
 #page-bill .a-days { order: 4; }
 #page-bill .a-compare { order: 5; }
 #page-bill .a-history { order: 6; }
@@ -546,15 +545,64 @@
 #page-bill .bill-wf {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 2px;
 }
 
+/* One Breakdown row: name, bar, amount, and a chevron when the row opens its lines. */
 #page-bill .bill-wf-row {
   display: grid;
-  grid-template-columns: 92px minmax(0, 1fr) 64px;
+  grid-template-columns: 92px minmax(0, 1fr) 64px 14px;
   align-items: center;
   gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
   font-size: 14px;
+  text-align: left;
+}
+
+#page-bill .bill-wf-row.is-btn {
+  cursor: pointer;
+}
+
+#page-bill .bill-wf-row.is-btn:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+#page-bill .bill-bk-chev {
+  text-align: center;
+  font-size: 18px;
+  color: var(--ink-2);
+  transition: transform 0.2s;
+}
+
+#page-bill .bill-bk.is-open .bill-bk-chev {
+  transform: rotate(90deg);
+}
+
+/* The lines under an open row: indented, the same dl the old Line by line panel used. */
+#page-bill .bill-bk-d {
+  margin: 2px 0 6px;
+  padding-left: 12px;
+  border-left: 2px solid var(--line);
+}
+
+#page-bill .bill-bk-d .bill-ln:first-child {
+  border-top: 0;
+}
+
+#page-bill .bill-bk-d .bill-ln:last-child {
+  border-bottom: 0;
+}
+
+#page-bill .bill-panel.is-fixed .bill-chev {
+  display: none;
 }
 
 #page-bill .bill-wf-nm {
@@ -591,12 +639,13 @@
   border-radius: 3px;
 }
 
-#page-bill .bill-wf-row.is-tot {
-  padding-top: 10px;
+#page-bill .bill-bk.is-tot {
+  margin-top: 6px;
+  padding-top: 6px;
   border-top: 1px solid var(--line);
 }
 
-#page-bill .bill-wf-row.is-tot .bill-wf-v {
+#page-bill .bill-bk.is-tot .bill-wf-v {
   font-size: 17px;
 }
 
@@ -692,20 +741,6 @@
 #page-bill .bill-why b {
   font-weight: 600;
   color: var(--ink);
-}
-
-#page-bill .bill-ln.is-total {
-  border-bottom: 0;
-  padding-top: 14px;
-}
-
-#page-bill .bill-ln.is-total dt {
-  font-size: 17px;
-  font-stretch: 112%;
-}
-
-#page-bill .bill-ln.is-total .bill-ln-v {
-  font-size: 22px;
 }
 
 #page-bill .bill-sw {
@@ -1195,7 +1230,7 @@
   }
 
   #page-bill .bill-wf-row {
-    grid-template-columns: 110px minmax(0, 1fr) 66px;
+    grid-template-columns: 110px minmax(0, 1fr) 66px 14px;
   }
 
   #page-bill .bill-dchart {
