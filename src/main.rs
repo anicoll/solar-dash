@@ -9,6 +9,7 @@ mod db;
 mod ev_cost;
 mod fuel_log;
 mod globird;
+mod home_assistant;
 mod hub;
 mod ingest;
 mod isolar;
@@ -247,6 +248,7 @@ async fn run_serve(config: Config) -> Result<()> {
         hub: hub::Hub::default(),
     };
 
+    state.spawn_warmup();
     info!(address = %config.server.bind, "web server started");
     // Run until Ctrl+C. `try_join!` polls both on this task and returns early
     // if the web server fails. The spokes never fail the whole: their errors

@@ -448,6 +448,178 @@ button {
   margin-right: 6px;
 }
 
+/* ---------- price timeline (shared: Today "Price now", History "Prices") ---------- */
+
+/* Price tones: Amber's descriptors (or our bands) as colours. Always shown with a word or a number. */
+.tone-cheap { background: var(--battery); }
+.tone-free { background: var(--sun); }
+.tone-neutral { background: var(--bar); }
+.tone-high { background: var(--peak); }
+.tone-spike { background: var(--missed); }
+.swatch[class*='tone-'] {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 35%, transparent);
+}
+
+/* The timeline: 30-minute blocks, scrolling sideways on a phone. */
+.ptl-head {
+  margin-top: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ptl-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.ptl-toggle {
+  display: flex;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.ptl-toggle-btn {
+  min-height: 44px;
+  padding: 4px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.ptl-toggle-btn[aria-pressed='true'] {
+  background: var(--ink);
+  color: var(--card);
+  font-weight: 700;
+}
+
+.ptl-wrap {
+  margin: 8px -4px 0;
+  padding: 4px 4px 8px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.ptl {
+  display: flex;
+  gap: 6px;
+  width: max-content;
+}
+
+.ptl-block {
+  box-sizing: border-box;
+  min-width: 72px;
+  min-height: 44px;
+  padding: 10px 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  border: 2px solid var(--line);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.ptl-block.is-actual { opacity: 0.75; }
+.ptl-block.is-now { border-color: var(--ink); background: color-mix(in srgb, var(--ink) 10%, transparent); }
+.ptl-block.is-picked { box-shadow: 0 0 0 2px var(--ink); }
+.ptl-block:focus-visible,
+.ptl-toggle-btn:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+.ptl-time { font-size: 12px; font-weight: 600; white-space: nowrap; }
+.ptl-cents { font-size: 15px; font-weight: 700; }
+.ptl-ren { font-size: 11px; color: var(--ink-2); }
+.ptl-kind { font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); }
+
+.ptl-dot {
+  display: inline-block;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 35%, transparent);
+}
+
+/* The spike dot is square, so it does not rely on colour alone. */
+.ptl-dot.is-spike { border-radius: 5px; }
+.ptl-dot-sm { width: 10px; height: 10px; }
+.ptl-dot-sm.is-spike { border-radius: 2px; }
+.ptl-dot-empty { background: var(--line); box-shadow: none; }
+
+.ptl-detail {
+  margin-top: 8px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.ptl-detail p { margin: 0; }
+
+.ptl-detail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ptl-detail-title { font-size: 15px; font-weight: 700; }
+.ptl-detail-line { font-size: 14px; }
+.ptl-detail-note { font-size: 12px; color: var(--ink-2); }
+
+.ptl-fives {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ptl-five {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 2px;
+  border-radius: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ptl-five.is-now { background: color-mix(in srgb, var(--ink) 10%, transparent); }
+.ptl-five.is-pending { opacity: 0.7; }
+.ptl-five-time { font-size: 11px; color: var(--ink-2); }
+.ptl-five-cents { font-size: 13px; font-weight: 700; }
+
+.ptl-legend {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.ptl-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 /* ---------- hatch: sold, projected or partial ---------- */
 
 .hatch {

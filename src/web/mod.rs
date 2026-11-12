@@ -14,8 +14,15 @@ mod globird;
 mod home_mix;
 mod payback;
 mod petrol;
+mod price_grid;
 mod prices;
+mod warm;
 mod whatif;
+
+// What the Home Assistant feed reads: the same day totals and day cost the
+// Today page uses.
+pub use api::{DayEnergy, day_energy};
+pub use costs::{DayMoney, day_money};
 
 pub(crate) use costs::house_intervals;
 
@@ -112,6 +119,8 @@ pub struct AppState {
     spokes: Arc<[SpokeInfo]>,
     /// Which source wins for a day's energy (`[sources]`).
     rules: Arc<SourceRules>,
+    /// Pinged when a GloBird sync finishes, so the cache warm-up runs again.
+    warm: Arc<tokio::sync::Notify>,
 }
 
 // Lets `SignedCookieJar` find the key inside our state.
@@ -151,6 +160,7 @@ impl AppState {
             offsite: crate::offsite::Status::default(),
             spokes: hub::spoke_infos(&[]).into(),
             rules: Arc::new(SourceRules::default()),
+            warm: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -160,7 +170,23 @@ impl AppState {
         self
     }
 
+    /// Whether a tariff is set up (on the Admin page or imported from the
+    /// config), so cost figures exist.
+    pub fn has_tariff(&self) -> bool {
+        self.admin.get().tariff.is_some()
+    }
+
     /// Records which spokes (by id) are running, for `/api/spokes`.
+    /// The signal the nightly GloBird sync gives when it brings in new data.
+    pub fn warm_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.warm.clone()
+    }
+
+    /// Starts the background task that warms the caches (see `warm`).
+    pub fn spawn_warmup(&self) {
+        tokio::spawn(warm::run(self.clone()));
+    }
+
     pub fn with_enabled_spokes(mut self, enabled: &[&str]) -> Self {
         self.spokes = hub::spoke_infos(enabled).into();
         self
@@ -418,6 +444,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/series", get(api::series))
         .route("/api/prices", get(prices::prices))
         .route("/api/prices/daily", get(prices::daily))
+        .route("/api/prices/grid", get(price_grid::grid))
         .route("/api/day", get(api::day))
         .route("/api/daily", get(api::daily))
         .route("/api/battery", get(battery::battery))
@@ -828,6 +855,7 @@ mod tests {
         "/api/series?metrics=battery_soc_pct&from=1767225600&to=1767312000&step=300",
         "/api/prices?from=1767225600&to=1767312000",
         "/api/prices/daily?from=2026-01-01&to=2026-01-07",
+        "/api/prices/grid?from=2026-01-01&to=2026-01-07",
         "/api/day?date=2026-01-01",
         "/api/day",
         "/api/daily",
@@ -1217,7 +1245,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let spokes = json["spokes"].as_array().unwrap();
-        assert_eq!(spokes.len(), 7);
+        assert_eq!(spokes.len(), 8);
         let modbus = &spokes[0];
         assert_eq!(modbus["id"], "sungrow-modbus");
         assert_eq!(modbus["kind"], "source");
@@ -1678,6 +1706,67 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["days"][0]["date"], "2027-01-15");
         assert!(json["days"][0]["pv_kwh"].is_null());
+    }
+
+    /// The Home Assistant feed's energy figures are the Today page's own: the
+    /// same numbers as `/api/daily` for that day, and no money without a plan.
+    #[tokio::test]
+    async fn day_energy_matches_api_daily() {
+        let (_dir, app, pool) = test_app_with_pool().await;
+        let cookie = log_in(&app).await;
+        // All of yesterday: a day needs 95% coverage before its totals count.
+        let tz = chrono_tz::Australia::Adelaide;
+        let date = api::today(tz).pred_opt().unwrap();
+        let (start, end) = api::day_bounds_or_error(date, tz).unwrap();
+        for ts in (start..=end).step_by(30) {
+            let mut sample = live_sample(ts);
+            (sample.pv_w, sample.load_w) = (Some(3600.0), Some(1800.0));
+            (sample.grid_w, sample.battery_w) = (Some(-1000.0), Some(800.0));
+            db::insert_live_sample(&pool, &sample).await.unwrap();
+        }
+        let uri = format!("/api/daily?from={date}&to={date}");
+        let json = body_json(send(&app, get_request(&uri, Some(&cookie))).await).await;
+        let day = &json["days"][0];
+
+        let hash = hash_password(PASSWORD).unwrap();
+        let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate()).unwrap();
+        let energy = day_energy(&state, date).await.unwrap();
+        assert_eq!(energy.pv_kwh, day["pv_kwh"].as_f64());
+        assert_eq!(energy.load_kwh, day["load_kwh"].as_f64());
+        assert_eq!(energy.import_kwh, day["import_kwh"].as_f64());
+        assert_eq!(energy.export_kwh, day["export_kwh"].as_f64());
+        assert_eq!(
+            energy.battery_charge_kwh,
+            day["battery_charge_kwh"].as_f64()
+        );
+        assert_eq!(
+            energy.battery_discharge_kwh,
+            day["battery_discharge_kwh"].as_f64()
+        );
+        // A day at 3.6 kW is 86.4 kWh of solar.
+        let pv = energy.pv_kwh.expect("the day has solar data");
+        assert!((pv - 86.4).abs() < 0.5, "{energy:?}");
+        // No tariff, no cost.
+        assert!(!state.has_tariff());
+        assert_eq!(day_money(&state, date).await.unwrap(), None);
+
+        // With a plan the money is `/api/costs`' own: bought less sold, and
+        // the whole day's `actual`.
+        let with_plan = state.with_tariff(Some(flat_tariff()));
+        let money = day_money(&with_plan, date).await.unwrap().unwrap();
+        let costs_app = costs_router(&pool, flat_tariff());
+        let cookie = log_in(&costs_app).await;
+        let uri = format!("/api/costs?from={date}&to={date}");
+        let json = body_json(send(&costs_app, get_request(&uri, Some(&cookie))).await).await;
+        let row = &json["days"][0];
+        let bought = row["import"].as_f64().unwrap();
+        let sold = row["feed_in"].as_f64().unwrap();
+        assert!(
+            (money.power - (bought - sold)).abs() < 0.011,
+            "{money:?} {row}"
+        );
+        assert_eq!(money.net, row["actual"].as_f64().unwrap());
+        assert!(with_plan.has_tariff());
     }
 
     fn live_sample(ts: i64) -> Sample {

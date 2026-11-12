@@ -31,7 +31,7 @@ pub(super) struct Step {
 
 /// The home load of a day by where it came from, in kWh. The first three add
 /// up to the load.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 pub(super) struct HomeMix {
     #[serde(rename = "home_solar_kwh")]
     pub solar_kwh: Option<f64>,

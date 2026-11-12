@@ -5,6 +5,7 @@
 mod amber;
 mod backups;
 mod globird_portal;
+mod ha_mqtt;
 mod isolarcloud;
 mod sungrow_modbus;
 mod teslamate_history;
@@ -17,13 +18,14 @@ use crate::offsite::Offsite;
 use crate::web::AppState;
 
 /// Every spoke this build has, in the order they are listed at startup.
-pub const ALL: [SpokeMeta; 7] = [
+pub const ALL: [SpokeMeta; 8] = [
     sungrow_modbus::META,
     isolarcloud::META,
     globird_portal::META,
     teslamate_mqtt::META,
     teslamate_history::META,
     amber::META,
+    ha_mqtt::META,
     backups::META,
 ];
 
@@ -48,7 +50,7 @@ pub fn build(
         spokes.push(Box::new(isolarcloud::IsolarCloudSpoke::new(client, cloud)));
     }
     if let Some(globird) = config.globird.clone() {
-        spokes.push(Box::new(globird_portal::GlobirdPortal::new(globird)));
+        spokes.push(Box::new(globird_portal::GlobirdPortal::new(globird, state)));
     }
     if let Some(teslamate) = config.teslamate.clone() {
         spokes.push(Box::new(teslamate_mqtt::TeslamateMqtt::new(
@@ -68,6 +70,13 @@ pub fn build(
     }
     if let Some(amber) = config.amber.clone() {
         spokes.push(Box::new(amber::AmberPrices::new(amber)));
+    }
+    if let Some(home_assistant) = config.home_assistant.clone() {
+        spokes.push(Box::new(ha_mqtt::HomeAssistantMqtt::new(
+            home_assistant,
+            state,
+            config.amber.is_some(),
+        )));
     }
     spokes.push(Box::new(backups::Backups::new(
         config.database.backup_dir(),
@@ -94,6 +103,7 @@ mod tests {
                 "teslamate-mqtt",
                 "teslamate-history",
                 "amber",
+                "home-assistant-mqtt",
                 "backups"
             ]
         );
@@ -119,5 +129,29 @@ mod tests {
         let spokes = build(&config, &state, None, None);
         let ids: Vec<_> = spokes.iter().map(|spoke| spoke.id()).collect();
         assert_eq!(ids, ["backups"]);
+    }
+
+    #[tokio::test]
+    async fn home_assistant_spoke_only_starts_with_its_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = crate::web::hash_password("pw").unwrap();
+        let state = AppState::new(
+            pool,
+            0,
+            chrono_tz::Australia::Adelaide,
+            &hash,
+            axum_extra::extract::cookie::Key::generate(),
+        )
+        .unwrap();
+        let config: Config = toml::from_str(
+            "[site]\ntimezone = \"Australia/Perth\"\n[home_assistant]\nmqtt_host = \"broker\"\n",
+        )
+        .unwrap();
+        let spokes = build(&config, &state, None, None);
+        let ids: Vec<_> = spokes.iter().map(|spoke| spoke.id()).collect();
+        assert_eq!(ids, ["home-assistant-mqtt", "backups"]);
     }
 }

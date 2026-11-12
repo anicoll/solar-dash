@@ -16,8 +16,8 @@
 //! a `run` that lasts until shutdown. The spokes themselves live in
 //! [`spokes`] and are thin adapters around the existing `run` functions.
 //!
-//! Nothing listens to the bus yet except a debug log line. Phase 4's MQTT
-//! sink (publishing to Home Assistant) will be the first real consumer.
+//! The bus is listened to by a debug log line and by the Home Assistant
+//! sink spoke (`home-assistant-mqtt`), which publishes readings over MQTT.
 
 mod bus;
 pub mod rules;
