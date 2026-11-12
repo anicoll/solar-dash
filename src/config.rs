@@ -658,6 +658,10 @@ pub struct HaSource {
     /// The entities to read, as repeated `[[home_assistant.source.entity]]`.
     #[serde(default)]
     pub entity: Vec<HaEntity>,
+    /// How many days of Home Assistant's long-term statistics to copy in for
+    /// each entity, the first time it is seen. 0 turns the backfill off.
+    #[serde(default = "default_ha_backfill_days")]
+    pub backfill_days: u32,
 }
 
 /// One `[[home_assistant.source.entity]]`.
@@ -705,6 +709,10 @@ impl HaSource {
 
     fn check(&self) -> Result<()> {
         self.websocket_url()?;
+        anyhow::ensure!(
+            self.backfill_days <= MAX_HA_BACKFILL_DAYS,
+            "backfill_days in [home_assistant.source] must be at most {MAX_HA_BACKFILL_DAYS} (0 turns it off)"
+        );
         let url = reqwest::Url::parse(self.url.trim())?;
         anyhow::ensure!(
             url.query().is_none() && url.fragment().is_none(),
@@ -768,8 +776,16 @@ impl fmt::Debug for HaSource {
             .field("url", &self.url)
             .field("token", &"<redacted>")
             .field("entity", &self.entity)
+            .field("backfill_days", &self.backfill_days)
             .finish()
     }
+}
+
+/// Ten years: more than Home Assistant keeps by default.
+const MAX_HA_BACKFILL_DAYS: u32 = 3650;
+
+fn default_ha_backfill_days() -> u32 {
+    365
 }
 
 fn default_mqtt_port() -> u16 {
@@ -1680,6 +1696,7 @@ mod tests {
         assert!(!ha.mqtt_enabled());
         let source = ha.source.as_ref().unwrap();
         assert_eq!(source.entity.len(), 2);
+        assert_eq!(source.backfill_days, 365);
         assert_eq!(source.entity[0].metric, Some(crate::metric::Metric::PvW));
         assert_eq!(source.entity[1].metric, None);
         assert_eq!(
@@ -1712,6 +1729,7 @@ mod tests {
                 url: u.into(),
                 token: "t".into(),
                 entity: vec![],
+                backfill_days: 365,
             }
             .websocket_url()
         };
@@ -1754,6 +1772,10 @@ mod tests {
         );
         let err = parse_source(&twice).check().unwrap_err().to_string();
         assert!(err.contains("more than one entity"), "{err}");
+        assert!(
+            bad(&|s| s.replace("token =", "backfill_days = 5000\ntoken ="))
+                .contains("backfill_days")
+        );
         let none = parse_source("[home_assistant.source]\nurl = \"http://h\"\ntoken = \"t\"\n");
         assert!(
             none.check()

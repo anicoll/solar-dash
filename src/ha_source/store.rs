@@ -96,3 +96,12 @@ pub async fn history(
     };
     rows.context("could not read Home Assistant history")
 }
+
+/// The oldest stored reading time of an entity, if any.
+pub async fn oldest_ts(pool: &SqlitePool, entity_id: &str) -> Result<Option<i64>> {
+    sqlx::query_scalar("SELECT MIN(ts) FROM ha_reading WHERE entity_id = ?")
+        .bind(entity_id)
+        .fetch_one(pool)
+        .await
+        .context("could not read Home Assistant readings")
+}

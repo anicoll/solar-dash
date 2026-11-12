@@ -401,6 +401,7 @@ async fn connection_talks_to_a_scripted_home_assistant() {
         url: "http://unused".into(),
         token: "secret".into(),
         entity: entities.clone(),
+        backfill_days: 0,
     };
     let view = HaView::new(&entities);
     let mut ingest = Ingest::new(&entities, view.clone());

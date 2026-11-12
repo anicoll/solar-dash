@@ -159,6 +159,9 @@ path = "data/solar.db"
 # [home_assistant.source]
 # url = "http://homeassistant.local:8123"
 # token = "your-long-lived-access-token"
+# Days of Home Assistant history to copy in the first time an entity is seen
+# (0 = off).
+# backfill_days = 365
 # [[home_assistant.source.entity]]
 # entity_id = "sensor.solar_power"
 # metric = "pv_w"

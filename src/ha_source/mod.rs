@@ -19,10 +19,14 @@
 //! back to it. The MQTT sink skips events from [`SOURCE_NAME`] (see
 //! [`is_home_assistant_source`] and `home_assistant::Feed::on_event`).
 //!
+//! Past values come from Home Assistant's long-term statistics, once per
+//! entity (see [`backfill`]).
+//!
 //! The split follows the MQTT sink: [`protocol`] and [`Ingest`] are plain
 //! code tested without a network; [`run`] is the thin loop that connects,
 //! reconnects and moves data between them and the database.
 
+pub mod backfill;
 pub mod protocol;
 pub mod store;
 
@@ -356,32 +360,40 @@ pub async fn run(
             );
         }
     }
+    // The live reading and the history backfill run side by side on this
+    // task, each with its own connection; shutdown stops both.
+    tokio::select! {
+        _ = shutdown => {}
+        _ = async {
+            tokio::join!(
+                live_loop(&url, &config, &view, &pool, &hub),
+                backfill::run(&url, &config, &pool, &hub),
+            )
+        } => {}
+    }
+    view.set_connected(false);
+    Ok(())
+}
+
+/// Keeps the live connection going forever: connect, read, and on any
+/// failure pause (logging once per outage) and connect again.
+async fn live_loop(url: &str, config: &HaSource, view: &HaView, pool: &SqlitePool, hub: &Hub) {
     let mut ingest = Ingest::new(&config.entity, view.clone());
     let mut health = Health::new();
-    tokio::pin!(shutdown);
     loop {
-        let result = tokio::select! {
-            _ = &mut shutdown => break,
-            result = connection(&url, &config, &mut ingest, &pool, &hub, &mut health) => result,
-        };
+        let result = connection(url, config, &mut ingest, pool, hub, &mut health).await;
         view.set_connected(false);
         // Do not leave a held reading waiting in memory.
         let held = ingest.flush(Utc::now().timestamp(), true);
-        if let Err(err) = save_and_announce(&pool, &hub, held).await {
+        if let Err(err) = save_and_announce(pool, hub, held).await {
             warn!("could not save Home Assistant readings: {err:#}");
         }
         let err = match result {
             Ok(()) => anyhow::anyhow!("the connection was closed"),
             Err(err) => err,
         };
-        let pause = health.failed(&err);
-        tokio::select! {
-            _ = &mut shutdown => break,
-            _ = tokio::time::sleep(pause) => {}
-        }
+        tokio::time::sleep(health.failed(&err)).await;
     }
-    view.set_connected(false);
-    Ok(())
 }
 
 /// One connection, from connecting until it fails.
