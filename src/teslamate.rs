@@ -30,7 +30,7 @@ use crate::db::{self, ChargeProgress};
 /// How often we ping the broker to show we are still here.
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
 /// First pause after a connection error. It doubles up to [`MAX_BACKOFF`].
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
+pub(crate) const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// While charging, the session row is updated at most this often. The row
 /// lives on an SSD, so we keep writes rare.
@@ -365,24 +365,24 @@ impl Odometer {
 /// limit, and starts over once a connection works. A plain struct with no
 /// sleeping of its own, so it can be unit tested.
 #[derive(Debug)]
-struct Backoff {
+pub(crate) struct Backoff {
     next: Duration,
 }
 
 impl Backoff {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { next: MIN_BACKOFF }
     }
 
     /// How long to wait now. The one after it is twice as long, up to the limit.
-    fn pause(&mut self) -> Duration {
+    pub(crate) fn pause(&mut self) -> Duration {
         let now = self.next;
         self.next = (self.next * 2).min(MAX_BACKOFF);
         now
     }
 
     /// Call when the connection works again.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.next = MIN_BACKOFF;
     }
 }

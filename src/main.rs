@@ -9,6 +9,7 @@ mod db;
 mod ev_cost;
 mod fuel_log;
 mod globird;
+mod home_assistant;
 mod hub;
 mod ingest;
 mod isolar;

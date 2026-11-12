@@ -14,6 +14,7 @@ A self-hosted dashboard for Sungrow iSolarCloud solar, battery and grid data. It
 - [x] Dashboard UI (a home page with Now and History (Day, Month, Year), plus Money, Payback and Cars views; ECharts from cdnjs)
 - [x] Local Modbus reader (`modbus-test`) for live power from the inverter
 - [x] `serve` polls Modbus when configured and stores live samples (`/api/live`, `/api/live/series`)
+- [x] `serve` publishes live readings to Home Assistant over MQTT discovery when `[home_assistant]` is configured (see docs/how-to-run.md)
 - [x] `serve` follows the Tesla's charge state from TeslaMate over MQTT when configured (`/api/live`)
 - [x] `/api/ev/cars` gives each TeslaMate car's details (trim, paint, wheels), home charging per plan, and a petrol comparison car; set the `compare_cars` and `petrol_grade` settings, for example `{"3": "Hyundai i30 Sedan N", "Y": "Toyota RAV4 GX 2WD"}` and `Unleaded 91` (kept in the database; see "Where the settings live" in `docs/how-to-run.md`)
 - [x] GloBird portal probe (`globird-probe`) to learn the response shapes (unofficial API)
@@ -45,6 +46,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/backup.rs`, `src/offsite.rs` - nightly database backups, and the optional upload of them to Cloudflare R2 (an S3-compatible client with hand-written request signing); see `[database.offsite]` in `config.example.toml` and `docs/deploy.md`
 - `src/modbus.rs` - Modbus TCP reader for live inverter data, and its poll loop
 - `src/teslamate.rs` - TeslaMate MQTT reader for the car's charge state
+- `src/home_assistant.rs` - publishes live readings to Home Assistant over MQTT discovery (publish only; see docs/how-to-run.md)
 - `src/ingest.rs` - parsing of history data, backfill and the live sync loop
 - `src/hub/` - the hub and its spokes: the `Spoke` trait, the event bus, `run_spokes`, one thin adapter per background job (`spokes/`) and the source rules (`rules.rs`)
 - `src/web/` - web server: login (`auth.rs`), JSON API (`api.rs`), the admin API (`admin.rs`), the cost API (`costs.rs`), the payback API (`payback.rs`) and embedded static files
