@@ -1277,10 +1277,20 @@
   gap: 18px;
 }
 
-#page-bill .bill-wi-verdict {
+/* The page's headline is the answer; the line under it says how many days and what the switches add. */
+#page-bill .bill-wi-head {
   margin: 0;
+  font-size: 26px;
+  font-stretch: 110%;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+#page-bill .bill-wi-lead {
+  margin: -10px 0 0;
   font-size: 15px;
   line-height: 1.4;
+  color: var(--ink-2);
 }
 
 #page-bill .bill-wi-sub {
@@ -1326,6 +1336,8 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+  margin: 0;
+  padding: 18px;
 }
 
 #page-bill .bill-wi-bar {
@@ -1500,17 +1512,48 @@
   cursor: pointer;
 }
 
+/* The method text, closed until asked for. */
 #page-bill .bill-wi-how {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 12px;
+  margin: 0;
+  padding: 4px 18px;
+  font-size: 13px;
   line-height: 1.45;
   color: var(--ink-2);
 }
 
-#page-bill .bill-wi-how b {
+#page-bill .bill-wi-how summary {
+  display: flex;
+  align-items: center;
+  min-height: 48px;
   color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#page-bill .bill-wi-how p {
+  margin: 0 0 10px;
+}
+
+/* ---------- the #bill/amber page ---------- */
+
+#page-bill .bill-amber-page {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 720px;
+}
+
+#page-bill .bill-amber-back {
+  align-self: flex-start;
+  padding: 10px 0;
+  font-size: 15px;
+}
+
+@media (min-width: 760px) {
+  #page-bill .bill-wi-head {
+    font-size: 34px;
+  }
 }
 
 /* The Amber panel's place while its answer is on the way. */

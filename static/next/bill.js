@@ -936,51 +936,56 @@
   }
 
   /**
-   * "Would Amber have been cheaper?": the verdict, period chips, three bars, three
-   * switches and the day-by-day list. Every figure for a switch mix comes from the
-   * API's `savings_dollars` (one number per mix), so flipping a switch needs no request.
-   * `periods` is [{ key, label, res }] with only usable answers; null when none.
-   * The returned panel also has `addPeriod({ key, label, res })`: the other chips are fetched
+   * The whole "Would Amber have been cheaper?" view, for the #bill/amber page: the answer as a
+   * headline, period chips, three bars, three switches, the day-by-day list and the method text
+   * in a closed disclosure. Every figure for a switch mix comes from the API's `savings_dollars`
+   * (one number per mix), so flipping a switch needs no request.
+   * `periods` is [{ key, label, when, res }] with only usable answers; null when none.
+   * The result has `node` and `addPeriod({ key, label, when, res })`: the other chips are fetched
    * after the first paint, and each one joins the chip row when its answer arrives.
    */
-  function whatifPanel(periods) {
+  function whatifView(periods) {
     let list = (periods || []).filter((p) => usableWhatif(p.res));
     if (!list.length) return null;
     const ORDER = ['bill', 'd30', 'd90'];
-    const state = { period: list[0].key, on: { car: true, grid_charge: true, spikes: true }, all: false };
-    const body = h('div', { class: 'bill-wi' });
+    const state = { period: list[0].key, on: { car: true, grid_charge: true, spikes: true }, all: false, how: false };
+    const node = h('div', { class: 'bill-wi' });
     const money = (v) => (v < 0 ? MINUS : '') + SD.fmt.dollars(Math.abs(v));
 
     function figures() {
-      const res = list.find((p) => p.key === state.period).res;
+      const period = list.find((p) => p.key === state.period);
+      const res = period.res;
       const t = res.totals;
       const mixes = t.savings_dollars || {};
       const key = mixKey(state.on);
       const save = key ? Number(mixes[key]) || 0 : 0;
-      return { res, t, mixes, key, save, shifted: t.amber_dollars - save };
+      return { period, res, t, mixes, key, save, shifted: t.amber_dollars - save };
     }
 
+    /** The answer as a short headline and one line under it about the switches. */
     function verdict(f) {
-      const { t, save, shifted } = f;
-      const n = plural(t.days, 'day', 'days');
+      const { t, save, shifted, period } = f;
       const asUsed = t.amber_dollars - t.globird_dollars;
-      if (!mixKey(state.on) || save <= 0.005) {
-        return asUsed < 0
-          ? `Yes. As you actually used power, Amber would have cost ${money(-asUsed)} less than GloBird over ${n}.`
-          : `No. As you actually used power, Amber would have cost ${money(asUsed)} more than GloBird over ${n}.`;
-      }
+      const withSwitches = mixKey(state.on) && save > 0.005;
       const diff = shifted - t.globird_dollars;
-      if (asUsed < 0) return `Yes. Amber would have cost ${money(-asUsed)} less than GloBird as you used power, and ${money(-diff)} less with your switches, over ${n}.`;
-      return diff < 0
-        ? `Yes, if you had changed habits: Amber would have cost ${money(-diff)} less than GloBird over ${n}.`
-        : `Not quite. Even with these changes Amber would have cost ${money(diff)} more than GloBird over ${n}.`;
+      const head = asUsed < 0
+        ? `Yes. Amber would have cost ${money(-asUsed)} less ${period.when}.`
+        : `No. As you used power, Amber would have cost ${money(asUsed)} more ${period.when}.`;
+      const notes = [`${plural(t.days, 'day', 'days')} with Amber prices.`];
+      if (withSwitches) {
+        notes.push(diff < 0
+          ? `With your switches, ${money(-diff)} less than GloBird.`
+          : `Even with your switches, ${money(diff)} more than GloBird.`);
+      }
+      return { head, sub: notes.join(' ') };
     }
 
     function render() {
       const f = figures();
       const { res, t } = f;
       const children = [];
-      children.push(h('p', { class: 'bill-wi-verdict', text: verdict(f) }));
+      const v = verdict(f);
+      children.push(h('h1', { class: 'bill-wi-head', text: v.head }), h('p', { class: 'bill-wi-lead', text: v.sub }));
 
       if (list.length > 1) {
         children.push(h('div', { class: 'bill-wi-chips', role: 'group', 'aria-label': 'Period' },
@@ -999,15 +1004,15 @@
         h('div', { class: 'bill-wi-track', 'aria-hidden': 'true' },
           h('div', { class: `bill-wi-fill is-${tone}`, style: `width:${Math.max(2, Math.max(0, value) / max * 100).toFixed(1)}%` })),
         h('span', { class: 'bill-wi-sub', text: sub }));
-      children.push(h('div', { class: 'bill-wi-bars' },
+      children.push(h('section', { class: 'card bill-wi-bars', 'aria-label': 'GloBird against Amber' },
         bar('GloBird, what you paid', t.globird_dollars, 'globird', billedNote),
         bar('Amber, as you used it', t.amber_dollars, 'amber', 'Same usage, same times'),
         bar('Amber, with your switches', f.shifted, 'switches',
           f.key && f.save > 0.005 ? `Saves ${money(f.save)} against as used` : 'Turn on a switch below')));
 
       const carSessions = res.days.reduce((n, d) => n + (d.car_sessions || 0), 0);
-      children.push(h('div', { class: 'bill-wi-levers' },
-        h('h3', { class: 'bill-wi-h', text: 'What if you had changed habits?' }),
+      children.push(h('section', { class: 'card bill-wi-levers' },
+        h('h2', { class: 'bill-wi-h', text: 'If you changed habits' }),
         h('p', { class: 'bill-wi-sub', text: 'Each switch replays your real usage against Amber’s settled 5-minute prices: the same kWh, moved in time.' }),
         ...LEVERS.map((l) => {
           const on = state.on[l.key];
@@ -1033,8 +1038,8 @@
         return { d, amber, paid: amber < 0 };
       });
       const shown = state.all ? rows : rows.slice(0, 14);
-      children.push(h('div', { class: 'bill-wi-days' },
-        h('div', { class: 'bill-wi-days-h' }, h('h3', { class: 'bill-wi-h', text: 'Day by day' }),
+      children.push(h('section', { class: 'card bill-wi-days' },
+        h('div', { class: 'bill-wi-days-h' }, h('h2', { class: 'bill-wi-h', text: 'Day by day' }),
           h('span', { class: 'bill-wi-sub', text: 'Amber with your switches' })),
         h('div', { class: 'bill-wi-row is-head', 'aria-hidden': 'true' },
           h('span', { text: 'Day' }), h('span', { text: 'GloBird' }), h('span', { text: 'Amber' })),
@@ -1051,32 +1056,92 @@
 
       const notes = Array.isArray(res.assumptions) ? res.assumptions : [];
       if (notes.length) {
-        children.push(h('div', { class: 'bill-wi-how' },
-          h('b', { text: 'How this is worked out' }),
-          ...notes.map((n) => h('span', { text: n })),
-          t.skipped_days > 0 ? h('span', { text: `${plural(t.skipped_days, 'day', 'days')} in this period left out for missing Amber prices.` }) : null));
+        const how = h('details', { class: 'card bill-wi-how', open: state.how ? true : null },
+          h('summary', { text: 'How this is worked out' }),
+          ...notes.map((n) => h('p', { text: n })),
+          t.skipped_days > 0 ? h('p', { text: `${plural(t.skipped_days, 'day', 'days')} in this period left out for missing Amber prices.` }) : null);
+        // Rebuilding the page on every switch must not shut the disclosure again.
+        how.addEventListener('toggle', () => { state.how = how.open; });
+        children.push(how);
       }
-      body.replaceChildren(...children.filter(Boolean));
+      node.replaceChildren(...children.filter(Boolean));
     }
     render();
 
-    const first = figures();
-    const diff = first.shifted - first.t.globird_dollars;
     /** Add a late period; the chips keep their fixed order and the open period stays selected. */
     function addPeriod(p) {
       if (!usableWhatif(p.res) || list.some((x) => x.key === p.key)) return;
       list = list.concat(p).sort((a, b) => ORDER.indexOf(a.key) - ORDER.indexOf(b.key));
       render();
     }
-    return {
-      addPeriod,
-      title: 'Would Amber have been cheaper?',
-      summary: `${plural(first.t.days, 'day', 'days')} covered`,
-      fig: `${diff > 0.0049 ? '+' : ''}${amt(diff)}`,
-      figClass: diff < -0.0049 ? 'is-good' : diff > 0.0049 ? 'is-bad' : '',
-      collapse: true,
-      body,
-    };
+    return { node, addPeriod };
+  }
+
+  /** The short answer for the summary card: { less, dollars, days, note }, from the first usable what-if period. */
+  function whatifAnswer(p) {
+    const t = p.res.totals;
+    const d = t.amber_dollars - t.globird_dollars;
+    return { less: d < 0, dollars: Math.abs(d), days: t.days, note: `as you used it, ${plural(t.days, 'day', 'days')}${p.key === 'bill' ? '' : `, ${p.label.toLowerCase()}`}` };
+  }
+
+  /** The same, from the plain "What would Amber cost?" comparison (no what-if). */
+  function amberAnswer(amber) {
+    const t = amber && amber.configured && amber.totals;
+    if (!t || !(t.days > 0) || !num(t.difference_dollars)) return null;
+    const d = Number(t.difference_dollars);
+    return { less: d < 0, dollars: Math.abs(d), days: t.days, note: `${plural(t.days, 'day', 'days')} with Amber prices` };
+  }
+
+  /** The Bill page's summary card for the answer; it opens #bill/amber. */
+  function amberCard(answer, href) {
+    return h('a', { class: 'card bill-tile', href },
+      h('h3', { text: 'Would Amber be cheaper?' }),
+      h('p', { class: 'bill-tile-fig fig', text: `${answer.less ? 'Yes' : 'No'}, ${whole(answer.dollars)}` }),
+      h('p', { class: 'bill-tile-s', text: `${answer.less ? '' : 'more, '}${answer.note}. Details ›` }));
+  }
+
+  /**
+   * Fetch the Amber answers in the order the page needs them: the bill's own period first, the
+   * other chips afterwards (only when `o.more`), the plain comparison when the what-if has nothing.
+   * `o.show({ periods, amber })` is called once with the first answer, `o.later(period)` for each
+   * further period. `periods` is the usable what-if periods, or null.
+   */
+  async function loadAmber(bill, today, late, o) {
+    const past = isPast(bill);
+    const last = bill.to < today ? bill.to : today;
+    const yesterday = addDays(today, -1);
+    // A finished bill is judged over its own dates only; the rolling windows are about today.
+    const periods = [
+      { key: 'bill', label: past ? pastName(bill) : 'This bill', when: past ? `in the ${monthLong(bill.to)} bill` : 'this bill', from: bill.from, to: last },
+      ...(past ? [] : [
+        { key: 'd30', label: 'Last 30 days', when: 'over the last 30 days', from: addDays(today, -30), to: yesterday },
+        // A 90-day answer is only worth a chip when the stored prices cover most of it.
+        { key: 'd90', label: 'Last 90 days', when: 'over the last 90 days', from: addDays(today, -90), to: yesterday, enough: 60 },
+      ]),
+    ];
+    const get = (p) => late.whatif(p.from, p.to).then((res) => ({
+      key: p.key, label: p.label, when: p.when, res: p.enough && !(res && res.totals && res.totals.days >= p.enough) ? null : res,
+    }));
+    const first = await get(periods[0]);
+    if (!alive) return;
+    if (usableWhatif(first.res)) {
+      o.show({ periods: [first], amber: null });
+      if (!o.more) return;
+      for (const p of periods.slice(1)) {
+        const got = await get(p);
+        if (!alive) return;
+        o.later(got);
+      }
+      return;
+    }
+    // The bill period has no usable answer: look at the other periods and the plain comparison.
+    const [rest, amber] = await Promise.all([
+      Promise.all(periods.slice(1).map(get)),
+      late.amber(bill.from, last),
+    ]);
+    if (!alive) return;
+    const usable = [first, ...rest].filter((p) => usableWhatif(p.res));
+    o.show({ periods: usable.length ? usable : null, amber });
   }
 
   /* ---------------------------------------------------------------- 7. past bills */
@@ -1151,29 +1216,17 @@
     };
   }
 
-  /* ---------------------------------------------------------------- 8. tiles: cars and the free window */
+  /* ---------------------------------------------------------------- 8. free window tile */
 
-  function tiles(bill) {
-    const out = [];
-    const c = bill.cars;
-    if (c && num(c.sessions) && c.sessions > 0 && num(c.kwh)) {
-      const self = num(c.self_kwh) && c.kwh > 0 ? Math.round((c.self_kwh / c.kwh) * 100) : null;
-      const icon = svg('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.6, 'aria-hidden': 'true' });
-      icon.append(svg('path', { d: 'M4 16v-4l2-5h12l2 5v4z' }), svg('circle', { cx: 7.5, cy: 16.5, r: 1.5 }), svg('circle', { cx: 16.5, cy: 16.5, r: 1.5 }));
-      out.push(h('a', { class: 'card bill-tile', href: '#cars' },
-        h('h3', {}, icon, 'Cars'),
-        h('p', { class: 'bill-tile-fig fig', text: num(c.cost_dollars) ? amt(c.cost_dollars) : SD.fmt.kwh(c.kwh, 0) }),
-        h('p', { class: 'bill-tile-s', text: `${plural(c.sessions, 'session', 'sessions')}, ${SD.fmt.kwh(c.kwh, 0)}${self != null && self > 0 ? `. ${self}% came from your own solar and battery.` : '.'}` })));
-    }
+  /** What the free window saved; null when the plan has none. The Amber card joins it in the same row. */
+  function freeTile(bill) {
     const s = bill.so_far;
-    if (num(s.free_value_dollars)) {
-      const free = (s.bands || []).find((b) => b.band === 'free');
-      out.push(h('div', { class: 'card bill-tile' },
-        h('h3', {}, h('span', { class: 'bill-sw is-free', 'aria-hidden': 'true' }), 'Free window'),
-        h('p', { class: 'bill-tile-fig fig', text: SD.fmt.dollars(s.free_value_dollars) }),
-        h('p', { class: 'bill-tile-s', text: free && num(free.kwh) ? `${SD.fmt.kwh(free.kwh, 1)} at shoulder price` : 'What the free power would have cost' })));
-    }
-    return out.length ? h('div', { class: `bill-tiles${out.length === 1 ? ' is-one' : ''}` }, out) : null;
+    if (!num(s.free_value_dollars)) return null;
+    const free = (s.bands || []).find((b) => b.band === 'free');
+    return h('div', { class: 'card bill-tile' },
+      h('h3', {}, h('span', { class: 'bill-sw is-free', 'aria-hidden': 'true' }), 'Free window'),
+      h('p', { class: 'bill-tile-fig fig', text: SD.fmt.dollars(s.free_value_dollars) }),
+      h('p', { class: 'bill-tile-s', text: free && num(free.kwh) ? `${SD.fmt.kwh(free.kwh, 1)} at shoulder price` : 'What the free power would have cost' }));
   }
 
   /* ---------------------------------------------------------------- 10. how this is worked out */
@@ -1260,19 +1313,24 @@
     const right = h('div', { class: 'bill-column bill-column-r' });
     grid.append(left, right);
 
-    // The Amber panel's place: a small loading card that is swapped for the panel (or removed).
+    // The Amber card's place: a small loading card that is swapped for the answer (or removed).
+    // The card is only the summary; the whole what-if lives on #bill/amber.
     let slot = SD.caps.prices && bill.days_elapsed > 0 && bill.so_far
-      ? h('section', { class: 'card bill-panel bill-slot', 'aria-busy': 'true' },
-        h('p', { class: 'muted bill-slot-line', role: 'status', text: 'Loading the Amber comparison' }))
+      ? h('section', { class: 'card bill-tile bill-slot', 'aria-busy': 'true' },
+        h('p', { class: 'muted bill-slot-line', role: 'status', text: 'Checking Amber' }))
       : null;
     let side = null;
-    function fillAmber(spec) {
+    function fillAmber(answer) {
       if (!slot || !alive) return;
-      const el = spec ? safe(() => makePanel(ctx, Object.assign({ key: 'amber', area: '' }, spec))) : null;
-      if (el) slot.replaceWith(el); else slot.remove();
+      const href = `#bill/amber${isPast(bill) ? `?date=${bill.to}` : ''}`;
+      const card = answer ? safe(() => amberCard(answer, href)) : null;
+      if (card) slot.replaceWith(card); else slot.remove();
       slot = null;
-      if (side && !side.children.length) side.remove();
-      ctx.apply();
+      if (side) {
+        const kids = side.children.length;
+        if (!kids) side.remove();
+        else side.classList.toggle('is-one', kids === 1);
+      }
     }
 
     if (bill.days_elapsed > 0 && bill.so_far) {
@@ -1281,10 +1339,8 @@
         if (!built) return null;
         return safe(() => makePanel(ctx, Object.assign({ key, area }, built)));
       };
-      side = h('div', { class: 'bill-side a-side' },
-        safe(() => tiles(bill)),
-        slot,
-        null);
+      const free = safe(() => freeTile(bill));
+      side = h('div', { class: `bill-tiles a-side${free && slot ? '' : ' is-one'}` }, free, slot);
       const breakdown = panel('break', 'a-break', () => breakdownPanel(bill, tariff));
       if (breakdown) left.append(breakdown);
       right.append(...[
@@ -1305,41 +1361,12 @@
 
     // ---- after first paint ----
     const last = bill.to < today ? bill.to : today;
-    const yesterday = addDays(today, -1);
     if (late.compare) late.compare(bill.from, last).then((c) => { if (alive) attachCheck(c); });
-    if (slot) loadAmber();
-
-    /** Fill the Amber slot: the selected what-if period first, the other chips afterwards. */
-    async function loadAmber() {
-      const past = isPast(bill);
-      // A finished bill is judged over its own dates only; the rolling windows are about today.
-      const periods = [
-        { key: 'bill', label: past ? pastName(bill) : 'This bill so far', from: bill.from, to: last },
-        ...(past ? [] : [
-          { key: 'd30', label: 'Last 30 days', from: addDays(today, -30), to: yesterday },
-          // A 90-day answer is only worth a chip when the stored prices cover most of it.
-          { key: 'd90', label: 'Last 90 days', from: addDays(today, -90), to: yesterday, enough: 60 },
-        ]),
-      ];
-      const get = (p) => late.whatif(p.from, p.to).then((res) => ({
-        key: p.key, label: p.label, res: p.enough && !(res && res.totals && res.totals.days >= p.enough) ? null : res,
-      }));
-      const firstPeriod = await get(periods[0]);
-      if (!alive) return;
-      const spec = usableWhatif(firstPeriod.res) ? safe(() => whatifPanel([firstPeriod])) : null;
-      if (spec) {
-        fillAmber(spec);
-        for (const p of periods.slice(1)) {
-          const got = await get(p);
-          if (!alive) return;
-          safe(() => spec.addPeriod(got));
-        }
-        return;
-      }
-      // The bill period has no usable answer: look at the other periods and the plain comparison.
-      const [rest, amber] = await Promise.all([Promise.all(periods.slice(1).map(get)), late.amber(bill.from, last)]);
-      if (!alive) return;
-      fillAmber(safe(() => whatifPanel([firstPeriod, ...rest])) || safe(() => amberPanel(amber)));
+    if (slot) {
+      loadAmber(bill, today, late, {
+        more: false,
+        show: ({ periods, amber }) => fillAmber(periods ? whatifAnswer(periods[0]) : amberAnswer(amber)),
+      }).catch((err) => { console.error(err); fillAmber(null); });
     }
   }
 
@@ -1349,20 +1376,90 @@
     return date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
   }
 
+  /** /api/bill/current for `date` (null: the live bill). A date the server refuses (in the future) opens `home` instead. */
+  function loadBill(date, home) {
+    return SD.fetchJSON(date ? `/api/bill/current?date=${date}` : '/api/bill/current').catch((err) => {
+      if (err && err.status === 404) return { missing: true };
+      if (date && err && err.status === 400) { SD.go(home); return { redirected: true }; }
+      throw err;
+    });
+  }
+
+  /** The late fetches, each turned into null on failure (see build()). */
+  const lateFetchers = () => ({
+    // No retailer meter source: nothing to check against, so skip the call (and the trust badge).
+    compare: SD.caps.meter ? (from, to) => quiet(`/api/globird/compare?from=${from}&to=${to}`) : null,
+    whatif: (from, to) => quiet(`/api/bill/amber-whatif?from=${from}&to=${to}`),
+    // {configured: false} without [amber], and the plain comparison stays out.
+    amber: (from, to) => quiet(`/api/bill/compare-dynamic?from=${from}&to=${to}`),
+  });
+
+  /* ---------------------------------------------------------------- the #bill/amber page */
+
+  /**
+   * The full Amber what-if on its own page. The bill loads first (for its dates), the Amber data
+   * after; the plain "What would Amber cost?" table stands in when the what-if has nothing.
+   * Without a price source there is nothing to show, only a way back.
+   */
+  function mountAmber(el, date) {
+    const back = `#bill${date ? `?date=${date}` : ''}`;
+    const root = h('div', { class: 'bill-amber-page' },
+      h('a', { class: 'bill-link bill-amber-back', href: back, text: '‹ Bill' }));
+    el.append(root);
+    window.scrollTo(0, 0);
+    const empty = (title, text) => root.append(
+      h('h1', { class: 'bill-wi-head', text: 'Would Amber be cheaper?' }),
+      emptyState(title, text, h('a', { class: 'card-link', href: back, text: 'Back to the bill' })));
+    if (!SD.caps.prices) {
+      empty('No price source yet', 'This comparison needs Amber prices stored for the days it covers.');
+      return;
+    }
+    const loading = h('p', { class: 'muted bill-loading', role: 'status', text: 'Loading the Amber comparison' });
+    root.append(loading);
+
+    loadBill(date, 'bill/amber').then(async (bill) => {
+      if (!alive || bill.redirected) return;
+      loading.remove();
+      if (bill.missing || !bill.configured || !(bill.days_elapsed > 0) || !bill.so_far) {
+        empty('Nothing to compare yet', 'Once the bill has a finished day, this page shows what Amber would have cost.');
+        return;
+      }
+      const slot = h('p', { class: 'muted bill-loading', role: 'status', text: 'Loading the Amber comparison' });
+      root.append(slot);
+      let view = null;
+      await loadAmber(bill, SD.local().date, lateFetchers(), {
+        more: true,
+        show: ({ periods, amber }) => {
+          view = periods ? safe(() => whatifView(periods)) : null;
+          if (view) { slot.replaceWith(view.node); return; }
+          const spec = safe(() => amberPanel(amber));
+          if (spec) {
+            slot.replaceWith(h('div', {},
+              h('h1', { class: 'bill-wi-head', text: spec.title }),
+              h('section', { class: 'card bill-panel' }, spec.body)));
+            return;
+          }
+          slot.remove();
+          empty('No Amber comparison yet', 'No day in this bill has stored Amber prices, so there is nothing to compare.');
+        },
+        later: (p) => { if (view) safe(() => view.addPeriod(p)); },
+      });
+    }).catch((err) => {
+      if (!alive) return;
+      loading.remove();
+      empty('Could not load the comparison', err.message || 'Something went wrong.');
+    });
+  }
+
   SD.page('bill', {
-    // The router remounts this page when only the query changes, so `date` is read once here.
+    // The router remounts this page when only the query or sub-route changes, so `date` is read once here.
     mount(el, rest, query) {
       alive = true;
       desktopQuery = window.matchMedia('(min-width: 760px)');
-      el.append(h('p', { class: 'muted bill-loading', role: 'status', text: 'Loading your bill' }));
       const date = dateOf(query);
-
-      const load = () => SD.fetchJSON(date ? `/api/bill/current?date=${date}` : '/api/bill/current').catch((err) => {
-        if (err && err.status === 404) return { missing: true };
-        // A date the server refuses (in the future) opens this bill instead.
-        if (date && err && err.status === 400) { openPeriod(null); return { redirected: true }; }
-        throw err;
-      });
+      if (rest === 'amber') { mountAmber(el, date); return; }
+      el.append(h('p', { class: 'muted bill-loading', role: 'status', text: 'Loading your bill' }));
+      const load = () => loadBill(date, 'bill');
 
       const tariffPromise = SD.tariff.get().catch(() => null);
       load().then(async (bill) => {
@@ -1384,13 +1481,7 @@
         // The tariff is quick and the bill needs it; everything else loads after first paint.
         const tariff = await tariffPromise;
         if (!alive) return;
-        build(el, bill, tariff, {
-          // No retailer meter source: nothing to check against, so skip the call (and the trust badge).
-          compare: SD.caps.meter ? (from, to) => quiet(`/api/globird/compare?from=${from}&to=${to}`) : null,
-          whatif: (from, to) => quiet(`/api/bill/amber-whatif?from=${from}&to=${to}`),
-          // {configured: false} without [amber], and the panel stays out.
-          amber: (from, to) => quiet(`/api/bill/compare-dynamic?from=${from}&to=${to}`),
-        });
+        build(el, bill, tariff, lateFetchers());
       }).catch((err) => {
         if (!alive) return;
         el.replaceChildren(
