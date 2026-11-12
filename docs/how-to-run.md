@@ -605,13 +605,106 @@ again; `serve` keeps running.
 
 ## Home Assistant (optional)
 
+`[home_assistant]` has two independent halves, and either or both may be used:
+**reading** entities from Home Assistant (the `home-assistant` source, below)
+and **publishing** solar-dash's readings to it over MQTT (the
+`home-assistant-mqtt` sink, further down). solar-dash never controls anything
+in Home Assistant: it makes no service calls and writes no states.
+
+### Reading entities from Home Assistant (the source)
+
+solar-dash can read the states of chosen Home Assistant entities over Home
+Assistant's WebSocket API and keep them in its database. An entity can also
+stand in for a source the home does not have: for example a home without
+Modbus can map `sensor.solar_power` to the `pv_w` metric.
+
+**Read-only guarantee.** The only messages solar-dash sends are the login
+(`auth`), one `subscribe_trigger` (a state trigger on your listed entities) and
+one `get_states`. It never sends `call_service` or anything else that changes
+Home Assistant (a test checks this). Anything that came from Home Assistant is
+also never published back to it by the MQTT sink.
+
+1. In Home Assistant open your profile (click your name at the bottom of the
+   sidebar), go to the **Security** tab, and under **Long-lived access tokens**
+   choose **Create token**. Copy it at once: it is shown only once. A token has
+   the full rights of your user, so keep `config.toml` private (mode 600). The
+   token is hidden in debug output and never logged.
+2. Add the table and your entities, then restart `serve`:
+
+   ```toml
+   [home_assistant.source]
+   url = "http://homeassistant.local:8123"   # https:// for TLS
+   token = "eyJhbGciOi..."
+
+   [[home_assistant.source.entity]]
+   entity_id = "sensor.solar_power"
+   metric = "pv_w"          # optional: one of the dashboard's metric names
+   name = "Solar"           # optional: a friendlier name
+   # unit = "W"             # optional: when Home Assistant reports no unit
+
+   [[home_assistant.source.entity]]
+   entity_id = "sensor.outdoor_temperature"
+   ```
+
+   `url` is turned into `ws://.../api/websocket` (`wss://` for `https://`).
+   With no `mqtt_host` in `[home_assistant]` the MQTT sink is off, so a
+   source-only setup is just the table above. Mistakes (empty token, bad
+   `entity_id`, a metric given to two entities, MQTT settings without
+   `mqtt_host`) stop `serve` at startup with a message that says what to fix.
+3. `metric` is one of: `pv_w`, `pv_dc_w`, `load_w`, `grid_w`, `battery_w`,
+   `soc_pct`, `pv_day_wh`, `grid_import_day_wh`, `grid_export_day_wh`,
+   `load_day_wh`, `battery_charge_day_wh`, `battery_discharge_day_wh`,
+   `self_consumed_day_wh`. The value is converted to the metric's unit (W, Wh
+   or %) from W/kW/MW and Wh/kWh/MWh. A unit that does not fit (kWh for a
+   power metric) or none at all means the value is not stored as that metric
+   (it is still stored as the entity's own reading) and one warning is logged;
+   set `unit` on the entity if Home Assistant reports none. A `*_day_wh`
+   metric is a counter that restarts from 0 at local midnight, so map only an
+   entity that does that (a daily `utility_meter`), not a lifetime total.
+
+**How it runs.** On start solar-dash logs in, subscribes to changes of the
+listed entities and asks once for their current states. If Home Assistant is
+down it retries with a growing pause (up to 10 minutes), logs the first
+failure of an outage once, and never holds up the dashboard. The spoke shows
+as `home-assistant` in `/api/spokes` and in the `sources` of `/api/capabilities`.
+
+**What gets stored.**
+
+- `ha_reading (entity_id, ts, value, unit)`: every numeric state, as Home
+  Assistant reported it, with at most one row per entity per 15 seconds (a
+  faster change is kept in memory and written when the 15 s are up, so the
+  newest value is never lost). `unknown`, `unavailable` and other text states
+  are not stored, but the last state text is shown by `/api/ha/entities`.
+- `metric_reading` with source `home-assistant`, for entities that have a
+  `metric`, converted to the metric's unit.
+
+**Which source the app uses.** Today the dashboard's pages read the
+iSolarCloud copy of a metric, the live Modbus samples and, for a day's energy,
+the `[sources] daily_energy` rule (ids `sungrow-modbus` and `isolarcloud`
+only). Home Assistant is not an accepted id there yet: putting `home-assistant`
+in `daily_energy` is an error that says so. The mapped readings are stored
+under the `home-assistant` source name, ready for the pages to prefer them per
+metric in a later change; until then they are visible through the API below.
+
+**API** (same login as the other `/api` routes):
+
+- `GET /api/ha/entities`: `{"configured", "connected", "entities": [{"entity_id",
+  "name", "metric", "state", "value", "unit", "last_updated"}]}`. Before the
+  first connection the values are the last stored ones.
+- `GET /api/ha/history?entity_id=sensor.solar_power&from=<unix>&to=<unix>`:
+  `{"entity_id", "unit", "step", "points": [{"ts", "value"}]}`, at most 31 days.
+  Ranges over about 12 hours are averaged into buckets (at most about 3000
+  points); `step=<seconds>` chooses the bucket length.
+
+### Publishing to Home Assistant over MQTT (the sink)
+
 solar-dash can publish its live readings to [Home Assistant](https://www.home-assistant.io/)
 over MQTT, using Home Assistant's MQTT discovery, so the sensors appear on
 their own with no YAML. It only **publishes**: it never subscribes to a
 command topic and never controls the inverter or anything else. The one topic
 it listens to is Home Assistant's own birth message (`homeassistant/status`),
 so it can send the sensor configs again when Home Assistant restarts. Without
-a `[home_assistant]` section nothing is published and no task runs.
+`mqtt_host` in `[home_assistant]` nothing is published and no MQTT task runs.
 
 1. In Home Assistant, set up the MQTT integration against a broker (such as
    Mosquitto). The broker can be the same one TeslaMate uses: just repeat its
@@ -996,7 +1089,7 @@ curl -b cookies.txt -X PUT -H 'Content-Type: text/csv' --data-binary @bills.csv 
 
 ## Spokes and source rules
 
-Inside, each outside system the dashboard talks to is a **spoke**: a background job that only runs when its config section is present and that only logs its own errors, so one failing spoke never stops the others or the dashboard. The ids are `sungrow-modbus` (`[modbus]`), `isolarcloud` (`[isolarcloud]`, optional), `globird-portal` (`[globird]`), `teslamate-mqtt` (`[teslamate]`), `teslamate-history` (`database_url` in `[teslamate]`), `amber` (`[amber]`) and `backups` (always on; they end at once when `backup_keep = 0`). At startup the log says which are on (`spokes: sungrow-modbus, isolarcloud, ...`), and `GET /api/spokes` (same login as the other `/api` routes) returns `{"spokes": [{"id", "kind", "capabilities", "enabled"}]}`.
+Inside, each outside system the dashboard talks to is a **spoke**: a background job that only runs when its config section is present and that only logs its own errors, so one failing spoke never stops the others or the dashboard. The ids are `sungrow-modbus` (`[modbus]`), `isolarcloud` (`[isolarcloud]`, optional), `globird-portal` (`[globird]`), `teslamate-mqtt` (`[teslamate]`), `teslamate-history` (`database_url` in `[teslamate]`), `amber` (`[amber]`), `home-assistant` (`[home_assistant.source]`), `home-assistant-mqtt` (`mqtt_host` in `[home_assistant]`) and `backups` (always on; they end at once when `backup_keep = 0`). At startup the log says which are on (`spokes: sungrow-modbus, isolarcloud, ...`), and `GET /api/spokes` (same login as the other `/api` routes) returns `{"spokes": [{"id", "kind", "capabilities", "enabled"}]}`.
 
 When two sources can answer the same question, the optional `[sources]` section says which one wins:
 

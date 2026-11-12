@@ -210,6 +210,10 @@ mod tests {
         let err = SourceRules::from_config(&sources(Some(&["amber"]))).unwrap_err();
         assert!(format!("{err:#}").contains("does not supply daily energy"));
 
+        // Home Assistant readings never decide a day's energy totals.
+        let err = SourceRules::from_config(&sources(Some(&["home-assistant"]))).unwrap_err();
+        assert!(format!("{err:#}").contains("does not supply daily energy"));
+
         assert!(SourceRules::from_config(&sources(Some(&[]))).is_err());
         assert!(SourceRules::from_config(&sources(Some(&["isolarcloud", "isolarcloud"]))).is_err());
     }

@@ -21,9 +21,9 @@
 //! without a broker.
 //!
 //! Rule from the design: a metric that itself came *from* Home Assistant
-//! must never be published back to it. There is no Home Assistant source
-//! yet, so nothing needs skipping today; [`Feed::on_event`] is the one place
-//! where such a source's readings would be filtered out.
+//! (the `home-assistant` source, see `ha_source`) must never be published
+//! back to it. [`Feed::on_event`] is the one place where such readings are
+//! filtered out, and it skips them before anything else.
 
 use std::time::Duration;
 
@@ -570,7 +570,12 @@ impl Feed {
     /// What to send for one hub event.
     pub fn on_event(&mut self, event: &HubEvent) -> Vec<Message> {
         // A source that came from Home Assistant itself must be skipped here
-        // so its values are never sent back. (None exists yet.)
+        // so its values are never sent back.
+        if let HubEvent::ReadingsStored { source, .. } = event
+            && crate::ha_source::is_home_assistant_source(source)
+        {
+            return Vec::new();
+        }
         match event {
             HubEvent::SampleArrived(sample) => {
                 let due = match self.last_state_ts {
@@ -625,7 +630,7 @@ fn mqtt_options(config: &HomeAssistant, status_topic: &str) -> MqttOptions {
     // with one id kick each other off a shared broker.
     let mut options = MqttOptions::new(
         "solar-dash-home-assistant",
-        &config.mqtt_host,
+        config.mqtt_host.as_deref().unwrap_or_default(),
         config.mqtt_port,
     );
     options.set_keep_alive(KEEP_ALIVE);
@@ -671,7 +676,10 @@ where
     let mut failing = false;
 
     tokio::pin!(shutdown);
-    info!(broker = %config.mqtt_host, "Home Assistant MQTT started");
+    info!(
+        broker = config.mqtt_host.as_deref().unwrap_or_default(),
+        "Home Assistant MQTT started"
+    );
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
@@ -1225,5 +1233,30 @@ mod tests {
         assert!(feed.take_today_request());
         feed.on_ha_status("homeassistant/status", b"online");
         assert!(feed.take_today_request());
+    }
+
+    /// The design rule: what came from Home Assistant is never sent back.
+    #[test]
+    fn readings_from_the_home_assistant_source_are_never_republished() {
+        let mut feed = Feed::new(config(), Offer::default());
+        feed.connect_messages();
+        // A request pending from connecting is taken first, so the check
+        // below sees only what the events cause.
+        assert!(feed.take_today_request());
+
+        let from_ha = HubEvent::ReadingsStored {
+            source: crate::ha_source::SOURCE_NAME.to_string(),
+            metrics: vec![crate::metric::Metric::PvW, crate::metric::Metric::LoadW],
+            from: 100,
+            to: 200,
+        };
+        assert!(feed.on_event(&from_ha).is_empty());
+        assert!(!feed.take_today_request());
+
+        // Nothing it could publish mentions an entity or the source either:
+        // the live state is built only from a Modbus sample.
+        let live = feed.on_event(&HubEvent::SampleArrived(sample(1000, 0.0)));
+        assert_eq!(live.len(), 1);
+        assert!(!live[0].payload.contains("home-assistant"));
     }
 }

@@ -6,6 +6,7 @@ mod amber;
 mod backups;
 mod globird_portal;
 mod ha_mqtt;
+mod ha_source;
 mod isolarcloud;
 mod sungrow_modbus;
 mod teslamate_history;
@@ -13,18 +14,20 @@ mod teslamate_mqtt;
 
 use super::{Spoke, SpokeMeta};
 use crate::config::Config;
+use crate::ha_source::HaView;
 use crate::isolar::client::Client;
 use crate::offsite::Offsite;
 use crate::web::AppState;
 
 /// Every spoke this build has, in the order they are listed at startup.
-pub const ALL: [SpokeMeta; 8] = [
+pub const ALL: [SpokeMeta; 9] = [
     sungrow_modbus::META,
     isolarcloud::META,
     globird_portal::META,
     teslamate_mqtt::META,
     teslamate_history::META,
     amber::META,
+    ha_source::META,
     ha_mqtt::META,
     backups::META,
 ];
@@ -71,12 +74,22 @@ pub fn build(
     if let Some(amber) = config.amber.clone() {
         spokes.push(Box::new(amber::AmberPrices::new(amber)));
     }
+    // The two halves of `[home_assistant]` are separate spokes: reading from
+    // Home Assistant (the source) and publishing to it (the MQTT sink).
     if let Some(home_assistant) = config.home_assistant.clone() {
-        spokes.push(Box::new(ha_mqtt::HomeAssistantMqtt::new(
-            home_assistant,
-            state,
-            config.amber.is_some(),
-        )));
+        if let Some(source) = home_assistant.source.clone() {
+            let view = state
+                .ha_view()
+                .unwrap_or_else(|| HaView::new(&source.entity));
+            spokes.push(Box::new(ha_source::HomeAssistantSource::new(source, view)));
+        }
+        if home_assistant.mqtt_enabled() {
+            spokes.push(Box::new(ha_mqtt::HomeAssistantMqtt::new(
+                home_assistant,
+                state,
+                config.amber.is_some(),
+            )));
+        }
     }
     spokes.push(Box::new(backups::Backups::new(
         config.database.backup_dir(),
@@ -103,6 +116,7 @@ mod tests {
                 "teslamate-mqtt",
                 "teslamate-history",
                 "amber",
+                "home-assistant",
                 "home-assistant-mqtt",
                 "backups"
             ]
@@ -153,5 +167,42 @@ mod tests {
         let spokes = build(&config, &state, None, None);
         let ids: Vec<_> = spokes.iter().map(|spoke| spoke.id()).collect();
         assert_eq!(ids, ["home-assistant-mqtt", "backups"]);
+    }
+
+    async fn ids_for(config: &str) -> Vec<&'static str> {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let hash = crate::web::hash_password("pw").unwrap();
+        let state = AppState::new(
+            pool,
+            0,
+            chrono_tz::Australia::Adelaide,
+            &hash,
+            axum_extra::extract::cookie::Key::generate(),
+        )
+        .unwrap();
+        let config: Config =
+            toml::from_str(&format!("[site]\ntimezone = \"Australia/Perth\"\n{config}")).unwrap();
+        build(&config, &state, None, None)
+            .iter()
+            .map(|spoke| spoke.id())
+            .collect()
+    }
+
+    const SOURCE: &str = "[home_assistant.source]\nurl = \"http://ha:8123\"\ntoken = \"t\"\n\
+        [[home_assistant.source.entity]]\nentity_id = \"sensor.x\"\n";
+
+    #[tokio::test]
+    async fn home_assistant_source_and_sink_start_independently() {
+        // Source only: no MQTT sink.
+        assert_eq!(ids_for(SOURCE).await, ["home-assistant", "backups"]);
+        // Both.
+        let both = format!("[home_assistant]\nmqtt_host = \"b\"\n{SOURCE}");
+        assert_eq!(
+            ids_for(&both).await,
+            ["home-assistant", "home-assistant-mqtt", "backups"]
+        );
     }
 }

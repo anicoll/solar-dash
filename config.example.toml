@@ -132,7 +132,7 @@ path = "data/solar.db"
 # Optional: publish live readings, today's energy and cost (and, with [amber],
 # the current prices) to Home Assistant over MQTT discovery
 # (publish only: solar-dash never listens for commands). The broker can be
-# the same one as [teslamate]'s. Without this section nothing is published.
+# the same one as [teslamate]'s. Without mqtt_host nothing is published.
 # See "Home Assistant" in docs/how-to-run.md.
 # [home_assistant]
 # mqtt_host = "192.168.1.70"
@@ -147,6 +147,23 @@ path = "data/solar.db"
 # device_name = "solar-dash"
 # At most one state message per this many seconds.
 # min_interval_secs = 15
+#
+# Optional: READ entities from Home Assistant over its WebSocket API (read-only:
+# no service calls, no state writes). Works without the MQTT settings above.
+# Make a long-lived access token on your Home Assistant profile (Security tab);
+# it is a secret, so keep this file's mode at 600. `metric` (optional) lets an
+# entity stand in for a source you do not have: one of pv_w, pv_dc_w, load_w,
+# grid_w, battery_w, soc_pct, pv_day_wh, grid_import_day_wh, grid_export_day_wh,
+# load_day_wh, battery_charge_day_wh, battery_discharge_day_wh,
+# self_consumed_day_wh.
+# [home_assistant.source]
+# url = "http://homeassistant.local:8123"
+# token = "your-long-lived-access-token"
+# [[home_assistant.source.entity]]
+# entity_id = "sensor.solar_power"
+# metric = "pv_w"
+# name = "Solar"
+# unit = "W"   # only if Home Assistant reports no unit
 
 # Optional: your GloBird Energy customer portal login, used by `globird-probe`
 # and by `serve`, which keeps GloBird's daily cost and usage in the database
