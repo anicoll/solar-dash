@@ -307,10 +307,20 @@
     return `You're selling ${kwOf(sellingW)} for 0c${until == null ? '' : ` until ${SD.fmt.minute(until)}`}. Good time for the dishwasher or a load of washing.`;
   }
 
-  function carLine(car) {
-    if (!isPlugged(car) || isCharging(car)) return null;
-    const state = car.charging_state === 'Complete' ? 'charge complete' : 'plugged in, not charging';
+  /** The car's charging power in watts, capped at the home load it is part of; 0 when not charging. */
+  function carWatts(car, sample) {
+    if (!isCharging(car) || car.charger_power_kw == null) return 0;
+    return Math.min(car.charger_power_kw * 1000, pos(sample && sample.load_w));
+  }
+
+  function carLine(car, carW) {
+    if (!isPlugged(car)) return null;
     const pct = car.battery_level_pct == null ? '' : ` · ${Math.round(car.battery_level_pct)}%`;
+    if (isCharging(car)) {
+      const at = carW >= FLOW_MIN_W ? ` at ${kwOf(carW)}` : '';
+      return h('p', { class: 'today-car is-charging' }, h('b', { text: carName(car) }), ` charging${at}${pct}`);
+    }
+    const state = car.charging_state === 'Complete' ? 'charge complete' : 'plugged in, not charging';
     return h('p', { class: 'today-car' }, h('b', { text: carName(car) }), ` ${state}${pct}`);
   }
 
@@ -408,15 +418,18 @@
         const bat = sample.battery_w;
         const grid = sample.grid_w;
         const nudge = nudgeText(sample);
+        // The inverter's home load includes the car: split it out so Home is the house alone.
+        const carW = carWatts(car, sample);
+        const homeSub = carW >= FLOW_MIN_W ? `+ ${kwOf(carW)} car` : null;
         fill(el,
           head,
           h('div', { class: 'today-figs is-four' },
             liveFig('Solar', kwOf(pos(sample.pv_w))),
-            liveFig('Home', kwOf(pos(sample.load_w))),
+            liveFig('Home', kwOf(pos(sample.load_w) - carW), homeSub),
             liveFig('Battery', sample.soc_pct == null ? kwOf(Math.abs(bat || 0)) : `${Math.round(sample.soc_pct)}%`,
               idle(bat) ? 'idle' : `${bat > 0 ? '+' : '-'}${kwOf(Math.abs(bat))}`, 'is-battery'),
             liveFig('Grid', idle(grid) ? '0 kW' : kwOf(Math.abs(grid)), idle(grid) ? 'idle' : grid < 0 ? 'selling' : 'buying')),
-          carLine(car),
+          carLine(car, carW),
           pullBlock(pull, sample),
           statusLine,
           nudge ? h('div', { class: 'today-nudge' }, nudgeIcon(), h('span', { text: nudge })) : null);
