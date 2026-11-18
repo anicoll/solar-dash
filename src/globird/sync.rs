@@ -22,8 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Days, LocalResult, Months, NaiveDate, NaiveTime, TimeDelta, TimeZone, Utc};
-use chrono_tz::Tz;
+use jiff::civil::{Date, Time};
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, ToSpan, ZonedDateTime};
 use sqlx::SqlitePool;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
@@ -45,9 +46,9 @@ const STARTUP_DELAY: Duration = Duration::from_secs(30);
 /// Pause before every portal call, to be polite to the portal.
 const CALL_PAUSE: Duration = Duration::from_secs(1);
 /// How long to wait before trying again when yesterday is still incomplete.
-const RETRY_AFTER: TimeDelta = TimeDelta::hours(2);
+const RETRY_AFTER: SignedDuration = SignedDuration::from_hours(2);
 /// Retries stop for the day once the next one would be after this local time.
-const RETRY_UNTIL: NaiveTime = NaiveTime::from_hms_opt(23, 0, 0).unwrap();
+const RETRY_UNTIL: Time = Time::constant(23, 0, 0, 0);
 /// A refresh starts this many days before the newest complete day.
 const RECENT_OVERLAP_DAYS: u64 = 7;
 /// How far back a refresh goes when nothing is stored yet.
@@ -67,30 +68,29 @@ fn done_job(service_id: &str) -> String {
 }
 
 /// A date as the `sync_state` cursor: midnight UTC of that date, as unix seconds.
-fn date_to_cursor(date: NaiveDate) -> i64 {
-    date.and_time(NaiveTime::MIN).and_utc().timestamp()
+fn date_to_cursor(date: Date) -> i64 {
+    crate::clock::local_ts(date.to_datetime(Time::midnight()), &TimeZone::UTC)
+        .expect("UTC has no daylight saving gaps")
 }
 
 /// The inverse of [`date_to_cursor`].
-fn cursor_to_date(cursor: i64) -> NaiveDate {
-    DateTime::from_timestamp(cursor, 0)
-        .expect("cursor out of range")
-        .date_naive()
+fn cursor_to_date(cursor: i64) -> Date {
+    crate::clock::local_date(cursor, &TimeZone::UTC)
 }
 
 /// The oldest day the backfill will ask for.
-fn backfill_floor(today: NaiveDate) -> NaiveDate {
+fn backfill_floor(today: Date) -> Date {
     today
-        .checked_sub_months(Months::new(BACKFILL_MONTHS))
+        .checked_sub(i64::from(BACKFILL_MONTHS).months())
         .unwrap_or(today)
 }
 
 /// The first day a refresh asks for: a week before the newest complete day, or
 /// a month back when nothing is stored. Never after `today`.
-fn recent_start(latest_complete: Option<NaiveDate>, today: NaiveDate) -> NaiveDate {
+fn recent_start(latest_complete: Option<Date>, today: Date) -> Date {
     let start = match latest_complete {
-        Some(date) => date - Days::new(RECENT_OVERLAP_DAYS),
-        None => today - Days::new(FIRST_RECENT_DAYS),
+        Some(date) => date - (RECENT_OVERLAP_DAYS as i64).days(),
+        None => today - (FIRST_RECENT_DAYS as i64).days(),
     };
     start.min(today)
 }
@@ -102,24 +102,21 @@ fn recent_start(latest_complete: Option<NaiveDate>, today: NaiveDate) -> NaiveDa
 /// The local time `time` on `date`. A time that does not exist that day (the
 /// hour skipped when the clocks go forward) moves an hour later, and one that
 /// happens twice (when they go back) means the first.
-fn local_at(tz: Tz, date: NaiveDate, time: NaiveTime) -> DateTime<Tz> {
-    let naive = date.and_time(time);
-    match tz.from_local_datetime(&naive) {
-        LocalResult::Single(t) => t,
-        LocalResult::Ambiguous(first, _second) => first,
-        LocalResult::None => tz
-            .from_local_datetime(&(naive + TimeDelta::hours(1)))
-            .earliest()
-            // Cannot happen with real zones; this only keeps the code total.
-            .unwrap_or_else(|| tz.from_utc_datetime(&naive)),
-    }
+fn local_at(tz: &TimeZone, date: Date, time: Time) -> ZonedDateTime {
+    let naive = date.to_datetime(time);
+    let ts = crate::clock::local_ts(naive, tz)
+        .or_else(|| crate::clock::local_ts(naive.checked_add(1.hour()).ok()?, tz))
+        // Cannot happen with real zones; this only keeps the code total.
+        .unwrap_or_else(|| crate::clock::local_ts(naive, &TimeZone::UTC).expect("UTC has no gaps"));
+    jiff::Timestamp::from_second(ts)
+        .expect("unix time within jiff's range")
+        .to_zoned_datetime(tz.clone())
 }
 
 /// The first `sync_time` strictly after `now`.
-pub(crate) fn next_daily(now: DateTime<Tz>, sync_time: NaiveTime) -> DateTime<Tz> {
-    let tz = now.timezone();
-    let today = local_at(tz, now.date_naive(), sync_time);
-    if today > now {
+pub(crate) fn next_daily(now: &ZonedDateTime, sync_time: Time) -> ZonedDateTime {
+    let today = local_at(now.time_zone(), now.date(), sync_time);
+    if today > *now {
         today
     } else {
         next_day(now, sync_time)
@@ -127,9 +124,9 @@ pub(crate) fn next_daily(now: DateTime<Tz>, sync_time: NaiveTime) -> DateTime<Tz
 }
 
 /// `sync_time` on the day after `now`'s local date.
-fn next_day(now: DateTime<Tz>, sync_time: NaiveTime) -> DateTime<Tz> {
-    let tomorrow = now.date_naive() + Days::new(1);
-    local_at(now.timezone(), tomorrow, sync_time)
+fn next_day(now: &ZonedDateTime, sync_time: Time) -> ZonedDateTime {
+    let tomorrow = now.date() + 1.day();
+    local_at(now.time_zone(), tomorrow, sync_time)
 }
 
 /// When the next run should start, after a run that ended at `now`.
@@ -138,13 +135,15 @@ fn next_day(now: DateTime<Tz>, sync_time: NaiveTime) -> DateTime<Tz> {
 /// hours from now, unless that is after 23:00 (or on another day), in which
 /// case it is the next `sync_time`. The 2 hours are real elapsed time, so on
 /// a day the clocks change the local time moves by 1 or 3 hours.
-pub fn next_run(now: DateTime<Tz>, sync_time: NaiveTime, yesterday_complete: bool) -> DateTime<Tz> {
+pub fn next_run(now: &ZonedDateTime, sync_time: Time, yesterday_complete: bool) -> ZonedDateTime {
     let daily = next_daily(now, sync_time);
     if yesterday_complete {
         return daily;
     }
-    let retry = now + RETRY_AFTER;
-    let retry_today = retry.date_naive() == now.date_naive() && retry.time() <= RETRY_UNTIL;
+    let retry = now
+        .checked_add(RETRY_AFTER)
+        .expect("a retry two hours ahead is within jiff's range");
+    let retry_today = retry.date() == now.date() && retry.time() <= RETRY_UNTIL;
     if retry_today { retry.min(daily) } else { daily }
 }
 
@@ -158,9 +157,9 @@ struct Summary {
     /// Services that were synced (electricity with a smart meter).
     services: usize,
     /// Days saved this run.
-    written: BTreeSet<NaiveDate>,
+    written: BTreeSet<Date>,
     /// The saved days that GloBird has not finished posting.
-    incomplete: BTreeSet<NaiveDate>,
+    incomplete: BTreeSet<Date>,
 }
 
 impl Summary {
@@ -175,12 +174,12 @@ impl Summary {
 
     /// The one-line summary. `newest_complete` is the newest complete day in
     /// the database, not only among this run's days.
-    fn describe(&self, newest_complete: Option<NaiveDate>) -> String {
+    fn describe(&self, newest_complete: Option<Date>) -> String {
         let newest = newest_complete.map_or("none".to_string(), |d| d.to_string());
         let incomplete = if self.incomplete.is_empty() {
             "none".to_string()
         } else {
-            let dates: Vec<String> = self.incomplete.iter().map(NaiveDate::to_string).collect();
+            let dates: Vec<String> = self.incomplete.iter().map(Date::to_string).collect();
             dates.join(", ")
         };
         format!(
@@ -252,7 +251,7 @@ async fn save_days(pool: &SqlitePool, days: &[DayRecord], summary: &mut Summary)
 async fn backfill(
     target: &Target<'_>,
     pool: &SqlitePool,
-    today: NaiveDate,
+    today: Date,
     summary: &mut Summary,
 ) -> Result<()> {
     let id = &target.service.id;
@@ -261,7 +260,7 @@ async fn backfill(
     }
     let floor = backfill_floor(today);
     let mut end = match db::get_cursor(pool, &oldest_job(id)).await? {
-        Some(cursor) => cursor_to_date(cursor) - Days::new(1),
+        Some(cursor) => cursor_to_date(cursor) - 1.day(),
         None => today,
     };
     info!(until = %end, "GloBird backfill started or resumed");
@@ -271,7 +270,7 @@ async fn backfill(
             info!("GloBird backfill finished: reached the {BACKFILL_MONTHS}-month limit");
             break;
         }
-        let from = (end - Days::new(MAX_WINDOW_DAYS - 1)).max(floor);
+        let from = (end - (MAX_WINDOW_DAYS as i64 - 1).days()).max(floor);
         let range = DateRange { from, to: end };
         let (cost, usage) = target.fetch(range).await?;
         if cost.is_empty() {
@@ -281,7 +280,7 @@ async fn backfill(
         save_days(pool, &group_days(&cost, &usage), summary).await?;
         db::set_cursor(pool, &oldest_job(id), date_to_cursor(from)).await?;
         debug!(%from, to = %end, "GloBird backfill window saved");
-        end = from - Days::new(1);
+        end = from - 1.day();
     }
     // `1` only has to exist; the row's presence is the marker.
     db::set_cursor(pool, &done_job(id), 1).await
@@ -291,7 +290,7 @@ async fn backfill(
 async fn refresh_recent(
     target: &Target<'_>,
     pool: &SqlitePool,
-    today: NaiveDate,
+    today: Date,
     summary: &mut Summary,
 ) -> Result<()> {
     let latest = db::latest_complete_globird_date(pool).await?;
@@ -324,10 +323,10 @@ async fn smart_meter_serial(client: &Client, service: &Service) -> Result<Option
 async fn sync_all(
     config: &Globird,
     pool: &SqlitePool,
-    tz: Tz,
+    tz: &TimeZone,
     summary: &mut Summary,
 ) -> Result<()> {
-    let today = Utc::now().with_timezone(&tz).date_naive();
+    let today = crate::clock::today(tz);
     // A new client for every run, so there are no old cookies to go stale.
     let client = Client::new(config.clone())?;
     client.login().await?;
@@ -372,7 +371,7 @@ enum Outcome {
 }
 
 /// Runs the sync once and logs how it went.
-async fn run_once(config: &Globird, pool: &SqlitePool, tz: Tz) -> Outcome {
+async fn run_once(config: &Globird, pool: &SqlitePool, tz: &TimeZone) -> Outcome {
     let mut summary = Summary::default();
     let result = sync_all(config, pool, tz, &mut summary).await;
 
@@ -404,7 +403,7 @@ async fn run_once(config: &Globird, pool: &SqlitePool, tz: Tz) -> Outcome {
             yesterday_complete: true,
         };
     }
-    let yesterday = Utc::now().with_timezone(&tz).date_naive() - Days::new(1);
+    let yesterday = crate::clock::today(tz) - 1.day();
     let yesterday_complete = db::globird_day_is_complete(pool, yesterday)
         .await
         .unwrap_or_else(|err| {
@@ -422,15 +421,15 @@ async fn run_once(config: &Globird, pool: &SqlitePool, tz: Tz) -> Outcome {
 pub async fn run(
     config: Globird,
     pool: SqlitePool,
-    tz: Tz,
+    tz: TimeZone,
     synced: Option<Arc<Notify>>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let sync_time = crate::clock::time_to_chrono(config.sync_time_of_day()?);
+    let sync_time = config.sync_time_of_day()?;
 
     // Pinning lets `select!` poll the same future in every loop round.
     tokio::pin!(shutdown);
-    info!(sync_time = %sync_time.format("%H:%M"), "GloBird sync started");
+    info!(sync_time = %sync_time.strftime("%H:%M"), "GloBird sync started");
     let mut wait = STARTUP_DELAY;
     loop {
         tokio::select! {
@@ -439,21 +438,21 @@ pub async fn run(
         }
         let outcome = tokio::select! {
             _ = &mut shutdown => break,
-            outcome = run_once(&config, &pool, tz) => outcome,
+            outcome = run_once(&config, &pool, &tz) => outcome,
         };
 
         // New meter data is in: let the page-cache warm-up run again.
         if let (Outcome::Done { .. }, Some(synced)) = (&outcome, &synced) {
             synced.notify_one();
         }
-        let now = Utc::now().with_timezone(&tz);
+        let now = ZonedDateTime::now().with_time_zone(tz.clone());
         let next = match outcome {
-            Outcome::Done { yesterday_complete } => next_run(now, sync_time, yesterday_complete),
-            Outcome::Failed => next_run(now, sync_time, false),
-            Outcome::Captcha => next_day(now, sync_time),
+            Outcome::Done { yesterday_complete } => next_run(&now, sync_time, yesterday_complete),
+            Outcome::Failed => next_run(&now, sync_time, false),
+            Outcome::Captcha => next_day(&now, sync_time),
         };
-        info!(at = %next.format("%Y-%m-%d %H:%M %Z"), "next GloBird sync");
-        wait = (next - now).to_std().unwrap_or(Duration::ZERO);
+        info!(at = %next.strftime("%Y-%m-%d %H:%M %Z"), "next GloBird sync");
+        wait = Duration::try_from(next.duration_since(&now)).unwrap_or(Duration::ZERO);
     }
     info!("GloBird sync stopped");
     Ok(())
@@ -462,27 +461,31 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono_tz::Australia::Adelaide;
+    use jiff::civil::date as civil_date;
 
-    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
     }
 
-    fn time(h: u32, m: u32) -> NaiveTime {
-        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    fn date(y: i16, m: i8, d: i8) -> Date {
+        civil_date(y, m, d)
+    }
+
+    fn time(h: i8, m: i8) -> Time {
+        jiff::civil::time(h, m, 0, 0)
     }
 
     /// A local Adelaide time.
-    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Tz> {
-        Adelaide
-            .with_ymd_and_hms(y, mo, d, h, mi, 0)
-            .single()
+    fn at(y: i16, mo: i8, d: i8, h: i8, mi: i8) -> ZonedDateTime {
+        civil_date(y, mo, d)
+            .at(h, mi, 0, 0)
+            .to_zoned_datetime(adelaide())
             .unwrap()
     }
 
     /// "2026-10-04 09:00" style text of a local time, to compare readably.
-    fn show(t: DateTime<Tz>) -> String {
-        t.format("%Y-%m-%d %H:%M %z").to_string()
+    fn show(t: &ZonedDateTime) -> String {
+        t.strftime("%Y-%m-%d %H:%M %z").to_string()
     }
 
     #[test]
@@ -490,16 +493,16 @@ mod tests {
         let nine = time(9, 0);
         // Before today's sync time: today. After it: tomorrow.
         assert_eq!(
-            show(next_run(at(2026, 10, 22, 8, 0), nine, true)),
+            show(&next_run(&at(2026, 10, 22, 8, 0), nine, true)),
             "2026-10-22 09:00 +1030"
         );
         assert_eq!(
-            show(next_run(at(2026, 10, 22, 9, 5), nine, true)),
+            show(&next_run(&at(2026, 10, 22, 9, 5), nine, true)),
             "2026-10-23 09:00 +1030"
         );
         // Exactly at the sync time counts as already done.
         assert_eq!(
-            show(next_run(at(2026, 10, 22, 9, 0), nine, true)),
+            show(&next_run(&at(2026, 10, 22, 9, 0), nine, true)),
             "2026-10-23 09:00 +1030"
         );
     }
@@ -508,21 +511,21 @@ mod tests {
     fn incomplete_yesterday_retries_every_two_hours_until_23() {
         let nine = time(9, 0);
         assert_eq!(
-            show(next_run(at(2026, 10, 22, 9, 1), nine, false)),
+            show(&next_run(&at(2026, 10, 22, 9, 1), nine, false)),
             "2026-10-22 11:01 +1030"
         );
         // 21:00 + 2h = 23:00 is still allowed; 21:30 + 2h is not.
         assert_eq!(
-            show(next_run(at(2026, 10, 22, 21, 0), nine, false)),
+            show(&next_run(&at(2026, 10, 22, 21, 0), nine, false)),
             "2026-10-22 23:00 +1030"
         );
         assert_eq!(
-            show(next_run(at(2026, 10, 22, 21, 30), nine, false)),
+            show(&next_run(&at(2026, 10, 22, 21, 30), nine, false)),
             "2026-10-23 09:00 +1030"
         );
         // A retry never runs past midnight into the next day.
         assert_eq!(
-            show(next_run(at(2026, 10, 22, 23, 30), nine, false)),
+            show(&next_run(&at(2026, 10, 22, 23, 30), nine, false)),
             "2026-10-23 09:00 +1030"
         );
     }
@@ -532,7 +535,7 @@ mod tests {
         // The startup run at 08:00 finds yesterday missing: 10:00 would be
         // later than the 09:00 sync, so 09:00 it is.
         assert_eq!(
-            show(next_run(at(2026, 10, 22, 8, 0), time(9, 0), false)),
+            show(&next_run(&at(2026, 10, 22, 8, 0), time(9, 0), false)),
             "2026-10-22 09:00 +1030"
         );
     }
@@ -540,11 +543,11 @@ mod tests {
     #[test]
     fn a_captcha_waits_for_the_next_days_sync_time() {
         assert_eq!(
-            show(next_day(at(2026, 10, 22, 9, 5), time(9, 0))),
+            show(&next_day(&at(2026, 10, 22, 9, 5), time(9, 0))),
             "2026-10-23 09:00 +1030"
         );
         assert_eq!(
-            show(next_day(at(2026, 10, 22, 0, 30), time(9, 0))),
+            show(&next_day(&at(2026, 10, 22, 0, 30), time(9, 0))),
             "2026-10-23 09:00 +1030"
         );
     }
@@ -554,25 +557,25 @@ mod tests {
         // Clocks go forward at 02:00 on Sunday 2026-10-04 (+0930 to +1030).
         let nine = time(9, 0);
         let before = at(2026, 10, 3, 22, 0);
-        let next = next_run(before, nine, true);
-        assert_eq!(show(next), "2026-10-04 09:00 +1030");
+        let next = next_run(&before, nine, true);
+        assert_eq!(show(&next), "2026-10-04 09:00 +1030");
         // 22:00 to 09:00 is 11 hours on the clock but only 10 real hours.
-        assert_eq!(next - before, TimeDelta::hours(10));
+        assert_eq!(next.duration_since(&before), SignedDuration::from_hours(10));
 
         // Two real hours after 00:30 is 03:30 on the new clock, not 02:30,
         // which does not exist that day.
         assert_eq!(
-            show(next_run(at(2026, 10, 4, 0, 30), nine, false)),
+            show(&next_run(&at(2026, 10, 4, 0, 30), nine, false)),
             "2026-10-04 03:30 +1030"
         );
         // A sync time inside the skipped hour moves an hour later.
         assert_eq!(
-            show(next_run(at(2026, 10, 3, 22, 0), time(2, 30), true)),
+            show(&next_run(&at(2026, 10, 3, 22, 0), time(2, 30), true)),
             "2026-10-04 03:30 +1030"
         );
         // The day after is back to normal.
         assert_eq!(
-            show(next_run(at(2026, 10, 4, 9, 5), nine, true)),
+            show(&next_run(&at(2026, 10, 4, 9, 5), nine, true)),
             "2026-10-05 09:00 +1030"
         );
     }
@@ -582,19 +585,22 @@ mod tests {
         // Clocks go back at 03:00 on Sunday 2026-04-05 (+1030 to +0930).
         let nine = time(9, 0);
         let before = at(2026, 4, 4, 22, 0);
-        let next = next_run(before, nine, true);
-        assert_eq!(show(next), "2026-04-05 09:00 +0930");
+        let next = next_run(&before, nine, true);
+        assert_eq!(show(&next), "2026-04-05 09:00 +0930");
         // 11 hours on the clock, 12 real hours.
-        assert_eq!(next - before, TimeDelta::hours(12));
+        assert_eq!(next.duration_since(&before), SignedDuration::from_hours(12));
 
         // 01:30 (still +1030) plus 2 real hours lands on 02:30 (+0930),
         // after the clocks went back.
-        let retry = next_run(at(2026, 4, 5, 1, 30), nine, false);
-        assert_eq!(show(retry), "2026-04-05 02:30 +0930");
-        assert_eq!(retry - at(2026, 4, 5, 1, 30), TimeDelta::hours(2));
+        let retry = next_run(&at(2026, 4, 5, 1, 30), nine, false);
+        assert_eq!(show(&retry), "2026-04-05 02:30 +0930");
+        assert_eq!(
+            retry.duration_since(&at(2026, 4, 5, 1, 30)),
+            SignedDuration::from_hours(2)
+        );
         // A sync time in the repeated hour means its first occurrence.
         assert_eq!(
-            show(next_run(at(2026, 4, 4, 22, 0), time(2, 30), true)),
+            show(&next_run(&at(2026, 4, 4, 22, 0), time(2, 30), true)),
             "2026-04-05 02:30 +1030"
         );
     }
@@ -607,7 +613,7 @@ mod tests {
             "GloBird sync: 0 days written, newest complete day none, incomplete days: none"
         );
 
-        let day = |d: u32, categories: &[&str]| {
+        let day = |d: i8, categories: &[&str]| {
             let rows: Vec<CostRow> = categories
                 .iter()
                 .map(|c| CostRow {
@@ -669,7 +675,7 @@ mod tests {
         let shutdown = tokio::time::sleep(Duration::from_millis(200));
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run(config, pool, Adelaide, None, shutdown),
+            run(config, pool, adelaide(), None, shutdown),
         )
         .await;
         assert!(result.expect("did not stop on shutdown").is_ok());
@@ -686,7 +692,7 @@ mod tests {
             password: "pw".into(),
             sync_time: "9am".into(),
         };
-        let result = run(config, pool, Adelaide, None, std::future::pending()).await;
+        let result = run(config, pool, adelaide(), None, std::future::pending()).await;
         assert!(result.is_err());
     }
 }

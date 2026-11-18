@@ -13,7 +13,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use tracing::{info, warn};
 
 use crate::admin_data::{log_change, tariff_body};
-use crate::config::{self, Config, parse_date};
+use crate::config::{self, Config};
 use crate::{bills, petrol_prices};
 
 /// What was copied: how many rows, and where from.
@@ -81,9 +81,9 @@ async fn import_tariffs(conn: &mut SqliteConnection, config: &Config) -> Result<
                 .or_else(|| previous.tariff.name.clone()),
             ..previous.tariff.clone()
         };
-        plans.push((start.map(|d: chrono::NaiveDate| d.to_string()), tariff));
+        plans.push((start.map(|d: jiff::civil::Date| d.to_string()), tariff));
         let until = parse_date(&previous.until)?;
-        start = Some(until.succ_opt().context("until is too late")?);
+        start = Some(until.tomorrow().context("until is too late")?);
     }
     plans.push((start.map(|d| d.to_string()), current.clone()));
     for (valid_from, tariff) in &plans {
@@ -95,6 +95,11 @@ async fn import_tariffs(conn: &mut SqliteConnection, config: &Config) -> Result<
             .context("could not save a tariff plan")?;
     }
     Ok((plans.len(), CONFIG_TOML.to_string()))
+}
+
+/// `YYYY-MM-DD` text as a date.
+fn parse_date(text: &str) -> Result<jiff::civil::Date> {
+    config::parse_date(text).map(crate::clock::date_to_jiff)
 }
 
 async fn import_petrol(conn: &mut SqliteConnection, config: &Config) -> Result<(usize, String)> {

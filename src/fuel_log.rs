@@ -9,7 +9,8 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{Datelike, NaiveDate};
+use jiff::ToSpan;
+use jiff::civil::Date;
 use serde::Serialize;
 
 use crate::db::FuelFill;
@@ -195,11 +196,11 @@ fn month_of(date: &str) -> String {
 /// The mean of the petrol price on each day of a "YYYY-MM" month, over the
 /// days that have a price; `None` when none do (or the month is not valid).
 fn month_average(petrol: &PetrolHistory, month: &str) -> Option<f64> {
-    let first = NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d").ok()?;
+    let first = Date::strptime("%Y-%m-%d", format!("{month}-01")).ok()?;
     let prices: Vec<f64> = first
-        .iter_days()
+        .series(1.day())
         .take_while(|day| day.month() == first.month())
-        .filter_map(|day| petrol.on(&day.format("%Y-%m-%d").to_string()))
+        .filter_map(|day| petrol.on(&day.strftime("%Y-%m-%d").to_string()))
         .collect();
     (!prices.is_empty()).then(|| prices.iter().sum::<f64>() / prices.len() as f64)
 }
@@ -367,7 +368,7 @@ mod tests {
 
     #[test]
     fn the_month_average_comes_from_the_petrol_price_history() {
-        let day = |d| crate::clock::date_to_jiff(NaiveDate::from_ymd_opt(2026, 10, d).unwrap());
+        let day = |d| jiff::civil::date(2026, 10, d);
         // 200 c/L for the first half of October (15 days), 100 c/L after (16).
         let petrol = PetrolHistory::new(None, vec![(day(1), 200.0), (day(16), 100.0)]);
         let fills = [

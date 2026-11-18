@@ -11,13 +11,13 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 
 /// The columns the file must start with, in this order.
 const HEADER: &str = "from,cents_per_litre";
 
 /// A price change: the first local day it applies and cents per litre.
-pub type Change = (NaiveDate, f64);
+pub type Change = (Date, f64);
 
 /// Checks a price the way the config does: finite and more than 0.
 pub fn check_price(cents: f64) -> Result<()> {
@@ -77,7 +77,7 @@ fn parse_line(line: &str) -> Result<Change> {
     if fields.len() != 2 {
         bail!("expected 2 comma-separated fields, found {}", fields.len());
     }
-    let from = NaiveDate::parse_from_str(fields[0], "%Y-%m-%d")
+    let from = Date::strptime("%Y-%m-%d", fields[0])
         .with_context(|| format!("from {:?} is not a date like 2026-03-01", fields[0]))?;
     let cents: f64 = fields[1]
         .parse()
@@ -92,8 +92,8 @@ fn parse_line(line: &str) -> Result<Change> {
 mod tests {
     use super::*;
 
-    fn day(text: &str) -> NaiveDate {
-        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+    fn day(text: &str) -> Date {
+        Date::strptime("%Y-%m-%d", text).unwrap()
     }
 
     #[test]

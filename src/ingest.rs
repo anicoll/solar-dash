@@ -8,8 +8,9 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone};
-use chrono_tz::Tz;
+use jiff::Timestamp;
+use jiff::civil::{Date, DateTime};
+use jiff::tz::{AmbiguousOffset, TimeZone};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tracing::{debug, info, warn};
@@ -64,11 +65,9 @@ const CATCH_UP_SECS: i64 = 2 * 24 * 3600;
 const LOCAL_FORMAT: &str = "%Y%m%d%H%M%S";
 
 /// Unix seconds (UTC) to the API's local-time text, e.g. "20261020110000".
-pub fn format_local(ts_utc: i64, tz: Tz) -> String {
-    DateTime::from_timestamp(ts_utc, 0)
-        .expect("timestamp out of range")
-        .with_timezone(&tz)
-        .format(LOCAL_FORMAT)
+pub fn format_local(ts_utc: i64, tz: &TimeZone) -> String {
+    crate::clock::local_datetime(ts_utc, tz)
+        .strftime(LOCAL_FORMAT)
         .to_string()
 }
 
@@ -77,50 +76,44 @@ pub fn format_local(ts_utc: i64, tz: Tz) -> String {
 /// Returns `None` if the text is malformed or the local time never happened
 /// (the hour skipped when the clocks go forward). A local time that happened
 /// twice (the hour repeated when the clocks go back) gives the earlier one.
-pub fn parse_local(s: &str, tz: Tz) -> Option<i64> {
-    let naive = NaiveDateTime::parse_from_str(s, LOCAL_FORMAT).ok()?;
-    match tz.from_local_datetime(&naive) {
-        LocalResult::Single(t) => Some(t.timestamp()),
-        LocalResult::Ambiguous(earliest, _latest) => Some(earliest.timestamp()),
-        LocalResult::None => None,
-    }
+pub fn parse_local(s: &str, tz: &TimeZone) -> Option<i64> {
+    let naive = DateTime::strptime(LOCAL_FORMAT, s).ok()?;
+    crate::clock::local_ts(naive, tz)
 }
 
 /// Like [`parse_local`], but a local time that happened twice is resolved with
 /// the UTC offset in force at `near_ts` (normally the start of the window the
 /// text came from). A window never crosses a clock change (see
 /// [`next_window_end`]), so this picks the right one of the two copies.
-pub fn parse_local_near(s: &str, tz: Tz, near_ts: i64) -> Option<i64> {
-    let naive = NaiveDateTime::parse_from_str(s, LOCAL_FORMAT).ok()?;
-    match tz.from_local_datetime(&naive) {
-        LocalResult::Single(t) => Some(t.timestamp()),
-        LocalResult::Ambiguous(earliest, latest) => {
+pub fn parse_local_near(s: &str, tz: &TimeZone, near_ts: i64) -> Option<i64> {
+    let naive = DateTime::strptime(LOCAL_FORMAT, s).ok()?;
+    let ambiguous = tz.to_ambiguous_timestamp(naive);
+    let picked = match ambiguous.offset() {
+        AmbiguousOffset::Gap { .. } => return None,
+        AmbiguousOffset::Unambiguous { .. } => ambiguous.unambiguous(),
+        AmbiguousOffset::Fold { before, after } => {
             let want = offset_secs(near_ts, tz);
-            if latest.offset().fix().local_minus_utc() == want
-                && earliest.offset().fix().local_minus_utc() != want
-            {
-                Some(latest.timestamp())
+            if after.seconds() == want && before.seconds() != want {
+                ambiguous.later()
             } else {
-                Some(earliest.timestamp())
+                ambiguous.earlier()
             }
         }
-        LocalResult::None => None,
-    }
+    };
+    picked.ok().map(|t| t.as_second())
 }
 
 /// The UTC offset, in seconds, in force at a unix timestamp.
-fn offset_secs(ts_utc: i64, tz: Tz) -> i32 {
-    let t = DateTime::from_timestamp(ts_utc, 0).expect("timestamp out of range");
-    tz.offset_from_utc_datetime(&t.naive_utc())
-        .fix()
-        .local_minus_utc()
+fn offset_secs(ts_utc: i64, tz: &TimeZone) -> i32 {
+    let t = Timestamp::from_second(ts_utc).expect("timestamp out of range");
+    tz.to_offset(t).seconds()
 }
 
 /// End (exclusive) of the window that starts at `start`: at most `step` long,
 /// at most `end`, and never past a clock change. Every instant the window asks
 /// for (up to one step before its end) then shares one UTC offset, so the
 /// local start and end strings are in order and unambiguous.
-pub fn next_window_end(start: i64, end: i64, step: i64, tz: Tz) -> i64 {
+pub fn next_window_end(start: i64, end: i64, step: i64, tz: &TimeZone) -> i64 {
     let to = (start + step).min(end);
     let base = offset_secs(start, tz);
     if offset_secs(to - STEP_SECS, tz) == base {
@@ -159,7 +152,12 @@ fn parse_value(value: &Value) -> Option<f64> {
 /// row are simply not stored; points present but empty are stored as `None`.
 /// `window_start` (unix seconds) is where the window began; it decides which
 /// copy of a repeated local time (clocks going back) is meant.
-pub fn parse_history(result_data: &Value, ps_key: &str, tz: Tz, window_start: i64) -> Vec<Reading> {
+pub fn parse_history(
+    result_data: &Value,
+    ps_key: &str,
+    tz: &TimeZone,
+    window_start: i64,
+) -> Vec<Reading> {
     let mut readings = Vec::new();
     let Some(rows) = result_data[ps_key].as_array() else {
         return readings; // no data for this device in the window
@@ -347,7 +345,7 @@ async fn sync_points(
 /// The plant settings from the config, checked and ready to use.
 struct PlantSetup {
     plant_id: i64,
-    tz: Tz,
+    tz: TimeZone,
     /// Device key used by the history API, e.g. "1234567_11_0_0".
     ps_key: String,
     /// The configured points as the API wants them, e.g. "p83022,p83033".
@@ -361,10 +359,7 @@ impl PlantSetup {
         let plant_id = config.plant_id.ok_or_else(|| {
             anyhow!("syncing needs plant_id in config.toml (run login-test to see your plants)")
         })?;
-        let tz: Tz = config
-            .timezone
-            .parse()
-            .map_err(|e| anyhow!("invalid timezone {:?}: {e}", config.timezone))?;
+        let tz = crate::clock::site_tz(&config.timezone)?;
         let points = config
             .points
             .iter()
@@ -375,11 +370,15 @@ impl PlantSetup {
             .history_from
             .as_deref()
             .map(|text| {
-                let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| {
+                let date = Date::strptime("%Y-%m-%d", text).map_err(|_| {
                     anyhow!("history_from must look like \"2024-01-01\", got {text:?}")
                 })?;
-                parse_local(&date.format("%Y%m%d000000").to_string(), tz)
-                    .ok_or_else(|| anyhow!("{date} has no local midnight in {tz}"))
+                parse_local(&date.strftime("%Y%m%d000000").to_string(), &tz).ok_or_else(|| {
+                    anyhow!(
+                        "{date} has no local midnight in {}",
+                        tz.iana_name().unwrap_or("UTC")
+                    )
+                })
             })
             .transpose()?;
         Ok(Self {
@@ -437,7 +436,7 @@ pub async fn sync_range(
     end_ts: i64,
 ) -> Result<SyncStats> {
     let plant = PlantSetup::from_config(config)?;
-    let tz = plant.tz;
+    let tz = &plant.tz;
     let mut stats = SyncStats::default();
     let mut start = start_ts;
     let mut window = START_WINDOW_SECS;
@@ -497,13 +496,17 @@ pub async fn backfill(
     client: &Client,
     pool: &SqlitePool,
     config: &IsolarCloud,
-    from: NaiveDate,
+    from: Date,
 ) -> Result<()> {
     let plant = PlantSetup::from_config(config)?;
-    let tz = plant.tz;
+    let tz = &plant.tz;
 
-    let from_ts = parse_local(&from.format("%Y%m%d000000").to_string(), tz)
-        .ok_or_else(|| anyhow!("{from} has no local midnight in {tz}"))?;
+    let from_ts = parse_local(&from.strftime("%Y%m%d000000").to_string(), tz).ok_or_else(|| {
+        anyhow!(
+            "{from} has no local midnight in {}",
+            tz.iana_name().unwrap_or("UTC")
+        )
+    })?;
     let cursor = db::get_cursor(pool, BACKFILL_JOB).await?;
     let start = cursor.map_or(from_ts, |c| c.max(from_ts));
     let end = round_down_to_step(db::now());
@@ -547,11 +550,9 @@ pub fn next_tick_delay(now_ts: i64) -> Duration {
 }
 
 /// Unix seconds of the most recent local midnight at or before `now_ts`.
-fn local_midnight(now_ts: i64, tz: Tz) -> Option<i64> {
-    let today = DateTime::from_timestamp(now_ts, 0)?
-        .with_timezone(&tz)
-        .date_naive();
-    parse_local(&today.format("%Y%m%d000000").to_string(), tz)
+fn local_midnight(now_ts: i64, tz: &TimeZone) -> Option<i64> {
+    let today = crate::clock::local_date(now_ts, tz);
+    parse_local(&today.strftime("%Y%m%d000000").to_string(), tz)
 }
 
 /// How far back each live sync re-reads before the cursor. iSolarCloud can
@@ -561,11 +562,15 @@ const LIVE_OVERLAP_SECS: i64 = 15 * 60;
 
 /// Where the next live sync should start: a little before its saved cursor,
 /// or else local midnight today.
-async fn live_start(pool: &SqlitePool, tz: Tz, now_ts: i64) -> Result<i64> {
+async fn live_start(pool: &SqlitePool, tz: &TimeZone, now_ts: i64) -> Result<i64> {
     let live = db::get_cursor(pool, LIVE_JOB).await?;
     let backfill = db::get_cursor(pool, BACKFILL_JOB).await?;
-    let midnight = local_midnight(now_ts, tz)
-        .ok_or_else(|| anyhow!("could not work out local midnight in {tz}"))?;
+    let midnight = local_midnight(now_ts, tz).ok_or_else(|| {
+        anyhow!(
+            "could not work out local midnight in {}",
+            tz.iana_name().unwrap_or("UTC")
+        )
+    })?;
     if live.is_none() {
         info!(
             "no live sync yet; starting from midnight today. Run backfill to fetch older history"
@@ -597,13 +602,13 @@ async fn sync_once(
     let tz = PlantSetup::from_config(config)?.tz;
     let now = db::now();
     let end = round_down_to_step(now);
-    let start = live_start(pool, tz, now).await?;
+    let start = live_start(pool, &tz, now).await?;
     if start >= end {
         debug!("already up to date");
         return Ok(());
     }
     if end - start > CATCH_UP_SECS {
-        info!(since = %format_local(start, tz), "cursor is far behind; catching up");
+        info!(since = %format_local(start, &tz), "cursor is far behind; catching up");
     }
     let stats = sync_range(client, pool, config, hub, LIVE_JOB, start, end).await?;
     info!(rows = stats.rows, calls = stats.calls, "sync done");
@@ -644,8 +649,12 @@ async fn backfill_step(
             let Some(live) = db::get_cursor(pool, LIVE_JOB).await? else {
                 return Ok(());
             };
-            let midnight = local_midnight(db::now(), plant.tz)
-                .ok_or_else(|| anyhow!("could not work out local midnight in {}", plant.tz))?;
+            let midnight = local_midnight(db::now(), &plant.tz).ok_or_else(|| {
+                anyhow!(
+                    "could not work out local midnight in {}",
+                    plant.tz.iana_name().unwrap_or("UTC")
+                )
+            })?;
             let until = live.min(midnight);
             db::set_cursor(pool, BACKFILL_UNTIL_JOB, until).await?;
             until
@@ -656,8 +665,8 @@ async fn backfill_step(
     }
     let end = (start + BACKFILL_STEP_SECS).min(until);
     info!(
-        from = %format_local(start, plant.tz),
-        to = %format_local(end, plant.tz),
+        from = %format_local(start, &plant.tz),
+        to = %format_local(end, &plant.tz),
         "filling in history"
     );
     sync_range(client, pool, config, hub, BACKFILL_JOB, start, end).await?;
@@ -894,7 +903,7 @@ mod tests {
             .await
             .unwrap();
         let until = db::get_cursor(&pool, BACKFILL_UNTIL_JOB).await.unwrap();
-        let midnight = local_midnight(now, PlantSetup::from_config(&config).unwrap().tz);
+        let midnight = local_midnight(now, &PlantSetup::from_config(&config).unwrap().tz);
         assert_eq!(until, midnight);
     }
 
@@ -917,7 +926,9 @@ mod tests {
         assert!(result.expect("did not stop promptly on shutdown").is_ok());
     }
 
-    const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
     const KEY: &str = "1234567_11_0_0";
 
     #[test]
@@ -936,10 +947,10 @@ mod tests {
             { "p83022": "--", "p83033": "", "time_stamp": "20261020110500" },
             { "p83022": null, "time_stamp": "20261020111000", "other": "x" },
         ]});
-        let readings = parse_history(&data, KEY, ADELAIDE, 0);
+        let readings = parse_history(&data, KEY, &adelaide(), 0);
 
         // 11:00 local on 20 Oct is ACDT (UTC+10:30).
-        let t0 = parse_local("20261020110000", ADELAIDE).unwrap();
+        let t0 = parse_local("20261020110000", &adelaide()).unwrap();
         assert_eq!(t0, 1_792_456_200); // 2026-10-20 00:30:00 UTC
         let at = |ts: i64, id: i64| {
             readings
@@ -959,8 +970,8 @@ mod tests {
     #[test]
     fn history_for_other_or_missing_device_is_empty() {
         let data = json!({ "999_11_0_0": [] });
-        assert!(parse_history(&data, KEY, ADELAIDE, 0).is_empty());
-        assert!(parse_history(&Value::Null, KEY, ADELAIDE, 0).is_empty());
+        assert!(parse_history(&data, KEY, &adelaide(), 0).is_empty());
+        assert!(parse_history(&Value::Null, KEY, &adelaide(), 0).is_empty());
     }
 
     #[test]
@@ -971,7 +982,7 @@ mod tests {
             { "p83022": "3" },
             { "p83022": "4", "time_stamp": "20261004030000" },
         ]});
-        let readings = parse_history(&data, KEY, ADELAIDE, 0);
+        let readings = parse_history(&data, KEY, &adelaide(), 0);
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].value, Some(4.0));
     }
@@ -979,36 +990,36 @@ mod tests {
     #[test]
     fn local_time_round_trips() {
         for text in ["20261020110000", "20230221000000", "20260101235500"] {
-            let ts = parse_local(text, ADELAIDE).unwrap();
-            assert_eq!(format_local(ts, ADELAIDE), text);
+            let ts = parse_local(text, &adelaide()).unwrap();
+            assert_eq!(format_local(ts, &adelaide()), text);
         }
-        assert_eq!(parse_local("not a time", ADELAIDE), None);
+        assert_eq!(parse_local("not a time", &adelaide()), None);
     }
 
     #[test]
     fn autumn_fall_back_takes_earliest() {
         // 2026-04-05: at 03:00 ACDT (+10:30) clocks go back to 02:00 ACST
         // (+9:30), so local times 02:00-02:59 happen twice.
-        let ts = parse_local("20260405023000", ADELAIDE).unwrap();
+        let ts = parse_local("20260405023000", &adelaide()).unwrap();
         let first = 1_775_318_400; // 2026-04-04 16:00:00 UTC = 02:30 ACDT
         assert_eq!(ts, first);
         // 03:00 ACST (after the repeated hour) is 90 real minutes later.
-        let after = parse_local("20260405030000", ADELAIDE).unwrap();
+        let after = parse_local("20260405030000", &adelaide()).unwrap();
         assert_eq!(after - first, 90 * 60);
         // Formatting the later copy of 02:30 (ACST) shows the same text.
-        assert_eq!(format_local(first + 3600, ADELAIDE), "20260405023000");
+        assert_eq!(format_local(first + 3600, &adelaide()), "20260405023000");
     }
 
     #[test]
     fn window_is_split_at_fall_back() {
         // Change at 2026-04-05 03:00 ACDT = 2026-04-04 16:30 UTC.
         let change = 1_775_320_200;
-        let start = parse_local("20260405010000", ADELAIDE).unwrap();
+        let start = parse_local("20260405010000", &adelaide()).unwrap();
         let end = start + 6 * 3600;
         let mut from = start;
         let mut spans = Vec::new();
         while from < end {
-            let to = next_window_end(from, end, START_WINDOW_SECS, ADELAIDE);
+            let to = next_window_end(from, end, START_WINDOW_SECS, &adelaide());
             assert!(to > from);
             spans.push((from, to));
             from = to;
@@ -1017,30 +1028,30 @@ mod tests {
         for &(f, t) in &spans {
             assert!(f >= change || t <= change, "window crosses the change");
             let (a, b) = (
-                format_local(f, ADELAIDE),
-                format_local(t - STEP_SECS, ADELAIDE),
+                format_local(f, &adelaide()),
+                format_local(t - STEP_SECS, &adelaide()),
             );
             assert!(a <= b, "{a} > {b}");
         }
         assert_eq!(
-            format_local(spans[0].1 - STEP_SECS, ADELAIDE),
+            format_local(spans[0].1 - STEP_SECS, &adelaide()),
             "20260405025500"
         );
-        assert_eq!(format_local(spans[1].0, ADELAIDE), "20260405020000");
+        assert_eq!(format_local(spans[1].0, &adelaide()), "20260405020000");
     }
 
     #[test]
     fn repeated_hour_is_kept_in_both_windows() {
         let change = 1_775_320_200;
-        let pre = parse_local_near("20260405023000", ADELAIDE, change - 3600).unwrap();
-        let post = parse_local_near("20260405023000", ADELAIDE, change).unwrap();
+        let pre = parse_local_near("20260405023000", &adelaide(), change - 3600).unwrap();
+        let post = parse_local_near("20260405023000", &adelaide(), change).unwrap();
         assert_eq!(post - pre, 3600);
         assert_eq!(pre, 1_775_318_400); // 02:30 ACDT
         // parse_history applies the window's offset to every row.
         let data = json!({ KEY: [{ "p1": "1", "time_stamp": "20260405023000" }] });
-        assert_eq!(parse_history(&data, KEY, ADELAIDE, change)[0].ts, post);
+        assert_eq!(parse_history(&data, KEY, &adelaide(), change)[0].ts, post);
         assert_eq!(
-            parse_history(&data, KEY, ADELAIDE, change - 3600)[0].ts,
+            parse_history(&data, KEY, &adelaide(), change - 3600)[0].ts,
             pre
         );
     }
@@ -1050,19 +1061,19 @@ mod tests {
         // Change at 2026-10-04 02:00 ACST = 2026-10-03 16:30 UTC.
         let change = 1_791_045_000;
         let start = change - 3600;
-        let to = next_window_end(start, start + 3 * 3600, START_WINDOW_SECS, ADELAIDE);
+        let to = next_window_end(start, start + 3 * 3600, START_WINDOW_SECS, &adelaide());
         assert_eq!(to, change);
-        assert_eq!(format_local(to - STEP_SECS, ADELAIDE), "20261004015500");
-        let to2 = next_window_end(change, change + 3 * 3600, START_WINDOW_SECS, ADELAIDE);
+        assert_eq!(format_local(to - STEP_SECS, &adelaide()), "20261004015500");
+        let to2 = next_window_end(change, change + 3 * 3600, START_WINDOW_SECS, &adelaide());
         assert_eq!(to2, change + 3 * 3600);
-        assert_eq!(format_local(change, ADELAIDE), "20261004030000");
+        assert_eq!(format_local(change, &adelaide()), "20261004030000");
     }
 
     #[test]
     fn window_end_respects_range_end() {
-        let start = parse_local("20261020110000", ADELAIDE).unwrap();
+        let start = parse_local("20261020110000", &adelaide()).unwrap();
         assert_eq!(
-            next_window_end(start, start + 600, 3 * 3600, ADELAIDE),
+            next_window_end(start, start + 600, 3 * 3600, &adelaide()),
             start + 600
         );
     }
@@ -1070,10 +1081,10 @@ mod tests {
     #[test]
     fn spring_forward_time_does_not_exist() {
         // 2026-10-04: at 02:00 ACST clocks jump to 03:00 ACDT.
-        assert_eq!(parse_local("20261004020000", ADELAIDE), None);
-        assert_eq!(parse_local("20261004025500", ADELAIDE), None);
-        let before = parse_local("20261004015500", ADELAIDE).unwrap();
-        let after = parse_local("20261004030000", ADELAIDE).unwrap();
+        assert_eq!(parse_local("20261004020000", &adelaide()), None);
+        assert_eq!(parse_local("20261004025500", &adelaide()), None);
+        let before = parse_local("20261004015500", &adelaide()).unwrap();
+        let after = parse_local("20261004030000", &adelaide()).unwrap();
         assert_eq!(after - before, 300); // only 5 real minutes apart
     }
 
@@ -1128,14 +1139,14 @@ mod tests {
     #[test]
     fn midnight_is_local_not_utc() {
         // 2026-10-20 23:30 local (+10:30) is 13:00 UTC the same day.
-        let now = parse_local("20261020233000", ADELAIDE).unwrap();
-        let midnight = local_midnight(now, ADELAIDE).unwrap();
-        assert_eq!(format_local(midnight, ADELAIDE), "20261020000000");
+        let now = parse_local("20261020233000", &adelaide()).unwrap();
+        let midnight = local_midnight(now, &adelaide()).unwrap();
+        assert_eq!(format_local(midnight, &adelaide()), "20261020000000");
         // Just after midnight local is still the new day.
-        let now = parse_local("20261021000500", ADELAIDE).unwrap();
+        let now = parse_local("20261021000500", &adelaide()).unwrap();
         assert_eq!(
-            local_midnight(now, ADELAIDE),
-            parse_local("20261021000000", ADELAIDE)
+            local_midnight(now, &adelaide()),
+            parse_local("20261021000000", &adelaide())
         );
     }
 

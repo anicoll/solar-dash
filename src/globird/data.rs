@@ -7,7 +7,8 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{Days, NaiveDate};
+use jiff::ToSpan;
+use jiff::civil::Date;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -20,7 +21,7 @@ pub const MAX_WINDOW_DAYS: u64 = 31;
 /// One `CostDetail` row: what one charge category cost on one day.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CostRow {
-    pub date: NaiveDate,
+    pub date: Date,
     /// GloBird's own text ("USAGE", "SUPPLY", "ZEROHERO Credit", ...). It is
     /// never interpreted, because new categories can turn up.
     pub category: String,
@@ -34,7 +35,7 @@ pub struct CostRow {
 /// One smart meter read row: the usage of one charge period on one day.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRow {
-    pub date: NaiveDate,
+    pub date: Date,
     /// The meter register, like "E7" or "B7".
     pub suffix: String,
     /// Text such as "Peak Usage"; empty if the portal sent none.
@@ -74,9 +75,9 @@ struct RawUsage {
 }
 
 /// Reads "2026/10/09" (what the portal sends) or "2026-10-09".
-fn parse_date(text: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(text, "%Y/%m/%d")
-        .or_else(|_| NaiveDate::parse_from_str(text, "%Y-%m-%d"))
+fn parse_date(text: &str) -> Result<Date> {
+    Date::strptime("%Y/%m/%d", text)
+        .or_else(|_| Date::strptime("%Y-%m-%d", text))
         .map_err(|_| anyhow!("{text:?} is not a date like 2026/10/09"))
 }
 
@@ -188,14 +189,14 @@ pub struct IntervalSeries {
 /// stored for that day.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DayRecord {
-    pub date: NaiveDate,
+    pub date: Date,
     pub cost: Vec<CostLine>,
     pub usage: Vec<UsageLine>,
     pub intervals: Vec<IntervalSeries>,
 }
 
 impl DayRecord {
-    fn new(date: NaiveDate) -> Self {
+    fn new(date: Date) -> Self {
         Self {
             date,
             cost: Vec::new(),
@@ -265,9 +266,9 @@ pub fn bucket_of(category: &str) -> Bucket {
 ///   is neither import nor export has no interval series (its per-period
 ///   usage is still kept).
 pub fn group_days(cost: &[CostRow], usage: &[UsageRow]) -> Vec<DayRecord> {
-    let mut days: BTreeMap<NaiveDate, DayRecord> = BTreeMap::new();
+    let mut days: BTreeMap<Date, DayRecord> = BTreeMap::new();
     // Every non-empty interval array seen for a register on a day.
-    let mut candidates: BTreeMap<(NaiveDate, &str), Vec<&Vec<f64>>> = BTreeMap::new();
+    let mut candidates: BTreeMap<(Date, &str), Vec<&Vec<f64>>> = BTreeMap::new();
 
     for row in cost {
         let day = days
@@ -342,17 +343,17 @@ pub fn group_days(cost: &[CostRow], usage: &[UsageRow]) -> Vec<DayRecord> {
 /// Splits `from..=to` into consecutive ranges of at most [`MAX_WINDOW_DAYS`]
 /// days, oldest first. Both ends are inclusive, and the ranges neither overlap
 /// nor leave a gap. Empty if `from` is after `to`.
-pub fn split_windows(from: NaiveDate, to: NaiveDate) -> Vec<DateRange> {
+pub fn split_windows(from: Date, to: Date) -> Vec<DateRange> {
     let mut windows = Vec::new();
     let mut start = from;
     while start <= to {
         // The last day of a window of exactly MAX_WINDOW_DAYS days.
-        let end = (start + Days::new(MAX_WINDOW_DAYS - 1)).min(to);
+        let end = (start + (MAX_WINDOW_DAYS as i64 - 1).days()).min(to);
         windows.push(DateRange {
             from: start,
             to: end,
         });
-        start = end + Days::new(1);
+        start = end + 1.day();
     }
     windows
 }
@@ -365,8 +366,8 @@ mod tests {
     const COST_JSON: &str = include_str!("testdata/cost_detail.json");
     const SMART_JSON: &str = include_str!("testdata/smart_meter_read.json");
 
-    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn date(y: i16, m: i8, d: i8) -> Date {
+        jiff::civil::date(y, m, d)
     }
 
     /// The `data` part of a saved reply, which is what the client hands back.
@@ -383,7 +384,7 @@ mod tests {
         parse_usage_rows(data_of(SMART_JSON)).unwrap()
     }
 
-    fn cost_row(day: u32, category: &str, cents: i64) -> CostRow {
+    fn cost_row(day: i8, category: &str, cents: i64) -> CostRow {
         CostRow {
             date: date(2026, 10, day),
             category: category.to_string(),
@@ -576,7 +577,7 @@ mod tests {
     #[test]
     fn days_come_out_oldest_first() {
         let rows = [cost_row(12, "USAGE", 1), cost_row(3, "USAGE", 1)];
-        let dates: Vec<NaiveDate> = group_days(&rows, &[]).iter().map(|d| d.date).collect();
+        let dates: Vec<Date> = group_days(&rows, &[]).iter().map(|d| d.date).collect();
         assert_eq!(dates, [date(2026, 10, 3), date(2026, 10, 12)]);
     }
 
@@ -633,11 +634,11 @@ mod tests {
         assert_eq!(windows[0].from, from);
         assert_eq!(windows.last().unwrap().to, to);
         for window in &windows {
-            let days = (window.to - window.from).num_days() + 1;
+            let days = (window.to - window.from).get_days() + 1;
             assert!((1..=31).contains(&days), "{window:?}");
         }
         for pair in windows.windows(2) {
-            assert_eq!(pair[1].from, pair[0].to + Days::new(1), "{pair:?}");
+            assert_eq!(pair[1].from, pair[0].to + 1.day(), "{pair:?}");
         }
     }
 

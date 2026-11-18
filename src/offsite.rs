@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::{NaiveDate, Utc};
 use hmac::{Hmac, KeyInit, Mac};
+use jiff::Timestamp;
+use jiff::civil::Date;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -255,7 +256,7 @@ impl Client {
             Some(key) => format!("/{}/{key}", self.bucket),
             None => format!("/{}", self.bucket),
         };
-        let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let amz_date = Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
         let payload_hash = sha256_hex(&body);
         let auth = authorization(
             &self.creds,
@@ -345,7 +346,7 @@ impl Client {
 #[derive(Clone, Debug, PartialEq)]
 struct Attempt {
     /// The date of the backup that was uploaded, from its file name.
-    date: Option<NaiveDate>,
+    date: Option<Date>,
     /// When the attempt finished (Unix seconds).
     at: i64,
     error: Option<String>,
@@ -372,7 +373,7 @@ impl Status {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn record(&self, date: Option<NaiveDate>, result: &Result<Synced>) {
+    fn record(&self, date: Option<Date>, result: &Result<Synced>) {
         let mut inner = self.inner();
         let error = result.as_ref().err().map(|err| {
             let text = format!("{err:#}");
@@ -383,7 +384,7 @@ impl Status {
         }
         inner.last = Some(Attempt {
             date,
-            at: Utc::now().timestamp(),
+            at: crate::clock::unix_now(),
             error,
         });
     }
@@ -412,7 +413,7 @@ impl Status {
 }
 
 /// The date in a backup file's name, if it is named like a backup.
-fn date_of_path(path: &Path) -> Option<NaiveDate> {
+fn date_of_path(path: &Path) -> Option<Date> {
     path.file_name()?.to_str().and_then(backup::date_of)
 }
 
@@ -473,7 +474,7 @@ impl Offsite {
 
     /// The backups among `keys`: those named `<prefix>solar-YYYY-MM-DD.db`
     /// exactly, oldest first. Anything else in the bucket is not ours.
-    fn backups<'a>(&self, keys: &'a [String]) -> Vec<(chrono::NaiveDate, &'a str)> {
+    fn backups<'a>(&self, keys: &'a [String]) -> Vec<(Date, &'a str)> {
         let mut found: Vec<_> = keys
             .iter()
             .filter_map(|key| {

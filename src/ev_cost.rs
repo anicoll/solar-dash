@@ -429,9 +429,7 @@ pub fn historic_session_cost(
 
 /// The bill that covers a local day, if there is one.
 fn bill_on(bills: &[PastBill], date: Date) -> Option<&PastBill> {
-    bills.iter().find(|b| {
-        crate::clock::date_to_jiff(b.from) <= date && date <= crate::clock::date_to_jiff(b.to)
-    })
+    bills.iter().find(|b| b.from <= date && date <= b.to)
 }
 
 /// The prices at a unix time, on the plan in effect that local day.

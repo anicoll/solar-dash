@@ -11,8 +11,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::{Days, NaiveDate, Utc};
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 use serde_json::{Map, Value, json};
 
 use super::client::Client;
@@ -119,12 +120,7 @@ async fn probed(call: impl Future<Output = Result<Value>>) -> Value {
 }
 
 /// Probes the endpoints of one service.
-async fn probe_service(
-    client: &Client,
-    service: &Service,
-    range: DateRange,
-    today: NaiveDate,
-) -> Value {
+async fn probe_service(client: &Client, service: &Service, range: DateRange, today: Date) -> Value {
     let asid = service.id.as_str();
     let by_service = [("accountServiceId", asid)];
 
@@ -178,7 +174,7 @@ async fn probe_service(
     // keep only a summary of each.
     let mut cost_history = Vec::new();
     for days_ago in HISTORY_STARTS {
-        let window = DateRange::starting_on(today - Days::new(days_ago), HISTORY_WINDOW_DAYS);
+        let window = DateRange::starting_on(today - (days_ago as i64).days(), HISTORY_WINDOW_DAYS);
         let reply = probed(client.post_json(
             "/api/transaction/CostDetail",
             &[],
@@ -260,8 +256,8 @@ fn first_usage_array_len(value: &Value) -> Option<usize> {
 }
 
 /// Probes everything and builds the dump (not yet redacted).
-async fn build_dump(client: &Client, tz: Tz, days: u32) -> Result<Value> {
-    let today = Utc::now().with_timezone(&tz).date_naive();
+async fn build_dump(client: &Client, tz: &TimeZone, days: u32) -> Result<Value> {
+    let today = crate::clock::today(tz);
     let range = DateRange::ending_on(today, u64::from(days));
 
     let current_user = client
@@ -295,7 +291,10 @@ async fn build_dump(client: &Client, tz: Tz, days: u32) -> Result<Value> {
     }
 
     Ok(json!({
-        "probed_at": Utc::now().to_rfc3339(),
+        "probed_at": Timestamp::now()
+            .to_zoned_datetime(TimeZone::UTC)
+            .strftime("%Y-%m-%dT%H:%M:%S%.f%:z")
+            .to_string(),
         "solar_dash_version": env!("CARGO_PKG_VERSION"),
         "days": days,
         "account": account,
@@ -368,7 +367,7 @@ pub(crate) fn write_private(path: &Path, text: &str) -> Result<()> {
 }
 
 /// Logs in, probes the portal, and writes the redacted dump to `out`.
-pub async fn run(client: Client, tz: Tz, days: u32, out: &Path) -> Result<()> {
+pub async fn run(client: Client, tz: &TimeZone, days: u32, out: &Path) -> Result<()> {
     client.login().await?;
     let mut dump = build_dump(&client, tz, days).await?;
     redact(&mut dump);
@@ -393,8 +392,8 @@ pub async fn run(client: Client, tz: Tz, days: u32, out: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn date(y: i16, m: i8, d: i8) -> Date {
+        jiff::civil::date(y, m, d)
     }
 
     #[test]
