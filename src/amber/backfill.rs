@@ -197,7 +197,10 @@ impl Backfill {
             .and_then(|ts| DateTime::from_timestamp(ts, 0))
             .map(|t| t.date_naive());
         let today = Utc::now().date_naive();
-        let floor = floor_date(config.backfill_from, today);
+        let floor = floor_date(
+            config.backfill_from.map(crate::clock::date_to_chrono),
+            today,
+        );
         let Some((start, end)) = plan_chunk(oldest_day, today, floor) else {
             debug!(%floor, "Amber price backfill has reached its start date");
             return Ok(false);
@@ -378,7 +381,7 @@ mod tests {
         Amber {
             token: "t".to_string(),
             site_id: None,
-            backfill_from: Some(day(2021, 1, 1)),
+            backfill_from: Some(crate::clock::date_to_jiff(day(2021, 1, 1))),
             base_url: format!("http://{addr}/v1"),
             compare: Default::default(),
         }

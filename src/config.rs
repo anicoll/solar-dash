@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{NaiveDate, NaiveTime};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -496,10 +496,10 @@ impl Globird {
     }
 
     /// `sync_time` as a time of day.
-    pub fn sync_time_of_day(&self) -> Result<NaiveTime> {
+    pub fn sync_time_of_day(&self) -> Result<jiff::civil::Time> {
         let minutes = parse_hhmm(&self.sync_time).context("sync_time in [globird]")?;
         // `parse_hhmm` guarantees less than 24 hours, so this always succeeds.
-        NaiveTime::from_hms_opt(minutes / 60, minutes % 60, 0)
+        jiff::civil::Time::new((minutes / 60) as i8, (minutes % 60) as i8, 0, 0)
             .context("sync_time in [globird] is not a valid time of day")
     }
 }
@@ -838,7 +838,7 @@ pub struct Amber {
     pub site_id: Option<String>,
     /// How far back `serve` fills in past prices (a `YYYY-MM-DD` date).
     /// Optional: the default is two years back.
-    pub backfill_from: Option<chrono::NaiveDate>,
+    pub backfill_from: Option<jiff::civil::Date>,
     #[serde(default = "default_amber_base_url")]
     pub base_url: String,
     /// The made-up plan behind the Bill page's "What would Amber cost?".
@@ -1274,7 +1274,7 @@ fn default_offsite_keep() -> usize {
 impl Config {
     /// The site's time zone: `[site] timezone`, else `[isolarcloud] timezone`
     /// (older configs), else the default.
-    pub fn timezone(&self) -> Result<chrono_tz::Tz> {
+    pub fn timezone(&self) -> Result<jiff::tz::TimeZone> {
         let name = self
             .site
             .as_ref()
@@ -1285,8 +1285,7 @@ impl Config {
                     .map(|cloud| cloud.timezone.clone())
             })
             .unwrap_or_else(default_timezone);
-        name.parse()
-            .map_err(|_| anyhow::anyhow!("unknown timezone {name:?} in config.toml"))
+        crate::clock::site_tz(&name).context("in config.toml")
     }
 
     /// The `[isolarcloud]` section, or a clear error for commands that need it.
@@ -1616,7 +1615,7 @@ mod tests {
         assert!(evening.check().is_ok());
         assert_eq!(
             evening.sync_time_of_day().unwrap(),
-            NaiveTime::from_hms_opt(18, 30, 0).unwrap()
+            jiff::civil::time(18, 30, 0, 0)
         );
         for bad in ["9:00", "25:00", "09:60", "noon", ""] {
             let globird = parse(&format!("sync_time = \"{bad}\""));
@@ -1664,7 +1663,7 @@ mod tests {
         assert_eq!(parse("").backfill_from, None);
         assert_eq!(
             parse("backfill_from = \"2024-03-01\"").backfill_from,
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 1)
+            Some(jiff::civil::date(2024, 3, 1))
         );
         let bad_date = format!("{MINIMAL}\n[amber]\ntoken = \"t\"\nbackfill_from = \"soon\"\n");
         assert!(toml::from_str::<Config>(&bad_date).is_err());
@@ -2453,28 +2452,40 @@ mod tests {
     fn isolarcloud_section_is_optional_and_site_sets_the_timezone() {
         let cfg: Config = toml::from_str("[site]\ntimezone = \"Australia/Sydney\"\n").unwrap();
         assert!(cfg.isolarcloud.is_none());
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Sydney);
+        assert_eq!(
+            cfg.timezone().unwrap().iana_name(),
+            Some("Australia/Sydney")
+        );
     }
 
     #[test]
     fn old_config_keeps_the_isolarcloud_timezone() {
         let cfg: Config = toml::from_str(CLOUD_TZ).unwrap();
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Perth);
+        assert_eq!(cfg.timezone().unwrap().iana_name(), Some("Australia/Perth"));
     }
 
     #[test]
     fn site_timezone_wins_over_isolarcloud() {
         let text = format!("{CLOUD_TZ}\n[site]\ntimezone = \"Australia/Sydney\"\n");
         let cfg: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Sydney);
+        assert_eq!(
+            cfg.timezone().unwrap().iana_name(),
+            Some("Australia/Sydney")
+        );
     }
 
     #[test]
     fn no_timezone_anywhere_gives_the_default() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Adelaide);
+        assert_eq!(
+            cfg.timezone().unwrap().iana_name(),
+            Some("Australia/Adelaide")
+        );
         let cfg: Config = toml::from_str(MINIMAL).unwrap();
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Adelaide);
+        assert_eq!(
+            cfg.timezone().unwrap().iana_name(),
+            Some("Australia/Adelaide")
+        );
     }
 
     #[test]

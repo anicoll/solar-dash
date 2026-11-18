@@ -379,7 +379,7 @@ impl AppState {
             )?,
             None => 0,
         };
-        let tz = config.timezone()?;
+        let tz = crate::clock::tz_to_chrono(&config.timezone()?);
         let secret = config.server.session_secret.as_deref().context(
             "serve needs session_secret in the [server] section of config.toml \
              (make one with `openssl rand -base64 64 | tr -d '\\n'; echo`)",
