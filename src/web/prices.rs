@@ -286,7 +286,7 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
     if (to - from).get_days() as u64 >= MAX_DAILY_DAYS {
         return Err(ApiError::bad_request("the range can be at most 400 days"));
     }
-    let tz = state.site_tz();
+    let tz = state.tz();
     let today_date = today(&tz);
     let spike_cents = state.admin.get().price_spike_cents;
     let dates: Vec<Date> = from.series(1.day()).take_while(|d| *d <= to).collect();

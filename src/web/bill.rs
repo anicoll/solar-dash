@@ -548,7 +548,7 @@ pub struct BillParams {
 async fn first_data_day(state: &AppState, bills: &[PastBill]) -> Result<Option<Date>, ApiError> {
     let from_readings = first_data_ts(state)
         .await?
-        .and_then(|ts| local_date_of(ts, &state.site_tz()));
+        .and_then(|ts| local_date_of(ts, &state.tz()));
     let from_bills = bills.iter().map(|b| b.from).min();
     Ok([from_readings, from_bills].into_iter().flatten().min())
 }
@@ -570,7 +570,7 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     let Some(schedule) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
-    let today = today(&state.site_tz());
+    let today = today(&state.tz());
     let wanted = match params.date.as_deref() {
         Some(text) => {
             let date = parse_date("date", text)?;
@@ -703,8 +703,8 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     // Charging sessions that started on a complete day of this period.
     let cars = match dates.first().zip(dates.last()) {
         Some((first, last)) => {
-            let (start, _) = day_bounds_or_error(*first, &state.site_tz())?;
-            let (_, end) = day_bounds_or_error(*last, &state.site_tz())?;
+            let (start, _) = day_bounds_or_error(*first, &state.tz())?;
+            let (_, end) = day_bounds_or_error(*last, &state.tz())?;
             db::tm_charge_totals(&state.pool, start, end).await?
         }
         None => None,
@@ -833,7 +833,7 @@ pub(super) fn compare_dates(
     to: Option<&str>,
 ) -> Result<(Date, Date, Vec<Date>), ApiError> {
     let data = state.admin.get();
-    let today = today(&state.site_tz());
+    let today = today(&state.tz());
     let (from, to) = match (from, to) {
         (None, None) => {
             let period = period_containing(today, &PeriodRule::of(&data), &data.bills);
@@ -844,7 +844,7 @@ pub(super) fn compare_dates(
                 .map(str::to_string)
                 .unwrap_or_else(|| (today - 1.day()).to_string());
             let (from, count) =
-                super::api::date_range(from, Some(&to), &state.site_tz(), MAX_COMPARE_DAYS, 30)?;
+                super::api::date_range(from, Some(&to), &state.tz(), MAX_COMPARE_DAYS, 30)?;
             (from, from + ((count - 1) as i64).days())
         }
     };

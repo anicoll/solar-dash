@@ -181,7 +181,7 @@ async fn day_key(
         .collect();
     Ok(format!(
         "{CACHE_VERSION}|{}|{}|{prices}|{:?}|paid_negative={}|spike={}|battery={}|reserve={}|{sessions:?}",
-        cache_key(&state.site_tz(), tariff),
+        cache_key(&state.tz(), tariff),
         hypothetical.key(),
         state.rules,
         compare.feed_in_paid_when_negative,
@@ -201,7 +201,7 @@ async fn work_out(
 ) -> Result<AmberDay, ApiError> {
     let mut mixes = BTreeMap::new();
     if hypo.coverage >= MIN_PRICE_COVERAGE {
-        let (start, end) = day_bounds_or_error(day.date, &state.site_tz())?;
+        let (start, end) = day_bounds_or_error(day.date, &state.tz())?;
         let mut slots = build_slots(
             start,
             end,
@@ -253,7 +253,7 @@ pub(super) async fn amber_days(
     let first_data = first_data_ts(state).await?;
     let mut dates_with_data = Vec::with_capacity(dates.len());
     for &date in dates {
-        let (_, end) = day_bounds_or_error(date, &state.site_tz())?;
+        let (_, end) = day_bounds_or_error(date, &state.tz())?;
         if first_data.is_some_and(|first| end > first) {
             dates_with_data.push(date);
         }
@@ -263,7 +263,7 @@ pub(super) async fn amber_days(
     let mut keys = Vec::with_capacity(dates.len());
     let mut extras: HashMap<Date, DayExtras> = HashMap::new();
     for &date in dates {
-        let (start, end) = day_bounds_or_error(date, &state.site_tz())?;
+        let (start, end) = day_bounds_or_error(date, &state.tz())?;
         let day_extras = day_extras(state, purchases, date, start, end).await?;
         let key = day_key(
             state,

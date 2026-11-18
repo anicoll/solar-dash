@@ -527,7 +527,7 @@ mod tests {
             .await
             .unwrap();
         let hash = crate::web::hash_password("pw").unwrap();
-        let tz = crate::clock::tz_to_chrono(&crate::clock::site_tz("Australia/Adelaide").unwrap());
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let key = axum_extra::extract::cookie::Key::generate();
         (dir, AppState::new(pool, 1, tz, &hash, key).unwrap())
     }

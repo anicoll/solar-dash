@@ -304,7 +304,7 @@ pub async fn compare(
     let (from, count) = date_range(
         params.from.as_deref(),
         params.to.as_deref(),
-        &state.site_tz(),
+        &state.tz(),
         MAX_COMPARE_DAYS,
         DEFAULT_COMPARE_DAYS,
     )?;

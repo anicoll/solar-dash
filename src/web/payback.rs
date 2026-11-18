@@ -390,7 +390,7 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
     let (Some(tariff), Some(first)) = (&data.tariff, data.purchases.first()) else {
         return Ok(Json(json!({ "configured": false })));
     };
-    let today = today(&state.site_tz());
+    let today = today(&state.tz());
 
     // From the first purchase until today (but not unreasonably far back).
     let start = first.date.max(today - (MAX_PAYBACK_DAYS as i64).days());

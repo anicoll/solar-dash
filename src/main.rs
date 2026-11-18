@@ -28,7 +28,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -244,7 +243,7 @@ async fn run_serve(config: Config) -> Result<()> {
     });
     let ctx = hub::SpokeContext {
         pool,
-        tz: clock::tz_to_jiff(tz),
+        tz: tz.clone(),
         shutdown,
         hub: hub::Hub::default(),
     };
@@ -309,13 +308,13 @@ fn warn_unconfigured_sources(config: &Config) {
 /// Opens the database, logs in and downloads history starting at `from`.
 async fn run_backfill(config: Config, from: &str) -> Result<()> {
     // Check the date first, so a typo fails before any network call.
-    let from = NaiveDate::parse_from_str(from, "%Y-%m-%d")
+    let from = jiff::civil::Date::strptime("%Y-%m-%d", from)
         .with_context(|| format!("--from must look like 2024-01-01, got {from:?}"))?;
     let cloud = config.require_isolarcloud("backfill")?;
     let pool = db::open(&config.database.path).await?;
     let mut client = Client::new(cloud.clone())?;
     client.login().await?;
-    ingest::backfill(&client, &pool, cloud, crate::clock::date_to_jiff(from)).await
+    ingest::backfill(&client, &pool, cloud, from).await
 }
 
 /// Logs in, calls one endpoint and prints its `result_data` as pretty JSON.
@@ -403,7 +402,9 @@ async fn modbus_test(config: Config, watch: bool) -> Result<()> {
             _ = &mut shutdown => break,
             _ = ticker.tick() => {}
         }
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let now = jiff::tz::TimeZone::system()
+            .to_datetime(jiff::Timestamp::now())
+            .strftime("%Y-%m-%d %H:%M:%S");
         // Stop at once on Ctrl+C even if the read is in progress.
         let result = tokio::select! {
             _ = &mut shutdown => break,

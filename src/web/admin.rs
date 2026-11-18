@@ -114,7 +114,7 @@ pub async fn read(
         return Ok(json.into_response());
     }
     let mut response = json.into_response();
-    let name = format!("solar-dash-admin-{}.json", today(&state.site_tz()));
+    let name = format!("solar-dash-admin-{}.json", today(&state.tz()));
     let disposition = format!("attachment; filename=\"{name}\"");
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
@@ -451,12 +451,12 @@ pub async fn tariff_preview(
         params
             .from
             .is_none()
-            .then(|| (today(&state.site_tz()) - 1.day()).to_string())
+            .then(|| (today(&state.tz()) - 1.day()).to_string())
     });
     let (from, count) = date_range(
         params.from.as_deref(),
         to.as_deref(),
-        &state.site_tz(),
+        &state.tz(),
         MAX_PREVIEW_DAYS,
         PREVIEW_DAYS,
     )?;
@@ -821,8 +821,7 @@ pub async fn car_create(
     State(state): State<AppState>,
     car: Result<Json<CarBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let (name, model, kind, owned_since) =
-        checked_car(body(car)?, "phev", today(&state.site_tz()))?;
+    let (name, model, kind, owned_since) = checked_car(body(car)?, "phev", today(&state.tz()))?;
     let mut created = Value::Null;
     admin_data::write(&state, async |tx| {
         let result = sqlx::query(
@@ -878,7 +877,7 @@ pub async fn car_update(
                 owned_since: car.owned_since.clone(),
             },
             &before.kind,
-            today(&state.site_tz()),
+            today(&state.tz()),
         )?;
         sqlx::query(
             "UPDATE manual_car SET name = ?, model = ?, kind = ?, owned_since = ? WHERE id = ?",
@@ -931,7 +930,7 @@ pub async fn teslamate_car_owned_since(
 ) -> ApiResult {
     let owned_since = body(owned)?
         .owned_since
-        .map(|date| checked_owned_since(&date, today(&state.site_tz())))
+        .map(|date| checked_owned_since(&date, today(&state.tz())))
         .transpose()?;
     let answer = json!({ "car_id": id, "owned_since": owned_since });
     admin_data::write(&state, async |tx| {
@@ -1064,7 +1063,7 @@ pub async fn fill_create(
     Path(car_id): Path<i64>,
     fill: Result<Json<FillBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let fill = checked_fill(body(fill)?, today(&state.site_tz()))?;
+    let fill = checked_fill(body(fill)?, today(&state.tz()))?;
     let mut created = Value::Null;
     admin_data::write(&state, async |tx| {
         if car_row(tx, car_id).await?.is_none() {
@@ -1117,7 +1116,7 @@ pub async fn fill_update(
     Path(id): Path<i64>,
     fill: Result<Json<FillBody>, JsonRejection>,
 ) -> ApiResult {
-    let fill = checked_fill(body(fill)?, today(&state.site_tz()))?;
+    let fill = checked_fill(body(fill)?, today(&state.tz()))?;
     let mut updated = Value::Null;
     admin_data::write(&state, async |tx| {
         let Some(before) = fill_row(tx, id).await? else {
