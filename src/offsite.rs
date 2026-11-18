@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
 use jiff::civil::Date;
-use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 

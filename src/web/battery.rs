@@ -133,9 +133,10 @@ fn day_sums(tariff: &Tariff, tz: Tz, free_start: u32, intervals: &[Interval]) ->
     let mut spells: BTreeMap<i64, (f64, i64)> = BTreeMap::new();
     // Export so far today, so the daily export tier is valued where it falls.
     let mut exported = 0.0;
+    let jiff_tz = crate::clock::tz_to_jiff(tz);
     for iv in intervals {
         let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
-        let minute = local_minute_of_day(tz, mid);
+        let minute = local_minute_of_day(&jiff_tz, mid);
         if tariff.in_credit_window(minute) {
             sums.has_window_data = true;
             sums.window_import_kwh += iv.import_kwh;
@@ -462,8 +463,13 @@ fn day_facts(
     let first_import_at = sums.as_ref().and_then(|s| s.first_import_ts);
     Some(DayFacts {
         estimate_earned: intervals.is_some_and(|iv| {
-            cost::day_cost_with_window_import(tariff, tz, iv, credit_import_kwh)
-                .zero_import_credit_cents
+            cost::day_cost_with_window_import(
+                tariff,
+                &crate::clock::tz_to_jiff(tz),
+                iv,
+                credit_import_kwh,
+            )
+            .zero_import_credit_cents
                 > 0.0
         }),
         sums,
@@ -647,8 +653,13 @@ async fn compute_facts(
             is_cacheable(date, today, source, *live_solid, newest_counter_ts, end)
         });
         let source = found.as_ref().map_or("", |(source, _, _)| source);
-        let credit_import =
-            credit_override_kwh(schedule.for_date(date), tz, date, source, day.meter);
+        let credit_import = credit_override_kwh(
+            schedule.for_date(crate::clock::date_to_jiff(date)),
+            tz,
+            date,
+            source,
+            day.meter,
+        );
         let intervals = found.map(|(_, intervals, _)| intervals);
         let soc = SocSeries {
             live: live
@@ -657,7 +668,7 @@ async fn compute_facts(
                 .collect(),
             cloud: slice_between(&cloud_soc, |r| r.0, start, end).to_vec(),
         };
-        let tariff = schedule.for_date(date);
+        let tariff = schedule.for_date(crate::clock::date_to_jiff(date));
         if let Some(facts) = day_facts(tariff, tz, date, intervals.as_deref(), credit_import, &soc)
         {
             out.push((date, facts, cacheable));
@@ -688,7 +699,13 @@ async fn facts_for(
         let Ok(date) = NaiveDate::from_str(&row.date) else {
             continue;
         };
-        if row.tariff_key != battery_cache_key(tz, schedule.for_date(date), &state.rules) {
+        if row.tariff_key
+            != battery_cache_key(
+                tz,
+                schedule.for_date(crate::clock::date_to_jiff(date)),
+                &state.rules,
+            )
+        {
             continue;
         }
         // A row that no longer parses is worked out again and replaced.
@@ -709,7 +726,11 @@ async fn facts_for(
             if cacheable {
                 to_store.push(db::DailyBattery {
                     date: date.to_string(),
-                    tariff_key: battery_cache_key(tz, schedule.for_date(date), &state.rules),
+                    tariff_key: battery_cache_key(
+                        tz,
+                        schedule.for_date(crate::clock::date_to_jiff(date)),
+                        &state.rules,
+                    ),
                     facts: serde_json::to_string(&facts).map_err(anyhow::Error::from)?,
                 });
             }
@@ -734,7 +755,11 @@ pub async fn battery(
     };
     let tz = state.tz;
     let today = today(tz);
-    if schedule.for_date(today).credit_window_minutes().is_none() {
+    if schedule
+        .for_date(crate::clock::date_to_jiff(today))
+        .credit_window_minutes()
+        .is_none()
+    {
         return Ok(Json(json!({ "configured": false })));
     }
 
@@ -766,7 +791,11 @@ pub async fn battery(
             billed: billed.get(&date.to_string()).copied(),
             sessions: &sessions,
         };
-        days.extend(build_day(schedule.for_date(date), tz, &input));
+        days.extend(build_day(
+            schedule.for_date(crate::clock::date_to_jiff(date)),
+            tz,
+            &input,
+        ));
     }
 
     add_reasons(&mut days);

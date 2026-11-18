@@ -267,7 +267,7 @@ pub(super) async fn amber_days(
         let day_extras = day_extras(state, purchases, date, start, end).await?;
         let key = day_key(
             state,
-            schedule.for_date(date),
+            schedule.for_date(crate::clock::date_to_jiff(date)),
             &hypothetical,
             compare,
             &day_extras,

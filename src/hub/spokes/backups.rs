@@ -34,7 +34,7 @@ impl Spoke for Backups {
                 ctx.pool,
                 self.dir,
                 self.keep,
-                crate::clock::tz_to_jiff(ctx.tz),
+                ctx.tz,
                 self.offsite,
                 ctx.shutdown.wait(),
             )

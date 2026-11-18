@@ -131,7 +131,10 @@ fn log_offsite(result: Result<crate::offsite::Synced>) {
 
 /// One backup, local pruning, then the offsite upload. Errors are logged, not
 /// returned.
-async fn run_once(pool: &SqlitePool, dir: &Path, keep: usize,
+async fn run_once(
+    pool: &SqlitePool,
+    dir: &Path,
+    keep: usize,
     tz: &TimeZone,
     offsite: Option<&Offsite>,
 ) {

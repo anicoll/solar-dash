@@ -134,12 +134,8 @@ impl AdminData {
 
         let plans = load_plans(conn).await?;
         if !plans.is_empty() {
-            let chrono_plans: Vec<_> = plans
-                .iter()
-                .map(|(from, tariff)| (from.map(crate::clock::date_to_chrono), tariff.clone()))
-                .collect();
-            let schedule = TariffSchedule::from_plans(&chrono_plans)
-                .context("the tariff plans do not work")?;
+            let schedule =
+                TariffSchedule::from_plans(&plans).context("the tariff plans do not work")?;
             data.tariff = Some(Arc::new(schedule));
         }
 
@@ -163,13 +159,7 @@ impl AdminData {
             check_price(cents).with_context(|| format!("petrol price from {from}"))?;
             changes.push((date, cents));
         }
-        data.petrol = PetrolHistory::new(
-            data.ev_prices.petrol_cents_per_litre,
-            changes
-                .into_iter()
-                .map(|(from, cents)| (crate::clock::date_to_chrono(from), cents))
-                .collect(),
-        );
+        data.petrol = PetrolHistory::new(data.ev_prices.petrol_cents_per_litre, changes);
 
         let rows: Vec<(String, String, f64, Option<f64>)> = sqlx::query_as(
             "SELECT name, date, cost_dollars, battery_kwh FROM purchase ORDER BY date, id",
@@ -201,9 +191,7 @@ fn parse_date(text: &str) -> Result<Date> {
 }
 
 /// The plans in `tariff_plan`, earliest first, as `(valid_from, tariff)`.
-async fn load_plans(
-    conn: &mut SqliteConnection,
-) -> Result<Vec<(Option<Date>, config::Tariff)>> {
+async fn load_plans(conn: &mut SqliteConnection) -> Result<Vec<(Option<Date>, config::Tariff)>> {
     let rows = load_plan_rows(conn).await?;
     Ok(rows
         .into_iter()
@@ -622,7 +610,7 @@ mod tests {
         // And through the schedule, which is what the cache reads.
         let before = TariffSchedule::from_plans(&[(None, from_toml)]).unwrap();
         let after = TariffSchedule::from_plans(&[(None, back)]).unwrap();
-        let day = crate::clock::date_to_chrono(jiff::civil::date(2026, 1, 1));
+        let day = jiff::civil::date(2026, 1, 1);
         assert_eq!(before.for_date(day).key(), after.for_date(day).key());
     }
 

@@ -60,11 +60,7 @@ pub fn floor_date(configured: Option<Date>, today: Date) -> Date {
 /// overlapping by a day is the way to be sure of leaving no gap. Rows already
 /// stored are harmless to fetch again (actual prices are never overwritten).
 /// With nothing stored the range ends yesterday.
-pub fn plan_chunk(
-    oldest: Option<Date>,
-    today: Date,
-    floor: Date,
-) -> Option<(Date, Date)> {
+pub fn plan_chunk(oldest: Option<Date>, today: Date, floor: Date) -> Option<(Date, Date)> {
     let end = match oldest {
         Some(day) if day <= floor => return None,
         Some(day) => day,
@@ -215,8 +211,13 @@ impl Backfill {
             Err(err) => return Err(err),
         };
         let stop = nothing_older(&items, oldest_ts);
-        let saved =
-            store::save_prices(pool, &source, &actuals_only(items), crate::clock::unix_now()).await?;
+        let saved = store::save_prices(
+            pool,
+            &source,
+            &actuals_only(items),
+            crate::clock::unix_now(),
+        )
+        .await?;
         debug!(%start, %end, saved, "Amber past prices stored");
         if stop {
             finish(pool, &job, start, "Amber has no older prices").await?;

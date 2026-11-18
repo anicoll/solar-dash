@@ -427,12 +427,7 @@ pub async fn tariff_preview(
     let rows = admin_data::load_plan_rows(&mut conn).await?;
     let current: Vec<_> = rows
         .iter()
-        .map(|(_, from, tariff)| {
-            (
-                from.map(crate::clock::date_to_chrono),
-                tariff.clone(),
-            )
-        })
+        .map(|(_, from, tariff)| (from.map(crate::clock::date_to_chrono), tariff.clone()))
         .collect();
     let mut changed = current.clone();
     match plan.id {
@@ -444,12 +439,22 @@ pub async fn tariff_preview(
         }
         None => changed.push((valid_from, plan.tariff)),
     }
-    let changed = TariffSchedule::from_plans(&changed)
-        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    let changed = TariffSchedule::from_plans(
+        &changed
+            .iter()
+            .map(|(d, t)| (d.map(crate::clock::date_to_jiff), t.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     let current = if current.is_empty() {
         None
     } else {
-        Some(TariffSchedule::from_plans(&current)?)
+        Some(TariffSchedule::from_plans(
+            &current
+                .iter()
+                .map(|(d, t)| (d.map(crate::clock::date_to_jiff), t.clone()))
+                .collect::<Vec<_>>(),
+        )?)
     };
 
     // The default range ends yesterday: today is not finished yet.

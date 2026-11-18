@@ -120,12 +120,7 @@ async fn probed(call: impl Future<Output = Result<Value>>) -> Value {
 }
 
 /// Probes the endpoints of one service.
-async fn probe_service(
-    client: &Client,
-    service: &Service,
-    range: DateRange,
-    today: Date,
-) -> Value {
+async fn probe_service(client: &Client, service: &Service, range: DateRange, today: Date) -> Value {
     let asid = service.id.as_str();
     let by_service = [("accountServiceId", asid)];
 
@@ -374,7 +369,7 @@ pub(crate) fn write_private(path: &Path, text: &str) -> Result<()> {
 /// Logs in, probes the portal, and writes the redacted dump to `out`.
 pub async fn run(client: Client, tz: &TimeZone, days: u32, out: &Path) -> Result<()> {
     client.login().await?;
-    let mut dump = build_dump(&client, &tz, days).await?;
+    let mut dump = build_dump(&client, tz, days).await?;
     redact(&mut dump);
     let text = serde_json::to_string_pretty(&dump)?;
     write_private(out, &text)?;

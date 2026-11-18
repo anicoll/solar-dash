@@ -28,9 +28,9 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use futures_util::{SinkExt, StreamExt};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::time::timeout;

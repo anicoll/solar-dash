@@ -8,9 +8,9 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use jiff::Timestamp;
 use jiff::civil::{Date, DateTime};
 use jiff::tz::{AmbiguousOffset, TimeZone};
-use jiff::Timestamp;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tracing::{debug, info, warn};
@@ -152,7 +152,12 @@ fn parse_value(value: &Value) -> Option<f64> {
 /// row are simply not stored; points present but empty are stored as `None`.
 /// `window_start` (unix seconds) is where the window began; it decides which
 /// copy of a repeated local time (clocks going back) is meant.
-pub fn parse_history(result_data: &Value, ps_key: &str, tz: &TimeZone, window_start: i64) -> Vec<Reading> {
+pub fn parse_history(
+    result_data: &Value,
+    ps_key: &str,
+    tz: &TimeZone,
+    window_start: i64,
+) -> Vec<Reading> {
     let mut readings = Vec::new();
     let Some(rows) = result_data[ps_key].as_array() else {
         return readings; // no data for this device in the window
@@ -368,8 +373,12 @@ impl PlantSetup {
                 let date = Date::strptime("%Y-%m-%d", text).map_err(|_| {
                     anyhow!("history_from must look like \"2024-01-01\", got {text:?}")
                 })?;
-                parse_local(&date.strftime("%Y%m%d000000").to_string(), &tz)
-                    .ok_or_else(|| anyhow!("{date} has no local midnight in {}", tz.iana_name().unwrap_or("UTC")))
+                parse_local(&date.strftime("%Y%m%d000000").to_string(), &tz).ok_or_else(|| {
+                    anyhow!(
+                        "{date} has no local midnight in {}",
+                        tz.iana_name().unwrap_or("UTC")
+                    )
+                })
             })
             .transpose()?;
         Ok(Self {
@@ -438,7 +447,7 @@ pub async fn sync_range(
         let params = json!({
             "ps_key_list": [&plant.ps_key],
             "points": plant.points,
-            "start_time_stamp": format_local(start, &tz),
+            "start_time_stamp": format_local(start, tz),
             "end_time_stamp": format_local(window_end - STEP_SECS, tz),
             "minute_interval": "5",
         });
@@ -469,8 +478,8 @@ pub async fn sync_range(
 
         let calls_this_hour = db::api_calls_since(pool, db::now() - 3600).await?;
         info!(
-            from = %format_local(start, &tz),
-            to = %format_local(window_end, &tz),
+            from = %format_local(start, tz),
+            to = %format_local(window_end, tz),
             rows = readings.len(),
             calls_this_hour,
             window_hours = window / 3600,
@@ -492,8 +501,12 @@ pub async fn backfill(
     let plant = PlantSetup::from_config(config)?;
     let tz = &plant.tz;
 
-    let from_ts = parse_local(&from.strftime("%Y%m%d000000").to_string(), tz)
-        .ok_or_else(|| anyhow!("{from} has no local midnight in {}", tz.iana_name().unwrap_or("UTC")))?;
+    let from_ts = parse_local(&from.strftime("%Y%m%d000000").to_string(), tz).ok_or_else(|| {
+        anyhow!(
+            "{from} has no local midnight in {}",
+            tz.iana_name().unwrap_or("UTC")
+        )
+    })?;
     let cursor = db::get_cursor(pool, BACKFILL_JOB).await?;
     let start = cursor.map_or(from_ts, |c| c.max(from_ts));
     let end = round_down_to_step(db::now());
@@ -552,8 +565,12 @@ const LIVE_OVERLAP_SECS: i64 = 15 * 60;
 async fn live_start(pool: &SqlitePool, tz: &TimeZone, now_ts: i64) -> Result<i64> {
     let live = db::get_cursor(pool, LIVE_JOB).await?;
     let backfill = db::get_cursor(pool, BACKFILL_JOB).await?;
-    let midnight = local_midnight(now_ts, tz)
-        .ok_or_else(|| anyhow!("could not work out local midnight in {}", tz.iana_name().unwrap_or("UTC")))?;
+    let midnight = local_midnight(now_ts, tz).ok_or_else(|| {
+        anyhow!(
+            "could not work out local midnight in {}",
+            tz.iana_name().unwrap_or("UTC")
+        )
+    })?;
     if live.is_none() {
         info!(
             "no live sync yet; starting from midnight today. Run backfill to fetch older history"
@@ -632,8 +649,12 @@ async fn backfill_step(
             let Some(live) = db::get_cursor(pool, LIVE_JOB).await? else {
                 return Ok(());
             };
-            let midnight = local_midnight(db::now(), &plant.tz)
-                .ok_or_else(|| anyhow!("could not work out local midnight in {}", plant.tz.iana_name().unwrap_or("UTC")))?;
+            let midnight = local_midnight(db::now(), &plant.tz).ok_or_else(|| {
+                anyhow!(
+                    "could not work out local midnight in {}",
+                    plant.tz.iana_name().unwrap_or("UTC")
+                )
+            })?;
             let until = live.min(midnight);
             db::set_cursor(pool, BACKFILL_UNTIL_JOB, until).await?;
             until

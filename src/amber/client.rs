@@ -144,12 +144,7 @@ impl Client {
 
     /// `GET /sites/{id}/usage`: metered usage from `start` to `end`, both
     /// inclusive. Amber allows at most 7 days between them.
-    pub async fn usage(
-        &self,
-        site_id: &str,
-        start: Date,
-        end: Date,
-    ) -> Result<Reply<Usage>> {
+    pub async fn usage(&self, site_id: &str, start: Date, end: Date) -> Result<Reply<Usage>> {
         let path = format!("/sites/{site_id}/usage");
         self.get(
             &path,

@@ -621,7 +621,10 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     let complete_dates: Vec<NaiveDate> = complete.iter().map(|day| day.date).collect();
     let splits = grid_splits(&state, schedule, &complete_dates).await?;
     for day in &costed {
-        let has_credit = schedule.for_date(day.date).credit_cents().is_some();
+        let has_credit = schedule
+            .for_date(crate::clock::date_to_jiff(day.date))
+            .credit_cents()
+            .is_some();
         daily.push(DailyEntry {
             date: day.date.to_string(),
             total_dollars: dollars(day.cost.actual_cents),
@@ -636,7 +639,7 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
         uses_globird |= day.source == SOURCE_GLOBIRD || day.source == SOURCE_BILL;
         credit_possible += u32::from(has_credit);
         if let Some(split) = splits.get(&day.date) {
-            let tariff = schedule.for_date(day.date);
+            let tariff = schedule.for_date(crate::clock::date_to_jiff(day.date));
             add_bands(&mut bands, split, tariff, day.cost.import_cents);
             add_feed_in(&mut feed_in, split, tariff, day.cost.export_cents);
             free_value_cents += split.import_free_kwh * tariff.default_import_cents();
@@ -644,7 +647,9 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     }
 
     let plan_day = today.min(period.to);
-    let supply_per_day = schedule.for_date(plan_day).supply_cents_per_day();
+    let supply_per_day = schedule
+        .for_date(crate::clock::date_to_jiff(plan_day))
+        .supply_cents_per_day();
     let (mut projected, mut projected_without) = project(&sums, days_total, supply_per_day);
     if finished {
         projected = sums.actual_cents;
@@ -653,7 +658,7 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     // Rates and window times are the last complete day's plan (today's when
     // there is none yet).
     let rate_day = complete.last().map_or(plan_day, |day| day.date);
-    let rate_plan = schedule.for_date(rate_day);
+    let rate_plan = schedule.for_date(crate::clock::date_to_jiff(rate_day));
     let band_cents = [
         0.0,
         rate_plan.default_import_cents(),

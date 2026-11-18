@@ -188,10 +188,7 @@ mod tests {
         assert_eq!(prices[0].channel_type, ChannelType::General);
         assert_eq!(prices[0].per_kwh, 24.33);
         assert_eq!(prices[0].duration, 30);
-        assert_eq!(
-            prices[0].start_time.to_string(),
-            "2021-05-05T02:00:01Z"
-        );
+        assert_eq!(prices[0].start_time.to_string(), "2021-05-05T02:00:01Z");
         assert!(prices[0].estimate.is_none());
 
         // A negative feed-in price and the current-interval extras.

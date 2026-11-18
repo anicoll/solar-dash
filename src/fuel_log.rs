@@ -370,13 +370,7 @@ mod tests {
     fn the_month_average_comes_from_the_petrol_price_history() {
         let day = |d| jiff::civil::date(2026, 10, d);
         // 200 c/L for the first half of October (15 days), 100 c/L after (16).
-        let petrol = PetrolHistory::new(
-            None,
-            vec![
-                (crate::clock::date_to_chrono(day(1)), 200.0),
-                (crate::clock::date_to_chrono(day(16)), 100.0),
-            ],
-        );
+        let petrol = PetrolHistory::new(None, vec![(day(1), 200.0), (day(16), 100.0)]);
         let fills = [
             fill(1, "2026-10-02", 10.0, 22.0, None, true),
             fill(2, "2026-09-02", 10.0, 22.0, None, true),

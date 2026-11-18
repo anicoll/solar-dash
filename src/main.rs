@@ -244,7 +244,7 @@ async fn run_serve(config: Config) -> Result<()> {
     });
     let ctx = hub::SpokeContext {
         pool,
-        tz,
+        tz: clock::tz_to_jiff(tz),
         shutdown,
         hub: hub::Hub::default(),
     };

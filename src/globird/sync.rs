@@ -107,9 +107,7 @@ fn local_at(tz: &TimeZone, date: Date, time: Time) -> ZonedDateTime {
     let ts = crate::clock::local_ts(naive, tz)
         .or_else(|| crate::clock::local_ts(naive.checked_add(1.hour()).ok()?, tz))
         // Cannot happen with real zones; this only keeps the code total.
-        .unwrap_or_else(|| {
-            crate::clock::local_ts(naive, &TimeZone::UTC).expect("UTC has no gaps")
-        });
+        .unwrap_or_else(|| crate::clock::local_ts(naive, &TimeZone::UTC).expect("UTC has no gaps"));
     jiff::Timestamp::from_second(ts)
         .expect("unix time within jiff's range")
         .to_zoned_datetime(tz.clone())
@@ -596,7 +594,10 @@ mod tests {
         // after the clocks went back.
         let retry = next_run(&at(2026, 4, 5, 1, 30), nine, false);
         assert_eq!(show(&retry), "2026-04-05 02:30 +0930");
-        assert_eq!(retry.duration_since(&at(2026, 4, 5, 1, 30)), SignedDuration::from_hours(2));
+        assert_eq!(
+            retry.duration_since(&at(2026, 4, 5, 1, 30)),
+            SignedDuration::from_hours(2)
+        );
         // A sync time in the repeated hour means its first occurrence.
         assert_eq!(
             show(&next_run(&at(2026, 4, 4, 22, 0), time(2, 30), true)),
