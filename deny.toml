@@ -13,9 +13,4 @@ ignore = [
     # is libsqlite3-sys 0.39, but sqlx-sqlite 0.9 requires <0.38; drop this
     # once an sqlx release allows 0.39 (then `cargo update -p libsqlite3-sys`).
     { id = "RUSTSEC-2026-0459", reason = "only our own database is opened; no sqlx release allows the fixed libsqlite3-sys yet" },
-    # chrono and chrono-tz are marked unmaintained (no patched release). This is
-    # temporary while the code moves to jiff; the last PR of that migration
-    # removes chrono, chrono-tz and these two entries.
-    { id = "RUSTSEC-2026-0543", reason = "temporary: chrono is being replaced by jiff" },
-    { id = "RUSTSEC-2026-0555", reason = "temporary: chrono-tz is being replaced by jiff" },
 ]

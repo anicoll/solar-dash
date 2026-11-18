@@ -61,7 +61,7 @@ fn checked(name: &str, result: ApiResult) -> Option<Value> {
 /// `{"configured": false}` quickly, so it costs nothing.
 pub async fn warm(state: &AppState) {
     let started = Instant::now();
-    let today = today(&state.site_tz());
+    let today = today(&state.tz());
     let day = |n: u64| (today - (n as i64).days()).to_string();
     let mut calls = 0;
 

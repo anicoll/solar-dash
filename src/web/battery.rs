@@ -594,7 +594,7 @@ async fn compute_facts(
     today: Date,
     now: i64,
 ) -> Result<Vec<(Date, DayFacts, bool)>, ApiError> {
-    let tz = state.site_tz();
+    let tz = state.tz();
     let range_start = day_bounds_or_error(dates[0], &tz)?.0;
     let range_end = day_bounds_or_error(dates[dates.len() - 1], &tz)?.1;
     let rows = db::readings_for_metrics_from(
@@ -669,7 +669,7 @@ async fn facts_for(
     let (Some(first), Some(last)) = (dates.first(), dates.last()) else {
         return Ok(HashMap::new());
     };
-    let tz = state.site_tz();
+    let tz = state.tz();
     let mut by_date: HashMap<Date, DayFacts> = HashMap::new();
     let stored =
         db::daily_battery_in_range(&state.pool, &first.to_string(), &last.to_string()).await?;
@@ -721,7 +721,7 @@ pub async fn battery(
     let Some(schedule) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
-    let tz = state.site_tz();
+    let tz = state.tz();
     let today = today(&tz);
     if schedule.for_date(today).credit_window_minutes().is_none() {
         return Ok(Json(json!({ "configured": false })));
