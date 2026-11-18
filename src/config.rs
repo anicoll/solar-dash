@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -437,7 +437,7 @@ impl Teslamate {
                 "compare_cars in [teslamate] needs a model and a car name in every entry"
             );
         }
-        let mut last: Option<NaiveDate> = None;
+        let mut last: Option<Date> = None;
         for (i, p) in self.petrol_price.iter().enumerate() {
             let section = format!("[[teslamate.petrol_price]] #{}", i + 1);
             let from = parse_date(&p.from).with_context(|| format!("from in {section}"))?;
@@ -1093,7 +1093,7 @@ fn check_previous_tariffs(previous: &[PreviousTariff], has_current: bool) -> Res
         previous.is_empty() || has_current,
         "[[previous_tariff]] needs a [tariff] section for the plan since the last `until`"
     );
-    let mut last: Option<NaiveDate> = None;
+    let mut last: Option<Date> = None;
     for (i, p) in previous.iter().enumerate() {
         let section = format!("[[previous_tariff]] #{}", i + 1);
         let until = parse_date(&p.until).with_context(|| format!("until in {section}"))?;
@@ -1168,9 +1168,11 @@ impl Purchase {
     }
 }
 
-/// Parse a "YYYY-MM-DD" date. Strict, like [`parse_hhmm`].
-pub fn parse_date(text: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+/// Parse a "YYYY-MM-DD" date. Same rules as the parser this replaced: it takes
+/// one or two digits for the month and day (`2026-1-5`), skips leading
+/// whitespace and rejects anything after the day.
+pub fn parse_date(text: &str) -> Result<Date> {
+    Date::strptime("%Y-%m-%d", text)
         .with_context(|| format!("\"{text}\" is not a date in YYYY-MM-DD form"))
 }
 
@@ -2140,6 +2142,29 @@ mod tests {
         assert_eq!(parse_hhmm("23:59").unwrap(), 1439);
         for bad in ["", "9:05", "24:00", "12:60", "12-30", "ab:cd", "12:300"] {
             assert!(parse_hhmm(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_date_keeps_its_old_leniency() {
+        use jiff::civil::date;
+        assert_eq!(parse_date("2026-10-20").unwrap(), date(2026, 10, 20));
+        // Un-padded months and days, and leading whitespace, were accepted.
+        for ok in ["2026-1-5", "2026-01-5", "2026-1-05", " 2026-01-05"] {
+            assert_eq!(parse_date(ok).unwrap(), date(2026, 1, 5), "{ok}");
+        }
+        for bad in [
+            "",
+            "2026-01-05 ",
+            "2026-01-05x",
+            "2026-01-05T00:00",
+            "2026/01/05",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-001-05",
+            "12026-01-05",
+        ] {
+            assert!(parse_date(bad).is_err(), "{bad:?} should be rejected");
         }
     }
 

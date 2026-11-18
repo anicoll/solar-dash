@@ -8,7 +8,7 @@
 //! by solar made at that moment first, then battery discharge, then the grid,
 //! the same order the Now view and the car charging split use.
 
-use chrono_tz::Tz;
+use jiff::tz::TimeZone;
 use serde::Serialize;
 
 use super::api::{MAX_HOLD_SECS, MAX_SPREAD_SECS, derive_power};
@@ -48,7 +48,7 @@ pub(super) struct HomeMix {
 /// The grid part bought while `tariff` makes import free (judged at each
 /// step's midpoint, as the bill does) is also counted in `grid_free_kwh`.
 /// No steps means no figures at all.
-pub(super) fn home_mix(steps: &[Step], tariff: Option<&Tariff>, tz: Tz) -> HomeMix {
+pub(super) fn home_mix(steps: &[Step], tariff: Option<&Tariff>, tz: &TimeZone) -> HomeMix {
     if steps.is_empty() {
         return HomeMix::default();
     }
@@ -63,9 +63,10 @@ pub(super) fn home_mix(steps: &[Step], tariff: Option<&Tariff>, tz: Tz) -> HomeM
         battery += from_battery * secs;
         grid += from_grid * secs;
         let mid = step.start + step.secs / 2;
-        if tariff
-            .is_some_and(|t| t.import_band_at(local_minute_of_day(tz, mid)) == ImportBand::Free)
-        {
+        if tariff.is_some_and(|t| {
+            t.import_band_at(local_minute_of_day(crate::clock::tz_to_chrono(tz), mid))
+                == ImportBand::Free
+        }) {
             free += from_grid * secs;
         }
     }
@@ -135,7 +136,9 @@ pub(super) fn cloud_steps(
 mod tests {
     use super::*;
 
-    const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
 
     fn step(start: i64, pv_w: f64, load_w: f64, discharge_w: f64) -> Step {
         Step {
@@ -152,7 +155,7 @@ mod tests {
         // 5 kW of solar and an 11 kW load (car charging) while 10 kW is
         // bought to fill the battery as well: the house still ran 5 kWh on
         // solar, and only the other 6 kWh came from the grid.
-        let mix = home_mix(&[step(0, 5000.0, 11_000.0, 0.0)], None, ADELAIDE);
+        let mix = home_mix(&[step(0, 5000.0, 11_000.0, 0.0)], None, &adelaide());
         assert_eq!(mix.solar_kwh, Some(5.0));
         assert_eq!(mix.battery_kwh, Some(0.0));
         assert_eq!(mix.grid_kwh, Some(6.0));
@@ -171,7 +174,7 @@ mod tests {
                 step(7200, 0.0, 2000.0, 1500.0),
             ],
             None,
-            ADELAIDE,
+            &adelaide(),
         );
         assert_eq!(mix.solar_kwh, Some(1.5));
         assert_eq!(mix.battery_kwh, Some(3.0));
@@ -203,7 +206,7 @@ mod tests {
                 step(noon + 3 * 3600, 0.0, 1000.0, 0.0),
             ],
             Some(&tariff),
-            ADELAIDE,
+            &adelaide(),
         );
         assert_eq!(mix.grid_kwh, Some(3.0));
         assert_eq!(mix.grid_free_kwh, Some(2.0));
@@ -211,7 +214,7 @@ mod tests {
 
     #[test]
     fn no_steps_means_no_figures() {
-        assert_eq!(home_mix(&[], None, ADELAIDE), HomeMix::default());
+        assert_eq!(home_mix(&[], None, &adelaide()), HomeMix::default());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -96,7 +96,7 @@ pub async fn amber_whatif(
     let selected = params.levers();
     let (from, to, dates) = compare_dates(&state, params.from.as_deref(), params.to.as_deref())?;
     let amber = amber_days(&state, schedule, compare, &data.purchases, &dates).await?;
-    let billed: BTreeMap<NaiveDate, (&'static str, f64)> = billed_days(&state, schedule, &dates)
+    let billed: BTreeMap<Date, (&'static str, f64)> = billed_days(&state, schedule, &dates)
         .await?
         .into_iter()
         .map(|day| (day.date, (day.source, day.cost.actual_cents)))

@@ -9,17 +9,17 @@
 //! The handler at the bottom only loads data and joins it up.
 
 use std::collections::{BTreeMap, HashMap};
-use std::str::FromStr;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::{Days, LocalResult, NaiveDate, NaiveTime, TimeZone};
-use chrono_tz::Tz;
+use jiff::ToSpan;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
-use super::api::{ApiError, ApiResult, day_bounds_or_error, today};
+use super::api::{ApiError, ApiResult, day_bounds_or_error, tariff_on, today};
 use super::costs::{
     DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, cache_key, credit_override_kwh,
     day_intervals, is_cacheable, live_in, meter_for_day, meter_in, round2, rules_key,
@@ -127,7 +127,7 @@ fn peak_load_kw(spells: &BTreeMap<i64, (f64, i64)>) -> Option<f64> {
 
 /// Adds up one day's intervals. `window` is the credit window and
 /// `free_start` the minute free import begins (both minutes since midnight).
-fn day_sums(tariff: &Tariff, tz: Tz, free_start: u32, intervals: &[Interval]) -> DaySums {
+fn day_sums(tariff: &Tariff, tz: &TimeZone, free_start: u32, intervals: &[Interval]) -> DaySums {
     let mut sums = DaySums::default();
     let credit_max_kwh = tariff.credit_max_kwh().unwrap_or(0.0);
     let mut spells: BTreeMap<i64, (f64, i64)> = BTreeMap::new();
@@ -135,7 +135,7 @@ fn day_sums(tariff: &Tariff, tz: Tz, free_start: u32, intervals: &[Interval]) ->
     let mut exported = 0.0;
     for iv in intervals {
         let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
-        let minute = local_minute_of_day(tz, mid);
+        let minute = local_minute_of_day(crate::clock::tz_to_chrono(tz), mid);
         if tariff.in_credit_window(minute) {
             sums.has_window_data = true;
             sums.window_import_kwh += iv.import_kwh;
@@ -411,17 +411,6 @@ fn summarise(rows: &[DayRow]) -> Summary {
 // Putting a day together
 // ---------------------------------------------------------------------------
 
-/// Unix time of `minutes` after local midnight on `date`, or `None` if that
-/// moment does not exist (a daylight saving gap).
-pub(super) fn local_time(date: NaiveDate, minutes: u32, tz: Tz) -> Option<i64> {
-    let naive = date.and_time(NaiveTime::MIN) + chrono::Duration::minutes(minutes.into());
-    match tz.from_local_datetime(&naive) {
-        LocalResult::Single(t) => Some(t.timestamp()),
-        LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp()),
-        LocalResult::None => None,
-    }
-}
-
 /// What one day's data says, before the bill and the car sessions are added.
 /// Working this out reads the day's raw samples, so finished days are kept in
 /// the `daily_battery` table as JSON (see [`BATTERY_CACHE_VERSION`]). Nothing
@@ -445,8 +434,8 @@ struct DayFacts {
 /// `None` if the plan in effect has no credit window.
 fn day_facts(
     tariff: &Tariff,
-    tz: Tz,
-    date: NaiveDate,
+    tz: &TimeZone,
+    date: Date,
     intervals: Option<&[Interval]>,
     credit_import_kwh: Option<f64>,
     soc: &SocSeries,
@@ -455,15 +444,20 @@ fn day_facts(
     let free_start = tariff
         .free_import_start()
         .unwrap_or(DEFAULT_FREE_START_MINUTE);
-    let at = |minute: u32| local_time(date, minute, tz);
+    let at = |minute: u32| crate::clock::local_minutes(date, minute, tz);
     let (window_start, window_end) = (at(window_from), at(window_to));
     let sums = intervals.map(|iv| day_sums(tariff, tz, free_start, iv));
     let soc_at = |ts: Option<i64>| ts.and_then(|ts| soc.at(ts)).map(round1);
     let first_import_at = sums.as_ref().and_then(|s| s.first_import_ts);
     Some(DayFacts {
         estimate_earned: intervals.is_some_and(|iv| {
-            cost::day_cost_with_window_import(tariff, tz, iv, credit_import_kwh)
-                .zero_import_credit_cents
+            cost::day_cost_with_window_import(
+                tariff,
+                crate::clock::tz_to_chrono(tz),
+                iv,
+                credit_import_kwh,
+            )
+            .zero_import_credit_cents
                 > 0.0
         }),
         sums,
@@ -481,7 +475,7 @@ fn day_facts(
 
 /// Everything one day's row is built from.
 struct DayInput<'a> {
-    date: NaiveDate,
+    date: Date,
     now: i64,
     facts: &'a DayFacts,
     billed: Option<bool>,
@@ -490,14 +484,14 @@ struct DayInput<'a> {
 
 /// Works out one day's row (without the reason, which needs all the days).
 /// `None` if the plan in effect has no credit window.
-fn build_day(tariff: &Tariff, tz: Tz, input: &DayInput) -> Option<DayRow> {
+fn build_day(tariff: &Tariff, tz: &TimeZone, input: &DayInput) -> Option<DayRow> {
     let (window_from, window_to) = tariff.credit_window_minutes()?;
     let free_start = tariff
         .free_import_start()
         .unwrap_or(DEFAULT_FREE_START_MINUTE);
     let date = input.date;
     let facts = input.facts;
-    let at = |minute: u32| local_time(date, minute, tz);
+    let at = |minute: u32| crate::clock::local_minutes(date, minute, tz);
     let (window_start, window_end) = (at(window_from), at(window_to));
     // A period only counts once it is over, so today's averages are not skewed.
     let is_over = |end: Option<i64>| end.is_some_and(|end| input.now >= end);
@@ -586,7 +580,7 @@ const BATTERY_CACHE_VERSION: u32 = 3;
 
 /// What stored [`DayFacts`] are tagged with: they only count while the time
 /// zone and the plan for that day are unchanged.
-fn battery_cache_key(tz: Tz, tariff: &Tariff, rules: &SourceRules) -> String {
+fn battery_cache_key(tz: &TimeZone, tariff: &Tariff, rules: &SourceRules) -> String {
     format!(
         "{BATTERY_CACHE_VERSION}|{}{}",
         cache_key(tz, tariff),
@@ -601,13 +595,13 @@ fn battery_cache_key(tz: Tz, tariff: &Tariff, rules: &SourceRules) -> String {
 async fn compute_facts(
     state: &AppState,
     schedule: &TariffSchedule,
-    dates: &[NaiveDate],
-    today: NaiveDate,
+    dates: &[Date],
+    today: Date,
     now: i64,
-) -> Result<Vec<(NaiveDate, DayFacts, bool)>, ApiError> {
-    let tz = state.tz;
-    let range_start = day_bounds_or_error(dates[0], tz)?.0;
-    let range_end = day_bounds_or_error(dates[dates.len() - 1], tz)?.1;
+) -> Result<Vec<(Date, DayFacts, bool)>, ApiError> {
+    let tz = state.site_tz();
+    let range_start = day_bounds_or_error(dates[0], &tz)?.0;
+    let range_end = day_bounds_or_error(dates[dates.len() - 1], &tz)?.1;
     let rows = db::readings_for_metrics_from(
         &state.pool,
         &state.counter_source(),
@@ -625,7 +619,7 @@ async fn compute_facts(
 
     let mut out = Vec::with_capacity(dates.len());
     for &date in dates {
-        let (start, end) = day_bounds_or_error(date, tz)?;
+        let (start, end) = day_bounds_or_error(date, &tz)?;
         // One day of live samples at a time, to keep memory small.
         let live = live_in(&state.pool, &state.rules, live_range, start, end).await?;
         let day = DayData {
@@ -648,7 +642,7 @@ async fn compute_facts(
         });
         let source = found.as_ref().map_or("", |(source, _, _)| source);
         let credit_import =
-            credit_override_kwh(schedule.for_date(date), tz, date, source, day.meter);
+            credit_override_kwh(tariff_on(schedule, date), &tz, date, source, day.meter);
         let intervals = found.map(|(_, intervals, _)| intervals);
         let soc = SocSeries {
             live: live
@@ -657,8 +651,8 @@ async fn compute_facts(
                 .collect(),
             cloud: slice_between(&cloud_soc, |r| r.0, start, end).to_vec(),
         };
-        let tariff = schedule.for_date(date);
-        if let Some(facts) = day_facts(tariff, tz, date, intervals.as_deref(), credit_import, &soc)
+        let tariff = tariff_on(schedule, date);
+        if let Some(facts) = day_facts(tariff, &tz, date, intervals.as_deref(), credit_import, &soc)
         {
             out.push((date, facts, cacheable));
         }
@@ -674,21 +668,21 @@ async fn compute_facts(
 async fn facts_for(
     state: &AppState,
     schedule: &TariffSchedule,
-    dates: &[NaiveDate],
+    dates: &[Date],
     now: i64,
-) -> Result<HashMap<NaiveDate, DayFacts>, ApiError> {
+) -> Result<HashMap<Date, DayFacts>, ApiError> {
     let (Some(first), Some(last)) = (dates.first(), dates.last()) else {
         return Ok(HashMap::new());
     };
-    let tz = state.tz;
-    let mut by_date: HashMap<NaiveDate, DayFacts> = HashMap::new();
+    let tz = state.site_tz();
+    let mut by_date: HashMap<Date, DayFacts> = HashMap::new();
     let stored =
         db::daily_battery_in_range(&state.pool, &first.to_string(), &last.to_string()).await?;
     for row in stored {
-        let Ok(date) = NaiveDate::from_str(&row.date) else {
+        let Ok(date) = Date::strptime("%Y-%m-%d", &row.date) else {
             continue;
         };
-        if row.tariff_key != battery_cache_key(tz, schedule.for_date(date), &state.rules) {
+        if row.tariff_key != battery_cache_key(&tz, tariff_on(schedule, date), &state.rules) {
             continue;
         }
         // A row that no longer parses is worked out again and replaced.
@@ -697,19 +691,19 @@ async fn facts_for(
         }
     }
 
-    let missing: Vec<NaiveDate> = dates
+    let missing: Vec<Date> = dates
         .iter()
         .copied()
         .filter(|date| !by_date.contains_key(date))
         .collect();
-    let today = today(tz);
+    let today = today(&tz);
     let mut to_store = Vec::new();
-    for run in missing.chunk_by(|a, b| a.succ_opt() == Some(*b)) {
+    for run in missing.chunk_by(|a, b| a.tomorrow().ok() == Some(*b)) {
         for (date, facts, cacheable) in compute_facts(state, schedule, run, today, now).await? {
             if cacheable {
                 to_store.push(db::DailyBattery {
                     date: date.to_string(),
-                    tariff_key: battery_cache_key(tz, schedule.for_date(date), &state.rules),
+                    tariff_key: battery_cache_key(&tz, tariff_on(schedule, date), &state.rules),
                     facts: serde_json::to_string(&facts).map_err(anyhow::Error::from)?,
                 });
             }
@@ -732,20 +726,20 @@ pub async fn battery(
     let Some(schedule) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
-    let tz = state.tz;
-    let today = today(tz);
-    if schedule.for_date(today).credit_window_minutes().is_none() {
+    let tz = state.site_tz();
+    let today = today(&tz);
+    if tariff_on(schedule, today).credit_window_minutes().is_none() {
         return Ok(Json(json!({ "configured": false })));
     }
 
     // Oldest first, ending today.
-    let dates: Vec<NaiveDate> = (0..count)
+    let dates: Vec<Date> = (0..count)
         .rev()
-        .filter_map(|back| today.checked_sub_days(Days::new(back)))
+        .filter_map(|back| today.checked_sub((back as i64).days()).ok())
         .collect();
     let (first, last) = (dates[0], dates[dates.len() - 1]);
-    let range_start = day_bounds_or_error(first, tz)?.0;
-    let range_end = day_bounds_or_error(last, tz)?.1;
+    let range_start = day_bounds_or_error(first, &tz)?.0;
+    let range_end = day_bounds_or_error(last, &tz)?.1;
     let now = db::now();
 
     let facts = facts_for(&state, schedule, &dates, now).await?;
@@ -766,7 +760,7 @@ pub async fn battery(
             billed: billed.get(&date.to_string()).copied(),
             sessions: &sessions,
         };
-        days.extend(build_day(schedule.for_date(date), tz, &input));
+        days.extend(build_day(tariff_on(schedule, date), &tz, &input));
     }
 
     add_reasons(&mut days);
@@ -812,7 +806,9 @@ mod tests {
         assert_eq!(soc.lowest_between(4000, 6000), Some(30.0));
     }
 
-    const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
 
     fn zerohero() -> Tariff {
         #[derive(serde::Deserialize)]
@@ -843,10 +839,10 @@ mod tests {
 
     /// Unix time of a local Adelaide time on 2026-09-15 (+09:30).
     fn at(hour: u32, minute: u32) -> i64 {
-        local_time(
-            NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+        crate::clock::local_minutes(
+            jiff::civil::date(2026, 9, 15),
             hour * 60 + minute,
-            ADELAIDE,
+            &adelaide(),
         )
         .unwrap()
     }
@@ -872,7 +868,7 @@ mod tests {
             iv((19, 0), (19, 5), 0.05, 0.5, 0.6), // window
             iv((22, 0), (22, 5), 1.0, 0.0, 1.0),  // after the window
         ];
-        let sums = day_sums(&tariff, ADELAIDE, 11 * 60, &intervals);
+        let sums = day_sums(&tariff, &adelaide(), 11 * 60, &intervals);
         assert!(sums.has_window_data);
         assert!((sums.window_import_kwh - 0.05).abs() < 1e-9);
         assert!((sums.window_export_kwh - 1.5).abs() < 1e-9);
@@ -893,14 +889,19 @@ mod tests {
             iv((19, 30), (19, 35), 0.06, 0.0, 0.1), // 0.12 kWh: over
             iv((20, 0), (20, 5), 1.0, 0.0, 1.0),
         ];
-        let sums = day_sums(&tariff, ADELAIDE, 11 * 60, &intervals);
+        let sums = day_sums(&tariff, &adelaide(), 11 * 60, &intervals);
         assert_eq!(sums.first_import_ts, Some(at(19, 30)));
     }
 
     #[test]
     fn a_day_with_nothing_in_the_window_has_no_window_data() {
         let tariff = zerohero();
-        let sums = day_sums(&tariff, ADELAIDE, 660, &[iv((9, 0), (9, 5), 0.2, 0.0, 0.2)]);
+        let sums = day_sums(
+            &tariff,
+            &adelaide(),
+            660,
+            &[iv((9, 0), (9, 5), 0.2, 0.0, 0.2)],
+        );
         assert!(!sums.has_window_data);
         assert_eq!(sums.peak_window_load_kw, None);
     }
@@ -1207,8 +1208,8 @@ mod tests {
             live: vec![(at(18, 0), 80.0), (at(19, 30), 55.0), (at(21, 0), 44.0)],
             cloud: vec![],
         };
-        let date = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
-        let facts = day_facts(&tariff, ADELAIDE, date, Some(&intervals), None, &soc).unwrap();
+        let date = jiff::civil::date(2026, 9, 15);
+        let facts = day_facts(&tariff, &adelaide(), date, Some(&intervals), None, &soc).unwrap();
         let mut input = DayInput {
             date,
             now: at(23, 0),
@@ -1216,7 +1217,7 @@ mod tests {
             billed: None,
             sessions: &[],
         };
-        let day = build_day(&tariff, ADELAIDE, &input).unwrap();
+        let day = build_day(&tariff, &adelaide(), &input).unwrap();
         assert_eq!(day.credit, "missed");
         assert_eq!(day.soc_at_window_start, Some(80.0));
         assert_eq!(day.soc_at_window_end, Some(44.0));
@@ -1226,7 +1227,7 @@ mod tests {
 
         // Mid-window the end has not happened, so nothing is used yet.
         input.now = at(19, 40);
-        let day = build_day(&tariff, ADELAIDE, &input).unwrap();
+        let day = build_day(&tariff, &adelaide(), &input).unwrap();
         assert_eq!(day.soc_at_window_start, Some(80.0));
         assert_eq!(day.soc_at_window_end, None);
         assert_eq!(day.window_soc_used_pct, None);
@@ -1234,7 +1235,7 @@ mod tests {
         // No readings: the fields are null, not zero.
         let empty = day_facts(
             &tariff,
-            ADELAIDE,
+            &adelaide(),
             date,
             Some(&intervals),
             None,
@@ -1243,7 +1244,7 @@ mod tests {
         .unwrap();
         input.facts = &empty;
         input.now = at(23, 0);
-        let day = build_day(&tariff, ADELAIDE, &input).unwrap();
+        let day = build_day(&tariff, &adelaide(), &input).unwrap();
         assert_eq!(day.window_soc_used_pct, None);
         assert_eq!(day.soc_at_first_import, None);
     }
@@ -1261,11 +1262,14 @@ mod tests {
     #[test]
     fn local_time_follows_daylight_saving() {
         // Adelaide's clocks went forward on 2026-10-04 (02:00 -> 03:00): 11:00 is +10:30 then.
-        let date = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
-        let utc_11 = chrono::Utc
-            .with_ymd_and_hms(2026, 10, 5, 0, 30, 0)
+        let date = jiff::civil::date(2026, 10, 5);
+        let utc_11 = "2026-10-05T00:30:00Z"
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .timestamp();
-        assert_eq!(local_time(date, 11 * 60, ADELAIDE), Some(utc_11));
+            .as_second();
+        assert_eq!(
+            crate::clock::local_minutes(date, 11 * 60, &adelaide()),
+            Some(utc_11)
+        );
     }
 }

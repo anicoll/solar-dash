@@ -7,8 +7,9 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Days, LocalResult, NaiveDate, TimeZone};
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::error;
@@ -301,7 +302,8 @@ pub async fn live(State(state): State<AppState>) -> ApiResult {
             break;
         }
     }
-    let since = local_midnight(today(state.tz), state.tz).unwrap_or(0);
+    let tz = state.site_tz();
+    let since = crate::clock::day_start(today(&tz), &tz).unwrap_or(0);
     // The peak comes from the source of the sample (or, with no sample, from
     // the preferred source).
     let peak_from_ha = from_ha
@@ -488,7 +490,11 @@ async fn home_session_cost(
     )
     .await?;
     Ok(ev_cost::session_cost(
-        session, &samples, schedule, state.tz, now,
+        session,
+        &samples,
+        schedule,
+        crate::clock::tz_to_chrono(&state.site_tz()),
+        now,
     ))
 }
 
@@ -643,13 +649,13 @@ pub async fn ev_summary(
     let (from, count) = date_range(
         params.from.as_deref(),
         params.to.as_deref(),
-        state.tz,
+        &state.site_tz(),
         MAX_DAILY_DAYS,
         DEFAULT_SUMMARY_DAYS,
     )?;
-    let to = from + Days::new(count - 1);
-    let (start, _) = day_bounds_or_error(from, state.tz)?;
-    let (_, end) = day_bounds_or_error(to, state.tz)?;
+    let to = from + ((count - 1) as i64).days();
+    let (start, _) = day_bounds_or_error(from, &state.site_tz())?;
+    let (_, end) = day_bounds_or_error(to, &state.site_tz())?;
 
     let odometer = db::odometer_in_range(&state.pool, &from.to_string(), &to.to_string()).await?;
     let km_by_month = ev_cost::monthly_km(&odometer, &from.to_string());
@@ -664,7 +670,7 @@ pub async fn ev_summary(
     for session in db::charge_sessions_in_range(&state.pool, start, end - 1, now).await? {
         let (Some(kwh), Some(started)) = (
             ev_cost::session_energy_kwh(&session),
-            DateTime::from_timestamp(session.started_at, 0),
+            local_date_of(session.started_at, &state.site_tz()),
         ) else {
             continue;
         };
@@ -683,7 +689,7 @@ pub async fn ev_summary(
             None
         };
         sessions.push(ev_cost::SessionEnergy {
-            month: started.with_timezone(&state.tz).format("%Y-%m").to_string(),
+            month: started.strftime("%Y-%m").to_string(),
             at_home,
             kwh,
             cost_cents,
@@ -737,7 +743,7 @@ pub async fn ev_cars(State(state): State<AppState>) -> ApiResult {
         let charges: Vec<ev_cost::CarCharge> = db::tm_charge_rows(&state.pool, car.id)
             .await?
             .into_iter()
-            .filter_map(|row| car_charge(&row, state.tz))
+            .filter_map(|row| car_charge(&row, &state.site_tz()))
             .collect();
         let history = ev_cost::summarise_car(&prices, petrol, &days, &charges);
         if history.first_day.is_some() {
@@ -815,8 +821,8 @@ fn charging_plans(schedule: Option<&TariffSchedule>) -> (Vec<String>, impl Fn(&s
             .collect(),
         None => vec!["Home charging".to_string()],
     };
-    let plan_of = move |day: &str| match (schedule, NaiveDate::parse_from_str(day, "%Y-%m-%d")) {
-        (Some(schedule), Ok(date)) => schedule.plan_index(date),
+    let plan_of = move |day: &str| match (schedule, Date::strptime("%Y-%m-%d", day)) {
+        (Some(schedule), Ok(date)) => plan_index_on(schedule, date),
         _ => 0,
     };
     (plans, plan_of)
@@ -834,12 +840,12 @@ fn car_label(car: &db::TmCar) -> String {
 
 /// A stored session as the savings summary adds it up, or `None` if it took
 /// no energy. Only a session at "Home" with all its cost columns is costed.
-pub(super) fn car_charge(row: &db::TmChargeRow, tz: Tz) -> Option<ev_cost::CarCharge> {
+pub(super) fn car_charge(row: &db::TmChargeRow, tz: &TimeZone) -> Option<ev_cost::CarCharge> {
     let kwh = row
         .energy_used_kwh
         .or(row.energy_added_kwh)
         .filter(|kwh| *kwh > 0.0)?;
-    let started = DateTime::from_timestamp(row.started_at, 0)?;
+    let started = local_date_of(row.started_at, tz)?;
     let cost = match (row.cost_key.as_ref(), row.cost_cents, row.baseline_cents) {
         (Some(_), Some(cost_cents), Some(baseline_cents)) => Some(ev_cost::HistoricCost {
             kwh,
@@ -853,48 +859,54 @@ pub(super) fn car_charge(row: &db::TmChargeRow, tz: Tz) -> Option<ev_cost::CarCh
         _ => None,
     };
     Some(ev_cost::CarCharge {
-        date: started.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+        date: started.strftime("%Y-%m-%d").to_string(),
         kwh,
         at_home: row.geofence.as_deref() == Some("Home"),
         cost,
     })
 }
 
-pub(super) fn parse_date(name: &str, text: &str) -> Result<NaiveDate, ApiError> {
-    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+pub(super) fn parse_date(name: &str, text: &str) -> Result<Date, ApiError> {
+    Date::strptime("%Y-%m-%d", text)
         .map_err(|_| ApiError::bad_request(format!("{name} must look like 2026-10-20")))
-}
-
-/// Unix time of the first moment of `date` in `tz`.
-///
-/// Midnight normally exists exactly once. In a zone whose clocks jump over
-/// midnight we take the first hour that does exist; if clocks go back over
-/// midnight we take the earlier of the two.
-fn local_midnight(date: NaiveDate, tz: Tz) -> Option<i64> {
-    for hour in 0..3 {
-        let naive = date.and_hms_opt(hour, 0, 0)?;
-        match tz.from_local_datetime(&naive) {
-            LocalResult::Single(t) => return Some(t.timestamp()),
-            LocalResult::Ambiguous(earliest, _) => return Some(earliest.timestamp()),
-            LocalResult::None => continue,
-        }
-    }
-    None
 }
 
 /// The local day `date` as `[start, end)` in unix seconds. On a daylight
 /// saving change this is 23 or 25 hours long, not 24.
-pub(super) fn day_bounds(date: NaiveDate, tz: Tz) -> Option<(i64, i64)> {
-    let next = date.checked_add_days(Days::new(1))?;
-    Some((local_midnight(date, tz)?, local_midnight(next, tz)?))
+pub(super) fn day_bounds(date: Date, tz: &TimeZone) -> Option<(i64, i64)> {
+    crate::clock::day_bounds(date, tz)
 }
 
-pub(super) fn day_bounds_or_error(date: NaiveDate, tz: Tz) -> Result<(i64, i64), ApiError> {
+pub(super) fn day_bounds_or_error(date: Date, tz: &TimeZone) -> Result<(i64, i64), ApiError> {
     day_bounds(date, tz).ok_or_else(|| ApiError::bad_request("date is out of range"))
 }
 
-pub(super) fn today(tz: Tz) -> NaiveDate {
-    chrono::Utc::now().with_timezone(&tz).date_naive()
+pub(super) fn today(tz: &TimeZone) -> Date {
+    crate::clock::today(tz)
+}
+
+/// The local date of unix time `ts`, or `None` for a time outside the range
+/// of dates.
+pub(super) fn local_date_of(ts: i64, tz: &TimeZone) -> Option<Date> {
+    let ts = Timestamp::from_second(ts).ok()?;
+    Some(tz.to_datetime(ts).date())
+}
+
+/// The tariff in force on local `date`.
+pub(super) fn tariff_on(schedule: &TariffSchedule, date: Date) -> &crate::cost::Tariff {
+    schedule.for_date(crate::clock::date_to_chrono(date))
+}
+
+/// Which of the schedule's plans is in force on local `date`.
+pub(super) fn plan_index_on(schedule: &TariffSchedule, date: Date) -> usize {
+    schedule.plan_index(crate::clock::date_to_chrono(date))
+}
+
+impl AppState {
+    /// The plant's time zone as a jiff zone.
+    pub(super) fn site_tz(&self) -> TimeZone {
+        crate::clock::tz_to_jiff(self.tz())
+    }
 }
 
 /// One step of a daily energy counter, spread over the time it covers.
@@ -1137,9 +1149,9 @@ pub struct DayParams {
 pub async fn day(State(state): State<AppState>, Query(params): Query<DayParams>) -> ApiResult {
     let date = match params.date.as_deref() {
         Some(text) => parse_date("date", text)?,
-        None => today(state.tz),
+        None => today(&state.site_tz()),
     };
-    let (start, end) = day_bounds_or_error(date, state.tz)?;
+    let (start, end) = day_bounds_or_error(date, &state.site_tz())?;
 
     let mut series = Vec::new();
     for (key, metric) in POWER_METRICS {
@@ -1296,25 +1308,29 @@ pub(super) async fn first_data_ts(state: &AppState) -> Result<Option<i64>, ApiEr
 /// first reading of any kind has no figure and costs no query.
 pub(super) async fn battery_discharge_by_date(
     state: &AppState,
-    dates: &[NaiveDate],
-) -> Result<std::collections::BTreeMap<NaiveDate, f64>, ApiError> {
+    dates: &[Date],
+) -> Result<std::collections::BTreeMap<Date, f64>, ApiError> {
     let live_range = samples::ts_range(&state.pool, &state.rules, Role::Daily).await?;
     let now = db::now();
-    let today = today(state.tz);
+    let today = today(&state.site_tz());
     let first_data = first_data_ts(state).await?;
 
     let mut keys = Vec::new();
     for &date in dates.iter().filter(|d| **d < today) {
         keys.push((
             date,
-            format!("{DISCHARGE_VERSION}|{}|{:?}", state.tz, state.rules),
+            format!(
+                "{DISCHARGE_VERSION}|{}|{:?}",
+                state.site_tz().iana_name().unwrap_or("UTC"),
+                state.rules
+            ),
         ));
     }
-    let mut stored: HashMap<NaiveDate, Option<f64>> = day_cache::load_with_data(
+    let mut stored: HashMap<Date, Option<f64>> = day_cache::load_with_data(
         &state.pool,
         state.plant_id,
         state.rules.uses_ha(),
-        state.tz,
+        &state.site_tz(),
         DISCHARGE_KIND,
         &keys,
     )
@@ -1325,7 +1341,7 @@ pub(super) async fn battery_discharge_by_date(
         if stored.contains_key(&date) {
             continue;
         }
-        let (_, end) = day_bounds_or_error(date, state.tz)?;
+        let (_, end) = day_bounds_or_error(date, &state.site_tz())?;
         // Nothing was recorded yet: every query below would come back empty.
         if first_data.is_none_or(|first| end <= first) {
             stored.insert(date, None);
@@ -1339,7 +1355,7 @@ pub(super) async fn battery_discharge_by_date(
         }
         stored.insert(date, discharge);
     }
-    let store_as: Vec<(NaiveDate, String, bool)> = to_store
+    let store_as: Vec<(Date, String, bool)> = to_store
         .iter()
         .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
         .collect();
@@ -1347,11 +1363,11 @@ pub(super) async fn battery_discharge_by_date(
         &state.pool,
         state.plant_id,
         state.rules.uses_ha(),
-        state.tz,
+        &state.site_tz(),
         &store_as,
     )
     .await?;
-    let rows: Vec<(NaiveDate, String, &Option<f64>)> = store_as
+    let rows: Vec<(Date, String, &Option<f64>)> = store_as
         .into_iter()
         .zip(&to_store)
         .map(|((date, key), (_, _, _, discharge))| (date, key, discharge))
@@ -1372,7 +1388,7 @@ pub(super) async fn battery_discharge_by_date(
 #[cfg(test)]
 async fn day_totals(
     state: &AppState,
-    date: NaiveDate,
+    date: Date,
     live_range: Option<(i64, i64)>,
     now: i64,
 ) -> Result<DayTotals, ApiError> {
@@ -1384,19 +1400,19 @@ async fn day_totals(
 /// its data (the test of [`is_cacheable`]), so a stored copy stays right.
 async fn day_totals_flagged(
     state: &AppState,
-    date: NaiveDate,
+    date: Date,
     live_range: Option<(i64, i64)>,
     now: i64,
 ) -> Result<(DayTotals, Vec<Sample>, bool), ApiError> {
     // Each day gets its own [start, end), so a 23 or 25 hour day is handled correctly.
-    let (start, end) = day_bounds_or_error(date, state.tz)?;
+    let (start, end) = day_bounds_or_error(date, &state.site_tz())?;
     let samples = match live_range {
         Some((first, last)) if first < end && last >= start => {
             samples::raw(&state.pool, &state.rules, Role::Daily, start, end).await?
         }
         _ => Vec::new(),
     };
-    let today = today(state.tz);
+    let today = today(&state.site_tz());
     let live = live_totals(&samples, start, end, now, &state.rules);
     let solid = live.as_ref().is_some_and(|l| l.solid);
     // A solid live day never needs the cloud (unless the rules prefer the
@@ -1434,7 +1450,7 @@ async fn day_totals_flagged(
 }
 
 /// A day's totals from the live samples.
-fn live_day(date: NaiveDate, live: &LiveTotals) -> DayTotals {
+fn live_day(date: Date, live: &LiveTotals) -> DayTotals {
     DayTotals {
         date: date.to_string(),
         source: "inverter".into(),
@@ -1455,7 +1471,7 @@ fn live_day(date: NaiveDate, live: &LiveTotals) -> DayTotals {
 /// A day's totals from the iSolarCloud counters.
 async fn cloud_day(
     state: &AppState,
-    date: NaiveDate,
+    date: Date,
     start: i64,
     end: i64,
 ) -> Result<DayTotals, ApiError> {
@@ -1489,7 +1505,7 @@ async fn cloud_day(
 
 impl DayTotals {
     /// A day with no figures, as from `source`.
-    fn no_data(date: NaiveDate, source: &'static str) -> Self {
+    fn no_data(date: Date, source: &'static str) -> Self {
         DayTotals {
             date: date.to_string(),
             source: source.into(),
@@ -1527,22 +1543,24 @@ impl DayTotals {
 pub(super) fn date_range(
     from: Option<&str>,
     to: Option<&str>,
-    tz: Tz,
+    tz: &TimeZone,
     max_days: u64,
     default_days: u64,
-) -> Result<(NaiveDate, u64), ApiError> {
+) -> Result<(Date, u64), ApiError> {
     let to = match to {
         Some(text) => parse_date("to", text)?,
         None => today(tz),
     };
     let from = match from {
         Some(text) => parse_date("from", text)?,
-        None => to - Days::new(default_days - 1),
+        None => to
+            .checked_sub(((default_days - 1) as i64).days())
+            .map_err(|_| ApiError::bad_request("date is out of range"))?,
     };
     if to < from {
         return Err(ApiError::bad_request("to must not be before from"));
     }
-    let count = (to - from).num_days() as u64 + 1;
+    let count = (to - from).get_days() as u64 + 1;
     if count > max_days {
         return Err(ApiError::bad_request(format!(
             "the range can be at most {max_days} days"
@@ -1602,7 +1620,7 @@ struct EnergyBucket {
 }
 
 /// Adds up days (oldest first) into one bucket per period that has data.
-fn bucket_energy(group: Group, days: &[(NaiveDate, DayTotals)]) -> Vec<EnergyBucket> {
+fn bucket_energy(group: Group, days: &[(Date, DayTotals)]) -> Vec<EnergyBucket> {
     let mut buckets: Vec<EnergyBucket> = Vec::new();
     for (date, day) in days.iter().filter(|(_, d)| d.has_data()) {
         let period = group.period_of(*date);
@@ -1624,15 +1642,18 @@ fn bucket_energy(group: Group, days: &[(NaiveDate, DayTotals)]) -> Vec<EnergyBuc
 async fn day_home_mix(
     state: &AppState,
     data: &crate::admin_data::AdminData,
-    date: NaiveDate,
+    date: Date,
     totals: &DayTotals,
     live: &[Sample],
 ) -> Result<HomeMix, ApiError> {
-    let tariff = data.tariff.as_ref().map(|schedule| schedule.for_date(date));
+    let tariff = data
+        .tariff
+        .as_ref()
+        .map(|schedule| tariff_on(schedule, date));
     let steps = if totals.source == "inverter" {
         home_mix::live_steps(live)
     } else if totals.load_kwh.is_some() {
-        let (start, end) = day_bounds_or_error(date, state.tz)?;
+        let (start, end) = day_bounds_or_error(date, &state.site_tz())?;
         let read = async |metric| -> Result<Vec<(i64, f64)>, ApiError> {
             let rows = db::readings_in_range_from(
                 &state.pool,
@@ -1656,7 +1677,7 @@ async fn day_home_mix(
     } else {
         Vec::new()
     };
-    Ok(home_mix::home_mix(&steps, tariff, state.tz))
+    Ok(home_mix::home_mix(&steps, tariff, &state.site_tz()))
 }
 
 /// The metrics `day_totals` reads from the cloud.
@@ -1685,7 +1706,7 @@ pub struct DayEnergy {
 /// The same totals `/api/daily` (and so the Today page) shows for `date`:
 /// `daily_days` is the one function behind both, so the two can never
 /// disagree (and a finished day comes from the same per-day cache).
-pub async fn day_energy(state: &AppState, date: NaiveDate) -> anyhow::Result<DayEnergy> {
+pub async fn day_energy(state: &AppState, date: Date) -> anyhow::Result<DayEnergy> {
     let live_range = samples::ts_range(&state.pool, &state.rules, Role::Daily).await?;
     let days = daily_days(state, &[date], live_range, db::now())
         .await
@@ -1718,27 +1739,27 @@ const DAILY_VERSION: u32 = 1;
 /// are stored. Today and later are never stored.
 async fn daily_days(
     state: &AppState,
-    dates: &[NaiveDate],
+    dates: &[Date],
     live_range: Option<(i64, i64)>,
     now: i64,
-) -> Result<Vec<(NaiveDate, DayTotals)>, ApiError> {
+) -> Result<Vec<(Date, DayTotals)>, ApiError> {
     let data = state.admin.get();
-    let today = today(state.tz);
+    let today = today(&state.site_tz());
     let spike_cents = data.price_spike_cents;
     let mut keys = Vec::new();
     for &date in dates.iter().filter(|d| **d < today) {
-        let tariff = data.tariff.as_ref().map(|s| s.for_date(date));
+        let tariff = data.tariff.as_ref().map(|s| tariff_on(s, date));
         let mut key = format!(
             "{DAILY_VERSION}|{}|{:?}|spike={}",
-            state.tz,
+            state.site_tz().iana_name().unwrap_or("UTC"),
             state.rules,
             spike_cents.to_bits()
         );
         match tariff {
             Some(tariff) => {
-                key.push_str(&format!("|{}", cache_key(state.tz, tariff)));
+                key.push_str(&format!("|{}", cache_key(&state.site_tz(), tariff)));
                 if let Some(source) = tariff.dynamic_source() {
-                    let (start, end) = day_bounds_or_error(date, state.tz)?;
+                    let (start, end) = day_bounds_or_error(date, &state.site_tz())?;
                     let fingerprint =
                         amber_store::day_prices_fingerprint(&state.pool, source, start, end, false)
                             .await?;
@@ -1749,11 +1770,11 @@ async fn daily_days(
         }
         keys.push((date, key));
     }
-    let mut stored: HashMap<NaiveDate, DayTotals> = day_cache::load_with_data(
+    let mut stored: HashMap<Date, DayTotals> = day_cache::load_with_data(
         &state.pool,
         state.plant_id,
         state.rules.uses_ha(),
-        state.tz,
+        &state.site_tz(),
         DAILY_KIND,
         &keys,
     )
@@ -1782,7 +1803,7 @@ async fn daily_days(
         }
         out.push((date, totals));
     }
-    let store_as: Vec<(NaiveDate, String, bool)> = to_store
+    let store_as: Vec<(Date, String, bool)> = to_store
         .iter()
         .map(|(date, key, complete, _)| (*date, key.clone(), *complete))
         .collect();
@@ -1790,11 +1811,11 @@ async fn daily_days(
         &state.pool,
         state.plant_id,
         state.rules.uses_ha(),
-        state.tz,
+        &state.site_tz(),
         &store_as,
     )
     .await?;
-    let rows: Vec<(NaiveDate, String, &DayTotals)> = store_as
+    let rows: Vec<(Date, String, &DayTotals)> = store_as
         .into_iter()
         .zip(&to_store)
         .map(|((date, key), (_, _, _, i))| (date, key, &out[*i].1))
@@ -1814,7 +1835,7 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
     let (mut from, mut count) = date_range(
         params.from.as_deref(),
         params.to.as_deref(),
-        state.tz,
+        &state.site_tz(),
         max_days,
         DEFAULT_DAILY_DAYS,
     )?;
@@ -1829,17 +1850,15 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
             .into_iter()
             .flatten()
             .min();
-        let to = from + Days::new(count - 1);
-        let first_day = first
-            .and_then(|ts| DateTime::from_timestamp(ts, 0))
-            .map(|t| t.with_timezone(&state.tz).date_naive());
+        let to = from + ((count - 1) as i64).days();
+        let first_day = first.and_then(|ts| local_date_of(ts, &state.site_tz()));
         match first_day {
             Some(day) if day > from => {
                 // Past `to` means no day in range can have data.
                 count = if day > to {
                     0
                 } else {
-                    (to - day).num_days() as u64 + 1
+                    (to - day).get_days() as u64 + 1
                 };
                 from = day;
             }
@@ -1847,7 +1866,7 @@ pub async fn daily(State(state): State<AppState>, Query(params): Query<DailyPara
             _ => {}
         }
     }
-    let dates: Vec<NaiveDate> = from.iter_days().take(count as usize).collect();
+    let dates: Vec<Date> = from.series(1.day()).take(count as usize).collect();
     let days = daily_days(&state, &dates, live_range, now).await?;
     if group == Group::Day {
         let days: Vec<_> = days.into_iter().map(|(_, d)| d).collect();
@@ -1870,7 +1889,9 @@ mod tests {
 
     use super::*;
 
-    const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
 
     #[test]
     fn grid_pull_counts_import_only() {
@@ -2006,8 +2027,8 @@ mod tests {
     fn dst_days_are_not_24_hours() {
         // Clocks go back on 2026-04-05 and forward on 2026-10-04.
         let hours = |date: &str| {
-            let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
-            let (start, end) = day_bounds(date, ADELAIDE).unwrap();
+            let date = Date::strptime("%Y-%m-%d", date).unwrap();
+            let (start, end) = day_bounds(date, &adelaide()).unwrap();
             (end - start) / 3600
         };
         assert_eq!(hours("2026-04-05"), 25);
@@ -2024,7 +2045,7 @@ mod tests {
 
         // Adelaide clocks go back on Sunday 2026-04-05, so that day has 25
         // hours: it starts at 13:30 UTC on the 4th and ends at 14:30 UTC on the 5th.
-        let utc = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        let utc = |s: &str| s.parse::<Timestamp>().unwrap().as_second();
         let rows = [
             // Saturday evening, 23:55 local: the last reading of the 4th.
             (utc("2026-04-04T13:25:00Z"), 100_000.0),
@@ -2044,9 +2065,10 @@ mod tests {
 
         let key = Key::generate();
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool, 7, ADELAIDE, &hash, key).unwrap();
+        let state =
+            AppState::new(pool, 7, crate::clock::tz_to_chrono(&adelaide()), &hash, key).unwrap();
 
-        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let date = |s: &str| Date::strptime("%Y-%m-%d", s).unwrap();
         let saturday = day_totals(&state, date("2026-04-04"), None, 0)
             .await
             .unwrap();
@@ -2175,7 +2197,14 @@ mod tests {
             .await
             .unwrap();
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let state = AppState::new(
+            pool,
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let sample = Sample {
             ts: db::now() - 5,
             pv_w: Some(5000.0),
@@ -2208,7 +2237,14 @@ mod tests {
             .await
             .unwrap();
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let state = AppState::new(
+            pool,
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let settings = modbus::Settings {
             ts: db::now() - 5,
             ems_mode: Some(2),
@@ -2250,7 +2286,14 @@ mod tests {
             .await
             .unwrap();
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool.clone(), 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let state = AppState::new(
+            pool.clone(),
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let params = |from: Option<&str>, to: Option<&str>| InverterHistoryParams {
             from: from.map(str::to_string),
             to: to.map(str::to_string),
@@ -2320,7 +2363,14 @@ mod tests {
             .await
             .unwrap();
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let state = AppState::new(
+            pool,
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let call = |from: &str, to: &str| {
             inverter_history(
                 State(state.clone()),
@@ -2346,8 +2396,8 @@ mod tests {
             .unwrap();
         // Cloud counter for both days: 5 kWh.
         let state_day = |date: &str| {
-            let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
-            day_bounds(date, ADELAIDE).unwrap()
+            let date = Date::strptime("%Y-%m-%d", date).unwrap();
+            day_bounds(date, &adelaide()).unwrap()
         };
         let (start, end) = state_day("2026-10-19");
         let (start2, _) = state_day("2026-10-20");
@@ -2372,8 +2422,15 @@ mod tests {
         }
 
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
-        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let state = AppState::new(
+            pool,
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
+        let date = |s: &str| Date::strptime("%Y-%m-%d", s).unwrap();
         let range = db::live_ts_range(&state.pool).await.unwrap();
         let now = start2 + 12 * 3600;
 
@@ -2402,8 +2459,8 @@ mod tests {
         let pool = db::open(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let day = NaiveDate::parse_from_str("2026-10-19", "%Y-%m-%d").unwrap();
-        let (start, end) = day_bounds(day, ADELAIDE).unwrap();
+        let day = Date::strptime("%Y-%m-%d", "2026-10-19").unwrap();
+        let (start, end) = day_bounds(day, &adelaide()).unwrap();
         db::seed_metrics(&pool, 7, &[(Metric::GridImportDayWh, start + 3600, 5000.0)]).await;
         let covered_end = start + (end - start) * covered_pct / 100;
         // One sample a minute, written in one statement: inserting them one by
@@ -2419,9 +2476,15 @@ mod tests {
         .await
         .unwrap();
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate())
-            .unwrap()
-            .with_source_rules(rules);
+        let state = AppState::new(
+            pool,
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap()
+        .with_source_rules(rules);
         let range = db::live_ts_range(&state.pool).await.unwrap();
         day_totals(&state, day, range, end + 3600)
             .await
@@ -2482,8 +2545,8 @@ mod tests {
         assert_eq!(empty, "cloud");
     }
 
-    fn totals_of(date: &str, pv: Option<f64>, import: Option<f64>) -> (NaiveDate, DayTotals) {
-        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+    fn totals_of(date: &str, pv: Option<f64>, import: Option<f64>) -> (Date, DayTotals) {
+        let date = Date::strptime("%Y-%m-%d", date).unwrap();
         let day = DayTotals {
             date: date.to_string(),
             source: "cloud".into(),
@@ -2592,8 +2655,8 @@ mod tests {
         let pool = db::open(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-        let start = day_bounds(date("2026-10-20"), ADELAIDE).unwrap().0;
+        let date = |s: &str| Date::strptime("%Y-%m-%d", s).unwrap();
+        let start = day_bounds(date("2026-10-20"), &adelaide()).unwrap().0;
         let at = |hour: i64, minute: i64| start + hour * 3600 + minute * 60;
         // Import: 1 kWh in the free window, 0.5 kWh in the peak.
         // Export: 2 kWh in the super window, 1 kWh in the rest of the peak.
@@ -2622,7 +2685,14 @@ mod tests {
         ));
         db::seed_metrics(&pool, 7, &rows).await;
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let state = AppState::new(
+            pool,
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let with_tariff = state.clone().with_tariff(Some(schedule));
         let ask = |group: Option<&str>| DailyParams {
             from: Some("2026-10-20".to_string()),
@@ -2683,8 +2753,8 @@ mod tests {
         let pool = db::open(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-        let start = day_bounds(date("2026-10-20"), ADELAIDE).unwrap().0;
+        let date = |s: &str| Date::strptime("%Y-%m-%d", s).unwrap();
+        let start = day_bounds(date("2026-10-20"), &adelaide()).unwrap().0;
         let at = |hour: i64, minute: i64| start + hour * 3600 + minute * 60;
         let rows = [
             (Metric::PvDayWh, at(12, 0), 5000.0),
@@ -2697,7 +2767,14 @@ mod tests {
         ];
         db::seed_metrics(&pool, 7, &rows).await;
         let hash = super::super::hash_password("x").unwrap();
-        let plain = AppState::new(pool.clone(), 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let plain = AppState::new(
+            pool.clone(),
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let state = plain.clone().with_tariff(Some(schedule));
         let ask = |group: Option<&str>| DailyParams {
             from: Some("2026-10-19".to_string()),
@@ -2748,10 +2825,10 @@ mod tests {
         let pool = db::open(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-        let start = day_bounds(date("2026-10-20"), ADELAIDE).unwrap().0;
-        let today_date = today(ADELAIDE);
-        let today_start = day_bounds(today_date, ADELAIDE).unwrap().0;
+        let date = |s: &str| Date::strptime("%Y-%m-%d", s).unwrap();
+        let start = day_bounds(date("2026-10-20"), &adelaide()).unwrap().0;
+        let today_date = today(&adelaide());
+        let today_start = day_bounds(today_date, &adelaide()).unwrap().0;
         // The cloud stopped at noon: no reading in the day's last 10 minutes,
         // so the day is not complete.
         let rows = [
@@ -2762,7 +2839,14 @@ mod tests {
         ];
         db::seed_metrics(&pool, 7, &rows).await;
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool.clone(), 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let state = AppState::new(
+            pool.clone(),
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let params = DailyParams {
             from: Some("2026-10-19".to_string()),
             to: Some(today_date.to_string()),
@@ -2805,8 +2889,8 @@ mod tests {
             .await
             .unwrap();
         let day_start = |s: &str| {
-            let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-            day_bounds(date, ADELAIDE).unwrap().0
+            let date = Date::strptime("%Y-%m-%d", s).unwrap();
+            day_bounds(date, &adelaide()).unwrap().0
         };
         let rows: Vec<_> = [
             ("2025-12-30", 4000.0),
@@ -2818,7 +2902,14 @@ mod tests {
         .collect();
         db::seed_metrics(&pool, 7, &rows).await;
         let hash = super::super::hash_password("x").unwrap();
-        let state = AppState::new(pool, 7, ADELAIDE, &hash, Key::generate()).unwrap();
+        let state = AppState::new(
+            pool,
+            7,
+            crate::clock::tz_to_chrono(&adelaide()),
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let ask = |from: &str, to: &str, group: &str| DailyParams {
             from: Some(from.to_string()),
             to: Some(to.to_string()),

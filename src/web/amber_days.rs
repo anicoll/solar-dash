@@ -8,11 +8,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use super::api::{ApiError, day_bounds_or_error, first_data_ts};
+use super::api::{ApiError, day_bounds_or_error, first_data_ts, tariff_on};
 use super::bill::{MIN_PRICE_COVERAGE, hypothetical_tariff};
 use super::costs::{HypotheticalDay, cache_key, compare_days, consecutive_runs};
 use super::day_cache;
@@ -39,7 +39,7 @@ const CACHE_VERSION: u32 = 1;
 /// One finished day, in cents, as both Amber endpoints use it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(super) struct AmberDay {
-    pub date: NaiveDate,
+    pub date: Date,
     /// The day on the plan in force then.
     pub current_cents: f64,
     /// The share of the day (0 to 1) that has a stored import price.
@@ -66,7 +66,7 @@ struct DayExtras {
 
 /// The battery capacity in kWh on `date`: the sum of the `battery_kwh` of the
 /// purchases made on or before it. 0 when there is none.
-fn battery_kwh_on(purchases: &[Purchase], date: NaiveDate) -> f64 {
+fn battery_kwh_on(purchases: &[Purchase], date: Date) -> f64 {
     purchases
         .iter()
         .filter(|p| p.date <= date)
@@ -131,7 +131,7 @@ async fn reserve_pct(state: &AppState, day_end: i64) -> Result<f64, ApiError> {
 async fn day_extras(
     state: &AppState,
     purchases: &[Purchase],
-    date: NaiveDate,
+    date: Date,
     start: i64,
     end: i64,
 ) -> Result<DayExtras, ApiError> {
@@ -181,7 +181,7 @@ async fn day_key(
         .collect();
     Ok(format!(
         "{CACHE_VERSION}|{}|{}|{prices}|{:?}|paid_negative={}|spike={}|battery={}|reserve={}|{sessions:?}",
-        cache_key(state.tz, tariff),
+        cache_key(&state.site_tz(), tariff),
         hypothetical.key(),
         state.rules,
         compare.feed_in_paid_when_negative,
@@ -201,7 +201,7 @@ async fn work_out(
 ) -> Result<AmberDay, ApiError> {
     let mut mixes = BTreeMap::new();
     if hypo.coverage >= MIN_PRICE_COVERAGE {
-        let (start, end) = day_bounds_or_error(day.date, state.tz)?;
+        let (start, end) = day_bounds_or_error(day.date, &state.site_tz())?;
         let mut slots = build_slots(
             start,
             end,
@@ -245,7 +245,7 @@ pub(super) async fn amber_days(
     schedule: &TariffSchedule,
     compare: &AmberCompare,
     purchases: &[Purchase],
-    dates: &[NaiveDate],
+    dates: &[Date],
 ) -> Result<Vec<AmberDay>, ApiError> {
     let hypothetical = hypothetical_tariff(compare)?;
     // A day that ends before the first reading has no energy, so it has no
@@ -253,7 +253,7 @@ pub(super) async fn amber_days(
     let first_data = first_data_ts(state).await?;
     let mut dates_with_data = Vec::with_capacity(dates.len());
     for &date in dates {
-        let (_, end) = day_bounds_or_error(date, state.tz)?;
+        let (_, end) = day_bounds_or_error(date, &state.site_tz())?;
         if first_data.is_some_and(|first| end > first) {
             dates_with_data.push(date);
         }
@@ -261,13 +261,13 @@ pub(super) async fn amber_days(
     let dates = &dates_with_data[..];
     // The day's key and extras, which are cheap queries; the energy is not read yet.
     let mut keys = Vec::with_capacity(dates.len());
-    let mut extras: HashMap<NaiveDate, DayExtras> = HashMap::new();
+    let mut extras: HashMap<Date, DayExtras> = HashMap::new();
     for &date in dates {
-        let (start, end) = day_bounds_or_error(date, state.tz)?;
+        let (start, end) = day_bounds_or_error(date, &state.site_tz())?;
         let day_extras = day_extras(state, purchases, date, start, end).await?;
         let key = day_key(
             state,
-            schedule.for_date(date),
+            tariff_on(schedule, date),
             &hypothetical,
             compare,
             &day_extras,
@@ -278,10 +278,9 @@ pub(super) async fn amber_days(
         keys.push((date, key));
         extras.insert(date, day_extras);
     }
-    let mut stored: HashMap<NaiveDate, AmberDay> =
-        day_cache::load(&state.pool, KIND, &keys).await?;
+    let mut stored: HashMap<Date, AmberDay> = day_cache::load(&state.pool, KIND, &keys).await?;
 
-    let missing: Vec<NaiveDate> = dates
+    let missing: Vec<Date> = dates
         .iter()
         .copied()
         .filter(|date| !stored.contains_key(date))
@@ -294,8 +293,8 @@ pub(super) async fn amber_days(
             to_store.push(worked);
         }
     }
-    let key_of: HashMap<NaiveDate, &String> = keys.iter().map(|(d, k)| (*d, k)).collect();
-    let rows: Vec<(NaiveDate, String, &AmberDay)> = to_store
+    let key_of: HashMap<Date, &String> = keys.iter().map(|(d, k)| (*d, k)).collect();
+    let rows: Vec<(Date, String, &AmberDay)> = to_store
         .iter()
         .map(|day| (day.date, key_of[&day.date].clone(), day))
         .collect();

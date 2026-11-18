@@ -6,13 +6,17 @@
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::{Datelike, Days, Months, NaiveDate};
+use jiff::ToSpan;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
 use super::amber_days::{AmberDay, amber_days};
-use super::api::{ApiError, ApiResult, day_bounds_or_error, first_data_ts, parse_date, today};
+use super::api::{
+    ApiError, ApiResult, day_bounds_or_error, first_data_ts, local_date_of, parse_date, tariff_on,
+    today,
+};
 use super::costs::{
     CostedDay, SOURCE_BILL, SOURCE_GLOBIRD, billed_days, grid_splits, hhmm, round2,
 };
@@ -40,14 +44,14 @@ enum PeriodSource {
 /// A bill period: inclusive local dates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Period {
-    from: NaiveDate,
-    to: NaiveDate,
+    from: Date,
+    to: Date,
     source: PeriodSource,
 }
 
 impl Period {
     fn days_total(&self) -> i64 {
-        (self.to - self.from).num_days() + 1
+        i64::from((self.to - self.from).get_days()) + 1
     }
 }
 
@@ -59,7 +63,7 @@ struct PeriodRule {
     start_day: Option<u32>,
     /// The first day of any real bill and the length of each bill in days.
     /// Wins over `start_day`.
-    anchor: Option<(NaiveDate, u32)>,
+    anchor: Option<(Date, u32)>,
 }
 
 impl PeriodRule {
@@ -68,7 +72,7 @@ impl PeriodRule {
             start_day: data.bill_start_day,
             anchor: data
                 .bill_anchor_date
-                .map(|date| (date, data.bill_length_days)),
+                .map(|date| (crate::clock::date_to_jiff(date), data.bill_length_days)),
         }
     }
 }
@@ -91,28 +95,28 @@ const MIN_ROLLING_BILL_DAYS: i64 = 25;
 ///    rolled forward by that length until it contains `today`. A bill shorter
 ///    than [`MIN_ROLLING_BILL_DAYS`] (such as a final bill) is not used.
 /// 3. Else the calendar month.
-fn period_containing(today: NaiveDate, rule: &PeriodRule, bills: &[PastBill]) -> Period {
+fn period_containing(today: Date, rule: &PeriodRule, bills: &[PastBill]) -> Period {
     if let Some((anchor, length)) = rule.anchor.filter(|(_, length)| *length > 0) {
         let length = i64::from(length);
         // `div_euclid` rounds down, so days before the anchor land in an
         // earlier period instead of being cut short at zero.
-        let k = (today - anchor).num_days().div_euclid(length);
-        let from = anchor + chrono::Duration::days(k * length);
+        let k = i64::from((today - anchor).get_days()).div_euclid(length);
+        let from = anchor + (k * length).days();
         return Period {
             from,
-            to: from + Days::new(length as u64 - 1),
+            to: from + (length - 1).days(),
             source: PeriodSource::Anchor,
         };
     }
     if let Some(day) = rule.start_day.filter(|d| (1..=28).contains(d)) {
         // Days 1 to 28 exist in every month, so building the date cannot fail.
-        let this_month = today.with_day(day).unwrap_or(today);
-        let from = if today.day() >= day {
+        let this_month = today.with().day(day as i8).build().unwrap_or(today);
+        let from = if today.day() as u32 >= day {
             this_month
         } else {
-            this_month - Months::new(1)
+            this_month - 1.month()
         };
-        let to = (from + Months::new(1)) - Days::new(1);
+        let to = (from + 1.month()) - 1.day();
         return Period {
             from,
             to,
@@ -122,24 +126,24 @@ fn period_containing(today: NaiveDate, rule: &PeriodRule, bills: &[PastBill]) ->
     if let Some(last) = bills
         .iter()
         .rev()
-        .find(|b| b.to < today)
+        .find(|b| crate::clock::date_to_jiff(b.to) < today)
         .filter(|b| b.days() >= MIN_ROLLING_BILL_DAYS)
     {
         let length = last.days();
-        let first = last.to + Days::new(1);
+        let first = crate::clock::date_to_jiff(last.to) + 1.day();
         // Whole periods that have passed since the one after the bill.
-        let rolled = (today - first).num_days() / length;
-        let from = first + Days::new((rolled * length) as u64);
+        let rolled = i64::from((today - first).get_days()) / length;
+        let from = first + (rolled * length).days();
         return Period {
             from,
-            to: from + Days::new(length as u64 - 1),
+            to: from + (length - 1).days(),
             source: PeriodSource::LastBill,
         };
     }
-    let from = today.with_day(1).unwrap_or(today);
+    let from = today.first_of_month();
     Period {
         from,
-        to: (from + Months::new(1)) - Days::new(1),
+        to: (from + 1.month()) - 1.day(),
         source: PeriodSource::Month,
     }
 }
@@ -484,7 +488,7 @@ fn periods_before(
     let mut out = Vec::with_capacity(count);
     let mut next_from = period.from;
     for _ in 0..count {
-        let before = period_containing(next_from - Days::new(1), rule, bills);
+        let before = period_containing(next_from - 1.day(), rule, bills);
         next_from = before.from;
         out.push(before);
     }
@@ -542,15 +546,14 @@ pub struct BillParams {
 
 /// The first local day we hold any data for: the first stored reading or the
 /// start of the oldest past bill, whichever is earlier. `None` with neither.
-async fn first_data_day(
-    state: &AppState,
-    bills: &[PastBill],
-) -> Result<Option<NaiveDate>, ApiError> {
+async fn first_data_day(state: &AppState, bills: &[PastBill]) -> Result<Option<Date>, ApiError> {
     let from_readings = first_data_ts(state)
         .await?
-        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-        .map(|t| t.with_timezone(&state.tz).date_naive());
-    let from_bills = bills.iter().map(|b| b.from).min();
+        .and_then(|ts| local_date_of(ts, &state.site_tz()));
+    let from_bills = bills
+        .iter()
+        .map(|b| crate::clock::date_to_jiff(b.from))
+        .min();
     Ok([from_readings, from_bills].into_iter().flatten().min())
 }
 
@@ -571,7 +574,7 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     let Some(schedule) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
-    let today = today(state.tz);
+    let today = today(&state.site_tz());
     let wanted = match params.date.as_deref() {
         Some(text) => {
             let date = parse_date("date", text)?;
@@ -586,19 +589,19 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     let period = period_containing(wanted, &rule, &data.bills);
     // A period that ended before today is finished: nothing is left to project.
     let finished = period.to < today;
-    let next_date = finished.then(|| period.to + Days::new(1));
+    let next_date = finished.then(|| period.to + 1.day());
     let first_day = first_data_day(&state, &data.bills).await?;
-    let before_period = period_containing(period.from - Days::new(1), &rule, &data.bills);
+    let before_period = period_containing(period.from - 1.day(), &rule, &data.bills);
     let prev_date = first_day
         .filter(|first| before_period.to >= *first)
-        .map(|_| period.from - Days::new(1));
+        .map(|_| period.from - 1.day());
     let days_total = period.days_total();
 
     // Complete days: from the period start to yesterday, and never past its end.
-    let last_done = (today - Days::new(1)).min(period.to);
-    let dates: Vec<NaiveDate> = period
+    let last_done = (today - 1.day()).min(period.to);
+    let dates: Vec<Date> = period
         .from
-        .iter_days()
+        .series(1.day())
         .take_while(|d| *d <= last_done)
         .collect();
     let days_elapsed = dates.len() as i64;
@@ -615,10 +618,10 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     let mut daily = Vec::with_capacity(costed.len());
     let mut uses_globird = false;
     // The tariff split of every complete day, read from the stored days where possible.
-    let complete_dates: Vec<NaiveDate> = complete.iter().map(|day| day.date).collect();
+    let complete_dates: Vec<Date> = complete.iter().map(|day| day.date).collect();
     let splits = grid_splits(&state, schedule, &complete_dates).await?;
     for day in &costed {
-        let has_credit = schedule.for_date(day.date).credit_cents().is_some();
+        let has_credit = tariff_on(schedule, day.date).credit_cents().is_some();
         daily.push(DailyEntry {
             date: day.date.to_string(),
             total_dollars: dollars(day.cost.actual_cents),
@@ -633,7 +636,7 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
         uses_globird |= day.source == SOURCE_GLOBIRD || day.source == SOURCE_BILL;
         credit_possible += u32::from(has_credit);
         if let Some(split) = splits.get(&day.date) {
-            let tariff = schedule.for_date(day.date);
+            let tariff = tariff_on(schedule, day.date);
             add_bands(&mut bands, split, tariff, day.cost.import_cents);
             add_feed_in(&mut feed_in, split, tariff, day.cost.export_cents);
             free_value_cents += split.import_free_kwh * tariff.default_import_cents();
@@ -641,7 +644,7 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     }
 
     let plan_day = today.min(period.to);
-    let supply_per_day = schedule.for_date(plan_day).supply_cents_per_day();
+    let supply_per_day = tariff_on(schedule, plan_day).supply_cents_per_day();
     let (mut projected, mut projected_without) = project(&sums, days_total, supply_per_day);
     if finished {
         projected = sums.actual_cents;
@@ -650,7 +653,7 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     // Rates and window times are the last complete day's plan (today's when
     // there is none yet).
     let rate_day = complete.last().map_or(plan_day, |day| day.date);
-    let rate_plan = schedule.for_date(rate_day);
+    let rate_plan = tariff_on(schedule, rate_day);
     let band_cents = [
         0.0,
         rate_plan.default_import_cents(),
@@ -672,10 +675,10 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
         .collect();
     // The last six periods in one pass over the costs, oldest first.
     let before = periods_before(&period, HISTORY_PERIODS, &rule, &data.bills);
-    let past_dates: Vec<NaiveDate> = before.first().map_or_else(Vec::new, |first| {
+    let past_dates: Vec<Date> = before.first().map_or_else(Vec::new, |first| {
         first
             .from
-            .iter_days()
+            .series(1.day())
             .take_while(|d| *d < period.from)
             .collect()
     });
@@ -704,8 +707,8 @@ pub async fn current(State(state): State<AppState>, Query(params): Query<BillPar
     // Charging sessions that started on a complete day of this period.
     let cars = match dates.first().zip(dates.last()) {
         Some((first, last)) => {
-            let (start, _) = day_bounds_or_error(*first, state.tz)?;
-            let (_, end) = day_bounds_or_error(*last, state.tz)?;
+            let (start, _) = day_bounds_or_error(*first, &state.site_tz())?;
+            let (_, end) = day_bounds_or_error(*last, &state.site_tz())?;
             db::tm_charge_totals(&state.pool, start, end).await?
         }
         None => None,
@@ -832,25 +835,25 @@ pub(super) fn compare_dates(
     state: &AppState,
     from: Option<&str>,
     to: Option<&str>,
-) -> Result<(NaiveDate, NaiveDate, Vec<NaiveDate>), ApiError> {
+) -> Result<(Date, Date, Vec<Date>), ApiError> {
     let data = state.admin.get();
-    let today = today(state.tz);
+    let today = today(&state.site_tz());
     let (from, to) = match (from, to) {
         (None, None) => {
             let period = period_containing(today, &PeriodRule::of(&data), &data.bills);
-            (period.from, (today - Days::new(1)).min(period.to))
+            (period.from, (today - 1.day()).min(period.to))
         }
         _ => {
             let to = to
                 .map(str::to_string)
-                .unwrap_or_else(|| (today - Days::new(1)).to_string());
+                .unwrap_or_else(|| (today - 1.day()).to_string());
             let (from, count) =
-                super::api::date_range(from, Some(&to), state.tz, MAX_COMPARE_DAYS, 30)?;
-            (from, from + Days::new(count - 1))
+                super::api::date_range(from, Some(&to), &state.site_tz(), MAX_COMPARE_DAYS, 30)?;
+            (from, from + ((count - 1) as i64).days())
         }
     };
-    let last = to.min(today - Days::new(1));
-    let dates: Vec<NaiveDate> = from.iter_days().take_while(|d| *d <= last).collect();
+    let last = to.min(today - 1.day());
+    let dates: Vec<Date> = from.series(1.day()).take_while(|d| *d <= last).collect();
     if dates.len() as u64 > MAX_COMPARE_DAYS {
         return Err(ApiError::bad_request(format!(
             "the range can be at most {MAX_COMPARE_DAYS} days"
@@ -905,7 +908,7 @@ pub async fn compare_dynamic(
 mod tests {
     use super::*;
 
-    fn date(text: &str) -> NaiveDate {
+    fn date(text: &str) -> Date {
         text.parse().unwrap()
     }
 
