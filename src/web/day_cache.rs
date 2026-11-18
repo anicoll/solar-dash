@@ -14,10 +14,9 @@
 //! freshly worked out one answer byte for byte the same.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 
-use chrono::NaiveDate;
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::SqlitePool;
@@ -31,16 +30,16 @@ use crate::db::{self, DailyCacheRow};
 pub(super) async fn load<T: DeserializeOwned>(
     pool: &SqlitePool,
     kind: &str,
-    keys: &[(NaiveDate, String)],
-) -> Result<HashMap<NaiveDate, T>, ApiError> {
+    keys: &[(Date, String)],
+) -> Result<HashMap<Date, T>, ApiError> {
     let (Some((first, _)), Some((last, _))) = (keys.first(), keys.last()) else {
         return Ok(HashMap::new());
     };
-    let wanted: HashMap<NaiveDate, &str> = keys.iter().map(|(d, k)| (*d, k.as_str())).collect();
+    let wanted: HashMap<Date, &str> = keys.iter().map(|(d, k)| (*d, k.as_str())).collect();
     let rows = db::daily_cache_in_range(pool, kind, &first.to_string(), &last.to_string()).await?;
     let mut found = HashMap::new();
     for row in rows {
-        let Ok(date) = NaiveDate::from_str(&row.date) else {
+        let Ok(date) = Date::strptime("%Y-%m-%d", &row.date) else {
             continue;
         };
         if wanted.get(&date) != Some(&row.cache_key.as_str()) {
@@ -78,9 +77,9 @@ pub(super) async fn fingerprints(
     pool: &SqlitePool,
     plant_id: i64,
     with_ha: bool,
-    tz: Tz,
-    dates: &[NaiveDate],
-) -> Result<HashMap<NaiveDate, String>, ApiError> {
+    tz: &TimeZone,
+    dates: &[Date],
+) -> Result<HashMap<Date, String>, ApiError> {
     let mut sorted = dates.to_vec();
     sorted.sort();
     sorted.dedup();
@@ -98,22 +97,22 @@ pub(super) async fn load_with_data<T: DeserializeOwned>(
     pool: &SqlitePool,
     plant_id: i64,
     with_ha: bool,
-    tz: Tz,
+    tz: &TimeZone,
     kind: &str,
-    keys: &[(NaiveDate, String)],
-) -> Result<HashMap<NaiveDate, T>, ApiError> {
+    keys: &[(Date, String)],
+) -> Result<HashMap<Date, T>, ApiError> {
     let (Some((first, _)), Some((last, _))) = (keys.first(), keys.last()) else {
         return Ok(HashMap::new());
     };
-    let wanted: HashMap<NaiveDate, &str> = keys.iter().map(|(d, k)| (*d, k.as_str())).collect();
+    let wanted: HashMap<Date, &str> = keys.iter().map(|(d, k)| (*d, k.as_str())).collect();
     let rows = db::daily_cache_in_range(pool, kind, &first.to_string(), &last.to_string()).await?;
-    let rows: Vec<(NaiveDate, DailyCacheRow)> = rows
+    let rows: Vec<(Date, DailyCacheRow)> = rows
         .into_iter()
-        .filter_map(|row| Some((NaiveDate::from_str(&row.date).ok()?, row)))
+        .filter_map(|row| Some((Date::strptime("%Y-%m-%d", &row.date).ok()?, row)))
         .filter(|(date, _)| wanted.contains_key(date))
         .collect();
     // Only the days stored as incomplete need their readings fingerprinted.
-    let incomplete: Vec<NaiveDate> = rows
+    let incomplete: Vec<Date> = rows
         .iter()
         .filter(|(date, row)| is_data_key_of(&row.cache_key, wanted[date]))
         .map(|(date, _)| *date)
@@ -144,10 +143,10 @@ pub(super) async fn store_keys(
     pool: &SqlitePool,
     plant_id: i64,
     with_ha: bool,
-    tz: Tz,
-    days: &[(NaiveDate, String, bool)],
-) -> Result<Vec<(NaiveDate, String)>, ApiError> {
-    let incomplete: Vec<NaiveDate> = days
+    tz: &TimeZone,
+    days: &[(Date, String, bool)],
+) -> Result<Vec<(Date, String)>, ApiError> {
+    let incomplete: Vec<Date> = days
         .iter()
         .filter(|(_, _, complete)| !complete)
         .map(|(date, _, _)| *date)
@@ -166,7 +165,7 @@ pub(super) async fn store_keys(
 pub(super) async fn save<T: Serialize>(
     pool: &SqlitePool,
     kind: &str,
-    days: &[(NaiveDate, String, &T)],
+    days: &[(Date, String, &T)],
 ) -> Result<(), ApiError> {
     let rows = days
         .iter()

@@ -16,7 +16,7 @@ use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -125,7 +125,7 @@ async fn price_row(tx: &mut sqlx::SqliteConnection, from: &str) -> Result<Option
     Ok(row.map(|(cents,)| json!({ "from": from, "cents_per_litre": cents })))
 }
 
-fn date(text: &str) -> Result<NaiveDate, ApiError> {
+fn date(text: &str) -> Result<Date, ApiError> {
     parse_date(text).map_err(|err| ApiError::bad_request(format!("from: {err}")))
 }
 

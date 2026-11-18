@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use axum::Json;
 use axum::extract::State;
-use chrono::{Datelike, Days, Months, NaiveDate};
+use jiff::ToSpan;
+use jiff::civil::Date;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -44,7 +45,7 @@ const BATTERY_USABLE: f64 = 0.95;
 #[derive(Debug, Clone)]
 pub struct Purchase {
     pub name: String,
-    pub date: NaiveDate,
+    pub date: Date,
     pub cost_dollars: f64,
     /// Capacity of the battery it added, in kWh, if any.
     pub battery_kwh: Option<f64>,
@@ -69,7 +70,7 @@ pub fn purchases_from_config(list: &[config::Purchase]) -> Result<Vec<Purchase>>
 }
 
 /// Savings in dollars on one local day.
-type DaySavings = (NaiveDate, f64);
+type DaySavings = (Date, f64);
 
 /// The end of a month: cumulative savings and the net position (savings
 /// minus what had been paid by then).
@@ -100,15 +101,12 @@ enum Projection {
     /// The savings rate is not positive, so it never will.
     Never,
     /// At the current rate, on about this day.
-    On(NaiveDate),
+    On(Date),
 }
 
 /// The last day of the month `date` is in.
-fn month_end(date: NaiveDate) -> NaiveDate {
-    date.with_day(1)
-        .and_then(|first| first.checked_add_months(Months::new(1)))
-        .and_then(|next| next.pred_opt())
-        .unwrap_or(date)
+fn month_end(date: Date) -> Date {
+    date.last_of_month()
 }
 
 /// One point per month from `first`'s month to `last`'s: savings so far and
@@ -117,12 +115,12 @@ fn month_end(date: NaiveDate) -> NaiveDate {
 fn monthly_series(
     days: &[DaySavings],
     purchases: &[Purchase],
-    first: NaiveDate,
-    last: NaiveDate,
+    first: Date,
+    last: Date,
 ) -> Vec<MonthPoint> {
     let mut points = Vec::new();
     let (mut saved, mut next_day) = (0.0, 0);
-    let mut month_start = first.with_day(1);
+    let mut month_start = Some(first.first_of_month());
     while let Some(start) = month_start
         && start <= last
     {
@@ -138,11 +136,11 @@ fn monthly_series(
             .map(|p| p.cost_dollars)
             .sum();
         points.push(MonthPoint {
-            month: start.format("%Y-%m").to_string(),
+            month: start.strftime("%Y-%m").to_string(),
             saved: round2(saved),
             net: round2(saved - spent),
         });
-        month_start = start.checked_add_months(Months::new(1));
+        month_start = start.checked_add(1.month()).ok();
     }
     points
 }
@@ -173,7 +171,7 @@ fn rate_per_day(days: &[DaySavings]) -> f64 {
 /// continuously by `price_rise_percent` a year. With g = ln(1 + p/100), the
 /// savings after T years are rate * 365.25 * (e^(gT) - 1) / g; solving that
 /// for the remaining cost gives T = ln(1 + remaining * g / (rate * 365.25)) / g.
-fn projected_payback(net: f64, rate: f64, price_rise_percent: f64, today: NaiveDate) -> Projection {
+fn projected_payback(net: f64, rate: f64, price_rise_percent: f64, today: Date) -> Projection {
     if net >= 0.0 {
         return Projection::PaidBack;
     }
@@ -191,9 +189,9 @@ fn projected_payback(net: f64, rate: f64, price_rise_percent: f64, today: NaiveD
     if days > MAX_PROJECTED_DAYS {
         return Projection::Never;
     }
-    match today.checked_add_days(Days::new(days as u64)) {
-        Some(date) => Projection::On(date),
-        None => Projection::Never,
+    match today.checked_add((days as i64).days()) {
+        Ok(date) => Projection::On(date),
+        Err(_) => Projection::Never,
     }
 }
 
@@ -214,11 +212,11 @@ fn added_savings(discharge_kwh: f64, owned_kwh: f64, peak_cents: f64) -> f64 {
 /// in dollars. `peak_cents` gives a day's peak import rate. Days without a
 /// figure are left out, so they add nothing.
 fn estimated_added(
-    discharge: &BTreeMap<NaiveDate, f64>,
-    from: NaiveDate,
+    discharge: &BTreeMap<Date, f64>,
+    from: Date,
     owned_kwh: f64,
-    peak_cents: impl Fn(NaiveDate) -> f64,
-) -> BTreeMap<NaiveDate, f64> {
+    peak_cents: impl Fn(Date) -> f64,
+) -> BTreeMap<Date, f64> {
     discharge
         .range(from..)
         .map(|(&date, &kwh)| (date, added_savings(kwh, owned_kwh, peak_cents(date))))
@@ -226,7 +224,7 @@ fn estimated_added(
 }
 
 /// `days` with each map's added savings taken off its days. Same days, same order.
-fn minus_added(days: &[DaySavings], added: &[&BTreeMap<NaiveDate, f64>]) -> Vec<DaySavings> {
+fn minus_added(days: &[DaySavings], added: &[&BTreeMap<Date, f64>]) -> Vec<DaySavings> {
     days.iter()
         .map(|&(date, saved)| {
             let taken: f64 = added.iter().filter_map(|a| a.get(&date)).sum();
@@ -237,11 +235,7 @@ fn minus_added(days: &[DaySavings], added: &[&BTreeMap<NaiveDate, f64>]) -> Vec<
 
 /// What `added` gives on the days of `days` from `from` (0 where it has none),
 /// so a rate over it covers every day since the purchase.
-fn added_on_days(
-    days: &[DaySavings],
-    added: &BTreeMap<NaiveDate, f64>,
-    from: NaiveDate,
-) -> Vec<DaySavings> {
+fn added_on_days(days: &[DaySavings], added: &BTreeMap<Date, f64>, from: Date) -> Vec<DaySavings> {
     days.iter()
         .filter(|d| d.0 >= from)
         .map(|&(date, _)| (date, added.get(&date).copied().unwrap_or(0.0)))
@@ -275,12 +269,12 @@ struct Part {
 /// the parts add up to the total.
 fn build_parts(
     purchases: &[Purchase],
-    added: &[Option<BTreeMap<NaiveDate, f64>>],
+    added: &[Option<BTreeMap<Date, f64>>],
     days: &[DaySavings],
     price_rise_percent: f64,
-    today: NaiveDate,
+    today: Date,
 ) -> Vec<Part> {
-    let estimates: Vec<&BTreeMap<NaiveDate, f64>> = added.iter().flatten().collect();
+    let estimates: Vec<&BTreeMap<Date, f64>> = added.iter().flatten().collect();
     let first_days = minus_added(days, &estimates);
     let estimated_total: f64 = estimates.iter().flat_map(|a| a.values()).sum();
     let total: f64 = days.iter().map(|d| d.1).sum();
@@ -332,7 +326,7 @@ struct TimelineEntry {
 
 /// Every purchase and every named plan start, oldest first (a purchase before
 /// a plan on the same day).
-fn build_timeline(purchases: &[Purchase], plans: &[(NaiveDate, String)]) -> Vec<TimelineEntry> {
+fn build_timeline(purchases: &[Purchase], plans: &[(Date, String)]) -> Vec<TimelineEntry> {
     let mut entries: Vec<TimelineEntry> = purchases
         .iter()
         .map(|p| TimelineEntry {
@@ -358,13 +352,16 @@ fn projection_json(projection: &Projection) -> Value {
     match projection {
         Projection::PaidBack => Value::Null,
         Projection::Never => json!("never"),
-        Projection::On(date) => json!(date.format("%Y-%m").to_string()),
+        Projection::On(date) => json!(date.strftime("%Y-%m").to_string()),
     }
 }
 
 /// Days in a calendar year: 365, or 366 in a leap year.
 fn days_in_year(year: i32) -> u32 {
-    NaiveDate::from_ymd_opt(year, 12, 31).map_or(365, |last| last.ordinal())
+    i16::try_from(year)
+        .ok()
+        .and_then(|year| Date::new(year, 12, 31).ok())
+        .map_or(365, |last| last.day_of_year() as u32)
 }
 
 /// Savings, days with data and whether the data is partial, per year, oldest
@@ -373,7 +370,7 @@ fn by_year(days: &[DaySavings]) -> Vec<YearTotal> {
     // A `BTreeMap` keeps its keys sorted, so the years come out in order.
     let mut years: BTreeMap<i32, (f64, u32)> = BTreeMap::new();
     for &(date, savings) in days {
-        let entry = years.entry(date.year()).or_default();
+        let entry = years.entry(i32::from(date.year())).or_default();
         entry.0 += savings;
         entry.1 += 1;
     }
@@ -393,11 +390,11 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
     let (Some(tariff), Some(first)) = (&data.tariff, data.purchases.first()) else {
         return Ok(Json(json!({ "configured": false })));
     };
-    let today = today(state.tz);
+    let today = today(&state.site_tz());
 
     // From the first purchase until today (but not unreasonably far back).
-    let start = first.date.max(today - Days::new(MAX_PAYBACK_DAYS));
-    let dates: Vec<NaiveDate> = start.iter_days().take_while(|d| *d <= today).collect();
+    let start = first.date.max(today - (MAX_PAYBACK_DAYS as i64).days());
+    let dates: Vec<Date> = start.series(1.day()).take_while(|d| *d <= today).collect();
     let days: Vec<DaySavings> = billed_days(&state, tariff, &dates)
         .await?
         .into_iter()
@@ -430,12 +427,12 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
         .min();
     let discharge = match battery_from {
         Some(from) => {
-            let dates: Vec<NaiveDate> = from.iter_days().take_while(|d| *d <= today).collect();
+            let dates: Vec<Date> = from.series(1.day()).take_while(|d| *d <= today).collect();
             battery_discharge_by_date(&state, &dates).await?
         }
         None => BTreeMap::new(),
     };
-    let added: Vec<Option<BTreeMap<NaiveDate, f64>>> = data
+    let added: Vec<Option<BTreeMap<Date, f64>>> = data
         .purchases
         .iter()
         .enumerate()
@@ -445,9 +442,7 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
             }
             let owned = battery_owned_before(&data.purchases, i);
             Some(estimated_added(&discharge, p.date, owned, |date| {
-                tariff
-                    .for_date(crate::clock::date_to_jiff(date))
-                    .peak_import_cents()
+                tariff.for_date(date).peak_import_cents()
             }))
         })
         .collect();
@@ -500,17 +495,12 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
     };
 
     let first_day = first.date;
-    let plans: Vec<(NaiveDate, String)> = tariff
+    let plans: Vec<(Date, String)> = tariff
         .plans()
         .into_iter()
         .filter_map(|(date, name)| {
             let name = name?.trim();
-            (!name.is_empty()).then(|| {
-                (
-                    date.map_or(first_day, crate::clock::date_to_chrono),
-                    name.to_string(),
-                )
-            })
+            (!name.is_empty()).then(|| (date.unwrap_or(first_day), name.to_string()))
         })
         .collect();
 
@@ -537,7 +527,7 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
 mod tests {
     use super::*;
 
-    fn date(text: &str) -> NaiveDate {
+    fn date(text: &str) -> Date {
         text.parse().unwrap()
     }
 
@@ -596,7 +586,7 @@ mod tests {
         // 100 old days at 10, then 365 recent days at 2: only the recent count.
         let first = date("2020-01-01");
         let days: Vec<DaySavings> = (0..465)
-            .map(|i| (first + Days::new(i), if i < 100 { 10.0 } else { 2.0 }))
+            .map(|i| (first + (i as i64).days(), if i < 100 { 10.0 } else { 2.0 }))
             .collect();
         assert_eq!(rate_per_day(&days), 2.0);
     }
@@ -639,7 +629,7 @@ mod tests {
         let (Projection::On(linear), Projection::On(rising)) = (linear, rising) else {
             panic!("expected dates");
         };
-        assert_eq!(linear, today + Days::new(3653));
+        assert_eq!(linear, today + 3653.days());
         // ln(1 + 36525 * ln(1.03) / 3652.5) / ln(1.03) is about 8.8 years.
         assert!(
             rising < date("2035-08-31") && rising > date("2035-06-01"),
@@ -659,7 +649,7 @@ mod tests {
     #[test]
     fn years_are_marked_partial_when_data_is_missing() {
         let mut days: Vec<DaySavings> = (0..367)
-            .map(|i| (date("2024-01-01") + Days::new(i), 1.0))
+            .map(|i| (date("2024-01-01") + (i as i64).days(), 1.0))
             .collect();
         // 2024 is complete (366 days, from 2024-01-01); 2025 has one day.
         assert_eq!(
@@ -704,7 +694,7 @@ mod tests {
 
     #[test]
     fn the_estimate_starts_on_the_purchase_day_and_skips_days_without_data() {
-        let discharge: BTreeMap<NaiveDate, f64> = [
+        let discharge: BTreeMap<Date, f64> = [
             (date("2025-09-30"), 20.0),
             (date("2025-10-01"), 20.0),
             // 2025-10-02 has no figure.
@@ -712,9 +702,9 @@ mod tests {
         ]
         .into();
         // Peak 40 c before the 3rd, 80 c from then on.
-        let peak = |d: NaiveDate| if d < date("2025-10-03") { 40.0 } else { 80.0 };
+        let peak = |d: Date| if d < date("2025-10-03") { 40.0 } else { 80.0 };
         let added = estimated_added(&discharge, date("2025-10-01"), 10.0, peak);
-        let got: Vec<(NaiveDate, f64)> = added.into_iter().collect();
+        let got: Vec<(Date, f64)> = added.into_iter().collect();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, date("2025-10-01"));
         // (20 - 9.5) * 0.40 and (10 - 9.5) * 0.80.
@@ -742,8 +732,8 @@ mod tests {
             (date("2025-01-02"), 10.0),
             (date("2025-01-03"), 10.0),
         ];
-        let one: BTreeMap<NaiveDate, f64> = [(date("2025-01-02"), 3.0)].into();
-        let two: BTreeMap<NaiveDate, f64> =
+        let one: BTreeMap<Date, f64> = [(date("2025-01-02"), 3.0)].into();
+        let two: BTreeMap<Date, f64> =
             [(date("2025-01-02"), 1.0), (date("2025-01-03"), 2.0)].into();
         assert_eq!(
             minus_added(&days, &[&one, &two]),
@@ -764,7 +754,7 @@ mod tests {
     fn last_12_months_use_the_rate_window() {
         let first = date("2020-01-01");
         let days: Vec<DaySavings> = (0..400)
-            .map(|i| (first + Days::new(i), if i < 35 { 100.0 } else { 1.0 }))
+            .map(|i| (first + (i as i64).days(), if i < 35 { 100.0 } else { 1.0 }))
             .collect();
         assert_eq!(last_12_months_saved(&days), 365.0);
         assert_eq!(last_12_months_saved(&[]), 0.0);
@@ -779,11 +769,11 @@ mod tests {
             battery("2025-03-01", 100.0, 5.0),
         ];
         let days: Vec<DaySavings> = (0..100)
-            .map(|i| (date("2025-01-01") + Days::new(i), 10.0))
+            .map(|i| (date("2025-01-01") + (i as i64).days(), 10.0))
             .collect();
         // The third purchase added 4 a day from 2025-03-01 (day 59) to day 99.
-        let added: BTreeMap<NaiveDate, f64> = (59..100)
-            .map(|i| (date("2025-01-01") + Days::new(i), 4.0))
+        let added: BTreeMap<Date, f64> = (59..100)
+            .map(|i| (date("2025-01-01") + (i as i64).days(), 4.0))
             .collect();
         let parts = build_parts(&purchases, &[None, None, Some(added)], &days, 0.0, today);
         assert_eq!(parts.len(), 3);
@@ -799,7 +789,7 @@ mod tests {
         let Some(Projection::On(first)) = parts[0].projection else {
             panic!("expected a date");
         };
-        assert_eq!(first, today + Days::new(20));
+        assert_eq!(first, today + 20.days());
         // 164 saved against 100: already paid back.
         assert_eq!(parts[2].projection, Some(Projection::PaidBack));
     }

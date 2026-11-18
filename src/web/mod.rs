@@ -1881,8 +1881,10 @@ mod tests {
         let cookie = log_in(&app).await;
         // All of yesterday: a day needs 95% coverage before its totals count.
         let tz = chrono_tz::Australia::Adelaide;
-        let date = api::today(tz).pred_opt().unwrap();
-        let (start, end) = api::day_bounds_or_error(date, tz).unwrap();
+        let date = api::today(&crate::clock::tz_to_jiff(tz))
+            .yesterday()
+            .unwrap();
+        let (start, end) = api::day_bounds_or_error(date, &crate::clock::tz_to_jiff(tz)).unwrap();
         for ts in (start..=end).step_by(30) {
             let mut sample = live_sample(ts);
             (sample.pv_w, sample.load_w) = (Some(3600.0), Some(1800.0));
@@ -2838,10 +2840,12 @@ mod tests {
         let (_dir, app, pool) = costs_app().await;
         let cookie = log_in(&app).await;
         let tz = chrono_tz::Australia::Adelaide;
-        let today = api::today(tz);
+        let today = api::today(&crate::clock::tz_to_jiff(tz));
         // Data from 90 days ago, so the periods just before now have a past.
-        let first_day = today - chrono::Days::new(90);
-        let start = api::day_bounds_or_error(first_day, tz).unwrap().0;
+        let first_day = today - jiff::ToSpan::days(90);
+        let start = api::day_bounds_or_error(first_day, &crate::clock::tz_to_jiff(tz))
+            .unwrap()
+            .0;
         seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
 
         let current = bill_json(&app, &cookie, "/api/bill/current").await;
@@ -2849,7 +2853,7 @@ mod tests {
         assert!(current["next_date"].is_null());
         assert!(current["prev_date"].is_string());
 
-        let date = today - chrono::Days::new(35);
+        let date = today - jiff::ToSpan::days(35);
         let uri = format!("/api/bill/current?date={date}");
         let past = bill_json(&app, &cookie, &uri).await;
         let (from, to) = (past["from"].as_str().unwrap(), past["to"].as_str().unwrap());
@@ -2877,7 +2881,7 @@ mod tests {
         .await;
         assert_eq!(
             next["from"].as_str().unwrap(),
-            (chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d").unwrap() + chrono::Days::new(1))
+            (jiff::civil::Date::strptime("%Y-%m-%d", to).unwrap() + jiff::ToSpan::days(1))
                 .to_string()
         );
     }
@@ -2895,7 +2899,8 @@ mod tests {
     async fn current_bill_rejects_bad_and_future_dates() {
         let (_dir, app, _pool) = costs_app().await;
         let cookie = log_in(&app).await;
-        let tomorrow = api::today(chrono_tz::Australia::Adelaide) + chrono::Days::new(1);
+        let tomorrow = api::today(&crate::clock::tz_to_jiff(chrono_tz::Australia::Adelaide))
+            + jiff::ToSpan::days(1);
         for uri in [
             "/api/bill/current?date=bad".to_string(),
             "/api/bill/current?date=2026-13-01".to_string(),
@@ -3284,7 +3289,7 @@ mod tests {
 
         // The bill's tariff split and the battery discharge too.
         let schedule = flat_tariff();
-        let dates: Vec<chrono::NaiveDate> = ["2026-09-15", "2026-09-16", "2026-09-17"]
+        let dates: Vec<jiff::civil::Date> = ["2026-09-15", "2026-09-16", "2026-09-17"]
             .iter()
             .map(|d| d.parse().unwrap())
             .collect();
@@ -3374,10 +3379,17 @@ mod tests {
         seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
         let now = SEP_15_START + 3 * 86_400;
         let (start, end) = (SEP_15_START + 3 * 3600, SEP_15_START + 5 * 3600);
-        let (intervals, covered) =
-            costs::house_intervals(&pool, PLANT, tz, start, end, now, &SourceRules::default())
-                .await
-                .unwrap();
+        let (intervals, covered) = costs::house_intervals(
+            &pool,
+            PLANT,
+            &crate::clock::tz_to_jiff(tz),
+            start,
+            end,
+            now,
+            &SourceRules::default(),
+        )
+        .await
+        .unwrap();
         assert!(!intervals.is_empty());
         // The whole day is the source, so these are the day's intervals.
         assert!(intervals.iter().any(|i| i.start_ts < start));
@@ -3389,7 +3401,7 @@ mod tests {
         let (_, covered) = costs::house_intervals(
             &pool,
             PLANT,
-            tz,
+            &crate::clock::tz_to_jiff(tz),
             night.0,
             night.1,
             now,
@@ -3404,7 +3416,7 @@ mod tests {
         let (intervals, covered) = costs::house_intervals(
             &pool,
             PLANT,
-            tz,
+            &crate::clock::tz_to_jiff(tz),
             later,
             later + 3600,
             now,
@@ -3414,10 +3426,17 @@ mod tests {
         .unwrap();
         assert!(intervals.is_empty());
         assert_eq!(covered, 0.0);
-        let (intervals, covered) =
-            costs::house_intervals(&pool, PLANT, tz, start, start, now, &SourceRules::default())
-                .await
-                .unwrap();
+        let (intervals, covered) = costs::house_intervals(
+            &pool,
+            PLANT,
+            &crate::clock::tz_to_jiff(tz),
+            start,
+            start,
+            now,
+            &SourceRules::default(),
+        )
+        .await
+        .unwrap();
         assert!(intervals.is_empty());
         assert_eq!(covered, 0.0);
     }
@@ -3442,7 +3461,12 @@ mod tests {
     /// Unix time of the start of today's local day.
     fn today_start() -> i64 {
         let tz = chrono_tz::Australia::Adelaide;
-        api::day_bounds_or_error(api::today(tz), tz).unwrap().0
+        api::day_bounds_or_error(
+            api::today(&crate::clock::tz_to_jiff(tz)),
+            &crate::clock::tz_to_jiff(tz),
+        )
+        .unwrap()
+        .0
     }
 
     /// Seconds after midnight of the last reading of a complete cloud day (23:55).
@@ -3451,7 +3475,7 @@ mod tests {
     #[tokio::test]
     async fn finished_days_come_from_the_cache_but_today_is_recomputed() {
         let (_dir, app, pool) = costs_app().await;
-        let today = api::today(chrono_tz::Australia::Adelaide);
+        let today = api::today(&crate::clock::tz_to_jiff(chrono_tz::Australia::Adelaide));
         let range = format!("from=2026-09-15&to={today}");
         seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
         seed_counters(&pool, today_start(), &[3600], 1000.0).await;
@@ -3505,7 +3529,9 @@ mod tests {
         let (_dir, plain, pool) = costs_app().await;
         let tz = chrono_tz::Australia::Adelaide;
         for date in ["2026-09-15", "2026-09-16"] {
-            let (day_start, _) = api::day_bounds_or_error(date.parse().unwrap(), tz).unwrap();
+            let (day_start, _) =
+                api::day_bounds_or_error(date.parse().unwrap(), &crate::clock::tz_to_jiff(tz))
+                    .unwrap();
             seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
         }
         let range = "from=2026-09-01&to=2026-09-30";
@@ -3637,7 +3663,9 @@ mod tests {
         assert_eq!(years["buckets"][0]["cars"]["fuel_saved"], 5.05);
 
         // A period with house data but no car activity gets zeros.
-        let (day_start, _) = api::day_bounds_or_error("2026-08-01".parse().unwrap(), tz).unwrap();
+        let (day_start, _) =
+            api::day_bounds_or_error("2026-08-01".parse().unwrap(), &crate::clock::tz_to_jiff(tz))
+                .unwrap();
         seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
         let august = costs_json(&app, "from=2026-08-01&to=2026-08-31&group=month").await;
         assert_eq!(
@@ -3655,7 +3683,9 @@ mod tests {
         // The same usage on 31 Dec 2025, then 15 Sep, 16 Sep and 1 Oct 2026.
         let tz = chrono_tz::Australia::Adelaide;
         for date in ["2025-12-31", "2026-09-15", "2026-09-16", "2026-10-01"] {
-            let (day_start, _) = api::day_bounds_or_error(date.parse().unwrap(), tz).unwrap();
+            let (day_start, _) =
+                api::day_bounds_or_error(date.parse().unwrap(), &crate::clock::tz_to_jiff(tz))
+                    .unwrap();
             seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
         }
         let months = costs_json(&app, "from=2025-01-01&to=2026-12-31&group=month").await;
@@ -3871,8 +3901,10 @@ mod tests {
         seed_globird(&pool).await;
         // Our counters for the 9th only: 1 kWh in, 2 kWh out.
         let tz = chrono_tz::Australia::Adelaide;
-        let oct_9 = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
-        let start = api::day_bounds_or_error(oct_9, tz).unwrap().0;
+        let oct_9 = jiff::civil::date(2026, 10, 9);
+        let start = api::day_bounds_or_error(oct_9, &crate::clock::tz_to_jiff(tz))
+            .unwrap()
+            .0;
         seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
 
         let json = compare_json(&app, "from=2026-10-01&to=2026-10-20").await;
@@ -3931,8 +3963,10 @@ mod tests {
         let (dir, _app, pool) = costs_app().await;
         seed_globird(&pool).await;
         let tz = chrono_tz::Australia::Adelaide;
-        let oct_9 = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
-        let start = api::day_bounds_or_error(oct_9, tz).unwrap().0;
+        let oct_9 = jiff::civil::date(2026, 10, 9);
+        let start = api::day_bounds_or_error(oct_9, &crate::clock::tz_to_jiff(tz))
+            .unwrap()
+            .0;
         seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
         (dir, pool)
     }
@@ -4207,8 +4241,8 @@ mod tests {
     /// battery sits at 60%, dropping to 30% in the evening.
     async fn seed_battery_day(pool: &SqlitePool, days_ago: u64, window_grid_w: f64) {
         let tz = chrono_tz::Australia::Adelaide;
-        let date = api::today(tz) - chrono::Days::new(days_ago);
-        let (start, end) = api::day_bounds_or_error(date, tz).unwrap();
+        let date = api::today(&crate::clock::tz_to_jiff(tz)) - jiff::ToSpan::days(days_ago as i64);
+        let (start, end) = api::day_bounds_or_error(date, &crate::clock::tz_to_jiff(tz)).unwrap();
         for ts in (start..end).step_by(60) {
             let hour = (ts - start) / 3600;
             let in_window = (18..21).contains(&hour);
@@ -4251,8 +4285,11 @@ mod tests {
         // Three days ago: the same, but the car was charging then.
         seed_battery_day(&pool, 3, 1000.0).await;
         let tz = chrono_tz::Australia::Adelaide;
-        let three_ago = api::today(tz) - chrono::Days::new(3);
-        let evening = api::day_bounds_or_error(three_ago, tz).unwrap().0 + 19 * 3600;
+        let three_ago = api::today(&crate::clock::tz_to_jiff(tz)) - jiff::ToSpan::days(3);
+        let evening = api::day_bounds_or_error(three_ago, &crate::clock::tz_to_jiff(tz))
+            .unwrap()
+            .0
+            + 19 * 3600;
         let id = db::start_charge_session(&pool, 1, evening, None, Some("Home"))
             .await
             .unwrap();
@@ -4314,7 +4351,7 @@ mod tests {
         seed_battery_day(&pool, 2, 1000.0).await;
         // ...but GloBird's bill for that day has the credit line.
         let tz = chrono_tz::Australia::Adelaide;
-        let date = (api::today(tz) - chrono::Days::new(2)).to_string();
+        let date = (api::today(&crate::clock::tz_to_jiff(tz)) - jiff::ToSpan::days(2)).to_string();
         for (category, cents) in [("SUPPLY", 100), ("USAGE", 75), ("ZEROHERO Credit", -100)] {
             sqlx::query("INSERT INTO globird_cost VALUES (?, ?, ?, 1.0, 0, 1000)")
                 .bind(&date)

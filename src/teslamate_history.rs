@@ -379,7 +379,7 @@ async fn cost_sessions(
             let (intervals, coverage) = web::house_intervals(
                 pool,
                 setup.plant_id,
-                crate::clock::tz_to_chrono(tz),
+                tz,
                 session.started_at,
                 session.ended_at,
                 now,

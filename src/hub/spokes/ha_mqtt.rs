@@ -62,9 +62,9 @@ async fn snapshot(
 ) -> anyhow::Result<TodaySnapshot> {
     let now = crate::clock::unix_now();
     let date = home_assistant::local_date(now, tz);
-    let energy = web::day_energy(state, crate::clock::date_to_chrono(date)).await?;
+    let energy = web::day_energy(state, date).await?;
     let money = if offer.costs {
-        web::day_money(state, crate::clock::date_to_chrono(date)).await?
+        web::day_money(state, date).await?
     } else {
         None
     };

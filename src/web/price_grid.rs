@@ -5,8 +5,9 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::{NaiveDate, Timelike};
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -50,7 +51,7 @@ type Cells = Vec<Option<f64>>;
 /// that never happened has `None` cells. A cell no row touches is `None` too.
 /// A row is split where it crosses a half hour and clipped to the day, so a
 /// 30-minute row and six 5-minute rows give the same cell.
-pub fn day_cells(tz: Tz, day_start: i64, day_end: i64, prices: &[PriceSpan]) -> Cells {
+pub fn day_cells(tz: &TimeZone, day_start: i64, day_end: i64, prices: &[PriceSpan]) -> Cells {
     let first = prices.partition_point(|p| p.start_ts < day_start);
     let last = prices.partition_point(|p| p.start_ts < day_end);
     // (sum of cents * seconds, seconds) per cell.
@@ -59,11 +60,13 @@ pub fn day_cells(tz: Tz, day_start: i64, day_end: i64, prices: &[PriceSpan]) -> 
         let end = span.end_ts.min(day_end);
         let mut t = span.start_ts;
         while t < end {
-            let Some(local) = chrono::DateTime::from_timestamp(t, 0).map(|u| u.with_timezone(&tz))
-            else {
+            let Ok(instant) = Timestamp::from_second(t) else {
                 break;
             };
-            let secs_of_day = i64::from(local.num_seconds_from_midnight());
+            let local = tz.to_datetime(instant).time();
+            let secs_of_day = i64::from(local.hour()) * 3600
+                + i64::from(local.minute()) * 60
+                + i64::from(local.second());
             let cell = (secs_of_day / 1800) as usize;
             // The clock's next half hour; clocks only change on one, so this is
             // the same distance on the timeline.
@@ -95,37 +98,42 @@ pub async fn grid(State(state): State<AppState>, Query(params): Query<GridParams
     if to < from {
         return Err(ApiError::bad_request("to must not be before from"));
     }
-    if (to - from).num_days() as u64 >= MAX_GRID_DAYS {
+    if (to - from).get_days() as u64 >= MAX_GRID_DAYS {
         return Err(ApiError::bad_request("the range can be at most 400 days"));
     }
-    let tz = state.tz;
-    let today_date = today(tz);
+    let tz = state.site_tz();
+    let today_date = today(&tz);
     let spike_cents = state.admin.get().price_spike_cents;
-    let dates: Vec<NaiveDate> = from.iter_days().take_while(|d| *d <= to).collect();
+    let dates: Vec<Date> = from.series(1.day()).take_while(|d| *d <= to).collect();
 
     // Finished days stored for these prices are loaded in one call.
     let mut keys = Vec::new();
     for &date in dates.iter().filter(|d| **d < today_date) {
-        let (start, end) = day_bounds_or_error(date, tz)?;
+        let (start, end) = day_bounds_or_error(date, &tz)?;
         let fingerprint =
             store::day_prices_fingerprint(&state.pool, AMBER_PREFIX, start, end, false).await?;
-        keys.push((date, format!("{GRID_VERSION}|{tz}|prices:{fingerprint}")));
+        keys.push((
+            date,
+            format!(
+                "{GRID_VERSION}|{}|prices:{fingerprint}",
+                tz.iana_name().unwrap_or("UTC")
+            ),
+        ));
     }
-    let mut stored: HashMap<NaiveDate, Cells> =
-        day_cache::load(&state.pool, GRID_KIND, &keys).await?;
-    let missing: Vec<NaiveDate> = dates
+    let mut stored: HashMap<Date, Cells> = day_cache::load(&state.pool, GRID_KIND, &keys).await?;
+    let missing: Vec<Date> = dates
         .iter()
         .copied()
         .filter(|d| !stored.contains_key(d))
         .collect();
 
-    let key_of: HashMap<NaiveDate, &String> = keys.iter().map(|(d, k)| (*d, k)).collect();
-    let (today_start, _) = day_bounds_or_error(today_date, tz)?;
-    let mut to_store: Vec<(NaiveDate, String, Cells)> = Vec::new();
+    let key_of: HashMap<Date, &String> = keys.iter().map(|(d, k)| (*d, k)).collect();
+    let (today_start, _) = day_bounds_or_error(today_date, &tz)?;
+    let mut to_store: Vec<(Date, String, Cells)> = Vec::new();
     // One range read for each run of consecutive missing days.
-    for run in missing.chunk_by(|a, b| a.succ_opt() == Some(*b)) {
-        let (range_start, _) = day_bounds_or_error(run[0], tz)?;
-        let (_, range_end) = day_bounds_or_error(run[run.len() - 1], tz)?;
+    for run in missing.chunk_by(|a, b| a.tomorrow().ok() == Some(*b)) {
+        let (range_start, _) = day_bounds_or_error(run[0], &tz)?;
+        let (_, range_end) = day_bounds_or_error(run[run.len() - 1], &tz)?;
         let prices = store::known_general_prices(
             &state.pool,
             AMBER_PREFIX,
@@ -135,15 +143,15 @@ pub async fn grid(State(state): State<AppState>, Query(params): Query<GridParams
         )
         .await?;
         for &date in run {
-            let (start, end) = day_bounds_or_error(date, tz)?;
-            let cells = day_cells(tz, start, end, &prices);
+            let (start, end) = day_bounds_or_error(date, &tz)?;
+            let cells = day_cells(&tz, start, end, &prices);
             if let Some(key) = key_of.get(&date) {
                 to_store.push((date, (*key).clone(), cells.clone()));
             }
             stored.insert(date, cells);
         }
     }
-    let rows: Vec<(NaiveDate, String, &Cells)> = to_store
+    let rows: Vec<(Date, String, &Cells)> = to_store
         .iter()
         .map(|(date, key, cells)| (*date, key.clone(), cells))
         .collect();
@@ -169,16 +177,14 @@ pub async fn grid(State(state): State<AppState>, Query(params): Query<GridParams
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    const TZ: Tz = chrono_tz::Australia::Adelaide;
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
 
-    fn ts(tz: Tz, text: &str) -> i64 {
-        let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M").unwrap();
-        tz.from_local_datetime(&naive)
-            .earliest()
-            .unwrap()
-            .timestamp()
+    fn ts(tz: &TimeZone, text: &str) -> i64 {
+        let local = jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", text).unwrap();
+        crate::clock::local_ts(local, tz).unwrap()
     }
 
     fn span(start_ts: i64, secs: i64, cents: f64) -> PriceSpan {
@@ -190,16 +196,16 @@ mod tests {
     }
 
     fn bounds(date: &str) -> (i64, i64) {
-        day_bounds_or_error(parse_date("d", date).unwrap(), TZ).unwrap()
+        day_bounds_or_error(parse_date("d", date).unwrap(), &adelaide()).unwrap()
     }
 
     #[test]
     fn a_cell_is_the_time_weighted_average_of_its_rows() {
         let (start, end) = bounds("2026-11-05");
-        let noon = ts(TZ, "2026-11-05 12:00");
+        let noon = ts(&adelaide(), "2026-11-05 12:00");
         // 12:00 to 12:10 at 10c, 12:10 to 12:30 at 40c: (10*10 + 40*20) / 30 = 30c.
         let prices = [span(noon, 600, 10.0), span(noon + 600, 1200, 40.0)];
-        let cells = day_cells(TZ, start, end, &prices);
+        let cells = day_cells(&adelaide(), start, end, &prices);
         assert_eq!(cells.len(), 48);
         assert!((cells[24].unwrap() - 30.0).abs() < 1e-9);
     }
@@ -207,25 +213,29 @@ mod tests {
     #[test]
     fn cells_without_prices_are_null() {
         let (start, end) = bounds("2026-11-05");
-        let prices = [span(ts(TZ, "2026-11-05 00:00"), 300, 7.5)];
-        let cells = day_cells(TZ, start, end, &prices);
+        let prices = [span(ts(&adelaide(), "2026-11-05 00:00"), 300, 7.5)];
+        let cells = day_cells(&adelaide(), start, end, &prices);
         assert_eq!(cells[0], Some(7.5));
         assert!(cells[1..].iter().all(Option::is_none));
-        assert!(day_cells(TZ, start, end, &[]).iter().all(Option::is_none));
+        assert!(
+            day_cells(&adelaide(), start, end, &[])
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     #[test]
     fn a_row_is_split_where_it_crosses_a_half_hour_and_clipped_to_the_day() {
         let (start, end) = bounds("2026-11-05");
         // A 30-minute row starting at 12:15 (+1 s like Amber's) covers 15 min of two cells.
-        let prices = [span(ts(TZ, "2026-11-05 12:15") + 1, 1800, 20.0)];
-        let cells = day_cells(TZ, start, end, &prices);
+        let prices = [span(ts(&adelaide(), "2026-11-05 12:15") + 1, 1800, 20.0)];
+        let cells = day_cells(&adelaide(), start, end, &prices);
         assert_eq!(cells[24], Some(20.0));
         assert_eq!(cells[25], Some(20.0));
         assert!(cells[26].is_none());
         // A row running past midnight does not leak into the next day's first cell.
         let late = [span(end - 300, 900, 5.0)];
-        let cells = day_cells(TZ, start, end, &late);
+        let cells = day_cells(&adelaide(), start, end, &late);
         assert_eq!(cells[47], Some(5.0));
         assert_eq!(cells.iter().flatten().count(), 1);
     }
@@ -235,10 +245,10 @@ mod tests {
         let (start, end) = bounds("2026-11-05");
         let prices = [
             span(start - 600, 300, 99.0),
-            span(ts(TZ, "2026-11-05 01:00"), 300, 1.0),
+            span(ts(&adelaide(), "2026-11-05 01:00"), 300, 1.0),
             span(end + 600, 300, 99.0),
         ];
-        let cells = day_cells(TZ, start, end, &prices);
+        let cells = day_cells(&adelaide(), start, end, &prices);
         assert_eq!(cells.iter().flatten().count(), 1);
         assert_eq!(cells[2], Some(1.0));
     }
@@ -251,7 +261,7 @@ mod tests {
         let first_pass = start + 2 * 3600; // 02:00 ACDT
         let second_pass = start + 3 * 3600; // 02:00 ACST
         let prices = [span(first_pass, 1800, 10.0), span(second_pass, 1800, 30.0)];
-        let cells = day_cells(TZ, start, end, &prices);
+        let cells = day_cells(&adelaide(), start, end, &prices);
         assert_eq!(cells.len(), 48);
         assert_eq!(cells[4], Some(20.0));
         assert_eq!(cells.iter().flatten().count(), 1);
@@ -266,7 +276,7 @@ mod tests {
         let prices: Vec<PriceSpan> = (0..(end - start) / 300)
             .map(|i| span(start + i * 300, 300, 12.0))
             .collect();
-        let cells = day_cells(TZ, start, end, &prices);
+        let cells = day_cells(&adelaide(), start, end, &prices);
         assert_eq!(cells.len(), 48);
         assert_eq!(cells.iter().flatten().count(), 46);
         assert!(cells[4].is_none() && cells[5].is_none());

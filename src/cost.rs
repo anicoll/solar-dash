@@ -414,7 +414,6 @@ impl TariffSchedule {
             .enumerate()
             .map(|(i, p)| {
                 let until = config::parse_date(&p.until)
-                    .map(crate::clock::date_to_jiff)
                     .with_context(|| format!("until in [[previous_tariff]] #{}", i + 1))?;
                 let tariff = Tariff::from_config(&p.tariff)
                     .with_context(|| format!("invalid [[previous_tariff]] #{}", i + 1))?;

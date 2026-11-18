@@ -14,7 +14,7 @@ use serde_json::Value;
 use sqlx::SqliteConnection;
 
 use crate::bills::PastBill;
-use crate::config;
+use crate::config::{self, parse_date};
 use crate::cost::TariffSchedule;
 use crate::db;
 use crate::ev_cost::{EvPrices, PetrolHistory};
@@ -183,11 +183,6 @@ impl AdminData {
         data.bills = load_bills(conn).await?.into();
         Ok(data)
     }
-}
-
-/// `YYYY-MM-DD` text as a date.
-fn parse_date(text: &str) -> Result<Date> {
-    config::parse_date(text).map(crate::clock::date_to_jiff)
 }
 
 /// The plans in `tariff_plan`, earliest first, as `(valid_from, tariff)`.
