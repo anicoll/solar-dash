@@ -8,8 +8,9 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
-use chrono::{Days, NaiveDate, Utc};
-use chrono_tz::Tz;
+use jiff::ToSpan;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use serde_json::{Map, Value, json};
 
 use super::client::Client;
@@ -88,7 +89,7 @@ fn site_lines(sites: &[Site]) -> Vec<String> {
 
 /// The price table: local time, kind, channel, perKwh, spotPerKwh, duration.
 /// Rows are sorted by time, then channel, so each half hour reads together.
-fn price_lines(prices: &[PriceInterval], tz: Tz) -> Vec<String> {
+fn price_lines(prices: &[PriceInterval], tz: &TimeZone) -> Vec<String> {
     let mut rows: Vec<&PriceInterval> = prices.iter().collect();
     rows.sort_by_key(|p| (p.start_time, p.channel_type));
     let mut lines = vec![format!(
@@ -98,9 +99,8 @@ fn price_lines(prices: &[PriceInterval], tz: Tz) -> Vec<String> {
     for p in rows {
         lines.push(format!(
             "{:<17} {:<9} {:<15} {:>9} {:>11} {:>8}",
-            p.start_time
-                .with_timezone(&tz)
-                .format("%Y-%m-%d %H:%M")
+            tz.to_datetime(p.start_time)
+                .strftime("%Y-%m-%d %H:%M")
                 .to_string(),
             p.kind.short_name(),
             p.channel_type.as_str(),
@@ -155,7 +155,7 @@ fn raw_value(raw: &str) -> Value {
 
 /// Runs the probe and prints the report. Only a failure to write the `--json`
 /// file is returned as an error; API failures are printed as part of the report.
-pub async fn run(config: &Amber, tz: Tz, json_out: Option<&std::path::Path>) -> Result<()> {
+pub async fn run(config: &Amber, tz: &TimeZone, json_out: Option<&std::path::Path>) -> Result<()> {
     let client = Client::new(config)?;
     let mut saved = Map::new();
 
@@ -224,11 +224,11 @@ pub async fn run(config: &Amber, tz: Tz, json_out: Option<&std::path::Path>) -> 
             }
         }
 
-        let end: NaiveDate = Utc::now().with_timezone(&tz).date_naive();
+        let end: Date = crate::clock::today(tz);
         println!("\n== Past prices for {site_id} (how far back does the API go?) ==");
         for (label, days_ago) in PAST_PRICE_PROBES {
-            let past_end = end - Days::new(days_ago);
-            let past_start = past_end - Days::new(PAST_PRICE_DAYS - 1);
+            let past_end = end - (days_ago as i64).days();
+            let past_start = past_end - (PAST_PRICE_DAYS as i64 - 1).days();
             let line = match client
                 .prices_between(&site_id, past_start, past_end, 30)
                 .await
@@ -242,7 +242,7 @@ pub async fn run(config: &Amber, tz: Tz, json_out: Option<&std::path::Path>) -> 
             println!("{label} ({past_start} to {past_end}): {line}");
         }
 
-        let start = end - Days::new(USAGE_DAYS - 1);
+        let start = end - (USAGE_DAYS as i64 - 1).days();
         println!("\n== Usage for {site_id}, {start} to {end} ==");
         match client.usage(&site_id, start, end).await {
             Ok(reply) => {
@@ -319,8 +319,8 @@ mod tests {
 
     #[test]
     fn price_table_uses_local_time() {
-        let tz: Tz = "Australia/Adelaide".parse().unwrap();
-        let lines = price_lines(&prices(), tz);
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let lines = price_lines(&prices(), &tz);
         assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("spotPerKwh"));
         // 02:00 UTC on 5 May is 11:30 in Adelaide (UTC+9:30 in winter).

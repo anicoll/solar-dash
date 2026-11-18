@@ -179,7 +179,7 @@ async fn newest_backup(state: &AppState) -> Result<Option<(Date, std::path::Path
     let found = tokio::task::spawn_blocking(move || crate::backup::latest(&dir))
         .await
         .map_err(anyhow::Error::from)??;
-    Ok(found.map(|(date, path)| (crate::clock::date_to_jiff(date), path)))
+    Ok(found)
 }
 
 /// What each setting is when it has no row.
@@ -420,8 +420,7 @@ pub async fn tariff_preview(
         .as_deref()
         .map(parse_date)
         .transpose()
-        .map_err(|err| ApiError::bad_request(format!("valid_from: {err:#}")))?
-        .map(crate::clock::date_to_chrono);
+        .map_err(|err| ApiError::bad_request(format!("valid_from: {err:#}")))?;
 
     let mut conn = state.pool().acquire().await.map_err(db_error)?;
     let rows = admin_data::load_plan_rows(&mut conn).await?;
@@ -439,22 +438,12 @@ pub async fn tariff_preview(
         }
         None => changed.push((valid_from, plan.tariff)),
     }
-    let changed = TariffSchedule::from_plans(
-        &changed
-            .iter()
-            .map(|(d, t)| (d.map(crate::clock::date_to_jiff), t.clone()))
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    let changed = TariffSchedule::from_plans(&changed)
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     let current = if current.is_empty() {
         None
     } else {
-        Some(TariffSchedule::from_plans(
-            &current
-                .iter()
-                .map(|(d, t)| (d.map(crate::clock::date_to_jiff), t.clone()))
-                .collect::<Vec<_>>(),
-        )?)
+        Some(TariffSchedule::from_plans(&current)?)
     };
 
     // The default range ends yesterday: today is not finished yet.

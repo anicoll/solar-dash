@@ -1589,19 +1589,10 @@ pub(super) async fn billed_days(
     let touched: Vec<&PastBill> = data
         .bills
         .iter()
-        .filter(|bill| {
-            crate::clock::date_to_jiff(bill.from) <= last
-                && crate::clock::date_to_jiff(bill.to) >= first
-        })
+        .filter(|bill| bill.from <= last && bill.to >= first)
         .collect();
-    let wide_first = touched
-        .iter()
-        .map(|b| crate::clock::date_to_jiff(b.from))
-        .fold(first, Date::min);
-    let wide_last = touched
-        .iter()
-        .map(|b| crate::clock::date_to_jiff(b.to))
-        .fold(last, Date::max);
+    let wide_first = touched.iter().map(|b| b.from).fold(first, Date::min);
+    let wide_last = touched.iter().map(|b| b.to).fold(last, Date::max);
     let wide: Vec<Date> = wide_first
         .series(1.day())
         .take_while(|d| *d <= wide_last)
@@ -1624,22 +1615,18 @@ pub(super) async fn billed_days(
                     load_kwh: c.load_kwh,
                     baseline_cents: c.baseline_cents,
                 };
-                (crate::clock::date_to_chrono(day.date), metered)
+                (day.date, metered)
             })
             .collect();
         for bill in touched {
             let plan = |date| {
-                let tariff = schedule.for_date(crate::clock::date_to_jiff(date));
+                let tariff = schedule.for_date(date);
                 bills::Plan {
                     supply_cents: tariff.supply_cents_per_day(),
                     average_import_cents: tariff.average_import_cents(),
                 }
             };
-            bill_days.extend(
-                bills::bill_days(bill, &ours, &monthly_load, plan)
-                    .into_iter()
-                    .map(|(date, cost)| (crate::clock::date_to_jiff(date), cost)),
-            );
+            bill_days.extend(bills::bill_days(bill, &ours, &monthly_load, plan));
         }
     }
 

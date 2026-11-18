@@ -71,7 +71,7 @@ impl PeriodRule {
             start_day: data.bill_start_day,
             anchor: data
                 .bill_anchor_date
-                .map(|date| (crate::clock::date_to_jiff(date), data.bill_length_days)),
+                .map(|date| (date, data.bill_length_days)),
         }
     }
 }
@@ -125,11 +125,11 @@ fn period_containing(today: Date, rule: &PeriodRule, bills: &[PastBill]) -> Peri
     if let Some(last) = bills
         .iter()
         .rev()
-        .find(|b| crate::clock::date_to_jiff(b.to) < today)
+        .find(|b| b.to < today)
         .filter(|b| b.days() >= MIN_ROLLING_BILL_DAYS)
     {
         let length = last.days();
-        let first = crate::clock::date_to_jiff(last.to) + 1.day();
+        let first = last.to + 1.day();
         // Whole periods that have passed since the one after the bill.
         let rolled = i64::from((today - first).get_days()) / length;
         let from = first + (rolled * length).days();
@@ -549,10 +549,7 @@ async fn first_data_day(state: &AppState, bills: &[PastBill]) -> Result<Option<D
     let from_readings = first_data_ts(state)
         .await?
         .and_then(|ts| local_date_of(ts, &state.site_tz()));
-    let from_bills = bills
-        .iter()
-        .map(|b| crate::clock::date_to_jiff(b.from))
-        .min();
+    let from_bills = bills.iter().map(|b| b.from).min();
     Ok([from_readings, from_bills].into_iter().flatten().min())
 }
 
@@ -913,8 +910,8 @@ mod tests {
 
     fn bill(from: &str, to: &str) -> PastBill {
         PastBill {
-            from: crate::clock::date_to_chrono(date(from)),
-            to: crate::clock::date_to_chrono(date(to)),
+            from: date(from),
+            to: date(to),
             bill_total: 0.0,
             excluded: 0.0,
             import_kwh: 0.0,

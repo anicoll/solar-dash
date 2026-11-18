@@ -91,7 +91,7 @@ pub async fn save_prices_in(
         ) else {
             continue;
         };
-        let start_ts = normalise_start(interval.start_time.timestamp());
+        let start_ts = normalise_start(interval.start_time.as_second());
         sqlx::query(
             "INSERT INTO price_interval
                (source, channel, start_ts, end_ts, cents, spot_cents, kind, fetched_at,
@@ -107,7 +107,7 @@ pub async fn save_prices_in(
         .bind(source)
         .bind(channel)
         .bind(start_ts)
-        .bind(interval.end_time.timestamp())
+        .bind(interval.end_time.as_second())
         .bind(interval.per_kwh)
         .bind(interval.spot_per_kwh)
         .bind(kind)
@@ -130,7 +130,7 @@ pub async fn save_prices_in(
             .bind(source)
             .bind(channel)
             .bind(start_ts)
-            .bind(interval.end_time.timestamp())
+            .bind(interval.end_time.as_second())
             .execute(&mut **tx)
             .await
             .context("could not drop forecasts covered by a longer interval")?;
@@ -363,10 +363,10 @@ pub async fn day_prices_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
 
     fn interval(kind: IntervalKind, channel: ChannelType, start: i64, cents: f64) -> PriceInterval {
-        let at = |ts| -> DateTime<Utc> { DateTime::from_timestamp(ts, 0).unwrap() };
+        let at = |ts| -> Timestamp { Timestamp::from_second(ts).unwrap() };
         PriceInterval {
             kind,
             channel_type: channel,
@@ -526,7 +526,7 @@ mod tests {
             .collect();
         save_prices(&pool, "amber:s", &short, 0).await.unwrap();
         let mut long = interval(ForecastInterval, General, 1800, 20.0);
-        long.end_time = DateTime::from_timestamp(3600, 0).unwrap();
+        long.end_time = Timestamp::from_second(3600).unwrap();
         save_prices(&pool, "amber:s", &[long], 1).await.unwrap();
         let rows = prices_between(&pool, None, 0, 9000).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -554,7 +554,7 @@ mod tests {
         use IntervalKind::*;
         let (_dir, pool) = pool().await;
         let mut long = interval(ForecastInterval, General, 0, 50.0);
-        long.end_time = DateTime::from_timestamp(1800, 0).unwrap();
+        long.end_time = Timestamp::from_second(1800).unwrap();
         let short = interval(CurrentInterval, General, 900, 32.0);
         save_prices(&pool, "amber:s", &[long, short], 0)
             .await
@@ -642,7 +642,7 @@ mod tests {
     /// An Amber-style interval: the start one second after the boundary, the
     /// end on it, `minutes` long.
     fn amber_style(kind: IntervalKind, boundary: i64, minutes: i64, cents: f64) -> PriceInterval {
-        let at = |ts| -> DateTime<Utc> { DateTime::from_timestamp(ts, 0).unwrap() };
+        let at = |ts| -> Timestamp { Timestamp::from_second(ts).unwrap() };
         let mut row = interval(kind, ChannelType::General, boundary + 1, cents);
         row.duration = minutes as u32;
         row.end_time = at(boundary + minutes * 60);
@@ -789,7 +789,7 @@ mod tests {
             now - 2 * CURRENT_LOOKBACK_SECS,
             1.0,
         );
-        stale.end_time = DateTime::from_timestamp(now + 300, 0).unwrap();
+        stale.end_time = Timestamp::from_second(now + 300).unwrap();
         let fresh = interval(CurrentInterval, General, now - 60, 2.0);
         save_prices(&pool, "amber:s", &[stale, fresh], 0)
             .await

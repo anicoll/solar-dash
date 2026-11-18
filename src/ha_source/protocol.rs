@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Result, bail};
-use chrono::DateTime;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 /// Message id of our subscription. Home Assistant wants ids that only go up.
@@ -190,8 +190,8 @@ fn parse_state(state: &Value, now: i64) -> Option<StateUpdate> {
         .map(str::to_string);
     let ts = state["last_updated"]
         .as_str()
-        .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-        .map_or(now, |time| time.timestamp());
+        .and_then(|time| time.parse::<Timestamp>().ok())
+        .map_or(now, |time| time.as_second());
     Some(StateUpdate {
         entity_id,
         state: text,
@@ -307,9 +307,10 @@ mod tests {
         assert_eq!(updates[0].numeric(), Some(412.5));
         assert_eq!(
             updates[0].ts,
-            DateTime::parse_from_rfc3339("2026-11-12T01:02:03Z")
+            "2026-11-12T01:02:03Z"
+                .parse::<Timestamp>()
                 .unwrap()
-                .timestamp()
+                .as_second()
         );
         // No last_updated: the caller's clock is used. Not a number.
         assert_eq!(updates[1].ts, NOW);

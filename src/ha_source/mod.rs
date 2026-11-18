@@ -38,7 +38,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -385,7 +384,7 @@ async fn live_loop(url: &str, config: &HaSource, view: &HaView, pool: &SqlitePoo
         let result = connection(url, config, &mut ingest, pool, hub, &mut health).await;
         view.set_connected(false);
         // Do not leave a held reading waiting in memory.
-        let held = ingest.flush(Utc::now().timestamp(), true);
+        let held = ingest.flush(crate::clock::unix_now(), true);
         if let Err(err) = save_and_announce(pool, hub, held).await {
             warn!("could not save Home Assistant readings: {err:#}");
         }
@@ -427,7 +426,7 @@ async fn connection(
                     // Pings are answered by the library; binary is not used.
                     _ => continue,
                 };
-                let steps = session.on_text(&text, Utc::now().timestamp())?;
+                let steps = session.on_text(&text, crate::clock::unix_now())?;
                 if session.is_authenticated() && !was_authenticated {
                     was_authenticated = true;
                     health.connected();
@@ -447,7 +446,7 @@ async fn connection(
                 }
             }
             _ = flush_timer.tick() => {
-                let rows = ingest.flush(Utc::now().timestamp(), false);
+                let rows = ingest.flush(crate::clock::unix_now(), false);
                 save_and_announce(pool, hub, rows).await?;
             }
         }

@@ -20,7 +20,6 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use anyhow::{Result, anyhow};
-use chrono::Utc;
 use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
@@ -140,7 +139,7 @@ async fn fetch_and_store(
     let short = client
         .current_prices(site_id, previous, NEXT_FIVE, 5)
         .await?;
-    let now = Utc::now().timestamp();
+    let now = crate::clock::unix_now();
     let source = store::source_name(site_id);
     // From the 30-minute call only the forecast is wanted: its "current" row
     // is the whole half hour under way, which the 5-minute rows describe better.
@@ -195,7 +194,7 @@ pub async fn run(
             } => result,
         };
 
-        let now = Utc::now().timestamp();
+        let now = crate::clock::unix_now();
         let wait = match result {
             Ok(saved) => {
                 // The first good fetch is logged at info, so a normal log shows
@@ -224,7 +223,7 @@ pub async fn run(
                     }
                 }
                 // The backfill used some of that time: wait for what is left.
-                let now = Utc::now().timestamp();
+                let now = crate::clock::unix_now();
                 Duration::from_secs((next_fetch_at(now) - now).max(0) as u64)
             }
             Err(err) => {
