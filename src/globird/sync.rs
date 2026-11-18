@@ -426,7 +426,7 @@ pub async fn run(
     synced: Option<Arc<Notify>>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let sync_time = config.sync_time_of_day()?;
+    let sync_time = crate::clock::time_to_chrono(config.sync_time_of_day()?);
 
     // Pinning lets `select!` poll the same future in every loop round.
     tokio::pin!(shutdown);

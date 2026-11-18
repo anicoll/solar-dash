@@ -3,6 +3,7 @@ mod admin_import;
 mod amber;
 mod backup;
 mod bills;
+mod clock;
 mod config;
 mod cost;
 mod db;
@@ -345,7 +346,7 @@ fn with_leading_slash(path: &str) -> String {
 
 /// Logs in to the GloBird portal and writes a redacted dump of its endpoints.
 async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
-    let tz: Tz = config.timezone()?;
+    let tz: Tz = clock::tz_to_chrono(&config.timezone()?);
     let globird = config.globird.context(
         "globird-probe needs a [globird] section in config.toml (see config.example.toml)",
     )?;
@@ -359,7 +360,7 @@ async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
 
 /// Prints what the Amber API returns for the configured site.
 async fn amber_probe(config: Config, json: Option<&Path>) -> Result<()> {
-    let tz: Tz = config.timezone()?;
+    let tz: Tz = clock::tz_to_chrono(&config.timezone()?);
     let amber = config
         .amber
         .context("amber-probe needs an [amber] section in config.toml (see config.example.toml)")?;
