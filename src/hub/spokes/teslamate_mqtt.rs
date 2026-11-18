@@ -32,7 +32,7 @@ impl Spoke for TeslamateMqtt {
 
     fn run(self: Box<Self>, ctx: SpokeContext) -> SpokeFuture {
         Box::pin(async move {
-            teslamate::run(self.config, self.car, ctx.pool, ctx.tz, ctx.shutdown.wait()).await
+            teslamate::run(self.config, self.car, ctx.pool, crate::clock::tz_to_jiff(ctx.tz), ctx.shutdown.wait()).await
         })
     }
 }

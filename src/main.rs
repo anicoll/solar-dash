@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
-use chrono_tz::Tz;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -316,7 +315,7 @@ async fn run_backfill(config: Config, from: &str) -> Result<()> {
     let pool = db::open(&config.database.path).await?;
     let mut client = Client::new(cloud.clone())?;
     client.login().await?;
-    ingest::backfill(&client, &pool, cloud, from).await
+    ingest::backfill(&client, &pool, cloud, crate::clock::date_to_jiff(from)).await
 }
 
 /// Logs in, calls one endpoint and prints its `result_data` as pretty JSON.
@@ -346,7 +345,7 @@ fn with_leading_slash(path: &str) -> String {
 
 /// Logs in to the GloBird portal and writes a redacted dump of its endpoints.
 async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
-    let tz: Tz = clock::tz_to_chrono(&config.timezone()?);
+    let tz = config.timezone()?;
     let globird = config.globird.context(
         "globird-probe needs a [globird] section in config.toml (see config.example.toml)",
     )?;
@@ -355,16 +354,16 @@ async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
         bail!("--days must be between 1 and 366, got {days}");
     }
     let client = globird::client::Client::new(globird)?;
-    globird::probe::run(client, tz, days, out).await
+    globird::probe::run(client, &tz, days, out).await
 }
 
 /// Prints what the Amber API returns for the configured site.
 async fn amber_probe(config: Config, json: Option<&Path>) -> Result<()> {
-    let tz: Tz = clock::tz_to_chrono(&config.timezone()?);
+    let tz = config.timezone()?;
     let amber = config
         .amber
         .context("amber-probe needs an [amber] section in config.toml (see config.example.toml)")?;
-    amber::probe::run(&amber, tz, json).await
+    amber::probe::run(&amber, &tz, json).await
 }
 
 /// Reads the inverter once, or with `watch` every `interval_secs` until Ctrl+C.

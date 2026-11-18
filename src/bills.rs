@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use chrono::{Datelike, NaiveDate};
+use jiff::ToSpan;
+use jiff::civil::Date;
 
 use crate::cost::DayCost;
 
@@ -21,9 +22,9 @@ const HEADER: &str = "from,to,bill_total,excluded,import_kwh,import_dollars,expo
 #[derive(Debug, Clone, PartialEq)]
 pub struct PastBill {
     /// First local day of the bill (inclusive).
-    pub from: NaiveDate,
+    pub from: Date,
     /// Last local day of the bill (inclusive).
-    pub to: NaiveDate,
+    pub to: Date,
     /// Dollars billed. A credit is negative.
     pub bill_total: f64,
     /// Rebates (say government relief) added back, so they do not count as
@@ -43,7 +44,7 @@ pub struct PastBill {
 impl PastBill {
     /// How many days the bill covers.
     pub fn days(&self) -> i64 {
-        (self.to - self.from).num_days() + 1
+        i64::from((self.to - self.from).get_days()) + 1
     }
 
     /// Checks one bill on its own (overlaps between bills are checked by the caller).
@@ -118,8 +119,8 @@ fn parse_line(line: &str) -> Result<PastBill> {
     if fields.len() != 10 {
         bail!("expected 10 comma-separated fields, found {}", fields.len());
     }
-    let date = |name: &str, text: &str| -> Result<NaiveDate> {
-        NaiveDate::parse_from_str(text, "%Y-%m-%d")
+    let date = |name: &str, text: &str| -> Result<Date> {
+        Date::strptime("%Y-%m-%d", text)
             .with_context(|| format!("{name} {text:?} is not a date like 2026-09-30"))
     };
     let number = |name: &str, text: &str| -> Result<f64> {
@@ -189,15 +190,15 @@ pub struct Plan {
 /// add up to `adjusted_total` exactly.
 pub fn bill_days(
     bill: &PastBill,
-    ours: &HashMap<NaiveDate, Metered>,
+    ours: &HashMap<Date, Metered>,
     monthly_load: &HashMap<u32, f64>,
-    plan: impl Fn(NaiveDate) -> Plan,
-) -> Vec<(NaiveDate, DayCost)> {
+    plan: impl Fn(Date) -> Plan,
+) -> Vec<(Date, DayCost)> {
     let days = bill.days() as f64;
     // What the days with data paid per kWh of load on the plan, past supply.
     let (load, load_cents) = bill
         .from
-        .iter_days()
+        .series(1.day())
         .take_while(|date| *date <= bill.to)
         .filter_map(|date| ours.get(&date).map(|m| (date, m)))
         .fold((0.0, 0.0), |(kwh, cents), (date, m)| {
@@ -212,14 +213,14 @@ pub fn bill_days(
     let flat_import = bill.import_kwh / days;
     let flat_export = bill.export_kwh / days;
 
-    let mut out: Vec<(NaiveDate, DayCost)> = bill
+    let mut out: Vec<(Date, DayCost)> = bill
         .from
-        .iter_days()
+        .series(1.day())
         .take_while(|date| *date <= bill.to)
         .map(|date| {
             let m = ours.get(&date).copied().unwrap_or_else(|| {
                 let load_kwh = monthly_load
-                    .get(&date.month())
+                    .get(&(date.month() as u32))
                     .copied()
                     .unwrap_or(flat_import);
                 let plan = plan(date);
@@ -283,7 +284,7 @@ pub fn cents_per_kwh(dollars: f64, kwh: f64) -> f64 {
 mod tests {
     use super::*;
 
-    fn date(text: &str) -> NaiveDate {
+    fn date(text: &str) -> Date {
         text.parse().unwrap()
     }
 
@@ -353,7 +354,7 @@ mod tests {
     }
 
     /// The plan in the tariff schedule: supply 100 c a day, 25 c/kWh on average.
-    fn plan(_: NaiveDate) -> Plan {
+    fn plan(_: Date) -> Plan {
         Plan {
             supply_cents: 100.0,
             average_import_cents: 25.0,

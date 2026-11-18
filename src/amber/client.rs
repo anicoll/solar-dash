@@ -7,7 +7,7 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use reqwest::header::{ACCEPT, AUTHORIZATION, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -126,16 +126,16 @@ impl Client {
     pub async fn prices_between(
         &self,
         site_id: &str,
-        start: NaiveDate,
-        end: NaiveDate,
+        start: Date,
+        end: Date,
         resolution: u32,
     ) -> Result<Reply<PriceInterval>> {
         let path = format!("/sites/{site_id}/prices");
         self.get(
             &path,
             &[
-                ("startDate", start.format("%Y-%m-%d").to_string()),
-                ("endDate", end.format("%Y-%m-%d").to_string()),
+                ("startDate", start.strftime("%Y-%m-%d").to_string()),
+                ("endDate", end.strftime("%Y-%m-%d").to_string()),
                 ("resolution", resolution.to_string()),
             ],
         )
@@ -147,15 +147,15 @@ impl Client {
     pub async fn usage(
         &self,
         site_id: &str,
-        start: NaiveDate,
-        end: NaiveDate,
+        start: Date,
+        end: Date,
     ) -> Result<Reply<Usage>> {
         let path = format!("/sites/{site_id}/usage");
         self.get(
             &path,
             &[
-                ("startDate", start.format("%Y-%m-%d").to_string()),
-                ("endDate", end.format("%Y-%m-%d").to_string()),
+                ("startDate", start.strftime("%Y-%m-%d").to_string()),
+                ("endDate", end.strftime("%Y-%m-%d").to_string()),
             ],
         )
         .await
@@ -364,7 +364,7 @@ mod tests {
         let prices = client.current_prices("s1", 12, 12, 5).await.unwrap();
         assert_eq!(prices.items.len(), 3);
 
-        let day = |d| NaiveDate::from_ymd_opt(2021, 5, d).unwrap();
+        let day = |d| jiff::civil::date(2021, 5, d);
         let usage = client.usage("s1", day(1), day(7)).await.unwrap();
         assert_eq!(usage.items.len(), 2);
 

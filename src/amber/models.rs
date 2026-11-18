@@ -6,7 +6,7 @@
 //! Enums have an `Unknown` case so a new value from Amber does not make the
 //! whole reply fail to parse.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Whether a site is still supplied by Amber.
@@ -126,8 +126,8 @@ pub struct PriceInterval {
     pub spot_per_kwh: f64,
     /// Minutes.
     pub duration: u32,
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
+    pub start_time: Timestamp,
+    pub end_time: Timestamp,
     /// NEM date (not local) the interval belongs to, `YYYY-MM-DD`.
     pub date: Option<String>,
     pub renewables: Option<f64>,
@@ -155,8 +155,8 @@ pub struct Usage {
     pub quality: Option<String>,
     /// Minutes.
     pub duration: u32,
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
+    pub start_time: Timestamp,
+    pub end_time: Timestamp,
 }
 
 #[cfg(test)]
@@ -189,8 +189,8 @@ mod tests {
         assert_eq!(prices[0].per_kwh, 24.33);
         assert_eq!(prices[0].duration, 30);
         assert_eq!(
-            prices[0].start_time.to_rfc3339(),
-            "2021-05-05T02:00:01+00:00"
+            prices[0].start_time.to_string(),
+            "2021-05-05T02:00:01Z"
         );
         assert!(prices[0].estimate.is_none());
 

@@ -1572,10 +1572,19 @@ pub(super) async fn billed_days(
     let touched: Vec<&PastBill> = data
         .bills
         .iter()
-        .filter(|bill| bill.from <= last && bill.to >= first)
+        .filter(|bill| {
+            crate::clock::date_to_chrono(bill.from) <= last
+                && crate::clock::date_to_chrono(bill.to) >= first
+        })
         .collect();
-    let wide_first = touched.iter().map(|b| b.from).fold(first, NaiveDate::min);
-    let wide_last = touched.iter().map(|b| b.to).fold(last, NaiveDate::max);
+    let wide_first = touched
+        .iter()
+        .map(|b| crate::clock::date_to_chrono(b.from))
+        .fold(first, NaiveDate::min);
+    let wide_last = touched
+        .iter()
+        .map(|b| crate::clock::date_to_chrono(b.to))
+        .fold(last, NaiveDate::max);
     let wide: Vec<NaiveDate> = wide_first
         .iter_days()
         .take_while(|d| *d <= wide_last)
@@ -1601,15 +1610,23 @@ pub(super) async fn billed_days(
                 (day.date, metered)
             })
             .collect();
+        let ours_jiff: HashMap<jiff::civil::Date, Metered> = ours
+            .iter()
+            .map(|(date, metered)| (crate::clock::date_to_jiff(*date), *metered))
+            .collect();
         for bill in touched {
-            let plan = |date: NaiveDate| {
-                let tariff = schedule.for_date(date);
+            let plan = |date: jiff::civil::Date| {
+                let tariff = schedule.for_date(crate::clock::date_to_chrono(date));
                 bills::Plan {
                     supply_cents: tariff.supply_cents_per_day(),
                     average_import_cents: tariff.average_import_cents(),
                 }
             };
-            bill_days.extend(bills::bill_days(bill, &ours, &monthly_load, plan));
+            bill_days.extend(
+                bills::bill_days(bill, &ours_jiff, &monthly_load, plan)
+                    .into_iter()
+                    .map(|(date, cost)| (crate::clock::date_to_chrono(date), cost)),
+            );
         }
     }
 

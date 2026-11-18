@@ -426,6 +426,7 @@ pub fn historic_session_cost(
 
 /// The bill that covers a local day, if there is one.
 fn bill_on(bills: &[PastBill], date: NaiveDate) -> Option<&PastBill> {
+    let date = crate::clock::date_to_jiff(date);
     bills.iter().find(|b| b.from <= date && date <= b.to)
 }
 

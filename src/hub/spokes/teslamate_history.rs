@@ -35,7 +35,7 @@ impl Spoke for TeslamateHistory {
             teslamate_history::run(
                 self.database_url,
                 ctx.pool,
-                ctx.tz,
+                crate::clock::tz_to_jiff(ctx.tz),
                 self.costing,
                 ctx.shutdown.wait(),
             )

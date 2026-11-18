@@ -180,7 +180,7 @@ async fn newest_backup(
     let found = tokio::task::spawn_blocking(move || crate::backup::latest(&dir))
         .await
         .map_err(anyhow::Error::from)??;
-    Ok(found)
+    Ok(found.map(|(date, path)| (crate::clock::date_to_chrono(date), path)))
 }
 
 /// What each setting is when it has no row.
@@ -427,7 +427,12 @@ pub async fn tariff_preview(
     let rows = admin_data::load_plan_rows(&mut conn).await?;
     let current: Vec<_> = rows
         .iter()
-        .map(|(_, from, tariff)| (*from, tariff.clone()))
+        .map(|(_, from, tariff)| {
+            (
+                from.map(crate::clock::date_to_chrono),
+                tariff.clone(),
+            )
+        })
         .collect();
     let mut changed = current.clone();
     match plan.id {

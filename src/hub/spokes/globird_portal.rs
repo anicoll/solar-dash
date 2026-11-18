@@ -38,7 +38,7 @@ impl Spoke for GlobirdPortal {
             sync::run(
                 self.config,
                 ctx.pool,
-                ctx.tz,
+                crate::clock::tz_to_jiff(ctx.tz),
                 Some(self.synced),
                 ctx.shutdown.wait(),
             )

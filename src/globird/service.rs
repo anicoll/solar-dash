@@ -2,41 +2,42 @@
 //! meter out of the account data, and the request bodies and date formats the
 //! usage and cost endpoints want.
 
-use chrono::{Days, NaiveDate};
+use jiff::ToSpan;
+use jiff::civil::Date;
 use serde_json::{Value, json};
 
 /// An inclusive range of local dates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DateRange {
-    pub from: NaiveDate,
-    pub to: NaiveDate,
+    pub from: Date,
+    pub to: Date,
 }
 
 impl DateRange {
     /// `days` before `end`, through `end`.
-    pub fn ending_on(end: NaiveDate, days: u64) -> Self {
+    pub fn ending_on(end: Date, days: u64) -> Self {
         Self {
-            from: end - Days::new(days),
+            from: end - (days as i64).days(),
             to: end,
         }
     }
 
     /// `days` after `start`, starting on `start`.
-    pub fn starting_on(start: NaiveDate, days: u64) -> Self {
+    pub fn starting_on(start: Date, days: u64) -> Self {
         Self {
             from: start,
-            to: start + Days::new(days),
+            to: start + (days as i64).days(),
         }
     }
 
     /// "2026/09/21", the form the usage endpoints want.
-    pub fn slash(date: NaiveDate) -> String {
-        date.format("%Y/%m/%d").to_string()
+    pub fn slash(date: Date) -> String {
+        date.strftime("%Y/%m/%d").to_string()
     }
 
     /// "2026-09-21", the form the cost endpoint wants.
-    pub fn dash(date: NaiveDate) -> String {
-        date.format("%Y-%m-%d").to_string()
+    pub fn dash(date: Date) -> String {
+        date.strftime("%Y-%m-%d").to_string()
     }
 
     /// The weather endpoint's start: midnight UTC on the first day.
@@ -200,8 +201,8 @@ pub fn is_basic_meter(meter: &Value) -> bool {
 mod tests {
     use super::*;
 
-    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn date(y: i16, m: i8, d: i8) -> Date {
+        jiff::civil::date(y, m, d)
     }
 
     #[test]

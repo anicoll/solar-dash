@@ -28,7 +28,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -146,9 +147,12 @@ pub fn parse_metadata(result: &Value, entity_id: &str) -> Option<Meta> {
 /// `recorder/statistics_during_period` for one entity and chunk.
 pub fn statistics_request(entity_id: &str, chunk: Chunk) -> Value {
     let iso = |ts: i64| {
-        DateTime::from_timestamp(ts, 0)
+        // Spelled with `+00:00` (not `Z`) as it always has been.
+        Timestamp::from_second(ts)
             .unwrap_or_default()
-            .to_rfc3339()
+            .to_zoned_datetime(TimeZone::UTC)
+            .strftime("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string()
     };
     json!({
         "type": "recorder/statistics_during_period",
@@ -172,7 +176,7 @@ pub fn parse_statistics(result: &Value, entity_id: &str, meta: &Meta) -> Vec<(i6
         .filter_map(|row| {
             let ts = match &row["start"] {
                 Value::Number(ms) => (ms.as_f64()? / 1000.0).floor() as i64,
-                Value::String(text) => DateTime::parse_from_rfc3339(text).ok()?.timestamp(),
+                Value::String(text) => text.parse::<Timestamp>().ok()?.as_second(),
                 _ => return None,
             };
             let number = |key: &str| row[key].as_f64().filter(|v| v.is_finite());
@@ -393,7 +397,7 @@ pub async fn run(url: &str, config: &HaSource, pool: &SqlitePool, hub: &Hub) {
 
 /// One pass over all entities on a fresh connection.
 async fn pass(url: &str, config: &HaSource, pool: &SqlitePool, hub: &Hub) -> Result<usize> {
-    let now = Utc::now().timestamp();
+    let now = crate::clock::unix_now();
     let floor = floor_ts(now, config.backfill_days);
     // Connect only when there is something left to do.
     let mut pending = Vec::new();
@@ -593,9 +597,12 @@ mod tests {
                     json!([])
                 });
             }
-            let start = DateTime::parse_from_rfc3339(message["start_time"].as_str().unwrap())
+            let start = message["start_time"]
+                .as_str()
                 .unwrap()
-                .timestamp();
+                .parse::<Timestamp>()
+                .unwrap()
+                .as_second();
             Ok(json!({"sensor.solar_power": [
                 {"start": start * 1000, "end": (start + 300) * 1000, "mean": 1.5}
             ]}))
@@ -772,9 +779,12 @@ mod tests {
             .iter()
             .find(|r| r["type"] == "recorder/statistics_during_period")
             .unwrap();
-        let end = DateTime::parse_from_rfc3339(request["end_time"].as_str().unwrap())
+        let end = request["end_time"]
+            .as_str()
             .unwrap()
-            .timestamp();
+            .parse::<Timestamp>()
+            .unwrap()
+            .as_second();
         assert_eq!(end, live_start);
     }
 
