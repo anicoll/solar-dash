@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use chrono::{Days, LocalResult, NaiveDate, TimeZone, Utc};
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -32,7 +32,7 @@ pub enum HubEvent {
     /// A source saved prices, under this name (like "amber:abc").
     PricesStored { source: String },
     /// A local day has just ended. Sent by the hub itself at local midnight.
-    DayClosed(NaiveDate),
+    DayClosed(Date),
 }
 
 /// A handle to the event bus. Cloning gives another handle to the same bus.
@@ -99,47 +99,24 @@ pub(super) async fn log_events(mut events: broadcast::Receiver<HubEvent>, shutdo
     }
 }
 
-/// Current time as unix seconds.
-pub(super) fn unix_now() -> i64 {
-    Utc::now().timestamp()
-}
-
-/// Unix time of the first moment of `date` in `tz`. If midnight does not
-/// exist (clocks jump over it) the first hour that does is used; if it
-/// happens twice, the earlier one.
-fn local_midnight(date: NaiveDate, tz: Tz) -> Option<i64> {
-    for hour in 0..3 {
-        let naive = date.and_hms_opt(hour, 0, 0)?;
-        match tz.from_local_datetime(&naive) {
-            LocalResult::Single(t) => return Some(t.timestamp()),
-            LocalResult::Ambiguous(earliest, _) => return Some(earliest.timestamp()),
-            LocalResult::None => continue,
-        }
-    }
-    None
-}
-
-/// When local `date` ends, as unix seconds. On a daylight saving change the
-/// day is 23 or 25 hours long, which is why this asks the time zone instead
-/// of adding 24 hours.
-fn day_end(date: NaiveDate, tz: Tz) -> Option<i64> {
-    local_midnight(date.checked_add_days(Days::new(1))?, tz)
-}
-
 /// Sends [`HubEvent::DayClosed`] at each local midnight until shutdown.
 /// `now` is the clock, a parameter so tests can use their own.
-pub(super) async fn run_day_clock(hub: Hub, tz: Tz, now: impl Fn() -> i64, shutdown: Shutdown) {
+pub(super) async fn run_day_clock(
+    hub: Hub,
+    tz: TimeZone,
+    now: impl Fn() -> i64,
+    shutdown: Shutdown,
+) {
     let shutdown = shutdown.wait();
     tokio::pin!(shutdown);
     // The day we are waiting to see end. Counting days from here, instead of
     // asking the clock "what day is it" after each wake-up, means a wake-up a
     // moment early or late can neither skip nor repeat a day.
-    let mut open = Utc
-        .timestamp_opt(now(), 0)
-        .single()
-        .map(|t| t.with_timezone(&tz).date_naive());
+    let mut open = jiff::Timestamp::from_second(now())
+        .ok()
+        .map(|t| tz.to_datetime(t).date());
     while let Some(date) = open {
-        let Some(end) = day_end(date, tz) else {
+        let Some(end) = crate::clock::day_end(date, &tz) else {
             warn!(%date, "could not work out when the day ends; no more day-closed events");
             return;
         };
@@ -153,7 +130,7 @@ pub(super) async fn run_day_clock(hub: Hub, tz: Tz, now: impl Fn() -> i64, shutd
             continue;
         }
         hub.publish(HubEvent::DayClosed(date));
-        open = date.checked_add_days(Days::new(1));
+        open = date.tomorrow().ok();
     }
 }
 
@@ -161,11 +138,22 @@ pub(super) async fn run_day_clock(hub: Hub, tz: Tz, now: impl Fn() -> i64, shutd
 mod tests {
     use super::*;
     use crate::hub::shutdown_channel;
+    use jiff::ToSpan;
 
-    const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
 
-    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn date(y: i16, m: i8, d: i8) -> Date {
+        jiff::civil::date(y, m, d)
+    }
+
+    /// Unix time of a UTC date and time.
+    fn utc_ts(y: i16, m: i8, d: i8, h: i8, min: i8, s: i8) -> i64 {
+        TimeZone::UTC
+            .to_timestamp(jiff::civil::datetime(y, m, d, h, min, s, 0))
+            .unwrap()
+            .as_second()
     }
 
     #[tokio::test]
@@ -193,9 +181,9 @@ mod tests {
     async fn a_lagging_listener_is_told_and_then_catches_up() {
         let hub = Hub::default();
         let mut rx = hub.subscribe();
-        for day in 0..(CAPACITY as u32 + 10) {
+        for day in 0..(CAPACITY as i32 + 10) {
             hub.publish(HubEvent::DayClosed(
-                date(2026, 1, 1) + Days::new(day.into()),
+                date(2026, 1, 1).checked_add(day.days()).unwrap(),
             ));
         }
         assert!(matches!(
@@ -208,19 +196,15 @@ mod tests {
 
     #[test]
     fn days_end_at_local_midnight_across_daylight_saving() {
-        let ts = |d: NaiveDate| day_end(d, ADELAIDE).unwrap();
+        let tz = adelaide();
+        let ts = |d: Date| crate::clock::day_end(d, &tz).unwrap();
         // Adelaide: clocks go forward on 2026-10-04 (23-hour day) and back
         // on 2026-04-05 (25-hour day).
         assert_eq!(ts(date(2026, 10, 4)) - ts(date(2026, 10, 3)), 23 * 3600);
         assert_eq!(ts(date(2026, 4, 5)) - ts(date(2026, 4, 4)), 25 * 3600);
         assert_eq!(ts(date(2026, 7, 1)) - ts(date(2026, 6, 30)), 24 * 3600);
         // 2026-07-01 00:00 +09:30 is 2026-06-30 14:30 UTC.
-        assert_eq!(
-            ts(date(2026, 6, 30)),
-            Utc.with_ymd_and_hms(2026, 6, 30, 14, 30, 0)
-                .unwrap()
-                .timestamp()
-        );
+        assert_eq!(ts(date(2026, 6, 30)), utc_ts(2026, 6, 30, 14, 30, 0));
     }
 
     /// The clock sends one `DayClosed` per local midnight, on the right
@@ -228,17 +212,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_day_clock_announces_each_local_midnight() {
         // 2026-10-03 23:00 local (+09:30), an hour before a 23-hour day starts.
-        let start = Utc
-            .with_ymd_and_hms(2026, 10, 3, 13, 30, 0)
-            .unwrap()
-            .timestamp();
+        let start = utc_ts(2026, 10, 3, 13, 30, 0);
         let began = tokio::time::Instant::now();
         let now = move || start + began.elapsed().as_secs() as i64;
 
         let hub = Hub::default();
         let mut rx = hub.subscribe();
         let (trigger, shutdown) = shutdown_channel();
-        let clock = tokio::spawn(run_day_clock(hub.clone(), ADELAIDE, now, shutdown));
+        let clock = tokio::spawn(run_day_clock(hub.clone(), adelaide(), now, shutdown));
 
         // Paused time jumps ahead whenever everything is waiting.
         for expected in [date(2026, 10, 3), date(2026, 10, 4), date(2026, 10, 5)] {

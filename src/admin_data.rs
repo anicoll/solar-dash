@@ -134,8 +134,13 @@ impl AdminData {
 
         let plans = load_plans(conn).await?;
         if !plans.is_empty() {
-            let schedule =
-                TariffSchedule::from_plans(&plans).context("the tariff plans do not work")?;
+            let schedule = TariffSchedule::from_plans(
+                &plans
+                    .iter()
+                    .map(|(d, t)| (d.map(crate::clock::date_to_jiff), t.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .context("the tariff plans do not work")?;
             data.tariff = Some(Arc::new(schedule));
         }
 
@@ -159,7 +164,13 @@ impl AdminData {
             check_price(cents).with_context(|| format!("petrol price from {from}"))?;
             changes.push((date, cents));
         }
-        data.petrol = PetrolHistory::new(data.ev_prices.petrol_cents_per_litre, changes);
+        data.petrol = PetrolHistory::new(
+            data.ev_prices.petrol_cents_per_litre,
+            changes
+                .into_iter()
+                .map(|(d, c)| (crate::clock::date_to_jiff(d), c))
+                .collect(),
+        );
 
         let rows: Vec<(String, String, f64, Option<f64>)> = sqlx::query_as(
             "SELECT name, date, cost_dollars, battery_kwh FROM purchase ORDER BY date, id",
@@ -608,6 +619,7 @@ mod tests {
         let before = TariffSchedule::from_plans(&[(None, from_toml)]).unwrap();
         let after = TariffSchedule::from_plans(&[(None, back)]).unwrap();
         let day = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let day = crate::clock::date_to_jiff(day);
         assert_eq!(before.for_date(day).key(), after.for_date(day).key());
     }
 

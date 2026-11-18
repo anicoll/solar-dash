@@ -53,6 +53,7 @@ pub(super) fn home_mix(steps: &[Step], tariff: Option<&Tariff>, tz: Tz) -> HomeM
         return HomeMix::default();
     }
     let (mut solar, mut battery, mut grid, mut free) = (0.0, 0.0, 0.0, 0.0);
+    let jiff_tz = crate::clock::tz_to_jiff(tz);
     for step in steps {
         let load = step.load_w.max(0.0);
         let from_solar = step.pv_w.max(0.0).min(load);
@@ -63,9 +64,9 @@ pub(super) fn home_mix(steps: &[Step], tariff: Option<&Tariff>, tz: Tz) -> HomeM
         battery += from_battery * secs;
         grid += from_grid * secs;
         let mid = step.start + step.secs / 2;
-        if tariff
-            .is_some_and(|t| t.import_band_at(local_minute_of_day(tz, mid)) == ImportBand::Free)
-        {
+        if tariff.is_some_and(|t| {
+            t.import_band_at(local_minute_of_day(&jiff_tz, mid)) == ImportBand::Free
+        }) {
             free += from_grid * secs;
         }
     }

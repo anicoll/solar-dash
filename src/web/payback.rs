@@ -445,7 +445,9 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
             }
             let owned = battery_owned_before(&data.purchases, i);
             Some(estimated_added(&discharge, p.date, owned, |date| {
-                tariff.for_date(date).peak_import_cents()
+                tariff
+                    .for_date(crate::clock::date_to_jiff(date))
+                    .peak_import_cents()
             }))
         })
         .collect();
@@ -503,7 +505,12 @@ pub async fn payback(State(state): State<AppState>) -> ApiResult {
         .into_iter()
         .filter_map(|(date, name)| {
             let name = name?.trim();
-            (!name.is_empty()).then(|| (date.unwrap_or(first_day), name.to_string()))
+            (!name.is_empty()).then(|| {
+                (
+                    date.map_or(first_day, crate::clock::date_to_chrono),
+                    name.to_string(),
+                )
+            })
         })
         .collect();
 

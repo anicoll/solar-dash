@@ -46,7 +46,7 @@ impl Spoke for HomeAssistantMqtt {
                 costs: self.state.has_tariff(),
             };
             let state = self.state;
-            let today = || snapshot(&state, &ctx.pool, ctx.tz, offer);
+            let today = || snapshot(&state, &ctx.pool, &ctx.tz, offer);
             home_assistant::run(self.config, offer, events, today, ctx.shutdown.wait()).await
         })
     }
@@ -57,14 +57,14 @@ impl Spoke for HomeAssistantMqtt {
 async fn snapshot(
     state: &AppState,
     pool: &sqlx::SqlitePool,
-    tz: chrono_tz::Tz,
+    tz: &jiff::tz::TimeZone,
     offer: Offer,
 ) -> anyhow::Result<TodaySnapshot> {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::clock::unix_now();
     let date = home_assistant::local_date(now, tz);
-    let energy = web::day_energy(state, date).await?;
+    let energy = web::day_energy(state, crate::clock::date_to_chrono(date)).await?;
     let money = if offer.costs {
-        web::day_money(state, date).await?
+        web::day_money(state, crate::clock::date_to_chrono(date)).await?
     } else {
         None
     };

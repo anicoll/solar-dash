@@ -2296,10 +2296,7 @@ mod tests {
         // uses its own price ($2.10 from 1 Sep, not the $1.95 base).
         let hash = hash_password(PASSWORD).unwrap();
         let tz = chrono_tz::Australia::Adelaide;
-        let history = PetrolHistory::new(
-            Some(195.0),
-            vec![(chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), 210.0)],
-        );
+        let history = PetrolHistory::new(Some(195.0), vec![(jiff::civil::date(2026, 9, 1), 210.0)]);
         let app = router(
             AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
                 .unwrap()
@@ -2345,7 +2342,7 @@ mod tests {
                     ),
             )
         };
-        let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        let day = |d: i8| jiff::civil::date(2026, 9, d);
         let app = router_with(PetrolHistory::new(Some(190.0), vec![(day(10), 200.0)]));
         let response = send(&app, get_request("/api/ev/cars", None)).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
