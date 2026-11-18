@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::models::{ChannelType, IntervalKind, PriceInterval};
 use crate::cost::{DayPrices, PriceSpan};
@@ -70,6 +70,19 @@ pub async fn save_prices(
     now: i64,
 ) -> Result<usize> {
     let mut tx = pool.begin().await?;
+    let saved = save_prices_in(&mut tx, source, intervals, now).await?;
+    tx.commit().await?;
+    Ok(saved)
+}
+
+/// [`save_prices`] inside a transaction the caller owns, so several saves
+/// (and a prune) can land together: a reader never sees half of a refresh.
+pub async fn save_prices_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    source: &str,
+    intervals: &[PriceInterval],
+    now: i64,
+) -> Result<usize> {
     let mut saved = 0;
     for interval in intervals {
         let (Some(channel), Some(kind)) = (
@@ -101,7 +114,7 @@ pub async fn save_prices(
         .bind(now)
         .bind(interval.descriptor.as_deref())
         .bind(interval.renewables)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("could not save a price interval")?;
         // A longer forecast row (say 30 minutes) replacing 5-minute ones would
@@ -118,22 +131,29 @@ pub async fn save_prices(
             .bind(channel)
             .bind(start_ts)
             .bind(interval.end_time.timestamp())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .context("could not drop forecasts covered by a longer interval")?;
         }
         saved += 1;
     }
-    tx.commit().await?;
     Ok(saved)
 }
 
 /// Deletes forecast rows that ended more than [`FORECAST_KEEP_SECS`] before
 /// `now`. Actual prices are never deleted. Returns how many rows went.
 pub async fn prune_forecasts(pool: &SqlitePool, now: i64) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let pruned = prune_forecasts_in(&mut tx, now).await?;
+    tx.commit().await?;
+    Ok(pruned)
+}
+
+/// [`prune_forecasts`] inside a transaction the caller owns.
+pub async fn prune_forecasts_in(tx: &mut Transaction<'_, Sqlite>, now: i64) -> Result<u64> {
     let result = sqlx::query("DELETE FROM price_interval WHERE kind = 'forecast' AND end_ts < ?")
         .bind(now - FORECAST_KEEP_SECS)
-        .execute(pool)
+        .execute(&mut **tx)
         .await
         .context("could not prune old forecast prices")?;
     Ok(result.rows_affected())

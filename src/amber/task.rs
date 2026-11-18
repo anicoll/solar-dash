@@ -149,10 +149,15 @@ async fn fetch_and_store(
         .into_iter()
         .filter(|item| item.kind == IntervalKind::ForecastInterval)
         .collect();
-    let mut saved = store::save_prices(pool, &source, &forecasts, now).await?;
-    saved += store::save_prices(pool, &source, &short.items, now).await?;
+    // One transaction for both saves and the prune. Saved one after the other,
+    // a page loading in between would see the 30-minute forecasts standing in
+    // for the 5-minute rows they had just replaced.
+    let mut tx = pool.begin().await?;
+    let mut saved = store::save_prices_in(&mut tx, &source, &forecasts, now).await?;
+    saved += store::save_prices_in(&mut tx, &source, &short.items, now).await?;
+    let pruned = store::prune_forecasts_in(&mut tx, now).await?;
+    tx.commit().await?;
     hub.publish(HubEvent::PricesStored { source });
-    let pruned = store::prune_forecasts(pool, now).await?;
     debug!(saved, pruned, "Amber prices stored");
     Ok(saved)
 }
