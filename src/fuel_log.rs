@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn the_month_average_comes_from_the_petrol_price_history() {
-        let day = |d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        let day = |d| crate::clock::date_to_jiff(NaiveDate::from_ymd_opt(2026, 10, d).unwrap());
         // 200 c/L for the first half of October (15 days), 100 c/L after (16).
         let petrol = PetrolHistory::new(None, vec![(day(1), 200.0), (day(16), 100.0)]);
         let fills = [

@@ -493,7 +493,7 @@ async fn home_session_cost(
         session,
         &samples,
         schedule,
-        crate::clock::tz_to_chrono(&state.site_tz()),
+        &state.site_tz(),
         now,
     ))
 }
@@ -822,7 +822,7 @@ fn charging_plans(schedule: Option<&TariffSchedule>) -> (Vec<String>, impl Fn(&s
         None => vec!["Home charging".to_string()],
     };
     let plan_of = move |day: &str| match (schedule, Date::strptime("%Y-%m-%d", day)) {
-        (Some(schedule), Ok(date)) => plan_index_on(schedule, date),
+        (Some(schedule), Ok(date)) => schedule.plan_index(date),
         _ => 0,
     };
     (plans, plan_of)
@@ -890,16 +890,6 @@ pub(super) fn today(tz: &TimeZone) -> Date {
 pub(super) fn local_date_of(ts: i64, tz: &TimeZone) -> Option<Date> {
     let ts = Timestamp::from_second(ts).ok()?;
     Some(tz.to_datetime(ts).date())
-}
-
-/// The tariff in force on local `date`.
-pub(super) fn tariff_on(schedule: &TariffSchedule, date: Date) -> &crate::cost::Tariff {
-    schedule.for_date(crate::clock::date_to_chrono(date))
-}
-
-/// Which of the schedule's plans is in force on local `date`.
-pub(super) fn plan_index_on(schedule: &TariffSchedule, date: Date) -> usize {
-    schedule.plan_index(crate::clock::date_to_chrono(date))
 }
 
 impl AppState {
@@ -1646,10 +1636,7 @@ async fn day_home_mix(
     totals: &DayTotals,
     live: &[Sample],
 ) -> Result<HomeMix, ApiError> {
-    let tariff = data
-        .tariff
-        .as_ref()
-        .map(|schedule| tariff_on(schedule, date));
+    let tariff = data.tariff.as_ref().map(|schedule| schedule.for_date(date));
     let steps = if totals.source == "inverter" {
         home_mix::live_steps(live)
     } else if totals.load_kwh.is_some() {
@@ -1748,7 +1735,7 @@ async fn daily_days(
     let spike_cents = data.price_spike_cents;
     let mut keys = Vec::new();
     for &date in dates.iter().filter(|d| **d < today) {
-        let tariff = data.tariff.as_ref().map(|s| tariff_on(s, date));
+        let tariff = data.tariff.as_ref().map(|s| s.for_date(date));
         let mut key = format!(
             "{DAILY_VERSION}|{}|{:?}|spike={}",
             state.site_tz().iana_name().unwrap_or("UTC"),
@@ -1891,6 +1878,28 @@ mod tests {
 
     fn adelaide() -> TimeZone {
         crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
+
+    #[test]
+    fn query_dates_accept_what_they_always_did() {
+        assert_eq!(
+            parse_date("from", "2026-10-20").unwrap().to_string(),
+            "2026-10-20"
+        );
+        // Un-padded numbers were accepted; trailing text and other forms were not.
+        assert_eq!(
+            parse_date("from", "2026-1-5").unwrap().to_string(),
+            "2026-01-05"
+        );
+        for bad in [
+            "",
+            "2026-10-20x",
+            "2026-10-20T00:00",
+            "2026/10/20",
+            "2026-02-30",
+        ] {
+            assert!(parse_date("from", bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

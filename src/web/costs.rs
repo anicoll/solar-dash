@@ -19,8 +19,7 @@ use sqlx::SqlitePool;
 use super::AppState;
 use super::api::{
     ApiError, ApiResult, DEFAULT_DAILY_DAYS, MAX_HOLD_SECS, Spread, cloud_counters_rose,
-    date_range, day_bounds, day_bounds_or_error, live_totals, local_date_of, spread_steps,
-    tariff_on, today,
+    date_range, day_bounds, day_bounds_or_error, live_totals, local_date_of, spread_steps, today,
 };
 use super::day_cache;
 use super::samples::{self, Role};
@@ -572,7 +571,7 @@ pub(super) async fn day_grid_split_checked(
         meter: &meter,
         rules,
     };
-    let tariff = tariff_on(schedule, date);
+    let tariff = schedule.for_date(date);
     let today = today(&state.site_tz());
     let prices = plan_day_prices(state, tariff, date, today).await?;
     let spike_cents = state.admin.get().price_spike_cents;
@@ -585,7 +584,7 @@ pub(super) async fn day_grid_split_checked(
             let cacheable = is_cacheable(date, today, source, live_solid, newest_counter_ts, end);
             let split = cost::grid_split_priced(
                 tariff,
-                crate::clock::tz_to_chrono(&state.site_tz()),
+                &state.site_tz(),
                 &intervals,
                 prices.as_ref(),
                 spike_cents,
@@ -614,7 +613,7 @@ pub(super) async fn grid_splits(
     let spike_cents = state.admin.get().price_spike_cents;
     let mut keys = Vec::with_capacity(dates.len());
     for &date in dates {
-        let tariff = tariff_on(schedule, date);
+        let tariff = schedule.for_date(date);
         let mut key = format!(
             "{GRID_SPLIT_VERSION}|{}|spike={}|{:?}",
             cache_key(&state.site_tz(), tariff),
@@ -968,7 +967,7 @@ async fn car_days(
     }
     let average = |date: &str| {
         Date::strptime("%Y-%m-%d", date)
-            .map_or(0.0, |d| tariff_on(schedule, d).average_import_cents())
+            .map_or(0.0, |d| schedule.for_date(d).average_import_cents())
     };
     Ok(Some(ev_cost::car_day_totals(
         &data.ev_prices,
@@ -1230,7 +1229,7 @@ async fn compute_days_with(
             let prices = plan_day_prices(state, tariff, date, today).await?;
             let cost = cost::day_cost_priced(
                 tariff,
-                crate::clock::tz_to_chrono(&state.site_tz()),
+                &state.site_tz(),
                 &intervals,
                 prices.as_ref(),
                 credit,
@@ -1245,7 +1244,7 @@ async fn compute_days_with(
                         coverage: covered as f64 / (end - start).max(1) as f64,
                         priced: cost::day_cost_priced(
                             h,
-                            crate::clock::tz_to_chrono(&state.site_tz()),
+                            &state.site_tz(),
                             &intervals,
                             Some(&prices),
                             credit,
@@ -1278,9 +1277,8 @@ pub(super) async fn costed_days(
 ) -> Result<Vec<CostedDay>, ApiError> {
     let mut costed = Vec::new();
     // Plans are in date order, so the days on one plan are next to each other.
-    for run in dates.chunk_by(|a, b| std::ptr::eq(tariff_on(schedule, *a), tariff_on(schedule, *b)))
-    {
-        costed.extend(costed_days_on(state, tariff_on(schedule, run[0]), run).await?);
+    for run in dates.chunk_by(|a, b| std::ptr::eq(schedule.for_date(*a), schedule.for_date(*b))) {
+        costed.extend(costed_days_on(state, schedule.for_date(run[0]), run).await?);
     }
     Ok(costed)
 }
@@ -1440,9 +1438,8 @@ pub(super) async fn compare_days(
 ) -> Result<Vec<(CostedDay, HypotheticalDay)>, ApiError> {
     let today = today(&state.site_tz());
     let mut out = Vec::new();
-    for run in dates.chunk_by(|a, b| std::ptr::eq(tariff_on(schedule, *a), tariff_on(schedule, *b)))
-    {
-        let tariff = tariff_on(schedule, run[0]);
+    for run in dates.chunk_by(|a, b| std::ptr::eq(schedule.for_date(*a), schedule.for_date(*b))) {
+        let tariff = schedule.for_date(run[0]);
         for (day, _, hypo) in
             compute_days_with(state, tariff, run, today, Some(hypothetical)).await?
         {
@@ -1465,9 +1462,8 @@ pub(super) async fn preview_days(
 ) -> Result<Vec<CostedDay>, ApiError> {
     let today = today(&state.site_tz());
     let mut costed = Vec::new();
-    for run in dates.chunk_by(|a, b| std::ptr::eq(tariff_on(schedule, *a), tariff_on(schedule, *b)))
-    {
-        let days = compute_days(state, tariff_on(schedule, run[0]), run, today).await?;
+    for run in dates.chunk_by(|a, b| std::ptr::eq(schedule.for_date(*a), schedule.for_date(*b))) {
+        let days = compute_days(state, schedule.for_date(run[0]), run, today).await?;
         costed.extend(days.into_iter().map(|(day, _)| day));
     }
     Ok(costed)
@@ -1633,7 +1629,7 @@ pub(super) async fn billed_days(
             .collect();
         for bill in touched {
             let plan = |date| {
-                let tariff = tariff_on(schedule, crate::clock::date_to_jiff(date));
+                let tariff = schedule.for_date(crate::clock::date_to_jiff(date));
                 bills::Plan {
                     supply_cents: tariff.supply_cents_per_day(),
                     average_import_cents: tariff.average_import_cents(),
@@ -1858,7 +1854,7 @@ pub async fn tariff(
     let Some(schedule) = &data.tariff else {
         return Ok(Json(json!({ "configured": false })));
     };
-    let t = tariff_on(schedule, date);
+    let t = schedule.for_date(date);
     let import: Vec<_> = t
         .import_windows()
         .into_iter()

@@ -134,8 +134,13 @@ impl AdminData {
 
         let plans = load_plans(conn).await?;
         if !plans.is_empty() {
-            let schedule =
-                TariffSchedule::from_plans(&plans).context("the tariff plans do not work")?;
+            let schedule = TariffSchedule::from_plans(
+                &plans
+                    .iter()
+                    .map(|(d, t)| (d.map(crate::clock::date_to_jiff), t.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .context("the tariff plans do not work")?;
             data.tariff = Some(Arc::new(schedule));
         }
 
@@ -208,7 +213,7 @@ pub(crate) async fn load_plan_rows(
     let mut plans = Vec::new();
     for (id, valid_from, body) in rows {
         let valid_from = valid_from
-            .map(|text| parse_date(&text))
+            .map(|text| parse_date(&text).map(crate::clock::date_to_chrono))
             .transpose()
             .with_context(|| format!("valid_from of tariff plan #{id}"))?;
         let tariff = tariff_from_body(&body).with_context(|| format!("tariff plan #{id}"))?;
@@ -246,8 +251,8 @@ pub(crate) async fn load_bills(conn: &mut SqliteConnection) -> Result<Vec<PastBi
     let mut bills: Vec<PastBill> = Vec::new();
     for row in rows {
         let bill = PastBill {
-            from: parse_date(&row.0).context("bill from")?,
-            to: parse_date(&row.1).context("bill to")?,
+            from: crate::clock::date_to_chrono(parse_date(&row.0).context("bill from")?),
+            to: crate::clock::date_to_chrono(parse_date(&row.1).context("bill to")?),
             bill_total: row.2,
             excluded: row.3,
             import_kwh: row.4,
@@ -608,6 +613,7 @@ mod tests {
         let before = TariffSchedule::from_plans(&[(None, from_toml)]).unwrap();
         let after = TariffSchedule::from_plans(&[(None, back)]).unwrap();
         let day = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let day = crate::clock::date_to_jiff(day);
         assert_eq!(before.for_date(day).key(), after.for_date(day).key());
     }
 

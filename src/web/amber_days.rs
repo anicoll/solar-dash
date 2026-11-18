@@ -12,7 +12,7 @@ use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use super::api::{ApiError, day_bounds_or_error, first_data_ts, tariff_on};
+use super::api::{ApiError, day_bounds_or_error, first_data_ts};
 use super::bill::{MIN_PRICE_COVERAGE, hypothetical_tariff};
 use super::costs::{HypotheticalDay, cache_key, compare_days, consecutive_runs};
 use super::day_cache;
@@ -267,7 +267,7 @@ pub(super) async fn amber_days(
         let day_extras = day_extras(state, purchases, date, start, end).await?;
         let key = day_key(
             state,
-            tariff_on(schedule, date),
+            schedule.for_date(date),
             &hypothetical,
             compare,
             &day_extras,

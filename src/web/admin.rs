@@ -439,12 +439,22 @@ pub async fn tariff_preview(
         }
         None => changed.push((valid_from, plan.tariff)),
     }
-    let changed = TariffSchedule::from_plans(&changed)
-        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    let changed = TariffSchedule::from_plans(
+        &changed
+            .iter()
+            .map(|(d, t)| (d.map(crate::clock::date_to_jiff), t.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     let current = if current.is_empty() {
         None
     } else {
-        Some(TariffSchedule::from_plans(&current)?)
+        Some(TariffSchedule::from_plans(
+            &current
+                .iter()
+                .map(|(d, t)| (d.map(crate::clock::date_to_jiff), t.clone()))
+                .collect::<Vec<_>>(),
+        )?)
     };
 
     // The default range ends yesterday: today is not finished yet.

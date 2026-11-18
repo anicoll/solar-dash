@@ -27,7 +27,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 
-use chrono_tz::Tz;
+use jiff::tz::TimeZone;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::sync::watch;
@@ -108,7 +108,7 @@ pub type SpokeFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>>>>;
 pub struct SpokeContext {
     pub pool: SqlitePool,
     /// The plant's time zone, for "today" and local midnight.
-    pub tz: Tz,
+    pub tz: TimeZone,
     pub shutdown: Shutdown,
     pub hub: Hub,
 }
@@ -196,8 +196,8 @@ pub async fn run_spokes(spokes: Vec<Box<dyn Spoke>>, ctx: SpokeContext) {
     ))));
     jobs.push(Some(Box::pin(bus::run_day_clock(
         ctx.hub.clone(),
-        ctx.tz,
-        bus::unix_now,
+        ctx.tz.clone(),
+        crate::clock::unix_now,
         ctx.shutdown.clone(),
     ))));
 
@@ -263,7 +263,7 @@ mod tests {
         let (trigger, shutdown) = shutdown_channel();
         let ctx = SpokeContext {
             pool,
-            tz: chrono_tz::Australia::Adelaide,
+            tz: crate::clock::site_tz("Australia/Adelaide").unwrap(),
             shutdown,
             hub: Hub::default(),
         };

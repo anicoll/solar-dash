@@ -432,7 +432,7 @@ struct StoredDay {
 fn days_in_range(
     from: Date,
     to: Date,
-    tz: &TimeZone,
+    tz: &jiff::tz::TimeZone,
     prices: &[PriceSpan],
     usage: &[Interval],
     spike_cents: f64,

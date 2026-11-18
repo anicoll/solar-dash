@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::AppState;
-use super::api::{ApiError, ApiResult, day_bounds_or_error, tariff_on, today};
+use super::api::{ApiError, ApiResult, day_bounds_or_error, today};
 use super::costs::{
     DayData, EXPORT_COUNTER, IMPORT_COUNTER, LOAD_COUNTER, cache_key, credit_override_kwh,
     day_intervals, is_cacheable, live_in, meter_for_day, meter_in, round2, rules_key,
@@ -135,7 +135,7 @@ fn day_sums(tariff: &Tariff, tz: &TimeZone, free_start: u32, intervals: &[Interv
     let mut exported = 0.0;
     for iv in intervals {
         let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
-        let minute = local_minute_of_day(crate::clock::tz_to_chrono(tz), mid);
+        let minute = local_minute_of_day(tz, mid);
         if tariff.in_credit_window(minute) {
             sums.has_window_data = true;
             sums.window_import_kwh += iv.import_kwh;
@@ -451,13 +451,8 @@ fn day_facts(
     let first_import_at = sums.as_ref().and_then(|s| s.first_import_ts);
     Some(DayFacts {
         estimate_earned: intervals.is_some_and(|iv| {
-            cost::day_cost_with_window_import(
-                tariff,
-                crate::clock::tz_to_chrono(tz),
-                iv,
-                credit_import_kwh,
-            )
-            .zero_import_credit_cents
+            cost::day_cost_with_window_import(tariff, tz, iv, credit_import_kwh)
+                .zero_import_credit_cents
                 > 0.0
         }),
         sums,
@@ -642,7 +637,7 @@ async fn compute_facts(
         });
         let source = found.as_ref().map_or("", |(source, _, _)| source);
         let credit_import =
-            credit_override_kwh(tariff_on(schedule, date), &tz, date, source, day.meter);
+            credit_override_kwh(schedule.for_date(date), &tz, date, source, day.meter);
         let intervals = found.map(|(_, intervals, _)| intervals);
         let soc = SocSeries {
             live: live
@@ -651,7 +646,7 @@ async fn compute_facts(
                 .collect(),
             cloud: slice_between(&cloud_soc, |r| r.0, start, end).to_vec(),
         };
-        let tariff = tariff_on(schedule, date);
+        let tariff = schedule.for_date(date);
         if let Some(facts) = day_facts(tariff, &tz, date, intervals.as_deref(), credit_import, &soc)
         {
             out.push((date, facts, cacheable));
@@ -682,7 +677,7 @@ async fn facts_for(
         let Ok(date) = Date::strptime("%Y-%m-%d", &row.date) else {
             continue;
         };
-        if row.tariff_key != battery_cache_key(&tz, tariff_on(schedule, date), &state.rules) {
+        if row.tariff_key != battery_cache_key(&tz, schedule.for_date(date), &state.rules) {
             continue;
         }
         // A row that no longer parses is worked out again and replaced.
@@ -703,7 +698,7 @@ async fn facts_for(
             if cacheable {
                 to_store.push(db::DailyBattery {
                     date: date.to_string(),
-                    tariff_key: battery_cache_key(&tz, tariff_on(schedule, date), &state.rules),
+                    tariff_key: battery_cache_key(&tz, schedule.for_date(date), &state.rules),
                     facts: serde_json::to_string(&facts).map_err(anyhow::Error::from)?,
                 });
             }
@@ -728,7 +723,7 @@ pub async fn battery(
     };
     let tz = state.site_tz();
     let today = today(&tz);
-    if tariff_on(schedule, today).credit_window_minutes().is_none() {
+    if schedule.for_date(today).credit_window_minutes().is_none() {
         return Ok(Json(json!({ "configured": false })));
     }
 
@@ -760,7 +755,7 @@ pub async fn battery(
             billed: billed.get(&date.to_string()).copied(),
             sessions: &sessions,
         };
-        days.extend(build_day(tariff_on(schedule, date), &tz, &input));
+        days.extend(build_day(schedule.for_date(date), &tz, &input));
     }
 
     add_reasons(&mut days);

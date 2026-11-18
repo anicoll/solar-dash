@@ -81,9 +81,9 @@ async fn import_tariffs(conn: &mut SqliteConnection, config: &Config) -> Result<
                 .or_else(|| previous.tariff.name.clone()),
             ..previous.tariff.clone()
         };
-        plans.push((start.map(|d: chrono::NaiveDate| d.to_string()), tariff));
+        plans.push((start.map(|d: jiff::civil::Date| d.to_string()), tariff));
         let until = parse_date(&previous.until)?;
-        start = Some(until.succ_opt().context("until is too late")?);
+        start = Some(until.tomorrow().ok().context("until is too late")?);
     }
     plans.push((start.map(|d| d.to_string()), current.clone()));
     for (valid_from, tariff) in &plans {
@@ -105,7 +105,10 @@ async fn import_petrol(conn: &mut SqliteConnection, config: &Config) -> Result<(
         // A bad file stops `serve` here, with the line in the message. A
         // missing file counts as empty, as it did before.
         Some(file) if std::path::Path::new(file).exists() => (
-            petrol_prices::load(std::path::Path::new(file))?,
+            petrol_prices::load(std::path::Path::new(file))?
+                .into_iter()
+                .map(|(date, cents)| (crate::clock::date_to_jiff(date), cents))
+                .collect(),
             file.clone(),
         ),
         Some(file) => (Vec::new(), file.clone()),

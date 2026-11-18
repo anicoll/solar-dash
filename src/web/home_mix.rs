@@ -63,10 +63,9 @@ pub(super) fn home_mix(steps: &[Step], tariff: Option<&Tariff>, tz: &TimeZone) -
         battery += from_battery * secs;
         grid += from_grid * secs;
         let mid = step.start + step.secs / 2;
-        if tariff.is_some_and(|t| {
-            t.import_band_at(local_minute_of_day(crate::clock::tz_to_chrono(tz), mid))
-                == ImportBand::Free
-        }) {
+        if tariff
+            .is_some_and(|t| t.import_band_at(local_minute_of_day(tz, mid)) == ImportBand::Free)
+        {
             free += from_grid * secs;
         }
     }
