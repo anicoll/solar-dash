@@ -137,10 +137,11 @@ fn needing_cost(
     bills: &[PastBill],
     tz: Tz,
 ) -> Vec<(TmChargeToCost, String)> {
+    let tz = crate::clock::tz_to_jiff(tz);
     sessions
         .into_iter()
         .filter_map(|s| {
-            let key = ev_cost::historic_cost_key(schedule, bills, tz, s.started_at);
+            let key = ev_cost::historic_cost_key(schedule, bills, &tz, s.started_at);
             (s.cost_key.as_deref() != Some(key.as_str())).then_some((s, key))
         })
         .collect()
@@ -369,7 +370,8 @@ async fn cost_sessions(
     let now = db::now();
     let finished = db::tm_charges_at_home(pool, now - COST_AFTER_SECS).await?;
     let todo = needing_cost(finished, schedule, &data.bills, tz);
-    let prices = ev_cost::session_prices(schedule, &data.bills, tz);
+    let jiff_tz = crate::clock::tz_to_jiff(tz);
+    let prices = ev_cost::session_prices(schedule, &data.bills, &jiff_tz);
     let mut costed = 0;
     for (session, key) in &todo {
         if costed >= MAX_COSTED_PER_RUN {
@@ -612,7 +614,12 @@ mod tests {
     fn only_sessions_with_a_stale_key_need_costing() {
         let schedule = schedule();
         let tz: Tz = "Australia/Adelaide".parse().unwrap();
-        let key = ev_cost::historic_cost_key(&schedule, &[], tz, 1_789_000_000);
+        let key = ev_cost::historic_cost_key(
+            &schedule,
+            &[],
+            &crate::clock::tz_to_jiff(tz),
+            1_789_000_000,
+        );
         let todo = needing_cost(
             vec![
                 session(1, None),

@@ -488,7 +488,11 @@ async fn home_session_cost(
     )
     .await?;
     Ok(ev_cost::session_cost(
-        session, &samples, schedule, state.tz, now,
+        session,
+        &samples,
+        schedule,
+        &crate::clock::tz_to_jiff(state.tz),
+        now,
     ))
 }
 
@@ -816,7 +820,7 @@ fn charging_plans(schedule: Option<&TariffSchedule>) -> (Vec<String>, impl Fn(&s
         None => vec!["Home charging".to_string()],
     };
     let plan_of = move |day: &str| match (schedule, NaiveDate::parse_from_str(day, "%Y-%m-%d")) {
-        (Some(schedule), Ok(date)) => schedule.plan_index(date),
+        (Some(schedule), Ok(date)) => schedule.plan_index(crate::clock::date_to_jiff(date)),
         _ => 0,
     };
     (plans, plan_of)
@@ -1628,7 +1632,10 @@ async fn day_home_mix(
     totals: &DayTotals,
     live: &[Sample],
 ) -> Result<HomeMix, ApiError> {
-    let tariff = data.tariff.as_ref().map(|schedule| schedule.for_date(date));
+    let tariff = data
+        .tariff
+        .as_ref()
+        .map(|schedule| schedule.for_date(crate::clock::date_to_jiff(date)));
     let steps = if totals.source == "inverter" {
         home_mix::live_steps(live)
     } else if totals.load_kwh.is_some() {
@@ -1727,7 +1734,10 @@ async fn daily_days(
     let spike_cents = data.price_spike_cents;
     let mut keys = Vec::new();
     for &date in dates.iter().filter(|d| **d < today) {
-        let tariff = data.tariff.as_ref().map(|s| s.for_date(date));
+        let tariff = data
+            .tariff
+            .as_ref()
+            .map(|s| s.for_date(crate::clock::date_to_jiff(date)));
         let mut key = format!(
             "{DAILY_VERSION}|{}|{:?}|spike={}",
             state.tz,
