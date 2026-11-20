@@ -14,12 +14,18 @@ pub const META: SpokeMeta = SpokeMeta {
 pub struct Backups {
     dir: PathBuf,
     keep: usize,
+    min_free_mb: u64,
     offsite: Option<Offsite>,
 }
 
 impl Backups {
-    pub fn new(dir: PathBuf, keep: usize, offsite: Option<Offsite>) -> Self {
-        Self { dir, keep, offsite }
+    pub fn new(dir: PathBuf, keep: usize, min_free_mb: u64, offsite: Option<Offsite>) -> Self {
+        Self {
+            dir,
+            keep,
+            min_free_mb,
+            offsite,
+        }
     }
 }
 
@@ -34,6 +40,7 @@ impl Spoke for Backups {
                 ctx.pool,
                 self.dir,
                 self.keep,
+                self.min_free_mb,
                 ctx.tz,
                 self.offsite,
                 ctx.shutdown.wait(),

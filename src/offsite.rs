@@ -851,6 +851,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handles_old_db_and_new_db_gz_backups_together() {
+        let (client, store) = mock(10).await;
+        let offsite = offsite_for(client, "p/", 2);
+        // Two uncompressed backups from before, still in the bucket.
+        for key in ["p/solar-2026-10-01.db", "p/solar-2026-10-02.db"] {
+            offsite.client.put_object(key, b"x".to_vec()).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("solar-2026-10-03.db.gz");
+        std::fs::write(&path, "gz").unwrap();
+        let synced = offsite.upload_if_missing(&path).await.unwrap().unwrap();
+        assert_eq!(synced.key, "p/solar-2026-10-03.db.gz");
+        assert_eq!(synced.deleted, ["p/solar-2026-10-01.db"]);
+        assert_eq!(synced.count, 2);
+        assert_eq!(
+            store.objects.lock().unwrap()["bkt/p/solar-2026-10-03.db.gz"],
+            b"gz"
+        );
+        // Already there: nothing to do.
+        assert_eq!(offsite.upload_if_missing(&path).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn reports_what_was_deleted() {
         let (client, _) = mock(10).await;
         let offsite = offsite_for(client, "p/", 2);

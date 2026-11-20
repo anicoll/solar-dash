@@ -55,7 +55,7 @@ See [docs/how-to-run.md](docs/how-to-run.md). To run it on a server (Proxmox LXC
 - `src/globird/` - GloBird portal client (`client.rs`), the `globird-probe` command (`probe.rs`), the daily sync (`sync.rs`) and the row types it saves (`data.rs`)
 - `src/isolar/` - iSolarCloud client (`client.rs`) and request encryption (`crypto.rs`)
 - `config.example.toml` - template for `config.toml`
-- `deploy/` - systemd units, backup timer, cloudflared example and `install.sh`
+- `deploy/` - systemd units, cloudflared example and `install.sh`
 - `docs/` - documentation
 - `.vscode/` - recommended extensions and debug config
 - `.github/workflows/ci.yml` - CI (fmt, clippy, tests)

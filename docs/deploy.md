@@ -13,7 +13,6 @@ The files used here are in [`deploy/`](../deploy):
 | File | What it is |
 | --- | --- |
 | `solar-dash.service` | systemd unit that runs `solar-dash serve` as its own user |
-| `solar-dash-backup.service` / `.timer` | nightly SQLite backup at 03:30, keeps 14 days |
 | `solar-dash-update.service` / `.timer` | optional nightly `update.sh` run at about 04:30, off until you enable it |
 | `cloudflared-config.yml` | example Cloudflare Tunnel config |
 | `install.sh` | sets up the user, folders, binary and units |
@@ -26,7 +25,8 @@ Where things end up inside the LXC:
 | `/opt/solar-dash/solar-dash` | the program (and `update.sh`, `VERSION`) |
 | `/etc/solar-dash/config.toml` | your config and secrets (only root and the service can read it) |
 | `/var/lib/solar-dash/solar.db` | the database |
-| `/var/backups/solar-dash/` | nightly backups |
+| `/var/lib/solar-dash/backups/` | nightly backups (`solar-YYYY-MM-DD.db.gz`) |
+| `/var/backups/solar-dash/` | the `pre-update-*.db` backup that `update.sh` takes |
 
 ## 1. Create the LXC
 
@@ -128,8 +128,8 @@ cd /root/solar-dash
 
 It creates the `solar-dash` user and the folders, copies the program and the
 systemd units, creates `/etc/solar-dash/config.toml` from
-`config.example.toml` (only if you do not have one yet) and turns on the
-backup timer. It is safe to run again. It does **not** start solar-dash, because
+`config.example.toml` (only if you do not have one yet) and removes the old
+backup timer if an earlier install set one up. It is safe to run again. It does **not** start solar-dash, because
 the config still needs your values.
 
 Make the dashboard password hash (type the password twice) and a session secret:
@@ -352,43 +352,47 @@ instead.
 
 ## 8. Backups and restore
 
-There are two nightly backups. `serve` makes its own: at startup (if today's is
+`serve` makes one nightly backup of its own: at startup (if today's is
 missing) and then every day at 03:30 in the site time zone (`[site] timezone`), it writes
-`/var/lib/solar-dash/backups/solar-YYYY-MM-DD.db` (a `backups` folder next to
-the database; change it with `backup_dir` in `[database]`) and keeps the newest
-14 (`backup_keep`; `0` turns it off). The folder is inside `/var/lib/solar-dash`,
+`/var/lib/solar-dash/backups/solar-YYYY-MM-DD.db.gz` (gzip-compressed, about a
+quarter of the database size; a `backups` folder next to the database, change
+it with `backup_dir` in `[database]`) and keeps the newest 7 (`backup_keep`;
+`0` turns it off). Older uncompressed `solar-YYYY-MM-DD.db` files from earlier
+versions are pruned the same way. The folder is inside `/var/lib/solar-dash`,
 which the service user already owns and may write to, so the systemd unit needs
 no change. Look for `database backup written` in `journalctl -u solar-dash`.
-Restoring is the same as below, using a file from that folder. The newest one
-can also be downloaded from the "Database backup" card on the Admin page (handy
-for opening it with `sqlite3` elsewhere).
 
-The second one is the systemd timer, described next.
+Before writing, it checks the disk: if it would not have the size of the
+database (plus half again, for the compressed copy) and `backup_min_free_mb`
+(default 1024; `0` for no headroom) left free, it logs `not enough free disk
+space, skipping the database backup` and carries on without a backup that night
+rather than filling the disk and breaking the app.
 
-The timer runs every night at 03:30 and writes
-`/var/backups/solar-dash/solar-YYYY-MM-DD.db`. It uses SQLite's online
-backup, which is safe while solar-dash is running, and deletes backups older
-than 14 days. Useful commands:
+The newest backup can also be downloaded from the "Database backup" card on the
+Admin page; it is gzipped, so `gunzip` it before opening it with `sqlite3`.
+
+Earlier versions also installed a systemd timer (`solar-dash-backup.timer`)
+that wrote a second, uncompressed copy to `/var/backups/solar-dash/`. `install.sh`
+(and so `update.sh`) now removes it. The old `solar-*.db` copies it made are left
+in place and can be deleted to free space:
 
 ```sh
-systemctl list-timers solar-dash-backup.timer     # when it next runs
-systemctl start solar-dash-backup.service         # run a backup now
-journalctl -u solar-dash-backup.service           # see what happened
-ls -l /var/backups/solar-dash/
+rm /var/backups/solar-dash/solar-*.db     # not the pre-update-*.db files
 ```
 
-To restore a backup (pick a file from the list):
+To restore a backup (pick a file from the folder):
 
 ```sh
 systemctl stop solar-dash
-cp /var/backups/solar-dash/solar-2026-10-20.db /var/lib/solar-dash/solar.db
+gunzip -c /var/lib/solar-dash/backups/solar-2026-10-20.db.gz > /var/lib/solar-dash/solar.db
 rm -f /var/lib/solar-dash/solar.db-wal /var/lib/solar-dash/solar.db-shm
 chown solar-dash:solar-dash /var/lib/solar-dash/solar.db
 systemctl start solar-dash
 ```
 
 The `-wal` and `-shm` files belong to the old database, so they must be removed
-or SQLite may mix them with the restored file.
+or SQLite may mix them with the restored file. (An old uncompressed
+`solar-YYYY-MM-DD.db` is restored with `cp` instead of `gunzip -c`.)
 
 ### Offsite backups to Cloudflare R2
 
@@ -434,10 +438,10 @@ upload failed. It is kept in memory, so after a restart it shows the number of
 copies once the startup check of the bucket has run.
 
 How it works: right after the local backup is written, the file is uploaded as
-`<prefix>solar-YYYY-MM-DD.db` in one request, then the bucket is listed and the
+`<prefix>solar-YYYY-MM-DD.db.gz` in one request, then the bucket is listed and the
 oldest backups beyond `keep` are deleted. At startup, if the newest local backup
 is not in the bucket (for example the last upload failed), it is uploaded then.
-Only objects named exactly `<prefix>solar-YYYY-MM-DD.db` are ever deleted;
+Only objects named exactly `<prefix>solar-YYYY-MM-DD.db.gz` (or the older `.db`) are ever deleted;
 anything else in the bucket is left alone. `[database.offsite]` can point at
 another S3-compatible store with `endpoint = "https://..."` instead of
 `account_id`.
@@ -451,13 +455,13 @@ however old they are. Do not add a lifecycle rule to this bucket.
 
 To restore from R2, download the backup you want (the bucket's page in the
 Cloudflare dashboard has a **Download** action on each object, or use
-`rclone copy` or `wrangler r2 object get solar-dash-backups/solar-dash/solar-2026-10-20.db --file solar-2026-10-20.db --remote`).
+`rclone copy` or `wrangler r2 object get solar-dash-backups/solar-dash/solar-2026-10-20.db.gz --file solar-2026-10-20.db.gz --remote`).
 Then copy it into place with the service stopped, exactly like the restore
 steps above:
 
 ```sh
 systemctl stop solar-dash
-cp solar-2026-10-20.db /var/lib/solar-dash/solar.db
+gunzip -c solar-2026-10-20.db.gz > /var/lib/solar-dash/solar.db
 rm -f /var/lib/solar-dash/solar.db-wal /var/lib/solar-dash/solar.db-shm
 chown solar-dash:solar-dash /var/lib/solar-dash/solar.db
 systemctl start solar-dash

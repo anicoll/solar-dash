@@ -203,6 +203,10 @@ pub struct Database {
     /// How many daily backups to keep; 0 turns backups off.
     #[serde(default = "default_backup_keep")]
     pub backup_keep: usize,
+    /// Free space (MB) that must stay on the backup disk after a backup is
+    /// written; below that the night's backup is skipped. 0 = no headroom.
+    #[serde(default = "default_backup_min_free_mb")]
+    pub backup_min_free_mb: u64,
     /// Optional copy of each nightly backup in an S3-compatible bucket such as
     /// Cloudflare R2. Absent: no offsite copy.
     pub offsite: Option<Offsite>,
@@ -214,6 +218,7 @@ impl Default for Database {
             path: default_db_path(),
             backup_dir: None,
             backup_keep: default_backup_keep(),
+            backup_min_free_mb: default_backup_min_free_mb(),
             offsite: None,
         }
     }
@@ -1260,7 +1265,11 @@ fn default_db_path() -> String {
 }
 
 fn default_backup_keep() -> usize {
-    14
+    7
+}
+
+fn default_backup_min_free_mb() -> u64 {
+    1024
 }
 
 fn default_offsite_prefix() -> String {
@@ -1467,7 +1476,8 @@ mod tests {
         assert_eq!(cfg.server.bind, "127.0.0.1:8080");
         assert_eq!(cfg.database.path, "data/solar.db");
         assert_eq!(cfg.database.backup_dir(), PathBuf::from("data/backups"));
-        assert_eq!(cfg.database.backup_keep, 14);
+        assert_eq!(cfg.database.backup_keep, 7);
+        assert_eq!(cfg.database.backup_min_free_mb, 1024);
         assert_eq!(
             cfg.isolarcloud.as_ref().unwrap().timezone,
             "Australia/Adelaide"
@@ -1491,7 +1501,7 @@ mod tests {
         assert_eq!(off.prefix(), "solar-dash/");
         assert_eq!(off.keep, 15);
         // The section nests under [database], so the other settings still apply.
-        assert_eq!(cfg.database.backup_keep, 14);
+        assert_eq!(cfg.database.backup_keep, 7);
     }
 
     #[test]
@@ -1535,10 +1545,11 @@ mod tests {
     #[test]
     fn backup_settings_can_be_changed() {
         let cfg: Config = toml::from_str(&format!(
-            "{MINIMAL}\n[database]\npath = \"/var/lib/x/solar.db\"\nbackup_keep = 0\n"
+            "{MINIMAL}\n[database]\npath = \"/var/lib/x/solar.db\"\nbackup_keep = 0\nbackup_min_free_mb = 0\n"
         ))
         .unwrap();
         assert_eq!(cfg.database.backup_keep, 0);
+        assert_eq!(cfg.database.backup_min_free_mb, 0);
         // Next to the database unless `backup_dir` says otherwise.
         assert_eq!(
             cfg.database.backup_dir(),

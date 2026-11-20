@@ -57,8 +57,6 @@ else
     git -C "$repo_dir" rev-parse HEAD >/opt/solar-dash/VERSION 2>/dev/null || echo unknown >/opt/solar-dash/VERSION
 fi
 install -m 644 "$repo_dir/deploy/solar-dash.service" /etc/systemd/system/
-install -m 644 "$repo_dir/deploy/solar-dash-backup.service" /etc/systemd/system/
-install -m 644 "$repo_dir/deploy/solar-dash-backup.timer" /etc/systemd/system/
 install -m 644 "$repo_dir/deploy/solar-dash-update.service" /etc/systemd/system/
 install -m 644 "$repo_dir/deploy/solar-dash-update.timer" /etc/systemd/system/
 
@@ -71,8 +69,18 @@ else
     sed -i 's|^path = "data/solar.db"|path = "/var/lib/solar-dash/solar.db"|' /etc/solar-dash/config.toml
 fi
 
+# The old nightly backup timer is retired: solar-dash makes its own (gzipped)
+# backups now. Remove the units from earlier installs. Its old copies are left
+# alone.
+if [ -e /etc/systemd/system/solar-dash-backup.timer ]; then
+    echo "Removing the old solar-dash-backup timer..."
+    systemctl disable --now solar-dash-backup.timer || true
+    rm -f /etc/systemd/system/solar-dash-backup.timer /etc/systemd/system/solar-dash-backup.service
+    echo "Note: old copies in /var/backups/solar-dash/solar-*.db are no longer used;"
+    echo "you can delete them to free space."
+fi
+
 systemctl daemon-reload
-systemctl enable --now solar-dash-backup.timer
 
 cat <<'MSG'
 
