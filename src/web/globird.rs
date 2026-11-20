@@ -7,11 +7,11 @@
 //! The building blocks are pure functions, tested with plain numbers.
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::NaiveDate;
+use jiff::ToSpan;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -162,7 +162,7 @@ fn minus(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 /// estimate for the same day. `diff` is ours minus GloBird's, and is `None`
 /// when `ours` is.
 fn compare_row(
-    date: NaiveDate,
+    date: Date,
     lines: &[GlobirdCostRow],
     kwh: DayKwh,
     ours: Option<(&DayCost, &'static str)>,
@@ -304,34 +304,34 @@ pub async fn compare(
     let (from, count) = date_range(
         params.from.as_deref(),
         params.to.as_deref(),
-        state.tz,
+        &state.tz(),
         MAX_COMPARE_DAYS,
         DEFAULT_COMPARE_DAYS,
     )?;
-    let to = from + chrono::Days::new(count - 1);
+    let to = from + ((count - 1) as i64).days();
     let (from_text, to_text) = (from.to_string(), to.to_string());
 
     let cost_rows = db::globird_cost_in_range(&state.pool, &from_text, &to_text).await?;
     let mut kwh = kwh_by_date(db::globird_kwh_in_range(&state.pool, &from_text, &to_text).await?);
 
     // GloBird's days, oldest first (the query is ordered by date).
-    let mut lines_by_date: BTreeMap<NaiveDate, Vec<GlobirdCostRow>> = BTreeMap::new();
+    let mut lines_by_date: BTreeMap<Date, Vec<GlobirdCostRow>> = BTreeMap::new();
     for row in &cost_rows {
-        if let Ok(date) = NaiveDate::from_str(&row.date) {
+        if let Ok(date) = Date::strptime("%Y-%m-%d", &row.date) {
             lines_by_date.entry(date).or_default().push(row.clone());
         }
     }
 
     // Our estimate, only for the span GloBird has days in. `costed_days`
     // leaves out days it has no data for, and without a tariff there is none.
-    let mut ours: BTreeMap<NaiveDate, CostedDay> = BTreeMap::new();
+    let mut ours: BTreeMap<Date, CostedDay> = BTreeMap::new();
     let data = state.admin.get();
     if let (Some(tariff), Some(first), Some(last)) = (
         &data.tariff,
         lines_by_date.keys().next(),
         lines_by_date.keys().next_back(),
     ) {
-        let dates: Vec<NaiveDate> = first.iter_days().take_while(|d| d <= last).collect();
+        let dates: Vec<Date> = first.series(1.day()).take_while(|d| d <= last).collect();
         for day in costed_days(&state, tariff, &dates).await? {
             ours.insert(day.date, day);
         }
@@ -367,8 +367,8 @@ mod tests {
         }
     }
 
-    fn date(text: &str) -> NaiveDate {
-        NaiveDate::from_str(text).unwrap()
+    fn date(text: &str) -> Date {
+        Date::strptime("%Y-%m-%d", text).unwrap()
     }
 
     /// The 9 October fixture day, as stored (cents).

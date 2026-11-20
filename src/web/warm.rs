@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::Days;
+use jiff::ToSpan;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::{debug, info};
@@ -61,8 +61,8 @@ fn checked(name: &str, result: ApiResult) -> Option<Value> {
 /// `{"configured": false}` quickly, so it costs nothing.
 pub async fn warm(state: &AppState) {
     let started = Instant::now();
-    let today = today(state.tz);
-    let day = |n: u64| (today - Days::new(n)).to_string();
+    let today = today(&state.tz());
+    let day = |n: u64| (today - (n as i64).days()).to_string();
     let mut calls = 0;
 
     // The current bill period (and its dates, for the what-if below).

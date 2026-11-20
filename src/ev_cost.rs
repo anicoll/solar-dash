@@ -11,8 +11,8 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate, Timelike};
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use serde::Serialize;
 
 use crate::admin_data::SharedAdminData;
@@ -53,9 +53,12 @@ pub struct SessionCost {
 
 /// Local date and minutes since midnight for a unix time, or `None` for an
 /// absurd time far outside real data.
-fn local_time(tz: Tz, ts: i64) -> Option<(NaiveDate, u32)> {
-    let local = DateTime::from_timestamp(ts, 0)?.with_timezone(&tz);
-    Some((local.date_naive(), local.hour() * 60 + local.minute()))
+fn local_time(tz: &TimeZone, ts: i64) -> Option<(Date, u32)> {
+    let local = tz.to_datetime(jiff::Timestamp::from_second(ts).ok()?);
+    Some((
+        local.date(),
+        local.hour() as u32 * 60 + local.minute() as u32,
+    ))
 }
 
 /// The energy a session took, kWh: from the wall if we know it, otherwise
@@ -97,7 +100,7 @@ pub fn session_cost(
     session: &ChargeSession,
     samples: &[Sample],
     schedule: &TariffSchedule,
-    tz: Tz,
+    tz: &TimeZone,
     now: i64,
 ) -> Option<SessionCost> {
     let start = session.started_at;
@@ -425,7 +428,7 @@ pub fn historic_session_cost(
 }
 
 /// The bill that covers a local day, if there is one.
-fn bill_on(bills: &[PastBill], date: NaiveDate) -> Option<&PastBill> {
+fn bill_on(bills: &[PastBill], date: Date) -> Option<&PastBill> {
     bills.iter().find(|b| b.from <= date && date <= b.to)
 }
 
@@ -443,7 +446,7 @@ fn bill_on(bills: &[PastBill], date: NaiveDate) -> Option<&PastBill> {
 pub fn session_prices<'a>(
     schedule: &'a TariffSchedule,
     bills: &'a [PastBill],
-    tz: Tz,
+    tz: &'a TimeZone,
 ) -> impl Fn(i64) -> Prices + 'a {
     move |ts| {
         let Some((date, minute)) = local_time(tz, ts) else {
@@ -470,7 +473,7 @@ pub fn session_prices<'a>(
 pub fn historic_cost_key(
     schedule: &TariffSchedule,
     bills: &[PastBill],
-    tz: Tz,
+    tz: &TimeZone,
     started_at: i64,
 ) -> String {
     let date = local_time(tz, started_at).map(|(date, _)| date);
@@ -478,7 +481,10 @@ pub fn historic_cost_key(
     let bill = date
         .and_then(|d| bill_on(bills, d))
         .map_or("-".to_string(), |b| format!("{}..{}", b.from, b.to));
-    format!("{HISTORIC_COST_VERSION}|{tz}|{plan}|{bill}")
+    format!(
+        "{HISTORIC_COST_VERSION}|{}|{plan}|{bill}",
+        tz.iana_name().unwrap_or("UTC")
+    )
 }
 
 /// What the comparison with petrol is based on; see `[teslamate]` in
@@ -678,13 +684,13 @@ pub struct PetrolHistory {
 }
 
 impl PetrolHistory {
-    pub fn new(base: Option<f64>, mut changes: Vec<(NaiveDate, f64)>) -> Self {
+    pub fn new(base: Option<f64>, mut changes: Vec<(Date, f64)>) -> Self {
         changes.sort_by_key(|(from, _)| *from);
         Self {
             base,
             changes: changes
                 .into_iter()
-                .map(|(from, cents)| (from.format("%Y-%m-%d").to_string(), cents))
+                .map(|(from, cents)| (from.strftime("%Y-%m-%d").to_string(), cents))
                 .collect(),
         }
     }
@@ -943,7 +949,7 @@ pub fn summarise_car(
 /// A name for a plan in [`PlanCharging`]: the configured name, else its days
 /// ("Plan until 2026-05-24", "Plan from 2026-05-25"), else "Current plan" for
 /// a schedule of one plan.
-pub fn plan_label(name: Option<&str>, from: Option<NaiveDate>, until: Option<NaiveDate>) -> String {
+pub fn plan_label(name: Option<&str>, from: Option<Date>, until: Option<Date>) -> String {
     if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
         return name.to_string();
     }
@@ -1184,9 +1190,9 @@ pub fn monthly_km(readings: &[(String, f64)], from: &str) -> BTreeMap<String, f6
 mod tests {
     use super::*;
     use crate::config;
-    use chrono::TimeZone;
-
-    const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
 
     /// The ZeroHero-like plan: free from 11:00 to 14:00, 60.0 c from 15:00 to
     /// 23:00, 40 c otherwise, and 5 c for exporting.
@@ -1214,10 +1220,11 @@ mod tests {
     /// Unix time of a local Adelaide clock time on 2026-09-15 (no DST change
     /// that day, so +09:30).
     fn at(hour: u32, minute: u32) -> i64 {
-        ADELAIDE
-            .with_ymd_and_hms(2026, 9, 15, hour, minute, 0)
-            .unwrap()
-            .timestamp()
+        crate::clock::local_ts(
+            jiff::civil::datetime(2026, 9, 15, hour as i8, minute as i8, 0, 0),
+            &adelaide(),
+        )
+        .unwrap()
     }
 
     /// A session from `start` for `hours`, with 7.4 kWh taken from the wall.
@@ -1264,7 +1271,7 @@ mod tests {
         let (from, to) = (at(10, 0), at(11, 0));
         // Plenty of sun for the house and the car.
         let samples = steady(from, to, sample(0, 9000.0, 8000.0, -1000.0, 0.0));
-        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        let got = session_cost(&session(from, 1), &samples, &schedule(), &adelaide(), to).unwrap();
         close(got.solar_kwh, 7.4);
         close(got.battery_kwh, 0.0);
         close(got.grid_kwh, 0.0);
@@ -1278,7 +1285,7 @@ mod tests {
     fn all_grid_session_at_peak_price() {
         let (from, to) = (at(18, 0), at(19, 0));
         let samples = steady(from, to, sample(0, 0.0, 8000.0, 8000.0, 0.0));
-        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        let got = session_cost(&session(from, 1), &samples, &schedule(), &adelaide(), to).unwrap();
         close(got.grid_kwh, 7.4);
         close(got.solar_kwh, 0.0);
         close(got.cost_cents, 7.4 * 60.0);
@@ -1289,7 +1296,7 @@ mod tests {
     fn session_in_the_free_window_costs_nothing() {
         let (from, to) = (at(12, 0), at(13, 0));
         let samples = steady(from, to, sample(0, 0.0, 8000.0, 8000.0, 0.0));
-        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        let got = session_cost(&session(from, 1), &samples, &schedule(), &adelaide(), to).unwrap();
         close(got.grid_kwh, 7.4);
         close(got.cost_cents, 0.0);
     }
@@ -1299,7 +1306,7 @@ mod tests {
         let (from, to) = (at(18, 0), at(19, 0));
         // Load 8 kW: 2 kW solar, 2 kW from the battery, 4 kW from the grid.
         let samples = steady(from, to, sample(0, 2000.0, 8000.0, 4000.0, -2000.0));
-        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        let got = session_cost(&session(from, 1), &samples, &schedule(), &adelaide(), to).unwrap();
         close(got.solar_kwh, 7.4 * 0.25);
         close(got.battery_kwh, 7.4 * 0.25);
         close(got.grid_kwh, 7.4 * 0.5);
@@ -1311,7 +1318,7 @@ mod tests {
         let (from, to) = (at(18, 0), at(19, 0));
         // 6 kW of sun, 3 kW into the battery, load 8 kW: 3 kW solar, 5 kW grid.
         let samples = steady(from, to, sample(0, 6000.0, 8000.0, 5000.0, 3000.0));
-        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        let got = session_cost(&session(from, 1), &samples, &schedule(), &adelaide(), to).unwrap();
         close(got.solar_kwh, 7.4 * 3.0 / 8.0);
         close(got.battery_kwh, 0.0);
         close(got.grid_kwh, 7.4 * 5.0 / 8.0);
@@ -1322,7 +1329,7 @@ mod tests {
         let (from, to) = (at(18, 0), at(19, 0));
         // The session averaged 7.4 kW, but the house only used 2 kW.
         let samples = steady(from, to, sample(0, 0.0, 2000.0, 2000.0, 0.0));
-        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        let got = session_cost(&session(from, 1), &samples, &schedule(), &adelaide(), to).unwrap();
         close(got.grid_kwh, 2.0);
     }
 
@@ -1340,7 +1347,7 @@ mod tests {
             &session(start, 1),
             &samples,
             &schedule(),
-            ADELAIDE,
+            &adelaide(),
             start + 3600,
         )
         .unwrap();
@@ -1361,7 +1368,7 @@ mod tests {
             &session(start, 1),
             &samples,
             &schedule(),
-            ADELAIDE,
+            &adelaide(),
             start + 3600,
         )
         .unwrap();
@@ -1376,7 +1383,7 @@ mod tests {
     fn a_fully_covered_session_has_nothing_uncovered() {
         let (from, to) = (at(18, 0), at(19, 0));
         let samples = steady(from, to, sample(0, 0.0, 8000.0, 8000.0, 0.0));
-        let got = session_cost(&session(from, 1), &samples, &schedule(), ADELAIDE, to).unwrap();
+        let got = session_cost(&session(from, 1), &samples, &schedule(), &adelaide(), to).unwrap();
         close(got.uncovered_kwh, 0.0);
         close(got.grid_kwh, 7.4);
     }
@@ -1384,7 +1391,7 @@ mod tests {
     #[test]
     fn no_samples_or_no_energy_gives_no_cost() {
         let start = at(18, 0);
-        let none = session_cost(&session(start, 1), &[], &schedule(), ADELAIDE, start).unwrap();
+        let none = session_cost(&session(start, 1), &[], &schedule(), &adelaide(), start).unwrap();
         close(none.coverage, 0.0);
         // No samples at all: the whole session is grid at the import price.
         close(none.grid_kwh, 7.4);
@@ -1396,12 +1403,12 @@ mod tests {
         empty.energy_used_kwh = None;
         empty.energy_added_kwh = None;
         assert_eq!(
-            session_cost(&empty, &[], &schedule(), ADELAIDE, start),
+            session_cost(&empty, &[], &schedule(), &adelaide(), start),
             None
         );
         let instant = session(start, 0);
         assert_eq!(
-            session_cost(&instant, &[], &schedule(), ADELAIDE, start),
+            session_cost(&instant, &[], &schedule(), &adelaide(), start),
             None
         );
     }
@@ -1412,7 +1419,7 @@ mod tests {
         let samples = steady(from, to, sample(0, 0.0, 8000.0, 8000.0, 0.0));
         let mut old = session(from, 1);
         old.energy_used_kwh = None;
-        let got = session_cost(&old, &samples, &schedule(), ADELAIDE, to).unwrap();
+        let got = session_cost(&old, &samples, &schedule(), &adelaide(), to).unwrap();
         close(got.grid_kwh, 6.8);
     }
 
@@ -1424,7 +1431,7 @@ mod tests {
         running.ended_at = None;
         // 30 minutes in, with 3.7 kWh drawn so far.
         running.energy_used_kwh = Some(3.7);
-        let got = session_cost(&running, &samples, &schedule(), ADELAIDE, start + 1800).unwrap();
+        let got = session_cost(&running, &samples, &schedule(), &adelaide(), start + 1800).unwrap();
         close(got.coverage, 1.0);
         close(got.grid_kwh, 3.7);
     }
@@ -1556,20 +1563,15 @@ mod tests {
         ]);
         let sessions = [charge("2026-09", true, 10.0, Some(250.0))];
         // No base price; $2.00 from 1 Oct only. September has no price.
-        let history = PetrolHistory::new(
-            None,
-            vec![(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), 200.0)],
-        );
+        let history = PetrolHistory::new(None, vec![(jiff::civil::date(2026, 10, 1), 200.0)]);
         let summary = summarise(&prices(), &history, &km, &sessions);
         assert!(summary.configured);
         assert_eq!(summary.months[0].period.petrol_cost, None);
         assert_eq!(summary.months[1].period.petrol_cost, Some(16.0));
         assert_eq!(summary.total.petrol_cost, None);
         // With a base price of $1.00 and the change to $2.00 in October.
-        let history = PetrolHistory::new(
-            Some(100.0),
-            vec![(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), 200.0)],
-        );
+        let history =
+            PetrolHistory::new(Some(100.0), vec![(jiff::civil::date(2026, 10, 1), 200.0)]);
         let summary = summarise(&prices(), &history, &km, &sessions);
         assert_eq!(summary.months[0].period.petrol_cost, Some(32.0));
         assert_eq!(summary.months[1].period.petrol_cost, Some(16.0));
@@ -1866,7 +1868,8 @@ mod tests {
     #[test]
     fn prices_follow_the_plan_at_that_time() {
         let schedule = schedule();
-        let prices = session_prices(&schedule, &[], ADELAIDE);
+        let tz = adelaide();
+        let prices = session_prices(&schedule, &[], &tz);
         let peak = prices(at(18, 0));
         assert_eq!(
             peak,
@@ -1884,7 +1887,8 @@ mod tests {
     fn a_bill_day_imports_at_the_bills_average_but_keeps_the_plan_baseline() {
         let schedule = schedule();
         let bills = [bill("2026-09-10", "2026-09-15")];
-        let prices = session_prices(&schedule, &bills, ADELAIDE);
+        let tz = adelaide();
+        let prices = session_prices(&schedule, &bills, &tz);
         let got = prices(at(18, 0));
         // $50 over 200 kWh.
         close(got.import_cents, 25.0);
@@ -1902,14 +1906,14 @@ mod tests {
     fn the_cost_key_follows_the_rules_zone_plan_and_bill() {
         let schedule = schedule();
         let start = at(18, 0);
-        let plain = historic_cost_key(&schedule, &[], ADELAIDE, start);
+        let plain = historic_cost_key(&schedule, &[], &adelaide(), start);
         assert!(plain.starts_with(&format!("{HISTORIC_COST_VERSION}|Australia/Adelaide|")));
         assert!(plain.ends_with("|-"));
-        assert_eq!(plain, historic_cost_key(&schedule, &[], ADELAIDE, start));
+        assert_eq!(plain, historic_cost_key(&schedule, &[], &adelaide(), start));
         let billed = historic_cost_key(
             &schedule,
             &[bill("2026-09-10", "2026-09-15")],
-            ADELAIDE,
+            &adelaide(),
             start,
         );
         assert!(billed.ends_with("|2026-09-10..2026-09-15"));
@@ -1918,14 +1922,19 @@ mod tests {
         let elsewhere = historic_cost_key(
             &schedule,
             &[bill("2026-08-01", "2026-08-31")],
-            ADELAIDE,
+            &adelaide(),
             start,
         );
         assert_eq!(plain, elsewhere);
         // Another zone, or a changed plan, changes it.
         assert_ne!(
             plain,
-            historic_cost_key(&schedule, &[], chrono_tz::Australia::Perth, start)
+            historic_cost_key(
+                &schedule,
+                &[],
+                &crate::clock::site_tz("Australia/Perth").unwrap(),
+                start
+            )
         );
         let other = {
             #[derive(serde::Deserialize)]
@@ -1939,7 +1948,7 @@ mod tests {
             .unwrap();
             TariffSchedule::from_config(&w.tariff, &[]).unwrap()
         };
-        assert_ne!(plain, historic_cost_key(&other, &[], ADELAIDE, start));
+        assert_ne!(plain, historic_cost_key(&other, &[], &adelaide(), start));
     }
 
     fn car_day(date: &str, km: f64) -> CarDay {
@@ -1975,8 +1984,8 @@ mod tests {
         }
     }
 
-    fn naive(text: &str) -> NaiveDate {
-        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+    fn naive(text: &str) -> Date {
+        Date::strptime("%Y-%m-%d", text).unwrap()
     }
 
     #[test]

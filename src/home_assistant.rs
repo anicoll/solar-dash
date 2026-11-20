@@ -28,8 +28,8 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{NaiveDate, TimeZone, Utc};
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -342,7 +342,7 @@ pub struct Offer {
 pub struct TodaySnapshot {
     /// The local day all the figures are for. It changes at local midnight,
     /// which is what resets the energy sensors.
-    pub date: NaiveDate,
+    pub date: Date,
     pub energy: DayEnergy,
     pub money: Option<DayMoney>,
     pub amber: Option<AmberNow>,
@@ -363,11 +363,10 @@ pub struct AmberNow {
 
 /// The local date at unix time `now` in `tz`. This is what "today" means for
 /// the daily sensors, so they reset at local midnight, not at UTC midnight.
-pub fn local_date(now: i64, tz: Tz) -> NaiveDate {
-    Utc.timestamp_opt(now, 0)
-        .single()
-        .map(|t| t.with_timezone(&tz).date_naive())
-        .unwrap_or_default()
+pub fn local_date(now: i64, tz: &TimeZone) -> Date {
+    jiff::Timestamp::from_second(now)
+        .map(|t| tz.to_datetime(t).date())
+        .unwrap_or(jiff::civil::date(1970, 1, 1))
 }
 
 /// Decides when to publish and what. Holds the throttle clock.
@@ -924,7 +923,7 @@ mod tests {
     #[test]
     fn other_events_publish_nothing() {
         let mut feed = Feed::new(config(), Offer::default());
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let day = jiff::civil::date(2026, 1, 1);
         assert!(feed.on_event(&HubEvent::DayClosed(day)).is_empty());
     }
 
@@ -979,7 +978,7 @@ mod tests {
         assert!(will.retain);
     }
 
-    fn snapshot(date: NaiveDate) -> TodaySnapshot {
+    fn snapshot(date: Date) -> TodaySnapshot {
         TodaySnapshot {
             date,
             energy: DayEnergy {
@@ -1002,8 +1001,8 @@ mod tests {
         }
     }
 
-    fn day(d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 11, d).unwrap()
+    fn day(d: u32) -> Date {
+        jiff::civil::date(2026, 11, d as i8)
     }
 
     #[test]
@@ -1209,17 +1208,17 @@ mod tests {
 
     #[test]
     fn today_means_the_local_day_not_the_utc_day() {
-        let adelaide = chrono_tz::Australia::Adelaide;
+        let adelaide = crate::clock::site_tz("Australia/Adelaide").unwrap();
         // In November Adelaide is on daylight time (+10:30), so 13:29:59 UTC
         // is 23:59:59 local on the 10th.
-        let before = Utc
-            .with_ymd_and_hms(2026, 11, 10, 13, 29, 59)
+        let before = "2026-11-10T13:29:59Z"
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .timestamp();
-        assert_eq!(local_date(before, adelaide), day(10));
-        assert_eq!(local_date(before + 1, adelaide), day(11));
+            .as_second();
+        assert_eq!(local_date(before, &adelaide), day(10));
+        assert_eq!(local_date(before + 1, &adelaide), day(11));
         // At the same instants UTC is still on the 10th.
-        assert_eq!(local_date(before + 1, chrono_tz::UTC), day(10));
+        assert_eq!(local_date(before + 1, &TimeZone::UTC), day(10));
     }
 
     #[test]

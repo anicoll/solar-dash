@@ -50,7 +50,7 @@ async fn app_with(rules: SourceRules, plant: i64) -> (tempfile::TempDir, Router,
         .await
         .unwrap();
     let hash = hash_password(PASSWORD).unwrap();
-    let tz = chrono_tz::Australia::Adelaide;
+    let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
     let state = AppState::new(pool.clone(), plant, tz, &hash, Key::generate())
         .unwrap()
         .with_tariff(Some(flat_tariff()))
@@ -467,7 +467,7 @@ async fn seeded_install(rules: Option<SourceRules>) -> (tempfile::TempDir, Route
         .await
         .unwrap();
     let hash = hash_password(PASSWORD).unwrap();
-    let tz = chrono_tz::Australia::Adelaide;
+    let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
     let mut state = AppState::new(pool, PLANT, tz, &hash, Key::generate())
         .unwrap()
         .with_tariff(Some(flat_tariff()));

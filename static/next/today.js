@@ -629,6 +629,22 @@
   const BLOCK_S = 1800;
   /** The prices are re-fetched this long after each 5-minute boundary (the server fetches at +15 s). */
   const PRICE_REFRESH_AFTER_S = 20;
+  /**
+   * How long the last price stays on the card after its interval ends with no newer row. Right after
+   * each 5-minute boundary the server has not fetched the new interval yet (it does at +15 s), and a
+   * fetch can fail or be retried: the card keeps the last price, marked as updating, instead of blanking.
+   */
+  const PRICE_HOLD_S = 10 * 60;
+
+  /** The row that ended most recently, at most PRICE_HOLD_S before `ts`, or null. */
+  function justEnded(rows, ts) {
+    let best = null;
+    for (const r of rows || []) {
+      if (r.end > ts || ts - r.end >= PRICE_HOLD_S) continue;
+      if (!best || r.end > best.end || (r.end === best.end && r.start > best.start)) best = r;
+    }
+    return best;
+  }
 
   /**
    * "Price now": the live buy and sell price, then a scrollable timeline of 30-minute blocks from
@@ -640,28 +656,43 @@
     const settled = h('span', { class: 'label' });
     const figs = h('div', { class: 'today-figs today-price-figs' });
     // Redraw gate: what the last draw showed.
-    const ui = { sig: null, dataRef: null };
+    const ui = { sig: null, dataRef: null, buy: null, sell: null };
 
     const section = {
       el,
+      /** True while the card shows a held price (no stored row covers now yet). */
+      get holding() { return !!ui.holding; },
       update(force) {
         const prices = SD.caps.prices ? data.prices : null; // no price source: the card stays hidden
         const nowTs = Math.floor(Date.now() / 1000);
         const channels = (prices && prices.channels) || {};
         const nowRows = (prices && prices.now) || {};
-        const buy = nowRows.general || SD.price.at(channels.general, nowTs);
+        const liveBuy = nowRows.general || SD.price.at(channels.general, nowTs);
+        let buy = liveBuy;
+        let sell = nowRows.feed_in || SD.price.at(channels.feed_in, nowTs);
+        // No row covers now yet (just after a boundary, or a failed fetch): hold the price that just
+        // ended, from this data or from the last draw, so a reload at the wrong moment never blanks the card.
+        const holding = !liveBuy;
+        ui.holding = false;
+        if (holding) {
+          const recent = (rows, last) => justEnded(rows, nowTs) || (last && nowTs - last.end < PRICE_HOLD_S ? last : null);
+          buy = recent(channels.general, ui.buy);
+          sell = sell || recent(channels.feed_in, ui.sell);
+        }
         // No price source, no data, or only old data (the source stopped): hide the whole card.
-        el.hidden = !buy || buy.end <= nowTs;
+        el.hidden = !buy;
         if (el.hidden) return;
+        ui.holding = holding;
+        ui.buy = buy;
+        ui.sell = sell;
         // The live tick calls this every few seconds: redraw only when something that shows has changed,
         // so a scroll position, focus or open block is never lost for nothing.
-        const sig = `${Math.floor(nowTs / 60)}|${buy.start}`;
+        const sig = `${Math.floor(nowTs / 60)}|${buy.start}|${holding}`;
         if (!force && sig === ui.sig && data.prices === ui.dataRef) return;
         ui.sig = sig;
         ui.dataRef = data.prices;
 
         const spike = prices.spike_cents > 0 ? prices.spike_cents : 100;
-        const sell = nowRows.feed_in || SD.price.at(channels.feed_in, nowTs);
         const look = SD.price.look(buy, spike);
 
         const buyFig = h('div', { class: 'today-fig' },
@@ -673,9 +704,11 @@
         const sellFig = sell ? h('div', { class: 'today-fig' },
           h('div', { class: 'label', text: 'Selling earns' }),
           h('div', { class: 'fig fig-md', text: `${SD.price.sellText(sell.cents)} a kWh` }),
-          h('div', { class: 'today-price-sub', text: sell.cents > 0 ? 'you pay to export' : sell.cents < 0 ? `Amber sends ${SD.fmt.cents(sell.cents)}: paid to you` : '' })) : null;
+          h('div', { class: 'today-price-sub', text: sell.cents > 0 ? 'you pay to export' : sell.cents < 0 ? `Amber sends ${SD.price.sellText(sell.cents)}: paid to you` : '' })) : null;
 
         const local = SD.local(nowTs);
+        // A held price stands in for the "now" block too: without it a block with no row yet would drop
+        // out of the timeline and the row would jump back to midnight.
         timeline.update(prices, { nowTs, dayStart: nowTs - local.minute * 60 - local.sec, buy, spike });
 
         // The card's frame is built once, so the timeline's element is never detached (that would reset its scroll).
@@ -683,7 +716,8 @@
           fill(el, h('div', { class: 'card-head' }, h('h2', { class: 'section-title', id: 'today-price-h', text: 'Price now' }), settled),
             figs, timeline.el);
         }
-        settled.textContent = buy.fetched_at ? `Amber · settled ${SD.fmt.time(buy.fetched_at)}` : 'Amber';
+        settled.textContent = holding ? 'Amber · updating…'
+          : buy.fetched_at ? `Amber · settled ${SD.fmt.time(buy.fetched_at)}` : 'Amber';
         fill(figs, buyFig, sellFig);
         timeline.settle(); // the card is on the page now: scroll the first time it can
       },
@@ -862,6 +896,23 @@
 
   const ok = (p) => p.catch(() => null);
 
+  /**
+   * While the price card holds an old price, asks again every 20 s until a row covers now. The hold
+   * ends by itself after PRICE_HOLD_S (the card then hides), so this cannot run forever.
+   */
+  function retryPricesWhileHolding() {
+    if (!view) return;
+    clearTimeout(view.priceRetry);
+    if (!SD.caps.prices || !view.sections.price.holding) return;
+    view.priceRetry = setTimeout(async () => {
+      if (!view) return;
+      const p = await refreshPrices();
+      if (!view) return;
+      if (p) { data.prices = p; view.sections.price.update(); }
+      retryPricesWhileHolding();
+    }, 20 * 1000);
+  }
+
   /** The stored prices: all of today so far, and the forecast up to a day ahead. */
   function refreshPrices() {
     const nowTs = Math.floor(Date.now() / 1000);
@@ -894,8 +945,10 @@
     data.daily = daily && daily.days ? daily.days[0] || null : null;
     data.samples = samples;
     data.battery = battery;
-    data.prices = prices;
+    // A failed price fetch keeps the prices already on the page rather than blanking the card.
+    data.prices = prices || data.prices || null;
     updateAll();
+    retryPricesWhileHolding();
   }
 
   function updateAll() {
@@ -957,6 +1010,7 @@
             arm();
             const p = await refreshPrices();
             if (view && p) { data.prices = p; view.sections.price.update(); }
+            retryPricesWhileHolding();
           }, (at - now) * 1000);
         };
         arm();
@@ -975,6 +1029,7 @@
       view.stopMq();
       view.timers.forEach(clearInterval);
       clearTimeout(view.priceTimer);
+      clearTimeout(view.priceRetry);
       view = null;
     },
   });

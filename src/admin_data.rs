@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::SqliteConnection;
@@ -44,7 +44,7 @@ pub struct AdminData {
     /// blocks of `bill_length_days` from it (both ways) and this wins over
     /// `bill_start_day`. For retailers whose periods start on a different
     /// day each month.
-    pub bill_anchor_date: Option<NaiveDate>,
+    pub bill_anchor_date: Option<Date>,
     /// How many days each rolling bill lasts (7 to 92); used with
     /// `bill_anchor_date` only.
     pub bill_length_days: u32,
@@ -186,9 +186,7 @@ impl AdminData {
 }
 
 /// The plans in `tariff_plan`, earliest first, as `(valid_from, tariff)`.
-async fn load_plans(
-    conn: &mut SqliteConnection,
-) -> Result<Vec<(Option<NaiveDate>, config::Tariff)>> {
+async fn load_plans(conn: &mut SqliteConnection) -> Result<Vec<(Option<Date>, config::Tariff)>> {
     let rows = load_plan_rows(conn).await?;
     Ok(rows
         .into_iter()
@@ -199,7 +197,7 @@ async fn load_plans(
 /// Like [`load_plans`], with each plan's `id` as the first part.
 pub(crate) async fn load_plan_rows(
     conn: &mut SqliteConnection,
-) -> Result<Vec<(i64, Option<NaiveDate>, config::Tariff)>> {
+) -> Result<Vec<(i64, Option<Date>, config::Tariff)>> {
     let rows: Vec<(i64, Option<String>, String)> =
         sqlx::query_as("SELECT id, valid_from, body FROM tariff_plan ORDER BY valid_from, id")
             .fetch_all(&mut *conn)
@@ -349,7 +347,7 @@ pub fn apply_setting(data: &mut AdminData, key: &str, value: &Value) -> Result<(
             } else {
                 let date = value
                     .as_str()
-                    .and_then(|text| NaiveDate::parse_from_str(text, "%Y-%m-%d").ok())
+                    .and_then(|text| Date::strptime("%Y-%m-%d", text).ok())
                     .with_context(|| format!("{key} must be a date as YYYY-MM-DD"))?;
                 Some(date)
             };
@@ -529,7 +527,7 @@ mod tests {
             .await
             .unwrap();
         let hash = crate::web::hash_password("pw").unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let key = axum_extra::extract::cookie::Key::generate();
         (dir, AppState::new(pool, 1, tz, &hash, key).unwrap())
     }
@@ -607,7 +605,7 @@ mod tests {
         // And through the schedule, which is what the cache reads.
         let before = TariffSchedule::from_plans(&[(None, from_toml)]).unwrap();
         let after = TariffSchedule::from_plans(&[(None, back)]).unwrap();
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let day = jiff::civil::date(2026, 1, 1);
         assert_eq!(before.for_date(day).key(), after.for_date(day).key());
     }
 
@@ -617,7 +615,7 @@ mod tests {
         assert_eq!((data.bill_anchor_date, data.bill_length_days), (None, 28));
         apply_setting(&mut data, "bill_anchor_date", &json!("2026-09-02")).unwrap();
         apply_setting(&mut data, "bill_length_days", &json!(30)).unwrap();
-        assert_eq!(data.bill_anchor_date, NaiveDate::from_ymd_opt(2026, 9, 2));
+        assert_eq!(data.bill_anchor_date, Some(jiff::civil::date(2026, 9, 2)));
         assert_eq!(data.bill_length_days, 30);
         for bad in [
             json!("2026-02-30"),

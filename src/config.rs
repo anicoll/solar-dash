@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{NaiveDate, NaiveTime};
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -442,7 +442,7 @@ impl Teslamate {
                 "compare_cars in [teslamate] needs a model and a car name in every entry"
             );
         }
-        let mut last: Option<NaiveDate> = None;
+        let mut last: Option<Date> = None;
         for (i, p) in self.petrol_price.iter().enumerate() {
             let section = format!("[[teslamate.petrol_price]] #{}", i + 1);
             let from = parse_date(&p.from).with_context(|| format!("from in {section}"))?;
@@ -501,10 +501,10 @@ impl Globird {
     }
 
     /// `sync_time` as a time of day.
-    pub fn sync_time_of_day(&self) -> Result<NaiveTime> {
+    pub fn sync_time_of_day(&self) -> Result<jiff::civil::Time> {
         let minutes = parse_hhmm(&self.sync_time).context("sync_time in [globird]")?;
         // `parse_hhmm` guarantees less than 24 hours, so this always succeeds.
-        NaiveTime::from_hms_opt(minutes / 60, minutes % 60, 0)
+        jiff::civil::Time::new((minutes / 60) as i8, (minutes % 60) as i8, 0, 0)
             .context("sync_time in [globird] is not a valid time of day")
     }
 }
@@ -843,7 +843,7 @@ pub struct Amber {
     pub site_id: Option<String>,
     /// How far back `serve` fills in past prices (a `YYYY-MM-DD` date).
     /// Optional: the default is two years back.
-    pub backfill_from: Option<chrono::NaiveDate>,
+    pub backfill_from: Option<jiff::civil::Date>,
     #[serde(default = "default_amber_base_url")]
     pub base_url: String,
     /// The made-up plan behind the Bill page's "What would Amber cost?".
@@ -1098,7 +1098,7 @@ fn check_previous_tariffs(previous: &[PreviousTariff], has_current: bool) -> Res
         previous.is_empty() || has_current,
         "[[previous_tariff]] needs a [tariff] section for the plan since the last `until`"
     );
-    let mut last: Option<NaiveDate> = None;
+    let mut last: Option<Date> = None;
     for (i, p) in previous.iter().enumerate() {
         let section = format!("[[previous_tariff]] #{}", i + 1);
         let until = parse_date(&p.until).with_context(|| format!("until in {section}"))?;
@@ -1173,9 +1173,11 @@ impl Purchase {
     }
 }
 
-/// Parse a "YYYY-MM-DD" date. Strict, like [`parse_hhmm`].
-pub fn parse_date(text: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+/// Parse a "YYYY-MM-DD" date. Same rules as the parser this replaced: it takes
+/// one or two digits for the month and day (`2026-1-5`), skips leading
+/// whitespace and rejects anything after the day.
+pub fn parse_date(text: &str) -> Result<Date> {
+    Date::strptime("%Y-%m-%d", text)
         .with_context(|| format!("\"{text}\" is not a date in YYYY-MM-DD form"))
 }
 
@@ -1283,7 +1285,7 @@ fn default_offsite_keep() -> usize {
 impl Config {
     /// The site's time zone: `[site] timezone`, else `[isolarcloud] timezone`
     /// (older configs), else the default.
-    pub fn timezone(&self) -> Result<chrono_tz::Tz> {
+    pub fn timezone(&self) -> Result<jiff::tz::TimeZone> {
         let name = self
             .site
             .as_ref()
@@ -1294,8 +1296,7 @@ impl Config {
                     .map(|cloud| cloud.timezone.clone())
             })
             .unwrap_or_else(default_timezone);
-        name.parse()
-            .map_err(|_| anyhow::anyhow!("unknown timezone {name:?} in config.toml"))
+        crate::clock::site_tz(&name).context("in config.toml")
     }
 
     /// The `[isolarcloud]` section, or a clear error for commands that need it.
@@ -1627,7 +1628,7 @@ mod tests {
         assert!(evening.check().is_ok());
         assert_eq!(
             evening.sync_time_of_day().unwrap(),
-            NaiveTime::from_hms_opt(18, 30, 0).unwrap()
+            jiff::civil::time(18, 30, 0, 0)
         );
         for bad in ["9:00", "25:00", "09:60", "noon", ""] {
             let globird = parse(&format!("sync_time = \"{bad}\""));
@@ -1675,7 +1676,7 @@ mod tests {
         assert_eq!(parse("").backfill_from, None);
         assert_eq!(
             parse("backfill_from = \"2024-03-01\"").backfill_from,
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 1)
+            Some(jiff::civil::date(2024, 3, 1))
         );
         let bad_date = format!("{MINIMAL}\n[amber]\ntoken = \"t\"\nbackfill_from = \"soon\"\n");
         assert!(toml::from_str::<Config>(&bad_date).is_err());
@@ -2156,6 +2157,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_date_keeps_its_old_leniency() {
+        use jiff::civil::date;
+        assert_eq!(parse_date("2026-10-20").unwrap(), date(2026, 10, 20));
+        // Un-padded months and days, and leading whitespace, were accepted.
+        for ok in ["2026-1-5", "2026-01-5", "2026-1-05", " 2026-01-05"] {
+            assert_eq!(parse_date(ok).unwrap(), date(2026, 1, 5), "{ok}");
+        }
+        for bad in [
+            "",
+            "2026-01-05 ",
+            "2026-01-05x",
+            "2026-01-05T00:00",
+            "2026/01/05",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-001-05",
+            "12026-01-05",
+        ] {
+            assert!(parse_date(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
     fn tariff_errors_name_the_field() {
         let base = "supply_cents_per_day = 1.0\ndefault_import_cents = 1.0\n";
         let cases = [
@@ -2464,28 +2488,40 @@ mod tests {
     fn isolarcloud_section_is_optional_and_site_sets_the_timezone() {
         let cfg: Config = toml::from_str("[site]\ntimezone = \"Australia/Sydney\"\n").unwrap();
         assert!(cfg.isolarcloud.is_none());
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Sydney);
+        assert_eq!(
+            cfg.timezone().unwrap().iana_name(),
+            Some("Australia/Sydney")
+        );
     }
 
     #[test]
     fn old_config_keeps_the_isolarcloud_timezone() {
         let cfg: Config = toml::from_str(CLOUD_TZ).unwrap();
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Perth);
+        assert_eq!(cfg.timezone().unwrap().iana_name(), Some("Australia/Perth"));
     }
 
     #[test]
     fn site_timezone_wins_over_isolarcloud() {
         let text = format!("{CLOUD_TZ}\n[site]\ntimezone = \"Australia/Sydney\"\n");
         let cfg: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Sydney);
+        assert_eq!(
+            cfg.timezone().unwrap().iana_name(),
+            Some("Australia/Sydney")
+        );
     }
 
     #[test]
     fn no_timezone_anywhere_gives_the_default() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Adelaide);
+        assert_eq!(
+            cfg.timezone().unwrap().iana_name(),
+            Some("Australia/Adelaide")
+        );
         let cfg: Config = toml::from_str(MINIMAL).unwrap();
-        assert_eq!(cfg.timezone().unwrap(), chrono_tz::Australia::Adelaide);
+        assert_eq!(
+            cfg.timezone().unwrap().iana_name(),
+            Some("Australia/Adelaide")
+        );
     }
 
     #[test]

@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::DateTime;
-use chrono_tz::Tz;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -332,13 +332,13 @@ async fn record(
 /// new day, then at most every [`ODOMETER_EVERY_SECS`], and never for a
 /// reading that has not changed (the car's odometer sits still while parked).
 struct Odometer {
-    tz: Tz,
+    tz: TimeZone,
     /// The local day, km and unix seconds of the last write.
     last: Option<(String, f64, i64)>,
 }
 
 impl Odometer {
-    fn new(tz: Tz) -> Self {
+    fn new(tz: TimeZone) -> Self {
         Self { tz, last: None }
     }
 
@@ -346,9 +346,10 @@ impl Odometer {
     /// ("YYYY-MM-DD") and km to write, if it is time to.
     fn next(&mut self, state: &CarState, now: i64) -> Option<(String, f64)> {
         let km = state.odometer_km?;
-        let date = DateTime::from_timestamp(now, 0)?
-            .with_timezone(&self.tz)
-            .date_naive()
+        let date = self
+            .tz
+            .to_datetime(Timestamp::from_second(now).ok()?)
+            .date()
             .to_string();
         if let Some((last_date, last_km, saved_at)) = &self.last
             && *last_date == date
@@ -397,7 +398,7 @@ pub async fn run(
     config: Teslamate,
     car: Car,
     pool: SqlitePool,
-    tz: Tz,
+    tz: TimeZone,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let mut options = MqttOptions::new("solar-dash", &config.host, config.port);
@@ -861,17 +862,22 @@ mod tests {
     }
 
     /// Unix time of a local Adelaide clock time in September 2026 (+09:30).
-    fn adelaide(day: u32, hour: u32, minute: u32) -> i64 {
-        use chrono::TimeZone;
-        chrono_tz::Australia::Adelaide
-            .with_ymd_and_hms(2026, 9, day, hour, minute, 0)
+    fn adelaide(day: i8, hour: i8, minute: i8) -> i64 {
+        jiff::civil::date(2026, 9, day)
+            .at(hour, minute, 0, 0)
+            .to_zoned_datetime(adelaide_tz())
             .unwrap()
             .timestamp()
+            .as_second()
+    }
+
+    fn adelaide_tz() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
     }
 
     #[test]
     fn odometer_is_saved_at_most_every_half_hour() {
-        let mut odometer = Odometer::new(chrono_tz::Australia::Adelaide);
+        let mut odometer = Odometer::new(adelaide_tz());
         // Nothing to save until the car has sent its odometer.
         assert_eq!(
             odometer.next(&CarState::default(), adelaide(15, 8, 0)),
@@ -889,7 +895,7 @@ mod tests {
 
     #[test]
     fn odometer_saves_at_once_on_a_new_local_day() {
-        let mut odometer = Odometer::new(chrono_tz::Australia::Adelaide);
+        let mut odometer = Odometer::new(adelaide_tz());
         odometer.next(&driven(1000.0), adelaide(15, 23, 50));
         // Ten minutes later, past local midnight (still the 15th in UTC).
         let next_day = Some(("2026-09-16".to_string(), 1000.0));

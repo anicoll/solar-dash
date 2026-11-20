@@ -3,6 +3,7 @@ mod admin_import;
 mod amber;
 mod backup;
 mod bills;
+mod clock;
 mod config;
 mod cost;
 mod db;
@@ -27,8 +28,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
-use chrono_tz::Tz;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -244,7 +243,7 @@ async fn run_serve(config: Config) -> Result<()> {
     });
     let ctx = hub::SpokeContext {
         pool,
-        tz,
+        tz: tz.clone(),
         shutdown,
         hub: hub::Hub::default(),
     };
@@ -309,7 +308,7 @@ fn warn_unconfigured_sources(config: &Config) {
 /// Opens the database, logs in and downloads history starting at `from`.
 async fn run_backfill(config: Config, from: &str) -> Result<()> {
     // Check the date first, so a typo fails before any network call.
-    let from = NaiveDate::parse_from_str(from, "%Y-%m-%d")
+    let from = jiff::civil::Date::strptime("%Y-%m-%d", from)
         .with_context(|| format!("--from must look like 2024-01-01, got {from:?}"))?;
     let cloud = config.require_isolarcloud("backfill")?;
     let pool = db::open(&config.database.path).await?;
@@ -345,7 +344,7 @@ fn with_leading_slash(path: &str) -> String {
 
 /// Logs in to the GloBird portal and writes a redacted dump of its endpoints.
 async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
-    let tz: Tz = config.timezone()?;
+    let tz = config.timezone()?;
     let globird = config.globird.context(
         "globird-probe needs a [globird] section in config.toml (see config.example.toml)",
     )?;
@@ -354,16 +353,16 @@ async fn globird_probe(config: Config, out: &Path, days: u32) -> Result<()> {
         bail!("--days must be between 1 and 366, got {days}");
     }
     let client = globird::client::Client::new(globird)?;
-    globird::probe::run(client, tz, days, out).await
+    globird::probe::run(client, &tz, days, out).await
 }
 
 /// Prints what the Amber API returns for the configured site.
 async fn amber_probe(config: Config, json: Option<&Path>) -> Result<()> {
-    let tz: Tz = config.timezone()?;
+    let tz = config.timezone()?;
     let amber = config
         .amber
         .context("amber-probe needs an [amber] section in config.toml (see config.example.toml)")?;
-    amber::probe::run(&amber, tz, json).await
+    amber::probe::run(&amber, &tz, json).await
 }
 
 /// Reads the inverter once, or with `watch` every `interval_secs` until Ctrl+C.
@@ -403,7 +402,9 @@ async fn modbus_test(config: Config, watch: bool) -> Result<()> {
             _ = &mut shutdown => break,
             _ = ticker.tick() => {}
         }
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let now = jiff::tz::TimeZone::system()
+            .to_datetime(jiff::Timestamp::now())
+            .strftime("%Y-%m-%d %H:%M:%S");
         // Stop at once on Ctrl+C even if the read is in progress.
         let result = tokio::select! {
             _ = &mut shutdown => break,

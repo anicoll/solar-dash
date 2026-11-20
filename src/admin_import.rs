@@ -81,9 +81,9 @@ async fn import_tariffs(conn: &mut SqliteConnection, config: &Config) -> Result<
                 .or_else(|| previous.tariff.name.clone()),
             ..previous.tariff.clone()
         };
-        plans.push((start.map(|d: chrono::NaiveDate| d.to_string()), tariff));
+        plans.push((start.map(|d: jiff::civil::Date| d.to_string()), tariff));
         let until = parse_date(&previous.until)?;
-        start = Some(until.succ_opt().context("until is too late")?);
+        start = Some(until.tomorrow().context("until is too late")?);
     }
     plans.push((start.map(|d| d.to_string()), current.clone()));
     for (valid_from, tariff) in &plans {

@@ -46,7 +46,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use axum_extra::extract::cookie::Key;
 use base64::Engine;
-use chrono_tz::Tz;
+use jiff::tz::TimeZone;
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
@@ -81,7 +81,7 @@ struct Assets;
 pub struct AppState {
     pool: SqlitePool,
     plant_id: i64,
-    tz: Tz,
+    tz: TimeZone,
     /// The Argon2 PHC string the login password is checked against.
     password_hash: Arc<str>,
     /// Signs the session cookie.
@@ -139,7 +139,7 @@ impl AppState {
     pub fn new(
         pool: SqlitePool,
         plant_id: i64,
-        tz: Tz,
+        tz: TimeZone,
         password_hash: &str,
         key: Key,
     ) -> Result<Self> {
@@ -361,8 +361,8 @@ impl AppState {
     }
 
     /// The plant's time zone, which decides where a day ends.
-    pub fn tz(&self) -> Tz {
-        self.tz
+    pub fn tz(&self) -> TimeZone {
+        self.tz.clone()
     }
 
     /// Builds the state from the config, with clear errors for missing settings.
@@ -787,7 +787,7 @@ mod tests {
         db::seed_metrics(&pool, PLANT, &readings).await;
 
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
             .unwrap()
             .with_cookie_secure(cookie_secure);
@@ -853,7 +853,7 @@ mod tests {
             .await
             .unwrap();
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let mut state = AppState::new(pool, 0, tz, &hash, Key::generate())
             .unwrap()
             .with_enabled_spokes(enabled);
@@ -1049,7 +1049,7 @@ mod tests {
             .await
             .unwrap();
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
             .unwrap()
             .with_api_token(token)
@@ -1332,7 +1332,14 @@ mod tests {
             .await
             .unwrap();
         let hash = hash_password(PASSWORD).unwrap();
-        let state = AppState::new(pool.clone(), 0, chrono_tz::UTC, &hash, Key::generate()).unwrap();
+        let state = AppState::new(
+            pool.clone(),
+            0,
+            jiff::tz::TimeZone::UTC,
+            &hash,
+            Key::generate(),
+        )
+        .unwrap();
         let app = router(state);
         let cookie = log_in(&app).await;
         for (ts, value) in [(1000, 1.0), (1015, 2.0), (5000, 9.0)] {
@@ -1784,7 +1791,7 @@ mod tests {
     #[tokio::test]
     async fn prices_are_grouped_by_channel_with_the_current_one() {
         let (_dir, app, pool) = test_app_with_pool().await;
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::clock::unix_now();
         let slot = now - now % 300;
         let row = |channel: &str, start: i64, cents: f64, kind: &str| {
             let pool = pool.clone();
@@ -1880,9 +1887,9 @@ mod tests {
         let (_dir, app, pool) = test_app_with_pool().await;
         let cookie = log_in(&app).await;
         // All of yesterday: a day needs 95% coverage before its totals count.
-        let tz = chrono_tz::Australia::Adelaide;
-        let date = api::today(tz).pred_opt().unwrap();
-        let (start, end) = api::day_bounds_or_error(date, tz).unwrap();
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let date = api::today(&tz.clone()).yesterday().unwrap();
+        let (start, end) = api::day_bounds_or_error(date, &tz.clone()).unwrap();
         for ts in (start..=end).step_by(30) {
             let mut sample = live_sample(ts);
             (sample.pv_w, sample.load_w) = (Some(3600.0), Some(1800.0));
@@ -2010,7 +2017,7 @@ mod tests {
             .await
             .unwrap();
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let state = AppState::new(pool, PLANT, tz, &hash, Key::generate())
             .unwrap()
             .with_cookie_secure(true);
@@ -2164,7 +2171,7 @@ mod tests {
         assert_eq!(body_json(response).await["sessions"][0]["cost"], 1.85);
         let no_tariff = {
             let hash = hash_password(PASSWORD).unwrap();
-            let tz = chrono_tz::Australia::Adelaide;
+            let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
             router(AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate()).unwrap())
         };
         let cookie = log_in(&no_tariff).await;
@@ -2179,7 +2186,7 @@ mod tests {
         let (_dir, _app, pool) = costs_app().await;
         let router_with = |prices: EvPrices| {
             let hash = hash_password(PASSWORD).unwrap();
-            let tz = chrono_tz::Australia::Adelaide;
+            let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
             router(
                 AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
                     .unwrap()
@@ -2295,11 +2302,8 @@ mod tests {
         // A monthly price history works without a base price, and the month
         // uses its own price ($2.10 from 1 Sep, not the $1.95 base).
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
-        let history = PetrolHistory::new(
-            Some(195.0),
-            vec![(chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), 210.0)],
-        );
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let history = PetrolHistory::new(Some(195.0), vec![(jiff::civil::date(2026, 9, 1), 210.0)]);
         let app = router(
             AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
                 .unwrap()
@@ -2328,7 +2332,7 @@ mod tests {
         let (_dir, _app, pool) = costs_app().await;
         let router_with = |petrol: PetrolHistory| {
             let hash = hash_password(PASSWORD).unwrap();
-            let tz = chrono_tz::Australia::Adelaide;
+            let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
             let prices = EvPrices {
                 petrol_cents_per_litre: None,
                 petrol_litres_per_100km: 8.0,
@@ -2345,7 +2349,7 @@ mod tests {
                     ),
             )
         };
-        let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        let day = |d: i8| jiff::civil::date(2026, 9, d);
         let app = router_with(PetrolHistory::new(Some(190.0), vec![(day(10), 200.0)]));
         let response = send(&app, get_request("/api/ev/cars", None)).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -2764,7 +2768,7 @@ mod tests {
     /// A router over `pool` with this tariff.
     fn costs_router(pool: &SqlitePool, tariff: TariffSchedule) -> Router {
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
             .unwrap()
             .with_tariff(Some(tariff));
@@ -2840,11 +2844,11 @@ mod tests {
     async fn current_bill_steps_back_to_a_finished_period() {
         let (_dir, app, pool) = costs_app().await;
         let cookie = log_in(&app).await;
-        let tz = chrono_tz::Australia::Adelaide;
-        let today = api::today(tz);
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let today = api::today(&tz.clone());
         // Data from 90 days ago, so the periods just before now have a past.
-        let first_day = today - chrono::Days::new(90);
-        let start = api::day_bounds_or_error(first_day, tz).unwrap().0;
+        let first_day = today - jiff::ToSpan::days(90);
+        let start = api::day_bounds_or_error(first_day, &tz.clone()).unwrap().0;
         seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
 
         let current = bill_json(&app, &cookie, "/api/bill/current").await;
@@ -2852,7 +2856,7 @@ mod tests {
         assert!(current["next_date"].is_null());
         assert!(current["prev_date"].is_string());
 
-        let date = today - chrono::Days::new(35);
+        let date = today - jiff::ToSpan::days(35);
         let uri = format!("/api/bill/current?date={date}");
         let past = bill_json(&app, &cookie, &uri).await;
         let (from, to) = (past["from"].as_str().unwrap(), past["to"].as_str().unwrap());
@@ -2880,7 +2884,7 @@ mod tests {
         .await;
         assert_eq!(
             next["from"].as_str().unwrap(),
-            (chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d").unwrap() + chrono::Days::new(1))
+            (jiff::civil::Date::strptime("%Y-%m-%d", to).unwrap() + jiff::ToSpan::days(1))
                 .to_string()
         );
     }
@@ -2898,7 +2902,8 @@ mod tests {
     async fn current_bill_rejects_bad_and_future_dates() {
         let (_dir, app, _pool) = costs_app().await;
         let cookie = log_in(&app).await;
-        let tomorrow = api::today(chrono_tz::Australia::Adelaide) + chrono::Days::new(1);
+        let tomorrow = api::today(&crate::clock::site_tz("Australia/Adelaide").unwrap())
+            + jiff::ToSpan::days(1);
         for uri in [
             "/api/bill/current?date=bad".to_string(),
             "/api/bill/current?date=2026-13-01".to_string(),
@@ -3124,7 +3129,7 @@ mod tests {
         let state = AppState::new(
             pool.clone(),
             PLANT,
-            chrono_tz::Australia::Adelaide,
+            crate::clock::site_tz("Australia/Adelaide").unwrap(),
             &hash,
             Key::generate(),
         )
@@ -3217,7 +3222,7 @@ mod tests {
         let state = AppState::new(
             pool.clone(),
             PLANT,
-            chrono_tz::Australia::Adelaide,
+            crate::clock::site_tz("Australia/Adelaide").unwrap(),
             &hash,
             Key::generate(),
         )
@@ -3287,7 +3292,7 @@ mod tests {
 
         // The bill's tariff split and the battery discharge too.
         let schedule = flat_tariff();
-        let dates: Vec<chrono::NaiveDate> = ["2026-09-15", "2026-09-16", "2026-09-17"]
+        let dates: Vec<jiff::civil::Date> = ["2026-09-15", "2026-09-16", "2026-09-17"]
             .iter()
             .map(|d| d.parse().unwrap())
             .collect();
@@ -3372,15 +3377,22 @@ mod tests {
     #[tokio::test]
     async fn house_intervals_cover_the_days_a_time_touches() {
         let (_dir, _app, pool) = costs_app().await;
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         // The 15th has counters all day; the 16th has none.
         seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
         let now = SEP_15_START + 3 * 86_400;
         let (start, end) = (SEP_15_START + 3 * 3600, SEP_15_START + 5 * 3600);
-        let (intervals, covered) =
-            costs::house_intervals(&pool, PLANT, tz, start, end, now, &SourceRules::default())
-                .await
-                .unwrap();
+        let (intervals, covered) = costs::house_intervals(
+            &pool,
+            PLANT,
+            &tz.clone(),
+            start,
+            end,
+            now,
+            &SourceRules::default(),
+        )
+        .await
+        .unwrap();
         assert!(!intervals.is_empty());
         // The whole day is the source, so these are the day's intervals.
         assert!(intervals.iter().any(|i| i.start_ts < start));
@@ -3392,7 +3404,7 @@ mod tests {
         let (_, covered) = costs::house_intervals(
             &pool,
             PLANT,
-            tz,
+            &tz.clone(),
             night.0,
             night.1,
             now,
@@ -3407,7 +3419,7 @@ mod tests {
         let (intervals, covered) = costs::house_intervals(
             &pool,
             PLANT,
-            tz,
+            &tz.clone(),
             later,
             later + 3600,
             now,
@@ -3417,10 +3429,17 @@ mod tests {
         .unwrap();
         assert!(intervals.is_empty());
         assert_eq!(covered, 0.0);
-        let (intervals, covered) =
-            costs::house_intervals(&pool, PLANT, tz, start, start, now, &SourceRules::default())
-                .await
-                .unwrap();
+        let (intervals, covered) = costs::house_intervals(
+            &pool,
+            PLANT,
+            &tz.clone(),
+            start,
+            start,
+            now,
+            &SourceRules::default(),
+        )
+        .await
+        .unwrap();
         assert!(intervals.is_empty());
         assert_eq!(covered, 0.0);
     }
@@ -3444,8 +3463,10 @@ mod tests {
 
     /// Unix time of the start of today's local day.
     fn today_start() -> i64 {
-        let tz = chrono_tz::Australia::Adelaide;
-        api::day_bounds_or_error(api::today(tz), tz).unwrap().0
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        api::day_bounds_or_error(api::today(&tz.clone()), &tz.clone())
+            .unwrap()
+            .0
     }
 
     /// Seconds after midnight of the last reading of a complete cloud day (23:55).
@@ -3454,7 +3475,7 @@ mod tests {
     #[tokio::test]
     async fn finished_days_come_from_the_cache_but_today_is_recomputed() {
         let (_dir, app, pool) = costs_app().await;
-        let today = api::today(chrono_tz::Australia::Adelaide);
+        let today = api::today(&crate::clock::site_tz("Australia/Adelaide").unwrap());
         let range = format!("from=2026-09-15&to={today}");
         seed_counters(&pool, SEP_15_START, &[3600, LAST_READING], 1000.0).await;
         seed_counters(&pool, today_start(), &[3600], 1000.0).await;
@@ -3506,9 +3527,10 @@ mod tests {
     #[tokio::test]
     async fn costs_show_the_cars_fuel_saving_per_bucket_and_in_total() {
         let (_dir, plain, pool) = costs_app().await;
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         for date in ["2026-09-15", "2026-09-16"] {
-            let (day_start, _) = api::day_bounds_or_error(date.parse().unwrap(), tz).unwrap();
+            let (day_start, _) =
+                api::day_bounds_or_error(date.parse().unwrap(), &tz.clone()).unwrap();
             seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
         }
         let range = "from=2026-09-01&to=2026-09-30";
@@ -3530,7 +3552,7 @@ mod tests {
                 away_cents_per_kwh: Some(60.0),
             };
             router(
-                AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
+                AppState::new(pool.clone(), PLANT, tz.clone(), &hash, Key::generate())
                     .unwrap()
                     .with_tariff(Some(flat_tariff()))
                     .with_ev_prices(prices)
@@ -3640,7 +3662,8 @@ mod tests {
         assert_eq!(years["buckets"][0]["cars"]["fuel_saved"], 5.05);
 
         // A period with house data but no car activity gets zeros.
-        let (day_start, _) = api::day_bounds_or_error("2026-08-01".parse().unwrap(), tz).unwrap();
+        let (day_start, _) =
+            api::day_bounds_or_error("2026-08-01".parse().unwrap(), &tz.clone()).unwrap();
         seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
         let august = costs_json(&app, "from=2026-08-01&to=2026-08-31&group=month").await;
         assert_eq!(
@@ -3656,9 +3679,10 @@ mod tests {
     async fn costs_can_be_grouped_by_month_and_year() {
         let (_dir, app, pool) = costs_app().await;
         // The same usage on 31 Dec 2025, then 15 Sep, 16 Sep and 1 Oct 2026.
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         for date in ["2025-12-31", "2026-09-15", "2026-09-16", "2026-10-01"] {
-            let (day_start, _) = api::day_bounds_or_error(date.parse().unwrap(), tz).unwrap();
+            let (day_start, _) =
+                api::day_bounds_or_error(date.parse().unwrap(), &tz.clone()).unwrap();
             seed_counters(&pool, day_start, &[3600, LAST_READING], 1000.0).await;
         }
         let months = costs_json(&app, "from=2025-01-01&to=2026-12-31&group=month").await;
@@ -3797,7 +3821,7 @@ mod tests {
     /// Like `costs_router`, with these purchases as well.
     fn payback_router(pool: &SqlitePool, purchases: Vec<Purchase>) -> Router {
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
             .unwrap()
             .with_tariff(Some(flat_tariff()))
@@ -3873,9 +3897,9 @@ mod tests {
         let (_dir, app, pool) = costs_app().await;
         seed_globird(&pool).await;
         // Our counters for the 9th only: 1 kWh in, 2 kWh out.
-        let tz = chrono_tz::Australia::Adelaide;
-        let oct_9 = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
-        let start = api::day_bounds_or_error(oct_9, tz).unwrap().0;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let oct_9 = jiff::civil::date(2026, 10, 9);
+        let start = api::day_bounds_or_error(oct_9, &tz.clone()).unwrap().0;
         seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
 
         let json = compare_json(&app, "from=2026-10-01&to=2026-10-20").await;
@@ -3933,9 +3957,9 @@ mod tests {
     async fn billed_pool() -> (tempfile::TempDir, SqlitePool) {
         let (dir, _app, pool) = costs_app().await;
         seed_globird(&pool).await;
-        let tz = chrono_tz::Australia::Adelaide;
-        let oct_9 = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
-        let start = api::day_bounds_or_error(oct_9, tz).unwrap().0;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let oct_9 = jiff::civil::date(2026, 10, 9);
+        let start = api::day_bounds_or_error(oct_9, &tz.clone()).unwrap().0;
         seed_counters(&pool, start, &[3600, LAST_READING], 1000.0).await;
         (dir, pool)
     }
@@ -3995,7 +4019,7 @@ mod tests {
     /// A router with the flat tariff, these purchases and the past bills in `csv`.
     fn bills_router(pool: &SqlitePool, csv: &str, purchases: Vec<Purchase>) -> Router {
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let state = AppState::new(pool.clone(), PLANT, tz, &hash, Key::generate())
             .unwrap()
             .with_tariff(Some(flat_tariff()))
@@ -4071,7 +4095,7 @@ mod tests {
         assert_eq!(payback_json(&app).await, off);
         // Purchases but no tariff.
         let hash = hash_password(PASSWORD).unwrap();
-        let tz = chrono_tz::Australia::Adelaide;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
         let state = AppState::new(pool, PLANT, tz, &hash, Key::generate())
             .unwrap()
             .with_purchases(vec![solar_purchase("2026-09-14", 10.0)]);
@@ -4209,9 +4233,9 @@ mod tests {
     /// grid power in the 18:00-21:00 window is `window_grid_w` and the
     /// battery sits at 60%, dropping to 30% in the evening.
     async fn seed_battery_day(pool: &SqlitePool, days_ago: u64, window_grid_w: f64) {
-        let tz = chrono_tz::Australia::Adelaide;
-        let date = api::today(tz) - chrono::Days::new(days_ago);
-        let (start, end) = api::day_bounds_or_error(date, tz).unwrap();
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let date = api::today(&tz.clone()) - jiff::ToSpan::days(days_ago as i64);
+        let (start, end) = api::day_bounds_or_error(date, &tz.clone()).unwrap();
         for ts in (start..end).step_by(60) {
             let hour = (ts - start) / 3600;
             let in_window = (18..21).contains(&hour);
@@ -4253,9 +4277,9 @@ mod tests {
         seed_battery_day(&pool, 2, 1000.0).await;
         // Three days ago: the same, but the car was charging then.
         seed_battery_day(&pool, 3, 1000.0).await;
-        let tz = chrono_tz::Australia::Adelaide;
-        let three_ago = api::today(tz) - chrono::Days::new(3);
-        let evening = api::day_bounds_or_error(three_ago, tz).unwrap().0 + 19 * 3600;
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let three_ago = api::today(&tz.clone()) - jiff::ToSpan::days(3);
+        let evening = api::day_bounds_or_error(three_ago, &tz.clone()).unwrap().0 + 19 * 3600;
         let id = db::start_charge_session(&pool, 1, evening, None, Some("Home"))
             .await
             .unwrap();
@@ -4316,8 +4340,8 @@ mod tests {
         // Our data says two days ago missed the credit (1 kW import in the window)...
         seed_battery_day(&pool, 2, 1000.0).await;
         // ...but GloBird's bill for that day has the credit line.
-        let tz = chrono_tz::Australia::Adelaide;
-        let date = (api::today(tz) - chrono::Days::new(2)).to_string();
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let date = (api::today(&tz.clone()) - jiff::ToSpan::days(2)).to_string();
         for (category, cents) in [("SUPPLY", 100), ("USAGE", 75), ("ZEROHERO Credit", -100)] {
             sqlx::query("INSERT INTO globird_cost VALUES (?, ?, ?, 1.0, 0, 1000)")
                 .bind(&date)
@@ -4464,7 +4488,7 @@ mod tests {
         let state = AppState::new(
             pool,
             PLANT,
-            chrono_tz::Australia::Adelaide,
+            crate::clock::site_tz("Australia/Adelaide").unwrap(),
             &hash,
             Key::generate(),
         )

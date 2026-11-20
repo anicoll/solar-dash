@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::models::{ChannelType, IntervalKind, PriceInterval};
 use crate::cost::{DayPrices, PriceSpan};
@@ -70,6 +70,19 @@ pub async fn save_prices(
     now: i64,
 ) -> Result<usize> {
     let mut tx = pool.begin().await?;
+    let saved = save_prices_in(&mut tx, source, intervals, now).await?;
+    tx.commit().await?;
+    Ok(saved)
+}
+
+/// [`save_prices`] inside a transaction the caller owns, so several saves
+/// (and a prune) can land together: a reader never sees half of a refresh.
+pub async fn save_prices_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    source: &str,
+    intervals: &[PriceInterval],
+    now: i64,
+) -> Result<usize> {
     let mut saved = 0;
     for interval in intervals {
         let (Some(channel), Some(kind)) = (
@@ -78,7 +91,7 @@ pub async fn save_prices(
         ) else {
             continue;
         };
-        let start_ts = normalise_start(interval.start_time.timestamp());
+        let start_ts = normalise_start(interval.start_time.as_second());
         sqlx::query(
             "INSERT INTO price_interval
                (source, channel, start_ts, end_ts, cents, spot_cents, kind, fetched_at,
@@ -94,14 +107,14 @@ pub async fn save_prices(
         .bind(source)
         .bind(channel)
         .bind(start_ts)
-        .bind(interval.end_time.timestamp())
+        .bind(interval.end_time.as_second())
         .bind(interval.per_kwh)
         .bind(interval.spot_per_kwh)
         .bind(kind)
         .bind(now)
         .bind(interval.descriptor.as_deref())
         .bind(interval.renewables)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("could not save a price interval")?;
         // A longer forecast row (say 30 minutes) replacing 5-minute ones would
@@ -117,23 +130,30 @@ pub async fn save_prices(
             .bind(source)
             .bind(channel)
             .bind(start_ts)
-            .bind(interval.end_time.timestamp())
-            .execute(&mut *tx)
+            .bind(interval.end_time.as_second())
+            .execute(&mut **tx)
             .await
             .context("could not drop forecasts covered by a longer interval")?;
         }
         saved += 1;
     }
-    tx.commit().await?;
     Ok(saved)
 }
 
 /// Deletes forecast rows that ended more than [`FORECAST_KEEP_SECS`] before
 /// `now`. Actual prices are never deleted. Returns how many rows went.
 pub async fn prune_forecasts(pool: &SqlitePool, now: i64) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let pruned = prune_forecasts_in(&mut tx, now).await?;
+    tx.commit().await?;
+    Ok(pruned)
+}
+
+/// [`prune_forecasts`] inside a transaction the caller owns.
+pub async fn prune_forecasts_in(tx: &mut Transaction<'_, Sqlite>, now: i64) -> Result<u64> {
     let result = sqlx::query("DELETE FROM price_interval WHERE kind = 'forecast' AND end_ts < ?")
         .bind(now - FORECAST_KEEP_SECS)
-        .execute(pool)
+        .execute(&mut **tx)
         .await
         .context("could not prune old forecast prices")?;
     Ok(result.rows_affected())
@@ -343,10 +363,10 @@ pub async fn day_prices_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
 
     fn interval(kind: IntervalKind, channel: ChannelType, start: i64, cents: f64) -> PriceInterval {
-        let at = |ts| -> DateTime<Utc> { DateTime::from_timestamp(ts, 0).unwrap() };
+        let at = |ts| -> Timestamp { Timestamp::from_second(ts).unwrap() };
         PriceInterval {
             kind,
             channel_type: channel,
@@ -506,7 +526,7 @@ mod tests {
             .collect();
         save_prices(&pool, "amber:s", &short, 0).await.unwrap();
         let mut long = interval(ForecastInterval, General, 1800, 20.0);
-        long.end_time = DateTime::from_timestamp(3600, 0).unwrap();
+        long.end_time = Timestamp::from_second(3600).unwrap();
         save_prices(&pool, "amber:s", &[long], 1).await.unwrap();
         let rows = prices_between(&pool, None, 0, 9000).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -534,7 +554,7 @@ mod tests {
         use IntervalKind::*;
         let (_dir, pool) = pool().await;
         let mut long = interval(ForecastInterval, General, 0, 50.0);
-        long.end_time = DateTime::from_timestamp(1800, 0).unwrap();
+        long.end_time = Timestamp::from_second(1800).unwrap();
         let short = interval(CurrentInterval, General, 900, 32.0);
         save_prices(&pool, "amber:s", &[long, short], 0)
             .await
@@ -622,7 +642,7 @@ mod tests {
     /// An Amber-style interval: the start one second after the boundary, the
     /// end on it, `minutes` long.
     fn amber_style(kind: IntervalKind, boundary: i64, minutes: i64, cents: f64) -> PriceInterval {
-        let at = |ts| -> DateTime<Utc> { DateTime::from_timestamp(ts, 0).unwrap() };
+        let at = |ts| -> Timestamp { Timestamp::from_second(ts).unwrap() };
         let mut row = interval(kind, ChannelType::General, boundary + 1, cents);
         row.duration = minutes as u32;
         row.end_time = at(boundary + minutes * 60);
@@ -769,7 +789,7 @@ mod tests {
             now - 2 * CURRENT_LOOKBACK_SECS,
             1.0,
         );
-        stale.end_time = DateTime::from_timestamp(now + 300, 0).unwrap();
+        stale.end_time = Timestamp::from_second(now + 300).unwrap();
         let fresh = interval(CurrentInterval, General, now - 60, 2.0);
         save_prices(&pool, "amber:s", &[stale, fresh], 0)
             .await

@@ -14,7 +14,8 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use chrono::{Days, NaiveDate};
+use jiff::ToSpan;
+use jiff::civil::Date;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sqlx::SqliteConnection;
@@ -113,7 +114,7 @@ pub async fn read(
         return Ok(json.into_response());
     }
     let mut response = json.into_response();
-    let name = format!("solar-dash-admin-{}.json", today(state.tz()));
+    let name = format!("solar-dash-admin-{}.json", today(&state.tz()));
     let disposition = format!("attachment; filename=\"{name}\"");
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
@@ -181,9 +182,7 @@ pub async fn backup_download(State(state): State<AppState>) -> Result<Response, 
         .into_response())
 }
 
-async fn newest_backup(
-    state: &AppState,
-) -> Result<Option<(NaiveDate, std::path::PathBuf)>, ApiError> {
+async fn newest_backup(state: &AppState) -> Result<Option<(Date, std::path::PathBuf)>, ApiError> {
     let Some(dir) = state.backup_dir().map(|d| d.to_path_buf()) else {
         return Ok(None);
     };
@@ -462,16 +461,16 @@ pub async fn tariff_preview(
         params
             .from
             .is_none()
-            .then(|| (today(state.tz) - Days::new(1)).to_string())
+            .then(|| (today(&state.tz()) - 1.day()).to_string())
     });
     let (from, count) = date_range(
         params.from.as_deref(),
         to.as_deref(),
-        state.tz,
+        &state.tz(),
         MAX_PREVIEW_DAYS,
         PREVIEW_DAYS,
     )?;
-    let dates: Vec<NaiveDate> = from.iter_days().take(count as usize).collect();
+    let dates: Vec<Date> = from.series(1.day()).take(count as usize).collect();
 
     let new_days = costs::preview_days(&state, &changed, &dates).await?;
     let current_days = match &current {
@@ -792,7 +791,7 @@ type CheckedCar = (String, Option<String>, String, Option<String>);
 
 /// Checks the day a car was bought: a valid YYYY-MM-DD, not after `today` (the
 /// local day). Gives the date as stored.
-fn checked_owned_since(date: &str, today: NaiveDate) -> Result<String, ApiError> {
+fn checked_owned_since(date: &str, today: Date) -> Result<String, ApiError> {
     let date = parse_date(date).map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     if date > today {
         return Err(ApiError::bad_request(format!(
@@ -804,11 +803,7 @@ fn checked_owned_since(date: &str, today: NaiveDate) -> Result<String, ApiError>
 
 /// Checks the car and tidies the text. `default_kind` is used when the body
 /// has none.
-fn checked_car(
-    body: CarBody,
-    default_kind: &str,
-    today: NaiveDate,
-) -> Result<CheckedCar, ApiError> {
+fn checked_car(body: CarBody, default_kind: &str, today: Date) -> Result<CheckedCar, ApiError> {
     let name = body.name.trim().to_string();
     if name.is_empty() {
         return Err(ApiError::bad_request("the car needs a name"));
@@ -836,7 +831,7 @@ pub async fn car_create(
     State(state): State<AppState>,
     car: Result<Json<CarBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let (name, model, kind, owned_since) = checked_car(body(car)?, "phev", today(state.tz()))?;
+    let (name, model, kind, owned_since) = checked_car(body(car)?, "phev", today(&state.tz()))?;
     let mut created = Value::Null;
     admin_data::write(&state, async |tx| {
         let result = sqlx::query(
@@ -892,7 +887,7 @@ pub async fn car_update(
                 owned_since: car.owned_since.clone(),
             },
             &before.kind,
-            today(state.tz()),
+            today(&state.tz()),
         )?;
         sqlx::query(
             "UPDATE manual_car SET name = ?, model = ?, kind = ?, owned_since = ? WHERE id = ?",
@@ -945,7 +940,7 @@ pub async fn teslamate_car_owned_since(
 ) -> ApiResult {
     let owned_since = body(owned)?
         .owned_since
-        .map(|date| checked_owned_since(&date, today(state.tz())))
+        .map(|date| checked_owned_since(&date, today(&state.tz())))
         .transpose()?;
     let answer = json!({ "car_id": id, "owned_since": owned_since });
     admin_data::write(&state, async |tx| {
@@ -1044,7 +1039,7 @@ fn full_by_default() -> bool {
 
 /// Checks a fill (a fill-up cannot be in the future, the local day being
 /// what counts) and tidies the note. `car_id` is not checked here.
-fn checked_fill(body: FillBody, today: NaiveDate) -> Result<FillBody, ApiError> {
+fn checked_fill(body: FillBody, today: Date) -> Result<FillBody, ApiError> {
     let date = parse_date(&body.date).map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     if date > today {
         return Err(ApiError::bad_request(format!(
@@ -1078,7 +1073,7 @@ pub async fn fill_create(
     Path(car_id): Path<i64>,
     fill: Result<Json<FillBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let fill = checked_fill(body(fill)?, today(state.tz()))?;
+    let fill = checked_fill(body(fill)?, today(&state.tz()))?;
     let mut created = Value::Null;
     admin_data::write(&state, async |tx| {
         if car_row(tx, car_id).await?.is_none() {
@@ -1131,7 +1126,7 @@ pub async fn fill_update(
     Path(id): Path<i64>,
     fill: Result<Json<FillBody>, JsonRejection>,
 ) -> ApiResult {
-    let fill = checked_fill(body(fill)?, today(state.tz()))?;
+    let fill = checked_fill(body(fill)?, today(&state.tz()))?;
     let mut updated = Value::Null;
     admin_data::write(&state, async |tx| {
         let Some(before) = fill_row(tx, id).await? else {

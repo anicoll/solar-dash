@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
@@ -1277,7 +1277,7 @@ pub async fn save_globird_day(pool: &SqlitePool, day: &DayRecord, fetched_at: i6
 
 /// The newest stored GloBird day that is complete, i.e. has a cost row other
 /// than SUPPLY. (`globird::data::is_supply` is the same rule in Rust.)
-pub async fn latest_complete_globird_date(pool: &SqlitePool) -> Result<Option<NaiveDate>> {
+pub async fn latest_complete_globird_date(pool: &SqlitePool) -> Result<Option<Date>> {
     let date: Option<String> = sqlx::query_scalar(
         "SELECT MAX(date) FROM globird_cost WHERE UPPER(TRIM(category)) <> 'SUPPLY'",
     )
@@ -1285,14 +1285,14 @@ pub async fn latest_complete_globird_date(pool: &SqlitePool) -> Result<Option<Na
     .await
     .context("could not read the newest complete GloBird day")?;
     date.map(|text| {
-        NaiveDate::parse_from_str(&text, "%Y-%m-%d")
+        text.parse::<Date>()
             .with_context(|| format!("bad date {text:?} in globird_cost"))
     })
     .transpose()
 }
 
 /// Whether a stored GloBird day is complete (see [`latest_complete_globird_date`]).
-pub async fn globird_day_is_complete(pool: &SqlitePool, date: NaiveDate) -> Result<bool> {
+pub async fn globird_day_is_complete(pool: &SqlitePool, date: Date) -> Result<bool> {
     let found: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM globird_cost
          WHERE date = ? AND UPPER(TRIM(category)) <> 'SUPPLY' LIMIT 1",
@@ -2687,7 +2687,7 @@ mod tests {
         assert_eq!(stored, days[0].intervals[0].intervals);
         assert_eq!(
             latest_complete_globird_date(&pool).await.unwrap(),
-            NaiveDate::from_ymd_opt(2026, 10, 17)
+            Some(jiff::civil::date(2026, 10, 17))
         );
 
         // GloBird revises the 9th: fewer lines. The old ones must be gone.
@@ -2712,10 +2712,10 @@ mod tests {
     async fn globird_completeness_ignores_supply() {
         use crate::globird::data::{CostRow, group_days};
         let (_dir, pool) = test_db().await;
-        let date = |d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        let date = |d| jiff::civil::date(2026, 10, d);
         assert_eq!(latest_complete_globird_date(&pool).await.unwrap(), None);
 
-        let row = |d: u32, category: &str| CostRow {
+        let row = |d: i8, category: &str| CostRow {
             date: date(d),
             category: category.to_string(),
             amount_cents: 100,

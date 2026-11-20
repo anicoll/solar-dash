@@ -2,8 +2,8 @@
 //! so every rule here can be tested with plain numbers.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, Timelike};
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 
 use crate::config;
 
@@ -376,7 +376,7 @@ impl Tariff {
 #[derive(Debug, Clone)]
 pub struct TariffSchedule {
     /// Oldest first, with strictly increasing `until` days (inclusive).
-    previous: Vec<(NaiveDate, Tariff)>,
+    previous: Vec<(Date, Tariff)>,
     current: Tariff,
     /// The configured plan names: one per previous plan, then the current one.
     names: Vec<Option<String>>,
@@ -388,9 +388,9 @@ pub struct PlanSpan {
     /// The `name` from the config, if it has one.
     pub name: Option<String>,
     /// The first local day it applied; `None` for the first plan.
-    pub from: Option<NaiveDate>,
+    pub from: Option<Date>,
     /// The last local day it applied; `None` for the current plan.
-    pub until: Option<NaiveDate>,
+    pub until: Option<Date>,
 }
 
 impl TariffSchedule {
@@ -441,9 +441,9 @@ impl TariffSchedule {
     /// only for the earliest). A plan lasts until the day before the next
     /// one starts. Gives the same schedule as [`TariffSchedule::from_config`]
     /// for the same plans, including each plan's `key`.
-    pub fn from_plans(plans: &[(Option<NaiveDate>, config::Tariff)]) -> Result<Self> {
+    pub fn from_plans(plans: &[(Option<Date>, config::Tariff)]) -> Result<Self> {
         anyhow::ensure!(!plans.is_empty(), "there are no tariff plans");
-        let mut sorted: Vec<&(Option<NaiveDate>, config::Tariff)> = plans.iter().collect();
+        let mut sorted: Vec<&(Option<Date>, config::Tariff)> = plans.iter().collect();
         // `None` sorts before every date, so a plan with no start comes first.
         sorted.sort_by_key(|(from, _)| *from);
         anyhow::ensure!(
@@ -460,7 +460,8 @@ impl TariffSchedule {
             // The next plan has a start date: only the first can lack one.
             let next_start = sorted[i + 1].0.context("a later plan has no start date")?;
             let until = next_start
-                .pred_opt()
+                .yesterday()
+                .ok()
                 .context("plan start date is too early")?;
             let tariff = Tariff::from_config(tariff)
                 .with_context(|| format!("invalid tariff plan #{}", i + 1))?;
@@ -477,7 +478,7 @@ impl TariffSchedule {
     /// Which plan applies on this local day: 0 for the oldest, up to the
     /// number of previous plans for the current one. The same choice as
     /// [`TariffSchedule::for_date`].
-    pub fn plan_index(&self, date: NaiveDate) -> usize {
+    pub fn plan_index(&self, date: Date) -> usize {
         self.previous
             .iter()
             .position(|(until, _)| *until >= date)
@@ -495,7 +496,7 @@ impl TariffSchedule {
                 from,
                 until,
             });
-            from = until.and_then(|u| u.succ_opt());
+            from = until.and_then(|u| u.tomorrow().ok());
         }
         spans
     }
@@ -503,9 +504,9 @@ impl TariffSchedule {
     /// Each plan, oldest first, as the first local day it applied and its
     /// name. The first plan has no known start (`None`); every later one
     /// starts the day after the one before ended.
-    pub fn plans(&self) -> Vec<(Option<NaiveDate>, Option<&str>)> {
+    pub fn plans(&self) -> Vec<(Option<Date>, Option<&str>)> {
         let starts = std::iter::once(None)
-            .chain(self.previous.iter().map(|(until, _)| until.succ_opt()))
+            .chain(self.previous.iter().map(|(until, _)| until.tomorrow().ok()))
             .take(self.names.len());
         starts
             .zip(&self.names)
@@ -515,7 +516,7 @@ impl TariffSchedule {
 
     /// The plan in effect on this local day: the first previous plan whose
     /// `until` is on or after it, otherwise the current one.
-    pub fn for_date(&self, date: NaiveDate) -> &Tariff {
+    pub fn for_date(&self, date: Date) -> &Tariff {
         self.previous
             .iter()
             .find(|(until, _)| *until >= date)
@@ -583,7 +584,7 @@ fn in_time_order<'a>(
 }
 
 /// The local minute an interval is priced at: its midpoint.
-fn interval_minute(tz: Tz, iv: &Interval) -> u32 {
+fn interval_minute(tz: &TimeZone, iv: &Interval) -> u32 {
     // Sum then halve, so we cannot overflow on huge timestamps.
     let mid = iv.start_ts + (iv.end_ts - iv.start_ts) / 2;
     local_minute_of_day(tz, mid)
@@ -596,7 +597,7 @@ fn interval_minute(tz: Tz, iv: &Interval) -> u32 {
 /// (splitting an interval that crosses the threshold); only the rest is
 /// classified by time of day.
 #[cfg(test)]
-pub fn grid_split(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> GridSplit {
+pub fn grid_split(tariff: &Tariff, tz: &TimeZone, intervals: &[Interval]) -> GridSplit {
     grid_split_priced(tariff, tz, intervals, None, 0.0)
 }
 
@@ -608,7 +609,7 @@ pub fn grid_split(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> GridSplit 
 /// exactly [`grid_split`].
 pub fn grid_split_priced(
     tariff: &Tariff,
-    tz: Tz,
+    tz: &TimeZone,
     intervals: &[Interval],
     prices: Option<&DayPrices>,
     spike_cents: f64,
@@ -737,12 +738,12 @@ impl Tariff {
 
 /// Local minutes since midnight for a unix time. We price an interval at its
 /// midpoint, so an interval straddling a price change is not split.
-pub(crate) fn local_minute_of_day(tz: Tz, ts: i64) -> u32 {
+pub(crate) fn local_minute_of_day(tz: &TimeZone, ts: i64) -> u32 {
     // `from_timestamp` only fails for absurd times far outside real data;
     // minute 0 is a harmless fallback there.
-    DateTime::from_timestamp(ts, 0).map_or(0, |utc| {
-        let local = utc.with_timezone(&tz);
-        local.hour() * 60 + local.minute()
+    jiff::Timestamp::from_second(ts).map_or(0, |utc| {
+        let local = tz.to_datetime(utc);
+        local.hour() as u32 * 60 + local.minute() as u32
     })
 }
 
@@ -751,7 +752,7 @@ pub(crate) fn local_minute_of_day(tz: Tz, ts: i64) -> u32 {
 /// The app itself always calls [`day_cost_with_window_import`]; this shorter
 /// form keeps the tests readable.
 #[cfg(test)]
-pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
+pub fn day_cost(tariff: &Tariff, tz: &TimeZone, intervals: &[Interval]) -> DayCost {
     day_cost_with_window_import(tariff, tz, intervals, None)
 }
 
@@ -761,7 +762,7 @@ pub fn day_cost(tariff: &Tariff, tz: Tz, intervals: &[Interval]) -> DayCost {
 /// comes from the intervals. The window must still be finished in the data.
 pub fn day_cost_with_window_import(
     tariff: &Tariff,
-    tz: Tz,
+    tz: &TimeZone,
     intervals: &[Interval],
     window_import_override_kwh: Option<f64>,
 ) -> DayCost {
@@ -776,7 +777,7 @@ pub fn day_cost_with_window_import(
 /// charge come from the plan either way.
 pub fn day_cost_priced(
     tariff: &Tariff,
-    tz: Tz,
+    tz: &TimeZone,
     intervals: &[Interval],
     prices: Option<&DayPrices>,
     window_import_override_kwh: Option<f64>,
@@ -857,9 +858,18 @@ pub fn day_cost_priced(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    fn adelaide() -> TimeZone {
+        crate::clock::site_tz("Australia/Adelaide").unwrap()
+    }
 
-    const ADELAIDE: Tz = chrono_tz::Australia::Adelaide;
+    /// Unix time of a local Adelaide date and clock time.
+    fn adelaide_ts(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> i64 {
+        crate::clock::local_ts(
+            jiff::civil::datetime(year, month, day, hour, minute, 0, 0),
+            &adelaide(),
+        )
+        .unwrap()
+    }
 
     /// Build a tariff from TOML, the same way the real config does.
     fn tariff(toml_text: &str) -> Tariff {
@@ -896,10 +906,7 @@ mod tests {
     /// Unix time of a local Adelaide clock time on 2026-09-15 (no DST change
     /// that day, so +09:30).
     fn at(hour: u32, minute: u32) -> i64 {
-        ADELAIDE
-            .with_ymd_and_hms(2026, 9, 15, hour, minute, 0)
-            .unwrap()
-            .timestamp()
+        adelaide_ts(2026, 9, 15, hour as i8, minute as i8)
     }
 
     /// An interval from `from` to `to` (local times) with the given energy.
@@ -922,18 +929,21 @@ mod tests {
         let t = zerohero();
         // The intervals saw 0.15 kWh in the window; the meter says 0.1.
         let day = [iv((18, 0), (21, 0), 0.15, 0.0, 1.0)];
-        assert_eq!(day_cost(&t, ADELAIDE, &day).zero_import_credit_cents, 0.0);
-        let earned = day_cost_with_window_import(&t, ADELAIDE, &day, Some(0.1));
+        assert_eq!(
+            day_cost(&t, &adelaide(), &day).zero_import_credit_cents,
+            0.0
+        );
+        let earned = day_cost_with_window_import(&t, &adelaide(), &day, Some(0.1));
         assert_eq!(earned.zero_import_credit_cents, 100.0);
         // Money is still worked out from the intervals.
         assert!(close(earned.import_kwh, 0.15));
         // And the other way round.
         let quiet = [iv((18, 0), (21, 0), 0.0, 0.0, 1.0)];
-        let missed = day_cost_with_window_import(&t, ADELAIDE, &quiet, Some(0.2));
+        let missed = day_cost_with_window_import(&t, &adelaide(), &quiet, Some(0.2));
         assert_eq!(missed.zero_import_credit_cents, 0.0);
         // An unfinished window still never earns it.
         let early = [iv((18, 0), (19, 0), 0.0, 0.0, 1.0)];
-        let early = day_cost_with_window_import(&t, ADELAIDE, &early, Some(0.0));
+        let early = day_cost_with_window_import(&t, &adelaide(), &early, Some(0.0));
         assert_eq!(early.zero_import_credit_cents, 0.0);
     }
 
@@ -1025,7 +1035,7 @@ mod tests {
         )
         .unwrap();
         let schedule = TariffSchedule::from_config(&w.tariff, &w.previous_tariff).unwrap();
-        let day = |text: &str| text.parse::<NaiveDate>().ok();
+        let day = |text: &str| text.parse::<Date>().ok();
         assert_eq!(
             schedule.plans(),
             vec![
@@ -1069,7 +1079,7 @@ mod tests {
     #[test]
     fn from_plans_builds_the_same_schedule_as_from_config() {
         let (current, previous) = three_plan_config();
-        let day = |text: &str| text.parse::<NaiveDate>().unwrap();
+        let day = |text: &str| text.parse::<Date>().unwrap();
         let named = |plan: &config::PreviousTariff| config::Tariff {
             name: plan.name.clone(),
             ..plan.tariff.clone()
@@ -1100,7 +1110,7 @@ mod tests {
     #[test]
     fn from_plans_rejects_bad_sets() {
         let (current, _) = three_plan_config();
-        let day = |text: &str| text.parse::<NaiveDate>().unwrap();
+        let day = |text: &str| text.parse::<Date>().unwrap();
         assert!(TariffSchedule::from_plans(&[]).is_err());
         // Only the earliest plan may have no start.
         let two_open = [(None, current.clone()), (None, current.clone())];
@@ -1136,11 +1146,11 @@ mod tests {
     fn intervals_are_priced_at_their_midpoint() {
         let t = zerohero();
         // 10:00-12:30 has its midpoint at 11:15 (free), though it starts at 40c.
-        let early = day_cost(&t, ADELAIDE, &[iv((10, 0), (12, 30), 1.0, 0.0, 0.0)]);
+        let early = day_cost(&t, &adelaide(), &[iv((10, 0), (12, 30), 1.0, 0.0, 0.0)]);
         assert_eq!(early.import_cents, 0.0);
         // 12:30-15:30 has its midpoint at 14:00 exactly, which is outside the
         // free window (end-exclusive), so it costs the default 40c.
-        let late = day_cost(&t, ADELAIDE, &[iv((12, 30), (15, 30), 1.0, 0.0, 0.0)]);
+        let late = day_cost(&t, &adelaide(), &[iv((12, 30), (15, 30), 1.0, 0.0, 0.0)]);
         assert!(close(late.import_cents, 40.0));
     }
 
@@ -1149,7 +1159,7 @@ mod tests {
         let t = zerohero();
         let day = day_cost(
             &t,
-            ADELAIDE,
+            &adelaide(),
             &[
                 iv((18, 0), (19, 0), 0.05, 0.0, 1.0),
                 iv((19, 0), (20, 0), 0.05, 0.0, 1.0), // total 0.1: still allowed
@@ -1165,7 +1175,7 @@ mod tests {
         let t = zerohero();
         let day = day_cost(
             &t,
-            ADELAIDE,
+            &adelaide(),
             &[
                 iv((18, 0), (19, 0), 0.06, 0.0, 1.0),
                 iv((19, 0), (20, 0), 0.06, 0.0, 1.0),
@@ -1179,16 +1189,16 @@ mod tests {
     fn credit_waits_for_the_window_to_finish() {
         let t = zerohero();
         // Today at 18:30: no import so far, but the window is not over.
-        let partial = day_cost(&t, ADELAIDE, &[iv((18, 0), (18, 30), 0.0, 0.0, 1.0)]);
+        let partial = day_cost(&t, &adelaide(), &[iv((18, 0), (18, 30), 0.0, 0.0, 1.0)]);
         assert_eq!(partial.zero_import_credit_cents, 0.0);
         // Data up to 20:30 is still short of the last 15 minutes.
-        let nearly = day_cost(&t, ADELAIDE, &[iv((18, 0), (20, 30), 0.0, 0.0, 1.0)]);
+        let nearly = day_cost(&t, &adelaide(), &[iv((18, 0), (20, 30), 0.0, 0.0, 1.0)]);
         assert_eq!(nearly.zero_import_credit_cents, 0.0);
         // Data through to 21:00 earns it.
-        let full = day_cost(&t, ADELAIDE, &[iv((18, 0), (21, 0), 0.0, 0.0, 1.0)]);
+        let full = day_cost(&t, &adelaide(), &[iv((18, 0), (21, 0), 0.0, 0.0, 1.0)]);
         assert_eq!(full.zero_import_credit_cents, 100.0);
         // A small gap at the end on a past day: the last data ends at 20:50.
-        let gap = day_cost(&t, ADELAIDE, &[iv((18, 0), (20, 50), 0.0, 0.0, 1.0)]);
+        let gap = day_cost(&t, &adelaide(), &[iv((18, 0), (20, 50), 0.0, 0.0, 1.0)]);
         assert_eq!(gap.zero_import_credit_cents, 100.0);
     }
 
@@ -1217,9 +1227,9 @@ mod tests {
     fn credit_needs_data_inside_the_window() {
         let t = zerohero();
         // Data only at lunchtime: we cannot say the evening used no grid power.
-        let day = day_cost(&t, ADELAIDE, &[iv((12, 0), (13, 0), 0.0, 1.0, 1.0)]);
+        let day = day_cost(&t, &adelaide(), &[iv((12, 0), (13, 0), 0.0, 1.0, 1.0)]);
         assert_eq!(day.zero_import_credit_cents, 0.0);
-        let empty = day_cost(&t, ADELAIDE, &[]);
+        let empty = day_cost(&t, &adelaide(), &[]);
         assert_eq!(empty.zero_import_credit_cents, 0.0);
         // An empty day still pays supply.
         assert_eq!(empty.actual_cents, 150.0);
@@ -1231,7 +1241,7 @@ mod tests {
         let t = zerohero();
         let day = day_cost(
             &t,
-            ADELAIDE,
+            &adelaide(),
             &[
                 // 06:00-07:00 midpoint 06:30, default 40c: buy 2 kWh, load 2 kWh.
                 iv((6, 0), (7, 0), 2.0, 0.0, 2.0),
@@ -1320,7 +1330,7 @@ mod tests {
     #[test]
     fn plans_are_listed_with_their_days() {
         let schedule = schedule();
-        let day = |text: &str| -> NaiveDate { text.parse().unwrap() };
+        let day = |text: &str| -> Date { text.parse().unwrap() };
         let plans = schedule.plan_spans();
         assert_eq!(plans.len(), 3);
         assert_eq!(
@@ -1380,7 +1390,7 @@ mod tests {
             export_kwh: 1.0,
             load_kwh: 0.0,
         };
-        grid_split(tariff, ADELAIDE, &[interval])
+        grid_split(tariff, &adelaide(), &[interval])
     }
 
     /// The (import, export) bands, as the index of the one field holding the kWh.
@@ -1432,8 +1442,8 @@ mod tests {
             iv((19, 0), (20, 0), 0.0, 3.0, 0.5),
             iv((21, 30), (22, 0), 0.4, 0.1, 0.4),
         ];
-        let cost = day_cost(&tariff, ADELAIDE, &intervals);
-        let split = grid_split(&tariff, ADELAIDE, &intervals);
+        let cost = day_cost(&tariff, &adelaide(), &intervals);
+        let split = grid_split(&tariff, &adelaide(), &intervals);
         let imports = split.import_free_kwh + split.import_shoulder_kwh + split.import_peak_kwh;
         let exports = split.export_super_kwh + split.export_peak_kwh + split.export_other_kwh;
         assert!(close(imports, cost.import_kwh));
@@ -1462,8 +1472,8 @@ mod tests {
             iv((19, 0), (20, 0), 0.0, 3.0, 0.5),
             iv((21, 30), (22, 0), 0.4, 0.1, 0.4),
         ];
-        let cost = day_cost(&tariff, ADELAIDE, &intervals);
-        let split = grid_split(&tariff, ADELAIDE, &intervals);
+        let cost = day_cost(&tariff, &adelaide(), &intervals);
+        let split = grid_split(&tariff, &adelaide(), &intervals);
         let imp = tariff.import_windows();
         let exp = tariff.export_windows();
         let (di, de) = (tariff.default_import_cents(), tariff.default_export_cents());
@@ -1513,10 +1523,10 @@ mod tests {
             iv((10, 0), (10, 5), 0.0, 13.9, 0.0),
             iv((12, 0), (12, 5), 0.0, 0.5, 0.0),
         ];
-        let cost = day_cost(&t, ADELAIDE, &intervals);
+        let cost = day_cost(&t, &adelaide(), &intervals);
         assert!(close(cost.export_kwh, 14.4));
         assert!(close(cost.export_cents, 14.0 * 15.0 + 0.4 * 5.0));
-        let split = grid_split(&t, ADELAIDE, &intervals);
+        let split = grid_split(&t, &adelaide(), &intervals);
         assert!(close(split.export_tier_kwh, 14.0));
         assert!(close(split.export_other_kwh, 0.4));
         assert!(close(split.export_super_kwh + split.export_peak_kwh, 0.0));
@@ -1526,9 +1536,9 @@ mod tests {
     fn days_below_and_above_the_threshold() {
         let t = tariff(TIERED);
         let below = [iv((12, 0), (12, 5), 0.0, 6.0, 0.0)];
-        let cost = day_cost(&t, ADELAIDE, &below);
+        let cost = day_cost(&t, &adelaide(), &below);
         assert!(close(cost.export_cents, 6.0 * 15.0));
-        let split = grid_split(&t, ADELAIDE, &below);
+        let split = grid_split(&t, &adelaide(), &below);
         assert!(close(split.export_tier_kwh, 6.0));
         assert!(close(split.export_other_kwh, 0.0));
 
@@ -1539,25 +1549,25 @@ mod tests {
             iv((17, 0), (17, 5), 0.0, 4.0, 0.0),
             iv((19, 0), (19, 5), 0.0, 6.0, 0.0),
         ];
-        let cost = day_cost(&t, ADELAIDE, &above);
+        let cost = day_cost(&t, &adelaide(), &above);
         assert!(close(cost.export_cents, 14.0 * 15.0 + 6.0 * 10.0));
-        let split = grid_split(&t, ADELAIDE, &above);
+        let split = grid_split(&t, &adelaide(), &above);
         assert!(close(split.export_tier_kwh, 14.0));
         assert!(close(split.export_super_kwh + split.export_peak_kwh, 6.0));
         // Parts add up to the exported energy, and out-of-order input is sorted.
         let reversed: Vec<_> = above.iter().rev().copied().collect();
         assert!(close(
-            day_cost(&t, ADELAIDE, &reversed).export_cents,
+            day_cost(&t, &adelaide(), &reversed).export_cents,
             cost.export_cents
         ));
-        assert_eq!(grid_split(&t, ADELAIDE, &reversed), split);
+        assert_eq!(grid_split(&t, &adelaide(), &reversed), split);
     }
 
     #[test]
     fn plans_without_a_tier_are_unchanged() {
         let t = zerohero();
         assert!(t.export_tier().is_none());
-        let cost = day_cost(&t, ADELAIDE, &[iv((19, 0), (19, 5), 0.0, 30.0, 0.0)]);
+        let cost = day_cost(&t, &adelaide(), &[iv((19, 0), (19, 5), 0.0, 30.0, 0.0)]);
         assert!(close(cost.export_cents, 300.0));
         // The key does not mention the tier, so stored costs stay valid.
         assert!(!t.key().contains("export_tier"));
@@ -1591,7 +1601,7 @@ mod tests {
         let schedule = TariffSchedule::from_config(&w.tariff, &w.previous_tariff).unwrap();
         let day = [iv((12, 0), (12, 5), 0.0, 20.0, 0.0)];
         let cost_on = |date: &str| {
-            day_cost(schedule.for_date(date.parse().unwrap()), ADELAIDE, &day).export_cents
+            day_cost(schedule.for_date(date.parse().unwrap()), &adelaide(), &day).export_cents
         };
         assert!(close(cost_on("2026-06-30"), 14.0 * 15.0 + 6.0 * 5.0));
         assert!(close(cost_on("2026-07-01"), 20.0 * 5.0));
@@ -1614,10 +1624,7 @@ mod tests {
 
     /// Two 5-minute intervals from midnight on 1 Sep 2026 (Adelaide, UTC+9:30).
     fn two_intervals() -> (i64, Vec<Interval>) {
-        let midnight = ADELAIDE
-            .with_ymd_and_hms(2026, 9, 1, 0, 0, 0)
-            .unwrap()
-            .timestamp();
+        let midnight = adelaide_ts(2026, 9, 1, 0, 0);
         let iv = |i: i64| Interval {
             start_ts: midnight + i * 300,
             end_ts: midnight + (i + 1) * 300,
@@ -1642,8 +1649,8 @@ mod tests {
     fn without_prices_the_static_path_is_unchanged() {
         let t = plan_with("");
         let (_, ivs) = two_intervals();
-        let plain = day_cost_with_window_import(&t, ADELAIDE, &ivs, None);
-        let priced = day_cost_priced(&t, ADELAIDE, &ivs, None, None);
+        let plain = day_cost_with_window_import(&t, &adelaide(), &ivs, None);
+        let priced = day_cost_priced(&t, &adelaide(), &ivs, None, None);
         assert_eq!(priced.cost, plain);
         assert_eq!(priced.fallback_minutes, 0);
         // Golden numbers: 2 x 2 kWh at the 10c window, 2 x 1 kWh at 5c.
@@ -1660,7 +1667,7 @@ mod tests {
             vec![span(m, 40.0), span(m + 300, 20.0)],
             vec![span(m, -8.0), span(m + 300, -2.0)],
         );
-        let r = day_cost_priced(&t, ADELAIDE, &ivs, Some(&prices), None);
+        let r = day_cost_priced(&t, &adelaide(), &ivs, Some(&prices), None);
         // Import: 2 kWh at 40c and at 20c. Feed-in: 1 kWh at +8c and +2c.
         assert_eq!(r.cost.import_cents, 120.0);
         assert_eq!(r.cost.export_cents, 10.0);
@@ -1678,12 +1685,12 @@ mod tests {
         // Only the first interval has prices; the second uses the plan's
         // 10c import window and 5c default export.
         let prices = DayPrices::new(vec![span(m, 40.0)], vec![span(m, -8.0)]);
-        let r = day_cost_priced(&t, ADELAIDE, &ivs, Some(&prices), None);
+        let r = day_cost_priced(&t, &adelaide(), &ivs, Some(&prices), None);
         assert_eq!(r.cost.import_cents, 2.0 * 40.0 + 2.0 * 10.0);
         assert_eq!(r.cost.export_cents, 8.0 + 5.0);
         assert_eq!(r.fallback_minutes, 5);
         // No rows at all: everything falls back.
-        let none = day_cost_priced(&t, ADELAIDE, &ivs, Some(&DayPrices::default()), None);
+        let none = day_cost_priced(&t, &adelaide(), &ivs, Some(&DayPrices::default()), None);
         assert_eq!(none.fallback_minutes, 10);
         assert_eq!(none.cost.import_cents, 40.0);
     }
@@ -1696,12 +1703,12 @@ mod tests {
             vec![span(m, -8.0), span(m + 300, 3.0)],
         );
         let flipped = plan_with(DYNAMIC);
-        let r = day_cost_priced(&flipped, ADELAIDE, &ivs, Some(&prices), None);
+        let r = day_cost_priced(&flipped, &adelaide(), &ivs, Some(&prices), None);
         // -8 earns 8 and +3 costs 3.
         assert_eq!(r.cost.export_cents, 8.0 - 3.0);
 
         let as_is = plan_with(&format!("{DYNAMIC}feed_in_paid_when_negative = false\n"));
-        let r = day_cost_priced(&as_is, ADELAIDE, &ivs, Some(&prices), None);
+        let r = day_cost_priced(&as_is, &adelaide(), &ivs, Some(&prices), None);
         assert_eq!(r.cost.export_cents, -8.0 + 3.0);
     }
 
@@ -1715,7 +1722,7 @@ mod tests {
             vec![span(m, 10.0), span(m + 300, 10.0)],
             vec![span(m, -8.0), span(m + 300, -2.0)],
         );
-        let r = day_cost_priced(&t, ADELAIDE, &ivs, Some(&prices), None);
+        let r = day_cost_priced(&t, &adelaide(), &ivs, Some(&prices), None);
         // The first exported kWh earns the tier's 12c; the second the live 2c.
         assert_eq!(r.cost.export_cents, 12.0 + 2.0);
     }
@@ -1723,10 +1730,7 @@ mod tests {
     #[test]
     fn a_dynamic_plan_still_earns_the_credit() {
         let t = plan_with(DYNAMIC);
-        let late = ADELAIDE
-            .with_ymd_and_hms(2026, 9, 1, 23, 40, 0)
-            .unwrap()
-            .timestamp();
+        let late = adelaide_ts(2026, 9, 1, 23, 40);
         let iv = Interval {
             start_ts: late,
             end_ts: late + 1140,
@@ -1734,7 +1738,7 @@ mod tests {
             export_kwh: 0.0,
             load_kwh: 0.1,
         };
-        let r = day_cost_priced(&t, ADELAIDE, &[iv], Some(&DayPrices::default()), None);
+        let r = day_cost_priced(&t, &adelaide(), &[iv], Some(&DayPrices::default()), None);
         assert_eq!(r.cost.zero_import_credit_cents, 50.0);
     }
 
@@ -1750,15 +1754,15 @@ mod tests {
             vec![span(m, 0.0), span(m + 300, 150.0)],
             vec![span(m, -8.0), span(m + 300, 3.0)],
         );
-        let split = grid_split_priced(&t, ADELAIDE, &ivs, Some(&prices), 100.0);
+        let split = grid_split_priced(&t, &adelaide(), &ivs, Some(&prices), 100.0);
         assert_eq!(split.import_free_kwh, 2.0);
         assert_eq!(split.import_peak_kwh, 2.0);
         assert_eq!(split.export_peak_kwh, 1.0);
         assert_eq!(split.export_other_kwh, 1.0);
         // Without prices it is the plain split.
         assert_eq!(
-            grid_split_priced(&t, ADELAIDE, &ivs, None, 100.0),
-            grid_split(&t, ADELAIDE, &ivs)
+            grid_split_priced(&t, &adelaide(), &ivs, None, 100.0),
+            grid_split(&t, &adelaide(), &ivs)
         );
     }
 

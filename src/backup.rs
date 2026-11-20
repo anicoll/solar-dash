@@ -26,8 +26,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
-use chrono_tz::Tz;
+use jiff::ZonedDateTime;
+use jiff::civil::{Date, Time};
+use jiff::tz::TimeZone;
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
@@ -35,27 +36,27 @@ use crate::globird::sync::next_daily;
 use crate::offsite::Offsite;
 
 /// The local time of the daily backup.
-const BACKUP_TIME: NaiveTime = NaiveTime::from_hms_opt(3, 30, 0).unwrap();
+const BACKUP_TIME: Time = Time::constant(3, 30, 0, 0);
 
 /// The file name of the backup for `date`, e.g. `solar-2026-10-26.db.gz`.
-fn file_name(date: NaiveDate) -> String {
-    format!("solar-{}.db.gz", date.format("%Y-%m-%d"))
+fn file_name(date: Date) -> String {
+    format!("solar-{}.db.gz", date.strftime("%Y-%m-%d"))
 }
 
 /// The name older versions used for the same backup (not compressed).
-fn legacy_file_name(date: NaiveDate) -> String {
-    format!("solar-{}.db", date.format("%Y-%m-%d"))
+fn legacy_file_name(date: Date) -> String {
+    format!("solar-{}.db", date.strftime("%Y-%m-%d"))
 }
 
 /// The date in a backup file name (`solar-YYYY-MM-DD.db.gz`, or the older
 /// `solar-YYYY-MM-DD.db`), or `None` for any other file (such as a
 /// `pre-update-*.db` made by update.sh), which pruning must leave alone.
-pub(crate) fn date_of(name: &str) -> Option<NaiveDate> {
+pub(crate) fn date_of(name: &str) -> Option<Date> {
     let text = name.strip_prefix("solar-")?;
     let text = text
         .strip_suffix(".db.gz")
         .or_else(|| text.strip_suffix(".db"))?;
-    let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+    let date = Date::strptime("%Y-%m-%d", text).ok()?;
     // Reject lookalikes such as `solar-2026-1-2.db`.
     (file_name(date) == name || legacy_file_name(date) == name).then_some(date)
 }
@@ -112,7 +113,7 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 
 /// Writes the backup for `date` into `dir` (created if missing) and returns
 /// its path. An existing backup for the same date is replaced.
-pub async fn backup_now(pool: &SqlitePool, dir: &Path, date: NaiveDate) -> Result<PathBuf> {
+pub async fn backup_now(pool: &SqlitePool, dir: &Path, date: Date) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("could not create backup directory {}", dir.display()))?;
     let done = dir.join(file_name(date));
@@ -152,7 +153,7 @@ async fn write_gz(pool: &SqlitePool, raw: &Path, zipped: &Path, done: &Path) -> 
 /// The newest backup in `dir` (by the date in its name) and its path, or
 /// `None` when there is none or the directory does not exist yet. Only files
 /// named like a backup (see [`date_of`]) count, like in [`prune`].
-pub fn latest(dir: &Path) -> Result<Option<(NaiveDate, PathBuf)>> {
+pub fn latest(dir: &Path) -> Result<Option<(Date, PathBuf)>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -161,7 +162,7 @@ pub fn latest(dir: &Path) -> Result<Option<(NaiveDate, PathBuf)>> {
                 .with_context(|| format!("could not read backup directory {}", dir.display()));
         }
     };
-    let mut newest: Option<(NaiveDate, PathBuf)> = None;
+    let mut newest: Option<(Date, PathBuf)> = None;
     for entry in entries {
         let entry = entry?;
         if let Some(date) = entry.file_name().to_str().and_then(date_of)
@@ -221,10 +222,10 @@ async fn run_once(
     dir: &Path,
     keep: usize,
     min_free_mb: u64,
-    tz: Tz,
+    tz: &TimeZone,
     offsite: Option<&Offsite>,
 ) {
-    let today = Utc::now().with_timezone(&tz).date_naive();
+    let today = crate::clock::today(tz);
     let written = match check_space(pool, dir, min_free_mb).await {
         Ok(true) => match backup_now(pool, dir, today).await {
             Ok(path) => {
@@ -303,7 +304,7 @@ pub async fn run(
     dir: PathBuf,
     keep: usize,
     min_free_mb: u64,
-    tz: Tz,
+    tz: TimeZone,
     offsite: Option<Offsite>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -315,11 +316,11 @@ pub async fn run(
     tokio::pin!(shutdown);
     info!(dir = %dir.display(), keep, offsite = offsite.is_some(), "database backups started");
 
-    let today = Utc::now().with_timezone(&tz).date_naive();
+    let today = crate::clock::today(&tz);
     if !dir.join(file_name(today)).exists() && !dir.join(legacy_file_name(today)).exists() {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            _ = run_once(&pool, &dir, keep, min_free_mb, tz, offsite.as_ref()) => {}
+            _ = run_once(&pool, &dir, keep, min_free_mb, &tz, offsite.as_ref()) => {}
         }
     }
     if let Some(offsite) = &offsite {
@@ -329,17 +330,17 @@ pub async fn run(
         }
     }
     loop {
-        let now: DateTime<Tz> = Utc::now().with_timezone(&tz);
-        let next = next_daily(now, BACKUP_TIME);
-        info!(at = %next.format("%Y-%m-%d %H:%M %Z"), "next database backup");
-        let wait = (next - now).to_std().unwrap_or(Duration::ZERO);
+        let now = ZonedDateTime::now().with_time_zone(tz.clone());
+        let next = next_daily(&now, BACKUP_TIME);
+        info!(at = %next.strftime("%Y-%m-%d %H:%M %Z"), "next database backup");
+        let wait = Duration::try_from(next.duration_since(&now)).unwrap_or(Duration::ZERO);
         tokio::select! {
             _ = &mut shutdown => break,
             _ = tokio::time::sleep(wait) => {}
         }
         tokio::select! {
             _ = &mut shutdown => break,
-            _ = run_once(&pool, &dir, keep, min_free_mb, tz, offsite.as_ref()) => {}
+            _ = run_once(&pool, &dir, keep, min_free_mb, &tz, offsite.as_ref()) => {}
         }
     }
     info!("database backups stopped");
@@ -351,8 +352,8 @@ mod tests {
     use super::*;
     use crate::db;
 
-    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn date(y: i16, m: i8, d: i8) -> Date {
+        jiff::civil::date(y, m, d)
     }
 
     #[test]

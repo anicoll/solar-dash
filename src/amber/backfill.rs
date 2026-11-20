@@ -16,7 +16,9 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use jiff::ToSpan;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use sqlx::SqlitePool;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -45,8 +47,8 @@ const RECHECK: Duration = Duration::from_secs(24 * 3600);
 const DEFAULT_DAYS_BACK: u64 = 2 * 365;
 
 /// The oldest day to fetch: the configured date, or two years before `today`.
-pub fn floor_date(configured: Option<NaiveDate>, today: NaiveDate) -> NaiveDate {
-    configured.unwrap_or_else(|| today - Days::new(DEFAULT_DAYS_BACK))
+pub fn floor_date(configured: Option<Date>, today: Date) -> Date {
+    configured.unwrap_or_else(|| today - (DEFAULT_DAYS_BACK as i64).days())
 }
 
 /// The next date range to ask for, as `(start, end)` inclusive, or `None`
@@ -58,20 +60,16 @@ pub fn floor_date(configured: Option<NaiveDate>, today: NaiveDate) -> NaiveDate 
 /// overlapping by a day is the way to be sure of leaving no gap. Rows already
 /// stored are harmless to fetch again (actual prices are never overwritten).
 /// With nothing stored the range ends yesterday.
-pub fn plan_chunk(
-    oldest: Option<NaiveDate>,
-    today: NaiveDate,
-    floor: NaiveDate,
-) -> Option<(NaiveDate, NaiveDate)> {
+pub fn plan_chunk(oldest: Option<Date>, today: Date, floor: Date) -> Option<(Date, Date)> {
     let end = match oldest {
         Some(day) if day <= floor => return None,
         Some(day) => day,
-        None => today - Days::new(1),
+        None => today - 1.day(),
     };
     if end < floor {
         return None;
     }
-    let start = (end - Days::new(CHUNK_DAYS - 1)).max(floor);
+    let start = (end - (CHUNK_DAYS as i64 - 1).days()).max(floor);
     Some((start, end))
 }
 
@@ -80,7 +78,7 @@ pub fn plan_chunk(
 /// reply is the plain case of that.
 pub fn nothing_older(items: &[PriceInterval], oldest_ts: Option<i64>) -> bool {
     match oldest_ts {
-        Some(oldest) => !items.iter().any(|p| p.start_time.timestamp() < oldest),
+        Some(oldest) => !items.iter().any(|p| p.start_time.as_second() < oldest),
         None => items.is_empty(),
     }
 }
@@ -108,11 +106,8 @@ fn done_job(site_id: &str) -> String {
     format!("amber-backfill-done:{site_id}")
 }
 
-fn day_start_ts(day: NaiveDate) -> i64 {
-    day.and_hms_opt(0, 0, 0)
-        .expect("midnight exists")
-        .and_utc()
-        .timestamp()
+fn day_start_ts(day: Date) -> i64 {
+    crate::clock::local_ts(day.at(0, 0, 0, 0), &TimeZone::UTC).expect("UTC has no gaps")
 }
 
 /// The backfill's state between cycles. Lives in the price task.
@@ -193,10 +188,8 @@ impl Backfill {
         }
         let source = store::source_name(site_id);
         let oldest_ts = store::oldest_actual_start(pool, &source).await?;
-        let oldest_day = oldest_ts
-            .and_then(|ts| DateTime::from_timestamp(ts, 0))
-            .map(|t| t.date_naive());
-        let today = Utc::now().date_naive();
+        let oldest_day = oldest_ts.map(|ts| crate::clock::local_date(ts, &TimeZone::UTC));
+        let today = crate::clock::local_date(crate::clock::unix_now(), &TimeZone::UTC);
         let floor = floor_date(config.backfill_from, today);
         let Some((start, end)) = plan_chunk(oldest_day, today, floor) else {
             debug!(%floor, "Amber price backfill has reached its start date");
@@ -218,8 +211,13 @@ impl Backfill {
             Err(err) => return Err(err),
         };
         let stop = nothing_older(&items, oldest_ts);
-        let saved =
-            store::save_prices(pool, &source, &actuals_only(items), Utc::now().timestamp()).await?;
+        let saved = store::save_prices(
+            pool,
+            &source,
+            &actuals_only(items),
+            crate::clock::unix_now(),
+        )
+        .await?;
         debug!(%start, %end, saved, "Amber past prices stored");
         if stop {
             finish(pool, &job, start, "Amber has no older prices").await?;
@@ -231,7 +229,7 @@ impl Backfill {
 
 /// Remembers that the backfill is finished and logs how far it got (once:
 /// the stored row stops later passes from asking again).
-async fn finish(pool: &SqlitePool, job: &str, reached: NaiveDate, why: &str) -> Result<()> {
+async fn finish(pool: &SqlitePool, job: &str, reached: Date, why: &str) -> Result<()> {
     crate::db::set_cursor(pool, job, day_start_ts(reached)).await?;
     info!("Amber price backfill stopped at {reached}: {why}");
     Ok(())
@@ -244,8 +242,8 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::get;
 
-    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn day(y: i16, m: i8, d: i8) -> Date {
+        jiff::civil::date(y, m, d)
     }
 
     #[test]
@@ -275,7 +273,7 @@ mod tests {
         assert_eq!(plan_chunk(None, today, day(2026, 12, 1)), None);
         // No chunk is longer than CHUNK_DAYS.
         let (s, e) = plan_chunk(None, today, day(2000, 1, 1)).unwrap();
-        assert_eq!((e - s).num_days() as u64 + 1, CHUNK_DAYS);
+        assert_eq!(i64::from((e - s).get_days()) as u64 + 1, CHUNK_DAYS);
     }
 
     fn actual_at(kind: IntervalKind, start: i64, cents: f64) -> PriceInterval {
@@ -289,8 +287,8 @@ mod tests {
             "perKwh": cents,
             "spotPerKwh": cents,
             "duration": 5,
-            "startTime": DateTime::from_timestamp(start, 0).unwrap(),
-            "endTime": DateTime::from_timestamp(start + 300, 0).unwrap(),
+            "startTime": jiff::Timestamp::from_second(start).unwrap(),
+            "endTime": jiff::Timestamp::from_second(start + 300).unwrap(),
         }))
         .unwrap()
     }

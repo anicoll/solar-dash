@@ -135,7 +135,7 @@ mod tests {
         let state = AppState::new(
             pool,
             0,
-            chrono_tz::Australia::Adelaide,
+            crate::clock::site_tz("Australia/Adelaide").unwrap(),
             &hash,
             axum_extra::extract::cookie::Key::generate(),
         )
@@ -156,7 +156,7 @@ mod tests {
         let state = AppState::new(
             pool,
             0,
-            chrono_tz::Australia::Adelaide,
+            crate::clock::site_tz("Australia/Adelaide").unwrap(),
             &hash,
             axum_extra::extract::cookie::Key::generate(),
         )
@@ -179,7 +179,7 @@ mod tests {
         let state = AppState::new(
             pool,
             0,
-            chrono_tz::Australia::Adelaide,
+            crate::clock::site_tz("Australia/Adelaide").unwrap(),
             &hash,
             axum_extra::extract::cookie::Key::generate(),
         )

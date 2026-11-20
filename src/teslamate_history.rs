@@ -45,8 +45,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{Days, Utc};
-use chrono_tz::Tz;
+use jiff::ToSpan;
+use jiff::tz::TimeZone;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
@@ -135,7 +135,7 @@ fn needing_cost(
     sessions: Vec<TmChargeToCost>,
     schedule: &TariffSchedule,
     bills: &[PastBill],
-    tz: Tz,
+    tz: &TimeZone,
 ) -> Vec<(TmChargeToCost, String)> {
     sessions
         .into_iter()
@@ -225,7 +225,7 @@ fn drive_job(car_id: i64) -> String {
 async fn fetch_drive_days(
     pg: &PgPool,
     car_id: i64,
-    tz: Tz,
+    tz: &TimeZone,
     after: i64,
     recent_from: &str,
 ) -> Result<(Vec<TmDriveDay>, Option<i64>)> {
@@ -249,7 +249,7 @@ async fn fetch_drive_days(
          GROUP BY day
          ORDER BY day",
     )
-    .bind(tz.name())
+    .bind(tz.iana_name().unwrap_or("UTC"))
     .bind(car_id)
     .bind(after)
     .bind(recent_from)
@@ -358,7 +358,7 @@ pub async fn charge_power(pg: &PgPool, charge_id: i64) -> Result<Vec<(i64, f64)>
 async fn cost_sessions(
     pg: &PgPool,
     pool: &sqlx::SqlitePool,
-    tz: Tz,
+    tz: &TimeZone,
     setup: &CostSetup,
 ) -> Result<()> {
     // The current data for this round; without a tariff nothing is costed.
@@ -435,7 +435,7 @@ async fn cost_sessions(
 async fn run_once(
     pg: &PgPool,
     pool: &sqlx::SqlitePool,
-    tz: Tz,
+    tz: &TimeZone,
     costing: &CostSetup,
 ) -> Result<Counts> {
     let mut counts = Counts::default();
@@ -444,8 +444,8 @@ async fn run_once(
     db::upsert_tm_cars(pool, &cars, db::now()).await?;
     counts.cars = cars.len();
 
-    let today = Utc::now().with_timezone(&tz).date_naive();
-    let recent_from = (today - Days::new(RECENT_DAYS - 1)).to_string();
+    let today = crate::clock::today(tz);
+    let recent_from = (today - (RECENT_DAYS as i64 - 1).days()).to_string();
     for car in &cars {
         let job = drive_job(car.id);
         let after = db::get_cursor(pool, &job).await?.unwrap_or(-1);
@@ -472,7 +472,7 @@ async fn run_once(
 async fn connect_and_run(
     database_url: &str,
     pool: &sqlx::SqlitePool,
-    tz: Tz,
+    tz: &TimeZone,
     costing: &CostSetup,
 ) -> Result<Counts> {
     let pg = PgPoolOptions::new()
@@ -493,7 +493,7 @@ async fn connect_and_run(
 pub async fn run(
     database_url: String,
     pool: sqlx::SqlitePool,
-    tz: Tz,
+    tz: TimeZone,
     costing: CostSetup,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -507,7 +507,7 @@ pub async fn run(
         }
         let outcome = tokio::select! {
             _ = &mut shutdown => break,
-            outcome = connect_and_run(&database_url, &pool, tz, &costing) => outcome,
+            outcome = connect_and_run(&database_url, &pool, &tz, &costing) => outcome,
         };
         match outcome {
             Ok(c) => info!(
@@ -611,8 +611,8 @@ mod tests {
     #[test]
     fn only_sessions_with_a_stale_key_need_costing() {
         let schedule = schedule();
-        let tz: Tz = "Australia/Adelaide".parse().unwrap();
-        let key = ev_cost::historic_cost_key(&schedule, &[], tz, 1_789_000_000);
+        let tz = crate::clock::site_tz("Australia/Adelaide").unwrap();
+        let key = ev_cost::historic_cost_key(&schedule, &[], &tz, 1_789_000_000);
         let todo = needing_cost(
             vec![
                 session(1, None),
@@ -621,7 +621,7 @@ mod tests {
             ],
             &schedule,
             &[],
-            tz,
+            &tz,
         );
         let ids: Vec<i64> = todo.iter().map(|(s, _)| s.id).collect();
         assert_eq!(ids, vec![1, 3]);
