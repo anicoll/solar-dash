@@ -4515,7 +4515,7 @@ mod tests {
 
         std::fs::create_dir_all(&backups).unwrap();
         std::fs::write(backups.join("solar-2026-10-25.db"), b"old").unwrap();
-        std::fs::write(backups.join("solar-2026-10-26.db"), b"SQLite newest").unwrap();
+        std::fs::write(backups.join("solar-2026-10-26.db.gz"), b"SQLite newest").unwrap();
         std::fs::write(backups.join("solar-2026-10-27.db.tmp"), b"partial").unwrap();
 
         let info = send(&app, get_request("/api/admin/backup", Some(&cookie))).await;
@@ -4532,13 +4532,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "application/vnd.sqlite3"
-        );
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/gzip");
         assert_eq!(
             response.headers()[header::CONTENT_DISPOSITION],
-            "attachment; filename=\"solar-2026-10-26.db\""
+            "attachment; filename=\"solar-2026-10-26.db.gz\""
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"SQLite newest");

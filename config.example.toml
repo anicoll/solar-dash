@@ -73,12 +73,15 @@ bind = "127.0.0.1:8080"
 [database]
 path = "data/solar.db"
 # `serve` copies the database once a day (03:30 in the site time zone ([site] timezone),
-# and at startup if today's copy is missing) to <backup_dir>/solar-YYYY-MM-DD.db
-# and keeps the newest `backup_keep` files. Default for backup_dir: a `backups`
+# and at startup if today's copy is missing) to <backup_dir>/solar-YYYY-MM-DD.db.gz
+# (gzip-compressed) and keeps the newest `backup_keep` files. Default for backup_dir: a `backups`
 # folder next to the database file. The user running solar-dash must be able to
 # write there. Set backup_keep = 0 to turn backups off.
 # backup_dir = "data/backups"
-# backup_keep = 14
+# backup_keep = 7
+# A backup is skipped (with a warning) unless the disk would still have this many
+# MB free afterwards, so backups never fill it. 0 = no headroom.
+# backup_min_free_mb = 1024
 
 # Optional: also upload each nightly backup to an S3-compatible bucket such as
 # Cloudflare R2, and keep the newest `keep` there (see docs/deploy.md). Without

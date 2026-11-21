@@ -94,6 +94,7 @@ pub fn build(
     spokes.push(Box::new(backups::Backups::new(
         config.database.backup_dir(),
         config.database.backup_keep,
+        config.database.backup_min_free_mb,
         offsite,
     )));
     spokes

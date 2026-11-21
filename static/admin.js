@@ -782,11 +782,10 @@
     const mb = (latest.bytes / 1e6).toFixed(1);
     const link = el('a', 'btn primary', 'Download');
     link.href = '/api/admin/backup/download';
-    link.download = `solar-${latest.date}.db`;
     const actions = el('div', 'aform-actions');
     actions.append(link);
     box.replaceChildren(
-      el('p', 'panel-note', `Latest backup: ${day}, ${mb} MB. A new one is made every night at 03:30.`),
+      el('p', 'panel-note', `Latest backup: ${day}, ${mb} MB. A new one is made every night at 03:30. The download is gzipped: gunzip it before opening it with sqlite3.`),
       ...[offsiteNote(offsite)].filter(Boolean),
       actions);
   }

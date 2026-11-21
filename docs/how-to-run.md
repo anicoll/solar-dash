@@ -253,7 +253,7 @@ To try it on your own machine without touching real data, copy a backup of the
 database and point a throwaway config at the copy:
 
 ```sh
-cp /path/to/backups/solar-2026-10-28.db /tmp/solar-try.db
+gunzip -c /path/to/backups/solar-2026-10-28.db.gz > /tmp/solar-try.db
 cp config.toml /tmp/config-try.toml
 # In /tmp/config-try.toml: set [database] path = "/tmp/solar-try.db",
 # [server] bind = "127.0.0.1:8081" and cookie_secure = false.
@@ -1200,7 +1200,7 @@ the API at once, and is added to `admin_change` with the row before and after.
 | --- | --- |
 | `GET /api/admin` | Everything: `{"tariffs":[Plan..],"petrol":{"fallback_cents_per_litre":..,"prices":[{from,cents_per_litre}..]},"purchases":[{id,name,date,cost_dollars,battery_kwh}..],"manual_cars":[{id,name,model,kind,fills}..],"bills":[{from,to,bill_total,excluded,import_kwh,import_dollars,export_kwh,export_dollars,supply_dollars,note}..],"settings":{key:value..},"setting_defaults":{key:value..},"changes":[{id,at,what,action,key}..]}`. `settings` holds the keys that are set, `setting_defaults` what the others are. `changes` is the last 50, newest first (`at` is unix seconds). With `?download=1` the answer is sent as `solar-dash-admin-YYYY-MM-DD.json` to save (the Export) |
 | `GET /api/admin/backup` | The newest nightly backup: `{"latest":{"date":"YYYY-MM-DD","bytes":n}}`, or `{"latest":null}` when there is none |
-| `GET /api/admin/backup/download` | The newest backup file as `solar-YYYY-MM-DD.db` (`application/vnd.sqlite3`), 404 if there is none. Needs the login cookie: the `api_token` Bearer is refused, since the file holds all the data |
+| `GET /api/admin/backup/download` | The newest backup file as `solar-YYYY-MM-DD.db.gz` (`application/gzip`; an old uncompressed `.db` is sent as `application/vnd.sqlite3`), 404 if there is none. Needs the login cookie: the `api_token` Bearer is refused, since the file holds all the data |
 | `POST /api/admin/tariffs` | Adds a plan and answers with it (201). Body: a Plan without `id` |
 | `POST /api/admin/tariffs/preview` | Prices the days so far on the current plans and on the plans with this change, without saving anything. Body: a Plan; with an `id` it replaces that plan, without one it is added. Optional `?from=YYYY-MM-DD&to=YYYY-MM-DD` (at most 92 days; default: the last 30 complete days). Answers `{"days":[{"date","current_cents","new_cents"}..],"total":{"current_cents","new_cents"}}`; days with no data are left out, and `current_cents` is null when no plan is saved yet |
 | `PUT /api/admin/tariffs/{id}` | Replaces a plan and answers with it. 404 if there is none |

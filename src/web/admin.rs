@@ -150,7 +150,17 @@ pub async fn backup_info(State(state): State<AppState>) -> Result<Json<Value>, A
 /// `auth::require_session`). 404 when there is no backup.
 pub async fn backup_download(State(state): State<AppState>) -> Result<Response, ApiError> {
     let none = || ApiError::new(StatusCode::NOT_FOUND, "there is no backup yet".to_string());
-    let (date, path) = newest_backup(&state).await?.ok_or_else(none)?;
+    let (_, path) = newest_backup(&state).await?.ok_or_else(none)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("solar-backup.db")
+        .to_string();
+    let content_type = if name.ends_with(".gz") {
+        "application/gzip"
+    } else {
+        "application/vnd.sqlite3"
+    };
     // The file is tens of MB, so read it off the async threads.
     let read = tokio::task::spawn_blocking(move || std::fs::read(path))
         .await
@@ -160,10 +170,10 @@ pub async fn backup_download(State(state): State<AppState>) -> Result<Response, 
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(none()),
         Err(err) => return Err(anyhow::Error::from(err).into()),
     };
-    let disposition = format!("attachment; filename=\"solar-{date}.db\"");
+    let disposition = format!("attachment; filename=\"{name}\"");
     Ok((
         [
-            (header::CONTENT_TYPE, "application/vnd.sqlite3".to_string()),
+            (header::CONTENT_TYPE, content_type.to_string()),
             (header::CONTENT_DISPOSITION, disposition),
             (header::CACHE_CONTROL, "no-store".to_string()),
         ],
